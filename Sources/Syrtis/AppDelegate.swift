@@ -587,3 +587,4 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 }
+// cache-hit probe; not for merge
