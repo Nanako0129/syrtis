@@ -175,7 +175,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         if: steps.scope.outputs.docs_only != 'true' && (steps.rustlib-restore.outputs.cache-hit != 'true')
         with:
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          save-if: true  # EXPERIMENT: let the branch save so a re-run measures a warm cache
 
       # --locked: the key names Cargo.lock, so the build must be held to it. A
       # manifest change without a regenerated lock fails here instead of being
@@ -183,6 +183,14 @@ jobs:
       - name: Build Rust staticlib
         if: steps.scope.outputs.docs_only != 'true' && (steps.rustlib-restore.outputs.cache-hit != 'true')
         run: cargo build --release --locked
+
+      - name: EXPERIMENT cargo test -p tb_core_ffi
+        if: steps.scope.outputs.docs_only != 'true' && (steps.rustlib-restore.outputs.cache-hit != 'true')
+        run: cargo test -p tb_core_ffi --locked
+
+      - name: EXPERIMENT cargo clippy --workspace --all-targets
+        if: steps.scope.outputs.docs_only != 'true' && (steps.rustlib-restore.outputs.cache-hit != 'true')
+        run: cargo clippy --workspace --all-targets --locked
 
       # The copy main saves is taken here, from this exact cargo invocation.
       - name: Stage Rust library for the cache
