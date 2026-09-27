@@ -176,6 +176,7 @@ jobs:
         if: steps.scope.outputs.docs_only != 'true' && (steps.rustlib-restore.outputs.cache-hit != 'true')
         with:
           save-if: true  # EXPERIMENT: let the branch save so a re-run measures a warm cache
+          key: cargo-test-exp  # EXPERIMENT: a key main never wrote, so attempt 1 saves the test-profile deps
 
       # --locked: the key names Cargo.lock, so the build must be held to it. A
       # manifest change without a regenerated lock fails here instead of being
