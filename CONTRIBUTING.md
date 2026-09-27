@@ -156,3 +156,4 @@ Public issues, pull requests, fixtures, and documentation must contain only sani
 | Personal absolute paths, private hosts, or machine-specific tooling | Use repository-relative paths, documented product-relative paths, placeholders, or omit the detail |
 | Machine-local instructions | Keep them outside the tracked repository; they are not project facts |
 | Unpublished or sensitive work | Describe only the sanitized project conclusion appropriate for a public repository |
+<!-- docs-only CI probe; not for merge -->
