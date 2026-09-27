@@ -112,3 +112,5 @@ Private memories and plans may contain local paths, credential handling details,
 ## Migration coverage
 
 [`migration-ledger.md`](migration-ledger.md) is the no-gaps inventory for the 37 memory sources, 19 plan sources, and 2 local sources reviewed for this migration. Every row has an opaque source ID, a privacy boundary, a treatment, a non-empty canonical destination, and a verification statement. Private and other-project sources remain classified rather than copied into canonical project facts.
+
+See [missing](does-not-exist.md).
