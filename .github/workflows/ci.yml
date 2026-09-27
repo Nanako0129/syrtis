@@ -92,7 +92,34 @@ jobs:
           # rather than a copy of it: literal <, &, >, an escaped &lt; and ]]>.
           scripts/render_notes_html.sh --self-test
 
+      # A PR that only changes prose needs the knowledge and release-notes
+      # checks above, not a 5-minute app build. Everything below is skipped for
+      # it, so the `build` check still ends green or red rather than disappearing
+      # (a missing check reads as "nothing pending" to a merge loop).
+      #
+      # Fail-closed: only a pull_request can be docs-only, the diff must list at
+      # least one file, and every file must be under docs/ or release-notes/ or
+      # be a Markdown file at the repository root. Anything else, including a
+      # diff that cannot be computed, runs the full build. A push to main never
+      # takes this path.
+      - name: Classify the change
+        id: scope
+        if: github.event_name == 'pull_request'
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -uo pipefail
+          docs_only=false
+          if files=$(git diff --name-only "$BASE" HEAD) && [ -n "$files" ]; then
+            if ! grep -vqE '^(docs/|release-notes/|[^/]+\.md$)' <<<"$files"; then
+              docs_only=true
+            fi
+          fi
+          printf '%s\n' "$files"
+          echo "docs_only=$docs_only" | tee -a "$GITHUB_OUTPUT"
+
       - uses: dtolnay/rust-toolchain@stable
+        if: steps.scope.outputs.docs_only != 'true'
 
       # Most PRs never touch Rust, yet rebuilt the staticlib every run: the
       # dependency cache hits, but the two workspace crates are path
@@ -112,6 +139,7 @@ jobs:
       # would not trip `set -e`, and an empty engine term would let a PR that
       # only moves the submodule link the previous engine.
       - name: Rust library cache key
+        if: steps.scope.outputs.docs_only != 'true'
         id: rustlib
         run: |
           set -euo pipefail
@@ -128,14 +156,14 @@ jobs:
       # the path into the entry's version, and a different path never matches.
       - name: Restore Rust library
         id: rustlib-restore
-        if: github.event_name == 'pull_request'
+        if: steps.scope.outputs.docs_only != 'true' && (github.event_name == 'pull_request')
         uses: actions/cache/restore@v6
         with:
           path: ${{ runner.temp }}/rustlib/libtb_core_ffi.a
           key: ${{ steps.rustlib.outputs.key }}
 
       - name: Link the restored Rust library
-        if: steps.rustlib-restore.outputs.cache-hit == 'true'
+        if: steps.scope.outputs.docs_only != 'true' && (steps.rustlib-restore.outputs.cache-hit == 'true')
         run: |
           mkdir -p target/release
           cp "$RUNNER_TEMP/rustlib/libtb_core_ffi.a" target/release/
@@ -143,7 +171,7 @@ jobs:
       # Saves on main only: a PR's own entry is scoped to that PR and would only
       # evict main's entries from the 10 GB budget.
       - uses: Swatinem/rust-cache@v2
-        if: steps.rustlib-restore.outputs.cache-hit != 'true'
+        if: steps.scope.outputs.docs_only != 'true' && (steps.rustlib-restore.outputs.cache-hit != 'true')
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
@@ -151,21 +179,21 @@ jobs:
       # manifest change without a regenerated lock fails here instead of being
       # resolved afresh and cached under a key that claims the old lock.
       - name: Build Rust staticlib
-        if: steps.rustlib-restore.outputs.cache-hit != 'true'
+        if: steps.scope.outputs.docs_only != 'true' && (steps.rustlib-restore.outputs.cache-hit != 'true')
         run: cargo build --release --locked
 
       # The copy main saves is taken here, from this exact cargo invocation —
       # the push-only steps below run cargo again through make and bundle.sh,
       # whose flags this key does not cover.
       - name: Stage Rust library for the cache
-        if: github.event_name == 'push'
+        if: steps.scope.outputs.docs_only != 'true' && (github.event_name == 'push')
         run: |
           mkdir -p "$RUNNER_TEMP/rustlib"
           cp target/release/libtb_core_ffi.a "$RUNNER_TEMP/rustlib/"
 
       - name: Check for an existing Rust library entry
         id: rustlib-exists
-        if: github.event_name == 'push'
+        if: steps.scope.outputs.docs_only != 'true' && (github.event_name == 'push')
         uses: actions/cache/restore@v6
         with:
           path: ${{ runner.temp }}/rustlib/libtb_core_ffi.a
@@ -173,15 +201,18 @@ jobs:
           lookup-only: true
 
       - name: Build Swift package
+        if: steps.scope.outputs.docs_only != 'true'
         run: swift build
 
       - name: Core logic selftest
+        if: steps.scope.outputs.docs_only != 'true'
         # Pace copy and Format's date output are localized, and several
         # assertions compare against the English text. Pin the language so the
         # result never depends on the runner's locale.
         run: swift run Syrtis --selftest -AppleLanguages "(en)"
 
       - name: FFI smoke test
+        if: steps.scope.outputs.docs_only != 'true'
         run: swift run Syrtis --smoke
 
       # Every step above compiles the debug configuration, so nothing here can
@@ -197,7 +228,7 @@ jobs:
       # trade. Running it on main still guarantees the tag is never the first
       # time this configuration is compiled.
       - name: Build Swift package (release configuration)
-        if: github.event_name == 'push'
+        if: steps.scope.outputs.docs_only != 'true' && (github.event_name == 'push')
         run: swift build -c release
 
       # Every step above runs the bare executable, where
@@ -225,14 +256,14 @@ jobs:
       # Empty rather than the literal: a second copy of the identifier is a
       # second place for a rename to silently weaken this into a no-op.
       - name: Selftest from the bundled release binary
-        if: github.event_name == 'push'
+        if: steps.scope.outputs.docs_only != 'true' && (github.event_name == 'push')
         run: make selftest-bundled SELFTEST_BUNDLE_ID=
 
       # Last, so only a main commit that passed every step above — the
       # release-configuration build and the bundled selftest included — can
       # publish the library PRs will link.
       - name: Save Rust library
-        if: github.event_name == 'push' && steps.rustlib-exists.outputs.cache-hit != 'true'
+        if: steps.scope.outputs.docs_only != 'true' && (github.event_name == 'push' && steps.rustlib-exists.outputs.cache-hit != 'true')
         uses: actions/cache/save@v6
         with:
           path: ${{ runner.temp }}/rustlib/libtb_core_ffi.a
