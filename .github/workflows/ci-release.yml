@@ -27,7 +27,7 @@ jobs:
     steps:
       # No step after checkout needs the token: the submodule is fetched by
       # checkout itself and SwiftPM clones Sparkle anonymously.
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
           persist-credentials: false
