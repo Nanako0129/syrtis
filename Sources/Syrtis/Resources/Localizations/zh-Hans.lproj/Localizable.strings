@@ -134,6 +134,7 @@
 /* ===== 额度窗口 ===== */
 "Session" = "会话";
 "Weekly" = "每周";
+"Rolling" = "滚动";
 "5h" = "5 小时";
 "Pro" = "Pro";
 "Flash" = "Flash";
