@@ -620,14 +620,21 @@ enum WindowCardGate {
     /// `quotaClients` is what the model builds cards for
     /// (`DashboardModel.windowCardClients`); `excluded` the tab/limits-hidden
     /// set. A grouped tab whose id is not itself a card client (a Grok Bot-only
-    /// install) gets no card and keeps its strip and heatmap.
+    /// install) draws its first quota member's card instead, one card per tab
+    /// as on Windows (Syrtis-Windows #178).
     static func clients(
         tab: String, presentClients: [String], quotaClients: [String], excluded: Set<String>,
         confirmed: [UsageAttribution.Record]
     ) -> (card: String?, scan: String?) {
-        guard quotaClients.contains(tab), !excluded.contains(tab) else { return (nil, nil) }
+        guard !excluded.contains(tab),
+              let card = quotaClients.contains(tab)
+                ? tab
+                : ClientRegistry.tabSlice(tab).first(where: {
+                    quotaClients.contains($0) && !excluded.contains($0)
+                })
+        else { return (nil, nil) }
         let records = tabHasLocalRecords(
             tab: tab, presentClients: presentClients, confirmed: confirmed)
-        return (tab, records ? tab : nil)
+        return (card, records ? card : nil)
     }
 }

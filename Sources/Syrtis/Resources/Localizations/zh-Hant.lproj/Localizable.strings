@@ -135,6 +135,7 @@
 /* ===== 額度視窗 ===== */
 "Session" = "工作階段";
 "Weekly" = "每週";
+"Rolling" = "滾動";
 "5h" = "5 小時";
 "Pro" = "Pro";
 "Flash" = "Flash";

@@ -1213,6 +1213,11 @@ enum SelfTest {
                     return value == nil || value == card.label
                 }
             }
+            // OpenCode Go's shortest window label, worded as Windows #180.
+            expect(
+                AppLanguage.localizedString("Rolling", locale: "zh-Hant", bundle: bundle) == "滾動"
+                    && AppLanguage.localizedString("Rolling", locale: "zh-Hans", bundle: bundle) == "滚动",
+                "OpenCode Go's Rolling window label is translated in zh-Hant and zh-Hans, from the \(bundleName)")
             expect(
                 untranslatedCards.isEmpty,
                 "Every hideable Overview card label is translated in zh-Hant and zh-Hans, from the \(bundleName); untranslated: \(untranslatedCards.map(\.label))")
@@ -18953,8 +18958,14 @@ enum SelfTest {
         expect(wcpGate("antigravity", present: ["antigravity-cli"],
                        quota: ["antigravity-cli", "antigravity"]) == "antigravity/antigravity",
                "WCP2-gate a grouped tab with only a member's local records has records: card and scan")
-        expect(wcpGate("grok", present: [], quota: ["grok-bot"]) == "nil/nil",
-               "WCP2-gate a Grok Bot-only tab gets no card and no scan (strip and heatmap stay)")
+        // Mutation: the member fallback dropped (Bot-only back to nil/nil).
+        expect(wcpGate("grok", present: [], quota: ["grok-bot"]) == "grok-bot/nil",
+               "WCP2-gate a Grok Bot-only tab draws Grok Bot's card, no scan")
+        expect(wcpGate("grok", present: ["grok"], quota: ["grok", "grok-bot"]) == "grok/grok",
+               "WCP2-gate Grok Build and Bot both installed: the tab keeps Grok Build's card")
+        expect(wcpGate("grok", present: [], quota: []) == "nil/nil"
+                   && wcpGate("grok", present: [], quota: ["grok-bot"], excluded: ["grok-bot"]) == "nil/nil",
+               "WCP2-gate control: no Grok Bot quota, or Grok Bot's limits hidden, gets no card")
         expect(wcpGate("claude", present: ["claude"], quota: ["claude"]) == "claude/claude",
                "WCP2-gate control: a tab with local records gets both, the same id")
         expect(wcpGate("claude", present: ["claude"], quota: ["claude"], excluded: ["claude"]) == "nil/nil"
