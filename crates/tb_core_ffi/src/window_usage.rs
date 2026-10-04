@@ -1053,7 +1053,7 @@ mod tests {
         let context = crate::LocalSourceContext::for_home(home.clone());
         let outer = scan(&context, &Some(d.display().to_string()));
 
-        assert!(output_tokens(&outer) >= D_OUTPUT, "D's own roots were excluded: {outer}");
+        assert_eq!(output_tokens(&outer), D_OUTPUT, "D's own roots were excluded: {outer}");
         reset_registries();
     }
 
