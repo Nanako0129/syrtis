@@ -18254,6 +18254,27 @@ enum SelfTest {
                       fake.read { $0.attempts } == 1 && ac.currentAgyKey == nil)
             }
 
+            // Turning automatic capture off during the marker read that
+            // precedes an attempt starts no attempt (CodeRabbit on #474): the
+            // callers' toggle check ran before that read.
+            do {
+                let fake = AGAutoFake(key: agKey, label: agEmail)
+                let (ac, defaults) = fresh(fake)
+                defaults.set(true, forKey: AntigravityAutoCapture.enabledKey)
+                nonisolated(unsafe) let suite = defaults
+                let enabledKey = AntigravityAutoCapture.enabledKey
+                fake.write { $0.onNextRead = { suite.set(false, forKey: enabledKey) } }
+                await ac.poll()
+                let viaPrepare = AGAutoFake(key: agKey, label: agEmail)
+                let (ac2, defaults2) = fresh(viaPrepare)
+                defaults2.set(true, forKey: AntigravityAutoCapture.enabledKey)
+                nonisolated(unsafe) let suite2 = defaults2
+                viaPrepare.write { $0.onNextRead = { suite2.set(false, forKey: enabledKey) } }
+                await TrayAnimator.prepareAntigravityAutoCapture(defaults: defaults2, autoCapture: ac2)?.value
+                check("AG-5 race: turning capture off during the pre-attempt marker read starts no attempt",
+                      fake.read { $0.attempts } == 0 && viaPrepare.read { $0.attempts } == 0)
+            }
+
             // One strip row and one heatmap row, through the model.
             @MainActor func lens(currentKey: Bool) async -> (summaries: Int, heatmaps: Int) {
                 let fake = AGAutoFake(key: agKey, label: agEmail)
@@ -19446,6 +19467,9 @@ private final class AGAutoFake: @unchecked Sendable {
     /// Runs on the first marker read after an automatic attempt, as if the
     /// user acted while that re-read was in flight.
     var onReadAfterAttempt: (@Sendable () -> Void)?
+    /// Runs once, on the next marker read, as if the user acted while that
+    /// read was in flight.
+    var onNextRead: (@Sendable () -> Void)?
     private var attemptPending = false
     private var markerUnreadable = false
     var attempts = 0
@@ -19477,8 +19501,12 @@ private final class AGAutoFake: @unchecked Sendable {
             marker: {
                 let (marker, unreadable, hook) = self.read { fake -> (String, Bool, (@Sendable () -> Void)?) in
                     fake.markerCalls += 1
-                    let hook = fake.attemptPending ? fake.onReadAfterAttempt : nil
+                    var hook = fake.attemptPending ? fake.onReadAfterAttempt : nil
                     fake.attemptPending = false
+                    if let next = fake.onNextRead {
+                        fake.onNextRead = nil
+                        hook = next
+                    }
                     return (fake.marker, fake.markerUnreadable, hook)
                 }
                 hook?()

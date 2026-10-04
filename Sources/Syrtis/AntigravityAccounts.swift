@@ -284,6 +284,11 @@ final class AntigravityAutoCapture: ObservableObject {
         guard let marker else { return await pollIfOwed() }
         unavailable = marker == "present"
         guard marker != lastAttemptedMarker, !busy else { return await pollIfOwed() }
+        // The toggle is checked here, right before an attempt, and not only by
+        // callers: they check it before the marker read this function (or
+        // `prepareForFetch`) awaits, and the user can turn capture off during
+        // that read. No new attempt starts after the toggle is off.
+        guard isEnabled else { return }
         busy = true
         // Both before the attempt: the old key may not be agy's account any
         // more, and a failed attempt must not be retried for this marker.
