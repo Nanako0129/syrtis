@@ -17866,8 +17866,10 @@ enum SelfTest {
                     await TrayAnimator.pollAntigravityAutoCapture(
                         defaults: defaults, autoCapture: ac)?.value
                 }
-                check("AG-5 control, toggle on: one marker call per poll, one attempt for one marker",
-                      fake.read { $0.markerCalls } == 3 && fake.read { $0.attempts } == 1
+                // One marker call per poll, plus the one re-read after the
+                // single attempt that binds the key only if the marker held.
+                check("AG-5 control, toggle on: one marker call per poll (+1 after the attempt), one attempt for one marker",
+                      fake.read { $0.markerCalls } == 4 && fake.read { $0.attempts } == 1
                           && ac.currentAgyKey == agKey)
                 fake.write { $0.marker = "m2" }
                 await ac.poll()
@@ -17925,9 +17927,10 @@ enum SelfTest {
                 fake.write { $0.hold = nil }
                 hold.signal()
                 await attempt?.value
+                // Two checks, each followed by its attempt's re-read: 4.
                 check("AG-5 a login change forgets the current account before the next fetch",
                       wasCurrent && attempt != nil && clearedBeforeFetch
-                          && fake.read { $0.markerCalls } == 2)
+                          && fake.read { $0.markerCalls } == 4)
             }
 
             // The marker is recorded BEFORE the attempt: toggling off and on
@@ -18165,6 +18168,111 @@ enum SelfTest {
                       both(inFlight))
                 check("AG-5 skipped_removed leaves the current key cleared: both cards",
                       both(afterSkip) && ac.currentAgyKey == nil)
+            }
+
+            // An automatic attempt binds the captured key only when agy's
+            // marker is the same after the attempt as before it (Windows W7b).
+            // Without that, an agy sign-in landing mid-attempt labels the next
+            // login's card with this account's email.
+            do {
+                let fake = AGAutoFake(key: agKey, label: agEmail)
+                let (ac, defaults) = fresh(fake)
+                defaults.set(true, forKey: AntigravityAutoCapture.enabledKey)
+                await ac.poll()
+                check("AG-5 race control: a steady marker binds the key to it",
+                      ac.currentAgyKey == agKey && ac.currentAgyMarker == "m1")
+            }
+            do {
+                let fake = AGAutoFake(key: agKey, label: agEmail)
+                fake.write { $0.markerAfterAttempt = "m2" }
+                let (ac, defaults) = fresh(fake)
+                defaults.set(true, forKey: AntigravityAutoCapture.enabledKey)
+                await ac.poll()
+                let listed = AntigravityAccounts.load(defaults: defaults).map(\.key)
+                check("AG-5 race: a sign-in during the attempt leaves the key unbound but listed",
+                      ac.currentAgyKey == nil && listed == [agKey])
+                await ac.poll()
+                check("AG-5 race: the next check attempts the new marker",
+                      fake.read { $0.attempts } == 2 && ac.currentAgyMarker == "m2")
+            }
+            do {
+                let fake = AGAutoFake(key: agKey, label: agEmail)
+                fake.write { $0.markerUnreadableAfterAttempt = true }
+                let (ac, defaults) = fresh(fake)
+                defaults.set(true, forKey: AntigravityAutoCapture.enabledKey)
+                await ac.poll()
+                check("AG-5 race: an unreadable marker after the attempt leaves the key unbound",
+                      ac.currentAgyKey == nil)
+                fake.write { $0.markerUnreadableAfterAttempt = false }
+                fake.markerReadable()
+                await ac.poll()
+                check("AG-5 race: an unreadable marker is retried, not waited out",
+                      fake.read { $0.attempts } == 2 && ac.currentAgyKey == agKey)
+            }
+
+            do {
+                let fake = AGAutoFake(key: agKey, label: agEmail)
+                let (ac, defaults) = fresh(fake)
+                defaults.set(true, forKey: AntigravityAutoCapture.enabledKey)
+                // The toggle goes off while the post-attempt marker read runs.
+                // UserDefaults is thread-safe, so the hook flips it directly.
+                nonisolated(unsafe) let suite = defaults
+                let enabledKey = AntigravityAutoCapture.enabledKey
+                fake.write { $0.onReadAfterAttempt = { suite.set(false, forKey: enabledKey) } }
+                await ac.poll()
+                check("AG-5 race: turning automatic capture off during the re-read leaves the key unbound",
+                      ac.currentAgyKey == nil)
+            }
+
+            // A poll owed during an attempt must not run once the toggle is
+            // off, even when the post-attempt marker read failed (which
+            // forgets the attempted marker) and the marker is readable again.
+            do {
+                let fake = AGAutoFake(key: agKey, label: agEmail)
+                let hold = DispatchSemaphore(value: 0)
+                fake.write {
+                    $0.hold = hold
+                    $0.markerUnreadableAfterAttempt = true
+                }
+                let (ac, defaults) = fresh(fake)
+                defaults.set(true, forKey: AntigravityAutoCapture.enabledKey)
+                nonisolated(unsafe) let suite = defaults
+                let enabledKey = AntigravityAutoCapture.enabledKey
+                fake.write {
+                    $0.onReadAfterAttempt = {
+                        suite.set(false, forKey: enabledKey)
+                        fake.markerReadable()
+                    }
+                }
+                let first = Task { await ac.poll() }
+                await until { fake.read { $0.attempts } == 1 }
+                await ac.poll() // refused while busy: owed
+                fake.write { $0.hold = nil }
+                hold.signal()
+                await first.value
+                check("AG-5 race: a poll owed during the attempt does not run after the toggle went off",
+                      fake.read { $0.attempts } == 1 && ac.currentAgyKey == nil)
+            }
+
+            // Turning automatic capture off during the marker read that
+            // precedes an attempt starts no attempt (CodeRabbit on #474): the
+            // callers' toggle check ran before that read.
+            do {
+                let fake = AGAutoFake(key: agKey, label: agEmail)
+                let (ac, defaults) = fresh(fake)
+                defaults.set(true, forKey: AntigravityAutoCapture.enabledKey)
+                nonisolated(unsafe) let suite = defaults
+                let enabledKey = AntigravityAutoCapture.enabledKey
+                fake.write { $0.onNextRead = { suite.set(false, forKey: enabledKey) } }
+                await ac.poll()
+                let viaPrepare = AGAutoFake(key: agKey, label: agEmail)
+                let (ac2, defaults2) = fresh(viaPrepare)
+                defaults2.set(true, forKey: AntigravityAutoCapture.enabledKey)
+                nonisolated(unsafe) let suite2 = defaults2
+                viaPrepare.write { $0.onNextRead = { suite2.set(false, forKey: enabledKey) } }
+                await TrayAnimator.prepareAntigravityAutoCapture(defaults: defaults2, autoCapture: ac2)?.value
+                check("AG-5 race: turning capture off during the pre-attempt marker read starts no attempt",
+                      fake.read { $0.attempts } == 0 && viaPrepare.read { $0.attempts } == 0)
             }
 
             // One strip row and one heatmap row, through the model.
@@ -19352,6 +19460,18 @@ private final class AGAutoFake: @unchecked Sendable {
     /// When set, the marker changes during `capture`, as if agy finished a
     /// sign-in while the Capture button's work was running.
     var markerAfterCapture: String?
+    /// When set, the marker changes during an automatic attempt.
+    var markerAfterAttempt: String?
+    /// When set, the marker cannot be read once an automatic attempt ran.
+    var markerUnreadableAfterAttempt = false
+    /// Runs on the first marker read after an automatic attempt, as if the
+    /// user acted while that re-read was in flight.
+    var onReadAfterAttempt: (@Sendable () -> Void)?
+    /// Runs once, on the next marker read, as if the user acted while that
+    /// read was in flight.
+    var onNextRead: (@Sendable () -> Void)?
+    private var attemptPending = false
+    private var markerUnreadable = false
     var attempts = 0
     var captures = 0
     var lastRemoved: [String] = []
@@ -19374,13 +19494,33 @@ private final class AGAutoFake: @unchecked Sendable {
 
     func write(_ body: (AGAutoFake) -> Void) { read(body) }
 
+    func markerReadable() { write { $0.markerUnreadable = false } }
+
     func io() -> AntigravityAutoCapture.IO {
         .init(
-            marker: { self.read { $0.markerCalls += 1; return $0.marker } },
+            marker: {
+                let (marker, unreadable, hook) = self.read { fake -> (String, Bool, (@Sendable () -> Void)?) in
+                    fake.markerCalls += 1
+                    var hook = fake.attemptPending ? fake.onReadAfterAttempt : nil
+                    fake.attemptPending = false
+                    if let next = fake.onNextRead {
+                        fake.onNextRead = nil
+                        hook = next
+                    }
+                    return (fake.marker, fake.markerUnreadable, hook)
+                }
+                hook?()
+                if unreadable { throw TBCoreError.bridge("marker_unreadable") }
+                return marker
+            },
             autoCapture: { removed in
                 let (hold, outcome) = self.read { fake -> (DispatchSemaphore?, Result<AntigravityAutoCaptureResult, TBCoreError>) in
                     fake.attempts += 1
+                    fake.attemptPending = true
                     fake.lastRemoved = removed
+                    // A sign-in that lands while the attempt runs.
+                    if let next = fake.markerAfterAttempt { fake.marker = next }
+                    if fake.markerUnreadableAfterAttempt { fake.markerUnreadable = true }
                     return (fake.hold, fake.outcome)
                 }
                 hold?.wait()

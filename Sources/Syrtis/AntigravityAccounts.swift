@@ -284,6 +284,11 @@ final class AntigravityAutoCapture: ObservableObject {
         guard let marker else { return await pollIfOwed() }
         unavailable = marker == "present"
         guard marker != lastAttemptedMarker, !busy else { return await pollIfOwed() }
+        // The toggle is checked here, right before an attempt, and not only by
+        // callers: they check it before the marker read this function (or
+        // `prepareForFetch`) awaits, and the user can turn capture off during
+        // that read. No new attempt starts after the toggle is off.
+        guard isEnabled else { return }
         busy = true
         // Both before the attempt: the old key may not be agy's account any
         // more, and a failed attempt must not be retried for this marker.
@@ -303,7 +308,26 @@ final class AntigravityAutoCapture: ObservableObject {
                     ? accounts
                     : AntigravityAccounts.adding(.init(key: key, label: label), to: accounts)
             }
-            if isEnabled { setCurrent(key, marker: marker) }
+            if isEnabled {
+                // Bound only if agy's marker did not move during the attempt,
+                // as `manualCapture`: the key is the account agy was signed
+                // into when the core read it, and a sign-in that landed
+                // meanwhile would label the next login's card with this one's
+                // email. Moved: left unbound, and the next check sees the new
+                // marker and attempts again. Unreadable: left unbound and the
+                // attempted marker forgotten, so the next check retries this
+                // marker instead of waiting for agy's login to change (the
+                // core answers `unchanged` with no Google request while its
+                // stored token equals agy's). Syrtis-Windows W7b does the same.
+                let after = try? await Self.detached({ try io.marker() })
+                // Re-checked after the await: the toggle may have been turned
+                // off while the marker was being read.
+                if after == marker, isEnabled {
+                    setCurrent(key, marker: marker)
+                } else if after == nil {
+                    lastAttemptedMarker = nil
+                }
+            }
         case .failure(TBCoreError.bridge("paused")):
             paused = true
             currentAgyKey = nil
@@ -348,6 +372,11 @@ final class AntigravityAutoCapture: ObservableObject {
     private func pollIfOwed() async {
         guard pollAgain else { return }
         pollAgain = false
+        // An owed poll is an automatic attempt, so it honours the toggle as
+        // the callers of `poll` do. Without this, a poll owed during an
+        // attempt whose marker re-read failed (which forgets the attempted
+        // marker) would re-attempt after the user turned capture off.
+        guard isEnabled else { return }
         await poll()
     }
 
