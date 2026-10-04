@@ -15,7 +15,7 @@
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
@@ -117,6 +117,40 @@ fn primary_exclusions() -> Vec<PathBuf> {
     excluded
 }
 
+/// The other accounts nested under `dir`, which `dir`'s own window must not
+/// read: their configured directories, and every registered Claude root under
+/// `dir` that is not one of `dir`'s own.
+///
+/// An extra account's window is scanned with `dir` as home, and the engine
+/// adds `<dir>/.claude/projects`, `<dir>/.claude/transcripts` and the cowork
+/// trees under it on its own. So an account configured at `dir/.claude` was
+/// counted both here and in its own window. Only paths under `dir` are listed:
+/// an unrelated account is never reached from this home, and an account that
+/// contains this one (an ancestor) must not be listed, or the exclusion would
+/// remove this account's own files. Compared component-wise as given; a nested
+/// account registered under another spelling of its folder (a symlink, a
+/// different case on a case-insensitive volume) is not recognised and stays
+/// counted twice, as before, rather than hidden. Windows does the same
+/// (Syrtis-Windows #203).
+fn nested_exclusions(dir: &str, own: &[PathBuf]) -> Vec<PathBuf> {
+    let owner = Path::new(dir);
+    let nested = |path: &Path| path != owner && path.starts_with(owner);
+    let mut excluded: Vec<PathBuf> = crate::claude_config_dirs::snapshot()
+        .into_iter()
+        .map(PathBuf::from)
+        .filter(|path| nested(path))
+        .collect();
+    if let Some(roots) = crate::extra_scan_paths::snapshot().get(CLAUDE) {
+        excluded.extend(
+            roots
+                .iter()
+                .filter(|root| !own.contains(root) && nested(root))
+                .cloned(),
+        );
+    }
+    excluded
+}
+
 /// Report options that read one account's transcripts and nothing else.
 ///
 /// The primary keeps the real home and every client, and simply refuses the
@@ -186,13 +220,28 @@ fn account_options(
             if roots.is_empty() {
                 return Err(NO_REGISTERED_ROOTS.to_string());
             }
+            let excluded = nested_exclusions(dir, &roots);
+            let mut scanner_settings = tokscale_core::scanner::ScannerSettings {
+                extra_scan_paths: BTreeMap::from([(CLAUDE.to_string(), roots)]),
+                ..Default::default()
+            };
+            if !excluded.is_empty() {
+                scanner_settings
+                    .excluded_scan_paths
+                    .insert(CLAUDE.to_string(), excluded);
+            }
             tokscale_core::ReportOptions {
                 home_dir: Some(dir.clone()),
                 use_env_roots: false,
-                scanner_settings: tokscale_core::scanner::ScannerSettings {
-                    extra_scan_paths: BTreeMap::from([(CLAUDE.to_string(), roots)]),
-                    ..Default::default()
-                },
+                // Exactly the Claude client. Rooted at `dir`, the engine also
+                // resolves every other client's home routes under it, and a
+                // `.cc-mirror` variant there may name a directory anywhere;
+                // those rows carry `cc-mirror/<variant>` or another client id
+                // and could reach this account's card through a usage
+                // attribution declaring them against Claude. The engine
+                // matches this per message (`report_message_client_passes`).
+                clients: Some(vec![CLAUDE.to_string()]),
+                scanner_settings,
                 ..Default::default()
             }
         }
@@ -213,6 +262,7 @@ fn account_parse_options(
     Ok(tokscale_core::LocalParseOptions {
         home_dir: report.home_dir,
         use_env_roots: report.use_env_roots,
+        clients: report.clients,
         scanner_settings: report.scanner_settings,
         ..Default::default()
     })
@@ -886,6 +936,164 @@ mod tests {
             PRIMARY_OUTPUT,
             "the primary folded a configured account: {primary}"
         );
+        reset_registries();
+    }
+
+    const INNER_OUTPUT: i64 = 3_000;
+
+    fn claude_roots(dirs: &[&PathBuf]) -> Vec<String> {
+        dirs.iter()
+            .flat_map(|d| {
+                [
+                    d.join("projects").display().to_string(),
+                    d.join("transcripts").display().to_string(),
+                ]
+            })
+            .collect()
+    }
+
+    fn install(roots: &[String], config_dirs: &[&PathBuf]) {
+        crate::extra_scan_paths::set_from_json(
+            &serde_json::json!({ "claude": roots }).to_string(),
+        )
+        .unwrap();
+        crate::claude_config_dirs::set_from_json(
+            &serde_json::json!(config_dirs
+                .iter()
+                .map(|d| d.display().to_string())
+                .collect::<Vec<_>>())
+            .to_string(),
+        )
+        .unwrap();
+    }
+
+    /// An account configured at `D/.claude` beside `D` itself. `D`'s window is
+    /// scanned with `D` as home, and the engine resolves `D/.claude/projects`
+    /// on its own, so before the nested-account exclusion `D` read 10,000:
+    /// its own 7,000 and the inner account's 3,000, which the inner window
+    /// also counted.
+    #[test]
+    fn an_account_nested_at_dot_claude_is_not_counted_in_the_outer_window() {
+        let _guards = lock_registries();
+        reset_registries();
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().to_path_buf();
+        let d = home.join("work-d");
+        let inner = d.join(".claude");
+        write_session(&home.join(".claude"), "primary", PRIMARY_OUTPUT);
+        write_session(&d, "d", D_OUTPUT);
+        write_session(&inner, "inner", INNER_OUTPUT);
+        install(&claude_roots(&[&d, &inner]), &[&d, &inner]);
+
+        let context = crate::LocalSourceContext::for_home(home.clone());
+        let outer = scan(&context, &Some(d.display().to_string()));
+        let nested = scan(&context, &Some(inner.display().to_string()));
+        let primary = scan(&context, &PRIMARY);
+
+        assert_eq!(
+            output_tokens(&outer),
+            D_OUTPUT,
+            "the outer account counted the account nested at .claude: {outer}"
+        );
+        assert_eq!(output_tokens(&nested), INNER_OUTPUT, "{nested}");
+        assert_eq!(output_tokens(&primary), PRIMARY_OUTPUT, "{primary}");
+        reset_registries();
+    }
+
+    /// A `.cc-mirror` variant under an extra account's directory may name a
+    /// directory anywhere; its rows carry `cc-mirror/<variant>`, and a usage
+    /// attribution declaring that id against Claude would put them on this
+    /// account's card. The account window asks for exactly `claude`.
+    #[test]
+    fn an_extra_account_window_reads_only_the_claude_client() {
+        let _guards = lock_registries();
+        reset_registries();
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().to_path_buf();
+        let d = home.join("work-d");
+        let elsewhere = home.join("elsewhere");
+        write_session(&d, "d", D_OUTPUT);
+        write_session(&elsewhere, "mirror", SUB_OUTPUT);
+        let variant = d.join(".cc-mirror").join("v");
+        std::fs::create_dir_all(&variant).unwrap();
+        std::fs::write(
+            variant.join("variant.json"),
+            serde_json::json!({ "configDir": elsewhere.to_string_lossy() }).to_string(),
+        )
+        .unwrap();
+        install(&claude_roots(&[&d]), &[&d]);
+
+        let context = crate::LocalSourceContext::for_home(home.clone());
+        let window = scan(&context, &Some(d.display().to_string()));
+
+        assert_eq!(output_tokens(&window), D_OUTPUT, "{window}");
+        assert!(
+            window["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|m| m["client"] == CLAUDE),
+            "a non-Claude client reached the account window: {window}"
+        );
+        reset_registries();
+    }
+
+    /// With nothing nested and no other client under the account, the window
+    /// is exactly what the options before the nested-account exclusion
+    /// produced: same messages, same undated count.
+    #[test]
+    fn an_unnested_account_window_is_unchanged_by_the_exclusion() {
+        let _guards = lock_registries();
+        reset_registries();
+        let fixture = account_fixture();
+        let context = crate::LocalSourceContext::for_home(fixture.home.clone());
+        for account in [&fixture.d, &fixture.e] {
+            let dir = account.display().to_string();
+            let before = tokscale_core::ReportOptions {
+                home_dir: Some(dir.clone()),
+                use_env_roots: false,
+                scanner_settings: tokscale_core::scanner::ScannerSettings {
+                    extra_scan_paths: BTreeMap::from([(
+                        CLAUDE.to_string(),
+                        registered_roots_under(&dir),
+                    )]),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let old = runtime
+                .block_on(tokscale_core::get_window_usage(before, WINDOW_FROM, WINDOW_UNTIL))
+                .unwrap();
+            let now = scan(&context, &Some(dir.clone()));
+            let old_messages: Vec<(i64, String, i64)> = old
+                .messages
+                .iter()
+                .map(|m| (m.timestamp, m.client.clone(), m.output))
+                .collect();
+            let new_messages: Vec<(i64, String, i64)> = now["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|m| {
+                    (
+                        m["timestamp"].as_i64().unwrap(),
+                        m["client"].as_str().unwrap().to_string(),
+                        m["output"].as_i64().unwrap(),
+                    )
+                })
+                .collect();
+            assert!(!old_messages.is_empty(), "{dir}: the control read nothing");
+            assert_eq!(old_messages, new_messages, "{dir}");
+            assert_eq!(
+                i64::from(old.undated_count),
+                now["undatedCount"].as_i64().unwrap(),
+                "{dir}"
+            );
+        }
         reset_registries();
     }
 
