@@ -367,6 +367,11 @@ final class AntigravityAutoCapture: ObservableObject {
     private func pollIfOwed() async {
         guard pollAgain else { return }
         pollAgain = false
+        // An owed poll is an automatic attempt, so it honours the toggle as
+        // the callers of `poll` do. Without this, a poll owed during an
+        // attempt whose marker re-read failed (which forgets the attempted
+        // marker) would re-attempt after the user turned capture off.
+        guard isEnabled else { return }
         await poll()
     }
 

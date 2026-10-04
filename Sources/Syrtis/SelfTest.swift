@@ -18224,6 +18224,36 @@ enum SelfTest {
                       ac.currentAgyKey == nil)
             }
 
+            // A poll owed during an attempt must not run once the toggle is
+            // off, even when the post-attempt marker read failed (which
+            // forgets the attempted marker) and the marker is readable again.
+            do {
+                let fake = AGAutoFake(key: agKey, label: agEmail)
+                let hold = DispatchSemaphore(value: 0)
+                fake.write {
+                    $0.hold = hold
+                    $0.markerUnreadableAfterAttempt = true
+                }
+                let (ac, defaults) = fresh(fake)
+                defaults.set(true, forKey: AntigravityAutoCapture.enabledKey)
+                nonisolated(unsafe) let suite = defaults
+                let enabledKey = AntigravityAutoCapture.enabledKey
+                fake.write {
+                    $0.onReadAfterAttempt = {
+                        suite.set(false, forKey: enabledKey)
+                        fake.markerReadable()
+                    }
+                }
+                let first = Task { await ac.poll() }
+                await until { fake.read { $0.attempts } == 1 }
+                await ac.poll() // refused while busy: owed
+                fake.write { $0.hold = nil }
+                hold.signal()
+                await first.value
+                check("AG-5 race: a poll owed during the attempt does not run after the toggle went off",
+                      fake.read { $0.attempts } == 1 && ac.currentAgyKey == nil)
+            }
+
             // One strip row and one heatmap row, through the model.
             @MainActor func lens(currentKey: Bool) async -> (summaries: Int, heatmaps: Int) {
                 let fake = AGAutoFake(key: agKey, label: agEmail)
