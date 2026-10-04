@@ -12730,10 +12730,12 @@ mod tests {
     /// carried through the agy parser and `enrich_snapshot_with` into a real
     /// history store, with this Mac's clock one second behind Google's and in
     /// step with it. As a contract it read `invalidEvidence` behind, and in
-    /// step every poll opened a fresh cycle; it now learns its duration at
-    /// either clock.
+    /// step every poll opened a fresh cycle. It now stays in
+    /// `learningDuration` (no contract, no sample) at either clock until it
+    /// is used: its reset rolls on every poll, so the observed duration can
+    /// never settle while it is idle.
     #[test]
-    fn an_unused_rolling_agy_bucket_learns_through_enrichment_at_any_clock() {
+    fn an_unused_rolling_agy_bucket_stays_learning_through_enrichment_at_any_clock() {
         // Google's now is 13:30:15Z; the unused 5h bucket resets at that plus 5h.
         let body = br#"{"status":"SUCCESS","command":{"name":"usage","data":{"groups":[
             {"name":"Gemini Models","buckets":[
