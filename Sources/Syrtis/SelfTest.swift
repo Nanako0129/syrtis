@@ -18142,8 +18142,10 @@ enum SelfTest {
                               && both(AgentUsagePublicationCoordinator.latestPayload))
                 }
                 AgentUsagePublicationCoordinator.resetForTesting()
+                // A failed primary publishes source "oauth" whatever route failed
+                // (agent_usage.rs `required_card_source`), agy timeouts included.
                 let agErrored = antigravity(AgentUsagePublicationCoordinator.resolve(
-                    payload(primarySource: "agy", primaryError: "Antigravity CLI failed.")))
+                    payload(primarySource: "oauth", primaryError: "Antigravity CLI usage timed out.")))
                 check("AG-5 an error on the agy primary: agy's captured account takes the primary slot",
                       agErrored.count == 1 && agErrored.first?.accountKey == nil
                           && agErrored.first?.error == nil
