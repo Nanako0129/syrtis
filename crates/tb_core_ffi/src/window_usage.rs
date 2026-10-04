@@ -148,6 +148,16 @@ fn nested_exclusions(dir: &str, own: &[PathBuf]) -> Vec<PathBuf> {
                 .cloned(),
         );
     }
+    // The engine canonicalises an exclusion before matching it, so one that is
+    // nested only as spelled (`D/.claude` a symlink back to `D` or above)
+    // would cover this account's own roots and empty its window. Such an
+    // entry is dropped: counted twice beats confidently zero.
+    let canonical = |path: &Path| std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let own: Vec<PathBuf> = own.iter().map(|root| canonical(root)).collect();
+    excluded.retain(|path| {
+        let path = canonical(path);
+        !own.iter().any(|root| root.starts_with(&path))
+    });
     excluded
 }
 
@@ -1021,6 +1031,29 @@ mod tests {
         let outer = scan(&context, &Some(d.display().to_string()));
 
         assert_eq!(output_tokens(&outer), D_OUTPUT, "{outer}");
+        reset_registries();
+    }
+
+    /// A configured `D/.claude` that is a symlink back to `D` is nested only as
+    /// spelled. The engine canonicalises exclusions, so listing it would cover
+    /// D's own roots and read D as zero; it is left out instead.
+    #[cfg(unix)]
+    #[test]
+    fn a_nested_path_that_resolves_to_the_account_itself_is_not_excluded() {
+        let _guards = lock_registries();
+        reset_registries();
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().to_path_buf();
+        let d = home.join("work-d");
+        write_session(&d, "d", D_OUTPUT);
+        let alias = d.join(".claude");
+        std::os::unix::fs::symlink(&d, &alias).unwrap();
+        install(&claude_roots(&[&d, &alias]), &[&d, &alias]);
+
+        let context = crate::LocalSourceContext::for_home(home.clone());
+        let outer = scan(&context, &Some(d.display().to_string()));
+
+        assert!(output_tokens(&outer) >= D_OUTPUT, "D's own roots were excluded: {outer}");
         reset_registries();
     }
 
