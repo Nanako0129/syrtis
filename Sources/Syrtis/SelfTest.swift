@@ -18142,9 +18142,12 @@ enum SelfTest {
                               && both(AgentUsagePublicationCoordinator.latestPayload))
                 }
                 AgentUsagePublicationCoordinator.resetForTesting()
-                check("AG-5 an error on the agy primary: both cards",
-                      both(AgentUsagePublicationCoordinator.resolve(
-                          payload(primarySource: "agy", primaryError: "Antigravity CLI failed."))))
+                let agErrored = antigravity(AgentUsagePublicationCoordinator.resolve(
+                    payload(primarySource: "agy", primaryError: "Antigravity CLI failed.")))
+                check("AG-5 an error on the agy primary: agy's captured account takes the primary slot",
+                      agErrored.count == 1 && agErrored.first?.accountKey == nil
+                          && agErrored.first?.error == nil
+                          && agErrored.first?.identity?.email == agEmail)
 
                 // Key A current, then a new marker: while that attempt is in
                 // flight, and after it returns skipped_removed, the primary is
@@ -19250,17 +19253,18 @@ enum SelfTest {
         }
         func wcpAgyPayload(
             primary: [String], captured: [String]?, capturedError: String? = nil,
-            marker: String = "m1", generation: UInt64 = 9
+            marker: String = "m1", generation: UInt64 = 9, primaryError: String? = nil
         ) -> AgentUsagePayload {
+            let primaryErr = primaryError.map { #","error":"\#($0)""# } ?? ""
             var agents = ["""
             {"clientId":"antigravity","source":"agy","updatedAt":"t","agyLoginMarker":"\(marker)",
-             "windows":[\(primary.joined(separator: ","))]}
+             "windows":[\(primary.joined(separator: ","))]\(primaryErr)}
             """]
             if let captured {
                 let err = capturedError.map { #","error":"\#($0)""# } ?? ""
                 agents.append("""
                 {"clientId":"antigravity","accountKey":"\(wcpAgyKey)","source":"oauth","updatedAt":"t",
-                 "identity":{"email":"k@example.com"},
+                 "identity":{"email":"k@example.com","plan":"Google AI Pro"},
                  "windows":[\(captured.joined(separator: ","))]\(err)}
                 """)
             }
@@ -19281,6 +19285,32 @@ enum SelfTest {
         let wcpAgyKAvailable = wcpAgyPaceJSON(
             card: "agy.b1.v1", state: "available", duration: 18_000, historical: true)
         let wcpAgyKLearning = wcpAgyPaceJSON(card: "agy.b1.v1", state: "learningHistory", duration: 18_000)
+        // Mutation: the merge keeps only the agy primary's (nil) plan.
+        let wcpPlanMerged = wcpPrimary(wcpMerge(wcpAgyPayload(primary: [wcpAgyUnscoped], captured: [wcpAgyKAvailable])))
+        expect(wcpPlanMerged?.identity?.email == "k@example.com"
+                   && wcpPlanMerged?.identity?.plan == "Google AI Pro",
+               "WCP2-dedup the merged agy primary shows the captured account's email and plan")
+        // Mutations: the errored-primary branch removed (both cards stay); the
+        // promoted card keeps its account key (not the primary slot).
+        let wcpTimedOut = wcpMerge(wcpAgyPayload(
+            primary: [], captured: [wcpAgyKAvailable], primaryError: "timed out"))
+        let wcpPromoted = wcpPrimary(wcpTimedOut)
+        expect(wcpTimedOut.agents.filter { $0.clientId == "antigravity" }.count == 1
+                   && wcpPromoted?.error == nil && wcpPromoted?.source == "oauth"
+                   && wcpPromoted?.identity?.plan == "Google AI Pro"
+                   && wcpPromoted?.historyReadAccountKey == wcpAgyKey
+                   && wcpPromoted?.windows.count == 1,
+               "WCP2-dedup an errored primary is replaced by agy's captured account in the primary slot")
+        let wcpBothErr = wcpMerge(wcpAgyPayload(
+            primary: [], captured: [wcpAgyKAvailable], capturedError: "boom", primaryError: "timed out"))
+        let wcpNoKey = AntigravityDedup.apply(
+            wcpAgyPayload(primary: [], captured: [wcpAgyKAvailable], primaryError: "timed out"),
+            currentAgyKey: nil, currentAgyMarker: "m1")
+        expect(wcpBothErr.agents.filter { $0.clientId == "antigravity" }.count == 2
+                   && wcpPrimary(wcpBothErr)?.error == "timed out"
+                   && wcpNoKey.agents.filter { $0.clientId == "antigravity" }.count == 2
+                   && wcpPrimary(wcpNoKey)?.error == "timed out",
+               "WCP2-dedup control: an errored captured account, or no verified agy account, keeps the error card")
 
         let wcpUnmerged = wcpAgyPayload(primary: [wcpAgyUnscoped], captured: nil)
         let wcpNoHistory: [String: Bool]? = wcpRun(wcpUnmerged, client: "antigravity", scan: false) { m, src in

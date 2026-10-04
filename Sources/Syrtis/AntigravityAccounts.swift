@@ -507,7 +507,11 @@ final class AntigravityAutoCapture: ObservableObject {
 /// - the primary Antigravity snapshot (`accountKey == nil`) came from the agy
 ///   route (`source == "agy"`) and has no error, so it is agy's account;
 /// - a captured snapshot carries that key.
-/// Otherwise (IDE `cli` or `oauth` source, any error) both are shown.
+/// Otherwise (IDE `cli` or `oauth` source) both are shown. An errored primary
+/// (e.g. agy timed out) is instead replaced by the captured account `currentAgyKey`
+/// names, promoted to the primary slot (`promotedToPrimary`), when that account
+/// has windows and no error; it is agy's current account, shown with its own
+/// data and identity.
 ///
 /// The primary keeps its own windows and values (gauge, tray, selection), but
 /// the agy route has no trusted history identity, so its windows carry no
@@ -531,9 +535,6 @@ enum AntigravityDedup {
               let primaryIndex = payload.agents.firstIndex(where: {
                   $0.clientId == "antigravity" && $0.accountKey == nil
               }),
-              payload.agents[primaryIndex].source == "agy",
-              payload.agents[primaryIndex].agyLoginMarker == marker,
-              payload.agents[primaryIndex].error == nil,
               let capturedIndex = payload.agents.firstIndex(where: {
                   $0.clientId == "antigravity" && $0.accountKey == key
               })
@@ -541,9 +542,19 @@ enum AntigravityDedup {
         var agents = payload.agents
         let primary = agents[primaryIndex]
         let captured = agents[capturedIndex]
+        if primary.error != nil {
+            guard captured.error == nil, !captured.windows.isEmpty else { return payload }
+            agents[primaryIndex] = captured.promotedToPrimary()
+            agents.remove(at: capturedIndex)
+            return payload.replacingAgents(agents)
+        }
+        guard primary.source == "agy", primary.agyLoginMarker == marker else { return payload }
         var merged = primary
         if let label = captured.identity?.email {
-            merged = merged.replacingIdentity(.make(email: label, plan: primary.identity?.plan))
+            // The agy route carries no plan; the captured snapshot is the same
+            // account (marker-bound above), so its plan labels the primary too.
+            merged = merged.replacingIdentity(.make(
+                email: label, plan: primary.identity?.plan ?? captured.identity?.plan))
         }
         agents[primaryIndex] = merged.adoptingHistory(of: captured)
         agents.remove(at: capturedIndex)
