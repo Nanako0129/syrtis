@@ -18210,6 +18210,20 @@ enum SelfTest {
                       fake.read { $0.attempts } == 2 && ac.currentAgyKey == agKey)
             }
 
+            do {
+                let fake = AGAutoFake(key: agKey, label: agEmail)
+                let (ac, defaults) = fresh(fake)
+                defaults.set(true, forKey: AntigravityAutoCapture.enabledKey)
+                // The toggle goes off while the post-attempt marker read runs.
+                // UserDefaults is thread-safe, so the hook flips it directly.
+                nonisolated(unsafe) let suite = defaults
+                let enabledKey = AntigravityAutoCapture.enabledKey
+                fake.write { $0.onReadAfterAttempt = { suite.set(false, forKey: enabledKey) } }
+                await ac.poll()
+                check("AG-5 race: turning automatic capture off during the re-read leaves the key unbound",
+                      ac.currentAgyKey == nil)
+            }
+
             // One strip row and one heatmap row, through the model.
             @MainActor func lens(currentKey: Bool) async -> (summaries: Int, heatmaps: Int) {
                 let fake = AGAutoFake(key: agKey, label: agEmail)
@@ -19399,6 +19413,10 @@ private final class AGAutoFake: @unchecked Sendable {
     var markerAfterAttempt: String?
     /// When set, the marker cannot be read once an automatic attempt ran.
     var markerUnreadableAfterAttempt = false
+    /// Runs on the first marker read after an automatic attempt, as if the
+    /// user acted while that re-read was in flight.
+    var onReadAfterAttempt: (@Sendable () -> Void)?
+    private var attemptPending = false
     private var markerUnreadable = false
     var attempts = 0
     var captures = 0
@@ -19427,16 +19445,20 @@ private final class AGAutoFake: @unchecked Sendable {
     func io() -> AntigravityAutoCapture.IO {
         .init(
             marker: {
-                let (marker, unreadable) = self.read { fake -> (String, Bool) in
+                let (marker, unreadable, hook) = self.read { fake -> (String, Bool, (@Sendable () -> Void)?) in
                     fake.markerCalls += 1
-                    return (fake.marker, fake.markerUnreadable)
+                    let hook = fake.attemptPending ? fake.onReadAfterAttempt : nil
+                    fake.attemptPending = false
+                    return (fake.marker, fake.markerUnreadable, hook)
                 }
+                hook?()
                 if unreadable { throw TBCoreError.bridge("marker_unreadable") }
                 return marker
             },
             autoCapture: { removed in
                 let (hold, outcome) = self.read { fake -> (DispatchSemaphore?, Result<AntigravityAutoCaptureResult, TBCoreError>) in
                     fake.attempts += 1
+                    fake.attemptPending = true
                     fake.lastRemoved = removed
                     // A sign-in that lands while the attempt runs.
                     if let next = fake.markerAfterAttempt { fake.marker = next }

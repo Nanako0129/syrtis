@@ -315,7 +315,9 @@ final class AntigravityAutoCapture: ObservableObject {
                 // core answers `unchanged` with no Google request while its
                 // stored token equals agy's). Syrtis-Windows W7b does the same.
                 let after = try? await Self.detached({ try io.marker() })
-                if after == marker {
+                // Re-checked after the await: the toggle may have been turned
+                // off while the marker was being read.
+                if after == marker, isEnabled {
                     setCurrent(key, marker: marker)
                 } else if after == nil {
                     lastAttemptedMarker = nil
