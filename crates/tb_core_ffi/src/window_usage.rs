@@ -1000,6 +1000,30 @@ mod tests {
         reset_registries();
     }
 
+    /// The other half of the nested exclusion: an account at `D/.claude`
+    /// whose roots reached the scan registry while its directory did not reach
+    /// the config-dir registry. `ClaudeExtraRoots.install` sets the two
+    /// separately and the lists can disagree (`primary_exclusions`), so the
+    /// config-dir half alone would leave this one counted in D.
+    #[test]
+    fn a_nested_account_known_only_by_its_roots_is_excluded_too() {
+        let _guards = lock_registries();
+        reset_registries();
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().to_path_buf();
+        let d = home.join("work-d");
+        let inner = d.join(".claude");
+        write_session(&d, "d", D_OUTPUT);
+        write_session(&inner, "inner", INNER_OUTPUT);
+        install(&claude_roots(&[&d, &inner]), &[&d]);
+
+        let context = crate::LocalSourceContext::for_home(home.clone());
+        let outer = scan(&context, &Some(d.display().to_string()));
+
+        assert_eq!(output_tokens(&outer), D_OUTPUT, "{outer}");
+        reset_registries();
+    }
+
     /// A `.cc-mirror` variant under an extra account's directory may name a
     /// directory anywhere; its rows carry `cc-mirror/<variant>`, and a usage
     /// attribution declaring that id against Claude would put them on this
