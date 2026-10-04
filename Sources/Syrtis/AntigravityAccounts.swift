@@ -303,7 +303,24 @@ final class AntigravityAutoCapture: ObservableObject {
                     ? accounts
                     : AntigravityAccounts.adding(.init(key: key, label: label), to: accounts)
             }
-            if isEnabled { setCurrent(key, marker: marker) }
+            if isEnabled {
+                // Bound only if agy's marker did not move during the attempt,
+                // as `manualCapture`: the key is the account agy was signed
+                // into when the core read it, and a sign-in that landed
+                // meanwhile would label the next login's card with this one's
+                // email. Moved: left unbound, and the next check sees the new
+                // marker and attempts again. Unreadable: left unbound and the
+                // attempted marker forgotten, so the next check retries this
+                // marker instead of waiting for agy's login to change (the
+                // core answers `unchanged` with no Google request while its
+                // stored token equals agy's). Syrtis-Windows W7b does the same.
+                let after = try? await Self.detached({ try io.marker() })
+                if after == marker {
+                    setCurrent(key, marker: marker)
+                } else if after == nil {
+                    lastAttemptedMarker = nil
+                }
+            }
         case .failure(TBCoreError.bridge("paused")):
             paused = true
             currentAgyKey = nil
