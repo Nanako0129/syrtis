@@ -4910,7 +4910,7 @@ fn history_scope_unavailable_reason(error: &AccountScopeError) -> &'static str {
     }
 }
 
-fn enrich_snapshot_with<F>(snapshot: &mut AgentUsageSnapshot, now: i64, mut record: F)
+pub(crate) fn enrich_snapshot_with<F>(snapshot: &mut AgentUsageSnapshot, now: i64, mut record: F)
 where
     F: FnMut(
         &[SeriesKey],
@@ -12724,6 +12724,73 @@ mod tests {
             None,
             Some(DurationEvidence::contract(5 * 3_600)),
         )
+    }
+
+    /// An unused Antigravity bucket, its reset rolling with Google's clock,
+    /// carried through the agy parser and `enrich_snapshot_with` into a real
+    /// history store while this Mac's clock is one second behind Google's.
+    /// With the declared window as a contract it read `invalidEvidence` on
+    /// every poll; it now learns its duration like an undeclared window.
+    #[test]
+    fn an_unused_rolling_agy_bucket_learns_through_enrichment_with_a_slow_clock() {
+        let scope = TestRefreshScope::new("antigravity", "rolling-bucket");
+        let history_path = scope
+            .root()
+            .join(crate::agent_quota_history::HISTORY_FILE_NAME);
+        let account_scope = scope
+            .resolve_current("antigravity", "rolling", b"rolling-marker")
+            .unwrap();
+        let history_scope = scope.resolve_history("antigravity", None).unwrap();
+        // Google's now is 13:30:15Z; the unused 5h bucket resets at that plus 5h.
+        let body = br#"{"status":"SUCCESS","command":{"name":"usage","data":{"groups":[
+            {"name":"Gemini Models","buckets":[
+              {"id":"gemini-weekly","name":"Weekly Limit Remaining","window":"weekly","remaining_fraction":0.8,"reset_time":"2026-10-08T18:46:28Z"},
+              {"id":"gemini-5h","name":"Five Hour Limit Remaining","window":"5h","remaining_fraction":1,"reset_time":"2026-10-04T18:30:15Z"}
+            ]}]}}}"#;
+        let local = Utc.with_ymd_and_hms(2026, 10, 4, 13, 30, 14).unwrap();
+        let windows = crate::agent_antigravity::parse_agy_usage(body, local)
+            .unwrap()
+            .windows;
+        let mut snapshot = AgentUsageSnapshot {
+            agy_login_marker: None,
+            account_key: None,
+            client_id: ProviderId::Antigravity,
+            source: "agy".to_string(),
+            updated_at: String::new(),
+            identity: None,
+            account_scope: Ok(account_scope),
+            history_scope: Ok(history_scope),
+            windows,
+            credits: None,
+            error: None,
+            transport_diagnostic: None,
+        };
+
+        enrich_snapshot_with(&mut snapshot, local.timestamp(), |active, observations, now| {
+            crate::agent_quota_history::record_observations_at_path_and_evaluate(
+                active,
+                observations,
+                now,
+                &history_path,
+            )
+        });
+
+        let wire = serde_json::to_value(&snapshot).unwrap();
+        let card = |id: &str| {
+            wire["windows"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|w| w["cardId"] == id)
+                .cloned()
+                .unwrap()
+        };
+        let rolling = card("agy.gemini-5h.v1");
+        assert_eq!(rolling["paceStatus"]["state"], "learningDuration", "{rolling}");
+        // Control: the weekly bucket, its cycle started, keeps its contract.
+        let weekly = card("agy.gemini-weekly.v1");
+        assert_eq!(weekly["paceStatus"]["durationSeconds"], 7 * 86_400, "{weekly}");
+        scope.cleanup();
     }
 
     /// Issue #183: a sibling application rotating the shared OAuth refresh token

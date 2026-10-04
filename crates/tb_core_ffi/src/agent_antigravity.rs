@@ -825,7 +825,18 @@ fn agy_window_duration(window: Option<&str>) -> Option<DurationEvidence> {
 
 /// A grouped bucket (agy `/usage` or `retrieveUserQuotaSummary`): card id and
 /// window key `agy.<bucketId>.v1`, with the declared window as a contract
-/// duration.
+/// duration once the bucket's cycle has started by this Mac's clock.
+///
+/// An unused bucket's reset rolls: Google reports it as its own now plus the
+/// window, on every poll (two unused 5h buckets measured at the same
+/// `18:30:15Z` reset). Its cycle start `reset - window` is then Google's now,
+/// and with this Mac's clock even one second behind it lies in the future.
+/// The duration contract rejects a cycle that has not started
+/// (`valid_evidence`), and a rejected contract is `InvalidEvidence` with no
+/// fallback, so the card read "invalid duration evidence" on every poll and
+/// left single-sample cycles in durable history. Such a bucket gets no
+/// contract and is learned like an undeclared window until it is used, when
+/// its reset stops rolling. Syrtis-Windows W7c does the same.
 fn agy_bucket_window(
     label: String,
     fraction: f64,
@@ -834,9 +845,16 @@ fn agy_bucket_window(
     card_id: String,
     window: Option<&str>,
 ) -> Option<UsageWindow> {
-    UsageWindow::try_from_provider_fraction(label, fraction, reset, now).map(|usage| {
-        usage.with_identity(card_id.clone(), Some(card_id), None, agy_window_duration(window))
-    })
+    let contract = agy_window_duration(window).filter(|evidence| {
+        reset.is_some_and(|reset| {
+            reset
+                .timestamp()
+                .checked_sub(evidence.duration_seconds)
+                .is_some_and(|cycle_start| cycle_start <= now.timestamp())
+        })
+    });
+    UsageWindow::try_from_provider_fraction(label, fraction, reset, now)
+        .map(|usage| usage.with_identity(card_id.clone(), Some(card_id), None, contract))
 }
 
 fn quota_window(
@@ -851,7 +869,7 @@ fn quota_window(
         .map(|window| window.with_identity(card_id, window_key, None, None))
 }
 
-fn parse_agy_usage(body: &[u8], now: DateTime<Utc>) -> Result<Fetched, String> {
+pub(crate) fn parse_agy_usage(body: &[u8], now: DateTime<Utc>) -> Result<Fetched, String> {
     let response: AgyUsageResponse =
         serde_json::from_slice(body).map_err(|e| format!("decode agy usage: {e}"))?;
     if response.status.as_deref() != Some("SUCCESS") {
@@ -3457,6 +3475,49 @@ mod tests {
         let _ = path;
     }
 
+    /// An unused bucket's reset rolls with Google's clock (reset = its now +
+    /// window). With this Mac one second behind, the cycle start lies in the
+    /// future; the declared window must not become a contract then, or the
+    /// card is `InvalidEvidence` on every poll.
+    #[test]
+    fn an_unused_rolling_bucket_gets_no_contract_until_its_cycle_starts() {
+        let google_now = DateTime::parse_from_rfc3339("2026-10-04T13:30:15Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let body = AGY_ROLLING_5H_USAGE;
+        let behind = google_now - chrono::Duration::seconds(1);
+
+        let at = |now| -> Vec<Option<i64>> {
+            parse_agy_usage(body, now)
+                .unwrap()
+                .windows
+                .iter()
+                .map(|w| w.duration_seconds_for_test())
+                .collect()
+        };
+
+        // Weekly bucket (in use, cycle started) keeps its contract either way;
+        // the rolling 5h bucket has none while its cycle is in the future.
+        assert_eq!(at(behind), [Some(7 * 86_400), None]);
+        assert_eq!(at(google_now), [Some(7 * 86_400), Some(5 * 3_600)]);
+        // The defect the filter avoids: that contract at that clock.
+        let reset = DateTime::parse_from_rfc3339("2026-10-04T18:30:15Z")
+            .unwrap()
+            .timestamp();
+        assert_eq!(
+            crate::agent_quota_duration::resolve_duration(
+                behind.timestamp(),
+                Some(reset),
+                None,
+                Some(DurationEvidence::contract(5 * 3_600)),
+                None,
+            ),
+            crate::agent_quota_duration::DurationResolution::Unavailable(
+                crate::agent_quota_duration::DurationUnavailableReason::InvalidEvidence
+            )
+        );
+    }
+
     #[test]
     fn gemini_home_uses_nonempty_configured_root_unchanged() {
         let configured = " /tmp/gemini-cli-home ";
@@ -5059,6 +5120,14 @@ mod tests {
     fn marker(value: &str) -> Option<String> {
         Some(value.to_string())
     }
+
+    /// agy `/usage` with one weekly bucket in use and one unused 5h bucket
+    /// whose reset is Google's now (13:30:15Z) plus five hours.
+    const AGY_ROLLING_5H_USAGE: &[u8] = br#"{"status":"SUCCESS","command":{"name":"usage","data":{"groups":[
+        {"name":"Gemini Models","buckets":[
+          {"id":"gemini-weekly","name":"Weekly Limit Remaining","window":"weekly","remaining_fraction":0.8,"reset_time":"2026-10-08T18:46:28Z"},
+          {"id":"gemini-5h","name":"Five Hour Limit Remaining","window":"5h","remaining_fraction":1,"reset_time":"2026-10-04T18:30:15Z"}
+        ]}]}}}"#;
 
     fn agy_now() -> DateTime<Utc> {
         DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap()
