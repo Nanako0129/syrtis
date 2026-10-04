@@ -3903,7 +3903,12 @@ mod tests {
 
     #[test]
     fn quota_summary_maps_like_agy_usage() {
-        let now = DateTime::parse_from_rfc3339("2026-10-02T00:00:00Z")
+        // The capture instant, not an arbitrary midnight: the unused 3p-weekly
+        // bucket's reset rolls as Google's now plus seven days, so this body
+        // was produced at 2026-10-09T07:58:14Z - 7 d. A declared window is a
+        // contract only once its cycle has started (`agy_bucket_window`), and
+        // at an earlier clock the 5h and 3p cycles would not have.
+        let now = DateTime::parse_from_rfc3339("2026-10-02T07:58:14Z")
             .unwrap()
             .with_timezone(&Utc);
         // Shape measured from retrieveUserQuotaSummary on 2026-10-02.
