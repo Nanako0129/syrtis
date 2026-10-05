@@ -354,6 +354,33 @@ struct AgentLimitsCard: View {
         return candidates.filter { !hidden.contains(clientId($0)) }
     }
 
+    /// The subscriptions opencode forwards that have a quota snapshot to draw.
+    /// Shared by the card's row list and `allRestrictedClientsHidden`, so the
+    /// "is anything forwarded still showing" answer cannot drift from the rows.
+    static func opencodeForwardedClients(
+        labels: [String], hasSnapshot: (String) -> Bool
+    ) -> [String] {
+        // The subscription-owner resolution, not the raw label mapper:
+        // `Xai` maps to `xai` there, while the quota snapshot is keyed
+        // `grok`, so the filter below would drop the very card opencode
+        // is authed against.
+        labels
+            .compactMap(UsageAttributionSettings.subscriptionClient(forLabel:))
+            .filter(hasSnapshot)
+    }
+
+    /// Pure core of `allRestrictedClientsHidden`: every id the card would draw
+    /// (`clients` plus the opencode-forwarded `forwarded`, empty elsewhere) is
+    /// limits-hidden and none has an extra account (exempt from the hide).
+    static func allHidden(
+        clients: [String], forwarded: [String], hidden: Set<String>,
+        hasExtraAccount: (String) -> Bool
+    ) -> Bool {
+        guard !clients.isEmpty else { return false }
+        let all = clients + forwarded
+        return all.allSatisfy(hidden.contains) && !all.contains(where: hasExtraAccount)
+    }
+
     /// Ordered client ids for the opencode router card. opencode used to be a
     /// pure router with no quota of its own; the OpenCode Go plan (ported from
     /// mana.bar) now gives it one. When that snapshot is present its own window
@@ -419,13 +446,8 @@ struct AgentLimitsCard: View {
         // returned it on snapshot availability alone. A rule that has to sit
         // ahead of every return is one binding, not a line to keep relocating.
         if opencodeView {
-            let subs = opencodeSubs
-                // The subscription-owner resolution, not the raw label mapper:
-                // `Xai` maps to `xai` there, while the quota snapshot is keyed
-                // `grok`, so the filter below would drop the very card opencode
-                // is authed against.
-                .compactMap(UsageAttributionSettings.subscriptionClient(forLabel:))
-                .filter { snapshots[primary($0)] != nil }
+            let subs = Self.opencodeForwardedClients(
+                labels: opencodeSubs, hasSnapshot: { snapshots[primary($0)] != nil })
             // opencode is no longer only a router: the OpenCode Go plan (fetched
             // via the opencode-go api key, ported from mana.bar) gives it a quota
             // of its own. When that snapshot is present, show opencode's own
@@ -500,13 +522,23 @@ struct AgentLimitsCard: View {
     /// payload arrives. Hidden is a fact about settings and is true immediately;
     /// unknown is a fact about the network and is not.
     var allRestrictedClientsHidden: Bool {
-        guard restrict, !clients.isEmpty else { return false }
-        let hidden = ClientRegistry.parseIdSet(limitsHiddenRaw)
-        guard clients.allSatisfy(hidden.contains) else { return false }
+        guard restrict else { return false }
+        // On the opencode view the forwarded subscription cards are part of the
+        // card, so opencode's own toggle alone must not hide it. Forwarded subs
+        // are unknown before the first payload, so on that path the card stays
+        // hidden until the payload arrives (accepted trade-off).
+        let snapshots = Self.snapshotsByRow(agentUsage?.agents ?? [])
+        let forwarded = opencodeView
+            ? Self.opencodeForwardedClients(
+                labels: opencodeSubs,
+                hasSnapshot: { snapshots[AccountIdentity(clientId: $0, accountKey: nil)] != nil })
+            : []
         // An extra account is exempt from this hide (see
         // `expandedWithExtraAccounts`), so its row still renders even while
         // every primary this card was asked to draw is hidden.
-        return !clients.contains(where: hasExtraAccount)
+        return Self.allHidden(
+            clients: clients, forwarded: forwarded,
+            hidden: ClientRegistry.parseIdSet(limitsHiddenRaw), hasExtraAccount: hasExtraAccount)
     }
 
     var body: some View {
