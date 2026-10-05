@@ -6215,6 +6215,43 @@ enum SelfTest {
                 == ["opencode", "codex"],
             "opencodeCardClients never duplicates opencode into the subscription tail")
 
+        // allRestrictedClientsHidden core: hiding opencode's own card must keep
+        // the subscription cards it forwards. Drawn rows come from the same
+        // production helpers the view uses.
+        let ocFwd = AgentLimitsCard.opencodeForwardedClients(
+            labels: ["Codex"], hasSnapshot: { _ in true })
+        let ocNone = AgentLimitsCard.opencodeForwardedClients(
+            labels: ["Codex"], hasSnapshot: { _ in false })
+        let ocDrawn = AgentLimitsCard.expandedWithExtraAccounts(
+            known: AgentLimitsCard.opencodeCardClients(ownQuotaPresent: true, subscriptions: ocFwd),
+            visiblePrimaries: Set(
+                AgentLimitsCard.visible(["opencode"] + ocFwd, hiddenRaw: "opencode") { $0 }),
+            agents: [])
+        expect(
+            !AgentLimitsCard.allHidden(
+                clients: ["opencode"], forwarded: ocFwd, hidden: ["opencode"],
+                hasExtraAccount: { _ in false })
+                && !ocFwd.isEmpty && ocDrawn.map(\.clientId) == ocFwd,
+            "opencode limits-hidden keeps a visible forwarded subscription card")
+        expect(
+            AgentLimitsCard.allHidden(
+                clients: ["opencode"], forwarded: ocNone, hidden: ["opencode"],
+                hasExtraAccount: { _ in false }),
+            "opencode hidden with no forwarded subscriptions hides the card")
+        expect(
+            AgentLimitsCard.allHidden(
+                clients: ["opencode"], forwarded: ocFwd, hidden: Set(["opencode"] + ocFwd),
+                hasExtraAccount: { _ in false }),
+            "opencode and its forwarded subscription both hidden hides the card")
+        expect(
+            AgentLimitsCard.allHidden(
+                clients: ["codex"], forwarded: [], hidden: ["codex"],
+                hasExtraAccount: { _ in false })
+                && !AgentLimitsCard.allHidden(
+                    clients: ["codex"], forwarded: [], hidden: [],
+                    hasExtraAccount: { _ in false }),
+            "non-opencode restricted client hidden hides the card, visible does not")
+
         // CSV id-set parse helper: empty string → empty set; commas split.
         expect(ClientRegistry.parseIdSet("").isEmpty, "parseIdSet empty string is empty")
         expect(
