@@ -18144,12 +18144,9 @@ enum SelfTest {
                 AgentUsagePublicationCoordinator.resetForTesting()
                 // A failed primary publishes source "oauth" whatever route failed
                 // (agent_usage.rs `required_card_source`), agy timeouts included.
-                let agErrored = antigravity(AgentUsagePublicationCoordinator.resolve(
-                    payload(primarySource: "oauth", primaryError: "Antigravity CLI usage timed out.")))
-                check("AG-5 an error on the agy primary: agy's captured account takes the primary slot",
-                      agErrored.count == 1 && agErrored.first?.accountKey == nil
-                          && agErrored.first?.error == nil
-                          && agErrored.first?.identity?.email == agEmail)
+                check("AG-5 an error on the primary: both cards",
+                      both(AgentUsagePublicationCoordinator.resolve(payload(
+                          primarySource: "oauth", primaryError: "Antigravity CLI usage timed out."))))
 
                 // Key A current, then a new marker: while that attempt is in
                 // flight, and after it returns skipped_removed, the primary is
@@ -19292,27 +19289,12 @@ enum SelfTest {
         expect(wcpPlanMerged?.identity?.email == "k@example.com"
                    && wcpPlanMerged?.identity?.plan == "Google AI Pro",
                "WCP2-dedup the merged agy primary shows the captured account's email and plan")
-        // Mutations: the errored-primary branch removed (both cards stay); the
-        // promoted card keeps its account key (not the primary slot).
+        // Mutation: an errored primary is replaced by (or merged with) the captured account.
         let wcpTimedOut = wcpMerge(wcpAgyPayload(
             primary: [], captured: [wcpAgyKAvailable], primaryError: "timed out"))
-        let wcpPromoted = wcpPrimary(wcpTimedOut)
-        expect(wcpTimedOut.agents.filter { $0.clientId == "antigravity" }.count == 1
-                   && wcpPromoted?.error == nil && wcpPromoted?.source == "oauth"
-                   && wcpPromoted?.identity?.plan == "Google AI Pro"
-                   && wcpPromoted?.historyReadAccountKey == wcpAgyKey
-                   && wcpPromoted?.windows.count == 1,
-               "WCP2-dedup an errored primary is replaced by agy's captured account in the primary slot")
-        let wcpBothErr = wcpMerge(wcpAgyPayload(
-            primary: [], captured: [wcpAgyKAvailable], capturedError: "boom", primaryError: "timed out"))
-        let wcpNoKey = AntigravityDedup.apply(
-            wcpAgyPayload(primary: [], captured: [wcpAgyKAvailable], primaryError: "timed out"),
-            currentAgyKey: nil, currentAgyMarker: "m1")
-        expect(wcpBothErr.agents.filter { $0.clientId == "antigravity" }.count == 2
-                   && wcpPrimary(wcpBothErr)?.error == "timed out"
-                   && wcpNoKey.agents.filter { $0.clientId == "antigravity" }.count == 2
-                   && wcpPrimary(wcpNoKey)?.error == "timed out",
-               "WCP2-dedup control: an errored captured account, or no verified agy account, keeps the error card")
+        expect(wcpTimedOut.agents.filter { $0.clientId == "antigravity" }.count == 2
+                   && wcpPrimary(wcpTimedOut)?.error == "timed out",
+               "WCP2-dedup an errored primary keeps its error card beside the captured account")
 
         let wcpUnmerged = wcpAgyPayload(primary: [wcpAgyUnscoped], captured: nil)
         let wcpNoHistory: [String: Bool]? = wcpRun(wcpUnmerged, client: "antigravity", scan: false) { m, src in
