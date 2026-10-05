@@ -507,11 +507,9 @@ final class AntigravityAutoCapture: ObservableObject {
 /// - the primary Antigravity snapshot (`accountKey == nil`) came from the agy
 ///   route (`source == "agy"`) and has no error, so it is agy's account;
 /// - a captured snapshot carries that key.
-/// Otherwise (IDE `cli` or `oauth` source) both are shown. An errored primary
-/// (e.g. agy timed out) is instead replaced by the captured account `currentAgyKey`
-/// names, promoted to the primary slot (`promotedToPrimary`), when that account
-/// has windows and no error; it is agy's current account, shown with its own
-/// data and identity.
+/// Otherwise (IDE `cli` or `oauth` source) both are shown. Any error on the
+/// primary (e.g. agy timed out) leaves both cards: a failed card carries source
+/// "oauth" and no login marker, so it cannot be bound to agy's account.
 ///
 /// The primary keeps its own windows and values (gauge, tray, selection), but
 /// the agy route has no trusted history identity, so its windows carry no
@@ -542,13 +540,8 @@ enum AntigravityDedup {
         var agents = payload.agents
         let primary = agents[primaryIndex]
         let captured = agents[capturedIndex]
-        if primary.error != nil {
-            guard captured.error == nil, !captured.windows.isEmpty else { return payload }
-            agents[primaryIndex] = captured.promotedToPrimary()
-            agents.remove(at: capturedIndex)
-            return payload.replacingAgents(agents)
-        }
-        guard primary.source == "agy", primary.agyLoginMarker == marker else { return payload }
+        guard primary.error == nil, primary.source == "agy",
+              primary.agyLoginMarker == marker else { return payload }
         var merged = primary
         if let label = captured.identity?.email {
             // The agy route carries no plan; the captured snapshot is the same

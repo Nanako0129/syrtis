@@ -910,19 +910,12 @@ extension AgentUsageSnapshot {
             copying: self, identity: identity, windows: merged, historyAccountKey: key)
     }
 
-    /// Captured account `self` standing in for an errored primary (Antigravity
-    /// dedup): the primary slot (no account key), its own identity and
-    /// windows, curves still read under its own key.
-    package func promotedToPrimary() -> AgentUsageSnapshot {
-        AgentUsageSnapshot(copying: self, identity: identity, promoted: true)
-    }
-
     private init(
         copying other: AgentUsageSnapshot, identity: AgentIdentity?,
-        windows: [UsageWindow]? = nil, historyAccountKey: String? = nil, promoted: Bool = false
+        windows: [UsageWindow]? = nil, historyAccountKey: String? = nil
     ) {
         clientId = other.clientId
-        accountKey = promoted ? nil : other.accountKey
+        accountKey = other.accountKey
         source = other.source
         updatedAt = other.updatedAt
         self.identity = identity
@@ -931,8 +924,7 @@ extension AgentUsageSnapshot {
         error = other.error
         transportDiagnostic = other.transportDiagnostic
         agyLoginMarker = other.agyLoginMarker
-        self.historyAccountKey = historyAccountKey
-            ?? (promoted ? other.accountKey : other.historyAccountKey)
+        self.historyAccountKey = historyAccountKey ?? other.historyAccountKey
     }
 }
 
