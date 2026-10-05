@@ -19113,6 +19113,14 @@ enum SelfTest {
         expect(wcpGate("grok", present: [], quota: []) == "nil/nil"
                    && wcpGate("grok", present: [], quota: ["grok-bot"], excluded: ["grok-bot"]) == "nil/nil",
                "WCP2-gate control: no Grok Bot quota, or Grok Bot's limits hidden, gets no card")
+        // Gate fed by the real quotaClients, the Antigravity tab with only
+        // antigravity-cli's local records and no payload yet (or Antigravity
+        // unconfigured). Mutation: quotaClients slices present unfolded.
+        let wcpCliOnlyQuota = ClientRegistry.quotaClients(
+            present: ["antigravity-cli"], quotaIds: [], tabHidden: [], orderRaw: "")
+        expect(wcpGate("antigravity", present: ["antigravity-cli"], quota: wcpCliOnlyQuota)
+                   == "antigravity/antigravity",
+               "WCP2-gate antigravity-cli records alone: the tab's card is antigravity's, never antigravity-cli's; got \(wcpCliOnlyQuota)")
         expect(wcpGate("claude", present: ["claude"], quota: ["claude"]) == "claude/claude",
                "WCP2-gate control: a tab with local records gets both, the same id")
         expect(wcpGate("claude", present: ["claude"], quota: ["claude"], excluded: ["claude"]) == "nil/nil"

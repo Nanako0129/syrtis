@@ -252,13 +252,17 @@ public enum ClientRegistry {
 
     /// Quota curves use provider ids, never the grouped navigation ids alone.
     /// Keep local clients for loading/error cards and add quota-only providers.
+    /// A present client is folded to its tab before slicing, so a member with
+    /// local records (`antigravity-cli`) brings its whole group: otherwise,
+    /// before the first payload or with Antigravity unconfigured, the tab's
+    /// card fell to `antigravity-cli`, which has no quota history (Windows #219).
     public static func quotaClients(
         present: [String], quotaIds: [String], tabHidden: Set<String>,
         orderRaw: String
     ) -> [String] {
         let hidden = hiddenTabClients(tabHidden)
         var seen = Set<String>()
-        let ids = (present.flatMap(tabSlice) + quotaIds)
+        let ids = (present.map { memberToTabId[$0] ?? $0 }.flatMap(tabSlice) + quotaIds)
             .filter { !hidden.contains($0) && seen.insert($0).inserted }
         return orderedClients(ids, orderRaw: orderRaw)
     }
