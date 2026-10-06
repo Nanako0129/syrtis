@@ -17005,6 +17005,156 @@ enum SelfTest {
                 + "pollers — there is nothing for the extra wake to correct")
         ClaudeExtraRoots.resetAppliedConfigDirsForTesting()
 
+        // Cursor usage sync (C3). Prefs -> the JSON handed to the core.
+        do {
+            let suite = "tokenbar.selftest.cursorSync"
+            let defaults = UserDefaults(suiteName: suite)!
+            defer { defaults.removePersistentDomain(forName: suite) }
+            defaults.removePersistentDomain(forName: suite)
+            let user = ["Syrtis"]
+            func config(_ args: [String] = user) -> [String: Any] {
+                let json = CursorSync.configJSON(dir: "/x/cursor-cache", defaults: defaults, arguments: args)
+                return (try? JSONSerialization.jsonObject(with: Data(json.utf8))) as? [String: Any] ?? [:]
+            }
+            func flags(_ c: [String: Any]) -> String {
+                "\(c["enabled"] as? Bool ?? false)/\(c["dir"] as? String ?? "-")/\(c["cliTakeoverConfirmed"] as? Bool ?? true)"
+            }
+            expect(CursorSync.enabled(defaults: defaults), "CURSOR-SYNC the preference defaults to ON (D3)")
+            expect(
+                flags(config()) == "false//x/cursor-cache/false",
+                "CURSOR-SYNC before the notice is acknowledged the core is told enabled=false: \(flags(config()))")
+            defaults.set(true, forKey: CursorSync.noticeKey)
+            expect(
+                flags(config()) == "true//x/cursor-cache/false",
+                "CURSOR-SYNC acknowledged + default pref -> enabled=true, dir passed, takeover not confirmed")
+            defaults.set(true, forKey: CursorSync.takeoverKey)
+            expect(
+                flags(config()) == "true//x/cursor-cache/true",
+                "CURSOR-SYNC the D6 confirmation is carried to the core")
+            defaults.set(false, forKey: CursorSync.enabledKey)
+            expect(
+                flags(config()) == "false//x/cursor-cache/true",
+                "CURSOR-SYNC turning the toggle off sends enabled=false")
+            defaults.set(true, forKey: CursorSync.enabledKey)
+            for flag in ["--demo", "--smoke", "--selftest", "--icon-gallery"] {
+                expect(
+                    config(["Syrtis", flag])["enabled"] as? Bool == false
+                        && !CursorSync.shouldSync(defaults: defaults, arguments: ["Syrtis", flag]),
+                    "CURSOR-SYNC \(flag) never enables, even with every preference on")
+            }
+            expect(CursorSync.shouldSync(defaults: defaults, arguments: user),
+                   "CURSOR-SYNC control: the same preferences enable in a user session")
+
+            // Per-bundle directory (S-5).
+            let support = URL(fileURLWithPath: "/tmp/AS", isDirectory: true)
+            expect(
+                CursorSync.syncDirectory(bundleID: "com.nyanako.tokenbar.livecheck", appSupport: support)
+                    == "/tmp/AS/com.nyanako.tokenbar.livecheck/cursor-cache"
+                    && CursorSync.syncDirectory(bundleID: "com.nyanako.tokenbar", appSupport: support)
+                        == "/tmp/AS/com.nyanako.tokenbar/cursor-cache"
+                    && CursorSync.syncDirectory(bundleID: nil, appSupport: support) == nil,
+                "CURSOR-SYNC the sync directory is per bundle id under Application Support; no bundle id -> none")
+
+            // Notice visibility: only with the Cursor app present, not yet answered, pref on.
+            defaults.removeObject(forKey: CursorSync.noticeKey)
+            expect(
+                CursorSync.noticeVisible(defaults: defaults, arguments: user, cursorPresent: true)
+                    && !CursorSync.noticeVisible(defaults: defaults, arguments: user, cursorPresent: false)
+                    && !CursorSync.noticeVisible(defaults: defaults, arguments: ["Syrtis", "--demo"], cursorPresent: true),
+                "CURSOR-SYNC the notice shows only for an unanswered, enabled, real session with Cursor present")
+            defaults.removePersistentDomain(forName: suite)
+        }
+
+        // Cursor sync: the gates in the production entry points, observed by
+        // injecting the FFI calls (a real call would touch the network).
+        let cursorGate: [Int]? = awaitMainActorValue {
+            let suite = "tokenbar.selftest.cursorSyncGate"
+            let defaults = UserDefaults(suiteName: suite)!
+            defer { defaults.removePersistentDomain(forName: suite) }
+            defaults.removePersistentDomain(forName: suite)
+            let syncCalls = UncheckedBox<Int>(0)
+            let configCalls = UncheckedBox<[String]>([])
+            let partial = try? JSONDecoder().decode(
+                CursorSyncStatus.self, from: Data(#"{"state":"partial","events":0,"lastSuccessMs":null}"#.utf8))
+            let sync: @Sendable (Bool) -> CursorSyncStatus? = { _ in syncCalls.value += 1; return partial }
+            let controller = CursorSyncController()
+            // 1. Notice not acknowledged -> no sync.
+            await controller.runSync(explicit: true, defaults: defaults, arguments: ["Syrtis"], sync: sync)
+            let beforeAck = syncCalls.value
+            // 2. Acknowledged but a test mode -> no sync.
+            defaults.set(true, forKey: CursorSync.noticeKey)
+            for flag in ["--demo", "--smoke", "--selftest"] {
+                await controller.runSync(explicit: true, defaults: defaults, arguments: ["Syrtis", flag], sync: sync)
+            }
+            let testModes = syncCalls.value
+            // 3. Test mode: reconfigure makes no core call at all.
+            controller.reconfigure(
+                refresh: false, defaults: defaults, arguments: ["Syrtis", "--demo"], dir: "/x",
+                setConfig: { configCalls.value.append($0) }, sync: sync)
+            try? await Task.sleep(nanoseconds: 100_000_000)
+            let demoReconfigure = configCalls.value.count + syncCalls.value
+            // 4. Control: a user session acknowledged -> config pushed and a sync runs.
+            controller.reconfigure(
+                refresh: false, defaults: defaults, arguments: ["Syrtis"], dir: "/x",
+                setConfig: { configCalls.value.append($0) }, sync: sync)
+            for _ in 0..<200 where syncCalls.value == 0 {
+                try? await Task.sleep(nanoseconds: 10_000_000)
+            }
+            let afterAck = syncCalls.value
+            // Stop the loop: turning the pref off cancels it and pushes enabled=false.
+            defaults.set(false, forKey: CursorSync.enabledKey)
+            controller.reconfigure(
+                refresh: false, defaults: defaults, arguments: ["Syrtis"], dir: "/x",
+                setConfig: { configCalls.value.append($0) }, sync: sync)
+            for _ in 0..<200 where configCalls.value.count < 2 {
+                try? await Task.sleep(nanoseconds: 10_000_000)
+            }
+            let offPushed = configCalls.value.last?.contains(#""enabled":false"#) == true ? 1 : 0
+            return [beforeAck, testModes, demoReconfigure, afterAck, offPushed]
+        }
+        expect(cursorGate?[0] == 0,
+               "CURSOR-SYNC no sync runs before the one-time notice is acknowledged")
+        expect(cursorGate?[1] == 0,
+               "CURSOR-SYNC --demo/--smoke/--selftest never sync, even acknowledged")
+        expect(cursorGate?[2] == 0,
+               "CURSOR-SYNC reconfigure under --demo makes no core call and no sync")
+        expect(cursorGate?[3] == 1,
+               "CURSOR-SYNC control: acknowledged in a user session, reconfigure runs one sync")
+        expect(cursorGate?[4] == 1,
+               "CURSOR-SYNC turning the preference off pushes enabled=false to the core")
+
+        // Status -> copy, every state; and every new key in both catalogs.
+        do {
+            let now = Date(timeIntervalSince1970: 1_000_000)
+            let ms = Int64((now.timeIntervalSince1970 - 3600) * 1000)
+            let mapped: [(String, String?)] = [
+                ("partial", CursorSync.Copy.partial), ("expired", CursorSync.Copy.expired),
+                ("notSignedIn", CursorSync.Copy.notSignedIn), ("offline", CursorSync.Copy.offline),
+                ("error", CursorSync.Copy.error), ("cliPresent", CursorSync.Copy.cliPresent),
+            ]
+            for (state, copy) in mapped {
+                expect(CursorSync.statusLine(state: state, lastSuccessMs: nil, now: now) == copy?.localized,
+                       "CURSOR-SYNC status \(state) maps to its approved line")
+            }
+            let ok = CursorSync.statusLine(state: "ok", lastSuccessMs: ms, now: now)
+            expect(ok?.hasPrefix("Last synced ") == true && ok?.contains("1 hour ago") == true,
+                   "CURSOR-SYNC status ok shows the relative time: \(ok ?? "nil")")
+            expect(CursorSync.statusLine(state: "disabled", lastSuccessMs: ms, now: now) == nil
+                       && CursorSync.statusLine(state: nil, lastSuccessMs: nil, now: now) == nil
+                       && CursorSync.statusLine(state: "ok", lastSuccessMs: nil, now: now) == nil,
+                   "CURSOR-SYNC disabled / not yet synced / ok without a time show no line")
+            let lines = mapped.compactMap { CursorSync.statusLine(state: $0.0, lastSuccessMs: nil, now: now) }
+            expect(Set(lines).count == 6, "CURSOR-SYNC the six problem states each have a distinct line")
+            var missing: [String] = []
+            for key in CursorSync.Copy.all {
+                for locale in ["zh-Hant", "zh-Hans"] {
+                    let value = AppLanguage.localizedString(key, locale: locale)
+                    if value == nil || value == key { missing.append("\(locale): \(key.prefix(30))") }
+                }
+            }
+            expect(missing.isEmpty, "CURSOR-SYNC every new copy key exists in zh-Hant and zh-Hans (English is the key): \(missing)")
+        }
+
         // Keychain consent, the stored answer. Three-valued on purpose:
         // `bool(forKey:)` would collapse "declined" into "never asked" and put
         // the full explanation back in front of someone who already said no.

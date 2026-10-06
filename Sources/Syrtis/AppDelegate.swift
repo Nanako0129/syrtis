@@ -96,6 +96,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // has not been asked and for someone who said no.
         GrokBotKeychainConsent.applyIfGranted()
 
+        // Cursor desktop sync: the core switch is in-memory and starts off, so
+        // the stored preference is re-applied here, and the 30-minute schedule
+        // starts if the one-time notice was acknowledged. `--demo` reaches
+        // this point too; `reconfigure` makes no core call in any test mode.
+        CursorSyncController.shared.reconfigure(refresh: false)
+
         // Captured Antigravity accounts: same in-memory registry story. The
         // label resolver goes first so no card can render a key as its label.
         AntigravityAccounts.installLabelResolver()

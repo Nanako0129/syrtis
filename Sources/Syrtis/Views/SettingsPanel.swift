@@ -122,6 +122,10 @@ struct SettingsPanel: View {
     @AppStorage(AntigravityAutoCapture.enabledKey) private var antigravityAutoCaptureOn = false
     /// Busy, paused, unavailable and the last failure sentence.
     @ObservedObject private var antigravityAutoCapture = AntigravityAutoCapture.shared
+    @ObservedObject private var cursorSync = CursorSyncController.shared
+    @AppStorage(CursorSync.enabledKey) private var cursorSyncOn = true
+    @AppStorage(CursorSync.takeoverKey) private var cursorTakeover = false
+    @AppStorage(CursorSync.noticeKey) private var cursorNoticeAck = false
     /// 0 = auto (≈60% of the screen). The popover's drag handle writes the
     /// same key, so the two stay in sync.
     @AppStorage(PopoverChrome.heightKey) private var popoverHeight = 0.0
@@ -1007,6 +1011,8 @@ struct SettingsPanel: View {
 
         antigravityAccountsSection()
 
+        cursorSyncSection()
+
         section("Language") {
             radioGroup(
                 selection: Binding(
@@ -1071,6 +1077,52 @@ struct SettingsPanel: View {
             hint("For another Claude account, run Claude Code with CLAUDE_CONFIG_DIR set to its own folder and add that folder here. Its usage joins your totals; accounts aren't shown separately.")
         }
         .onAppear { refreshMissingClaudeRoots() }
+    }
+
+    /// Cursor usage synced from the Cursor desktop app. The hint is the same
+    /// privacy paragraph the one-time notice shows (`CursorSync.Copy.privacy`).
+    @ViewBuilder
+    private func cursorSyncSection() -> some View {
+        section(CursorSync.Copy.title) {
+            toggleRow(
+                CursorSync.Copy.toggle,
+                isOn: Binding(get: { cursorSyncOn }, set: { cursorSync.setEnabled($0) }))
+            hint(CursorSync.Copy.privacy)
+            if cursorSyncOn {
+                if let line = CursorSync.statusLine(
+                    state: cursorSync.state, lastSuccessMs: cursorSync.lastSuccessMs)
+                {
+                    Text(line)
+                        .font(.caption2)
+                        .foregroundStyle(cursorSync.state == "ok" ? Color.secondary : Color.orange)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                if cursorSync.state == "cliPresent", !cursorTakeover {
+                    hint(CursorSync.Copy.cliQuestion)
+                    Button(CursorSync.Copy.useSyrtis.localized) {
+                        cursorSync.setTakeoverConfirmed(true)
+                    }
+                    .controlSize(.small)
+                    .padding(.horizontal, 10)
+                } else if cursorTakeover {
+                    // Undo for the D6 answer; the question returns on the next sync.
+                    Button(CursorSync.Copy.keepCLI.localized) {
+                        cursorSync.setTakeoverConfirmed(false)
+                    }
+                    .controlSize(.small)
+                    .padding(.horizontal, 10)
+                }
+                Button {
+                    Task { await cursorSync.runSync(explicit: true) }
+                } label: {
+                    Text((cursorSync.syncing ? CursorSync.Copy.syncing : CursorSync.Copy.syncNow).localized)
+                        .font(.caption)
+                }
+                .buttonStyle(.plain)
+                .disabled(cursorSync.syncing || !cursorNoticeAck)
+                .padding(.horizontal, 10)
+            }
+        }
     }
 
     /// Extra Google accounts for Antigravity, each its own card. The copy says
