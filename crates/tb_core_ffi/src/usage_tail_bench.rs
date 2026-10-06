@@ -1,21 +1,32 @@
-//! `cargo test -p tb_core_ffi --release --lib usage_tail::bench -- --ignored --nocapture --test-threads=1`
-//! with HOME / TOKSCALE_CONFIG_DIR pointing at a disposable corpus. One test at
-//! a time: CPU is read for the whole process, so a second bench running beside
-//! it would be counted in its numbers.
+//! `env -i HOME=<corpus>/home TOKSCALE_CONFIG_DIR=<corpus>/cfg PATH=/usr/bin:/bin \`
+//! `  cargo test -p tb_core_ffi --release --lib usage_tail::bench -- --ignored --nocapture --test-threads=1`
+//!
+//! Runs against a disposable corpus only: HOME's parent must hold an `IDENTITY`
+//! file and TOKSCALE_CONFIG_DIR must sit inside that parent, or the bench
+//! refuses to start — it writes the message cache, and in append mode the
+//! session file, so pointing it at a real HOME would alter real data. Scrub the
+//! environment (`env -i`): the engine's per-client root variables (CODEX_HOME
+//! and the like) override HOME. Copy the corpus preserving mtimes; the tail
+//! prunes by mtime, so a copy that resets them changes the workload. One bench
+//! at a time: CPU is read for the whole process (the two benches also take a
+//! lock).
 //!
 //!   BENCH_NOW_MS       fixed clock in Unix milliseconds, normally the corpus
-//!                      capture time; a malformed or seconds-sized value fails
+//!                      capture time; anything that is not a millisecond-sized
+//!                      integer fails the run
 //!   BENCH_TICKS        ticks after the first (default 20)
-//!   BENCH_APPEND       file inside HOME to append one synthesized line to per tick
+//!   BENCH_GRAPH_ITERS  graph recomputes (default 10)
+//!   BENCH_APPEND       file inside HOME to append one synthesized line to per
+//!                      tick; required by the graph bench
 //!   BENCH_APPEND_KIND  `claude` (default) or `codex`
 //!
 //! A synthesized line carries a fresh per-run identity (Claude ids; Codex
 //! cumulative totals), because re-appending an existing line is dropped by
-//! dedup and would never add an event. The parser, not the line, decides the
-//! event's timestamp — Claude uses the pending request start of a preceding
-//! user line, Codex the previous accepted token_count — so the append target's
-//! last real record must already be inside the window; the run fails (`grow`)
-//! when an append adds no event.
+//! dedup and would never add an event. Its timestamp is not always the one
+//! written: a Claude assistant line right after a user or tool_result line
+//! takes that line's request start, and a Codex token_count takes the previous
+//! accepted token_count's time — so the target's last real record should be
+//! inside the window. The run fails when an append adds no event to its lane.
 //!
 //! Limits: the digest covers the tail's event window, not `rate_in_window` or
 //! `trace` (they still read the wall clock), and the graph bench measures cost
@@ -27,7 +38,11 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::io::{BufRead, Read, Seek, SeekFrom, Write};
 use std::path::Path;
+use std::sync::Mutex;
 use std::time::Instant;
+
+/// Both benches read whole-process CPU and may append to the same file.
+static BENCH_LOCK: Mutex<()> = Mutex::new(());
 
 #[repr(C)]
 #[derive(Default)]
@@ -108,8 +123,10 @@ fn mutants(events: &[UsageEvent]) -> Vec<(&'static str, bool, Vec<UsageEvent>)> 
 
 fn last_line_with(path: &str, needles: &[&str], keep: impl Fn(&Value) -> bool) -> String {
     std::io::BufReader::new(std::fs::File::open(path).expect("open append target"))
-        .lines()
+        .split(b'\n')
+        // Stop on an I/O error; skip a line that is not UTF-8, as the parsers do.
         .map_while(Result::ok)
+        .filter_map(|bytes| String::from_utf8(bytes).ok())
         .filter(|l| needles.iter().all(|n| l.contains(n)))
         .filter(|l| serde_json::from_str::<Value>(l).is_ok_and(|v| keep(&v)))
         .last()
@@ -213,14 +230,26 @@ struct BenchEnv {
 
 impl BenchEnv {
     fn read() -> Self {
+        let home = Path::new(&std::env::var("HOME").expect("HOME")).canonicalize().expect("canonicalize HOME");
+        let corpus = home.parent().expect("HOME has a parent").to_path_buf();
+        assert!(
+            corpus.join("IDENTITY").is_file(),
+            "HOME {} is not a corpus home (no IDENTITY beside it)",
+            home.display()
+        );
+        let cfg = std::env::var("TOKSCALE_CONFIG_DIR").expect("TOKSCALE_CONFIG_DIR must point into the corpus");
+        let cfg = Path::new(&cfg).canonicalize().expect("canonicalize TOKSCALE_CONFIG_DIR");
+        assert!(cfg.starts_with(&corpus), "TOKSCALE_CONFIG_DIR {} is outside the corpus", cfg.display());
         let fixed_now = std::env::var("BENCH_NOW_MS").ok().map(|v| {
             let ms: i64 = v.parse().unwrap_or_else(|_| panic!("BENCH_NOW_MS {v:?} is not an integer"));
-            assert!(ms >= 1_000_000_000_000, "BENCH_NOW_MS {ms} looks like seconds, not milliseconds");
+            // 2001..2286 in milliseconds: rejects seconds, micro- and nanoseconds.
+            assert!(
+                (1_000_000_000_000..10_000_000_000_000).contains(&ms),
+                "BENCH_NOW_MS {ms} is not a millisecond timestamp"
+            );
             ms
         });
         let append = std::env::var("BENCH_APPEND").ok().map(|p| {
-            let home = std::env::var("HOME").expect("HOME");
-            let home = Path::new(&home).canonicalize().expect("canonicalize HOME");
             let file = Path::new(&p).canonicalize().expect("canonicalize BENCH_APPEND");
             assert!(file.is_file(), "BENCH_APPEND {p} is not a file");
             assert!(file.starts_with(&home), "BENCH_APPEND {p} is outside HOME (the corpus)");
@@ -238,6 +267,13 @@ impl BenchEnv {
             None => println!("clock\twall"),
         }
         Self { fixed_now, append, kind, run }
+    }
+
+    /// A count setting; a malformed value fails the run instead of using `default`.
+    fn count(name: &str, default: usize) -> usize {
+        std::env::var(name).map_or(default, |v| {
+            v.parse().unwrap_or_else(|_| panic!("{name} {v:?} is not a non-negative integer"))
+        })
     }
 
     fn now(&self) -> i64 {
@@ -269,8 +305,9 @@ fn report(label: &str, tailer: &UsageTailer, cpu: f64, wall: f64, parses_before:
 #[test]
 #[ignore]
 fn bench_tail_tick() {
+    let _serial = BENCH_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let env = BenchEnv::read();
-    let ticks: usize = std::env::var("BENCH_TICKS").ok().and_then(|v| v.parse().ok()).unwrap_or(20);
+    let ticks = BenchEnv::count("BENCH_TICKS", 20);
     let clock = || env.now();
     let mut failures = Vec::new();
 
@@ -281,29 +318,25 @@ fn bench_tail_tick() {
         "warmup\tcpu_ms={:.0}\twall_ms={:.0}\tmessages={}",
         cpu_ms() - c0,
         w0.elapsed().as_secs_f64() * 1000.0,
-        parsed.map(|p| p.messages.len()).unwrap_or(0)
+        parsed.as_ref().map(|p| p.messages.len()).unwrap_or(0)
     );
+    if let Err(e) = &parsed {
+        failures.push(format!("warmup parse failed: {e}"));
+    }
 
     let tailer = UsageTailer::new();
     let (c, w) = (cpu_ms(), Instant::now());
     tailer.tick_with_clock(clock);
     let first = report("tick0", &tailer, cpu_ms() - c, w.elapsed().as_secs_f64() * 1000.0, 0);
-    if first.is_empty() {
-        println!("mutation\tskipped\tthe tick0 window is empty");
-    } else {
-        let base = digest(&first);
-        for (name, should_change, mutated) in mutants(&first) {
-            let changed = digest(&mutated) != base;
-            let ok = changed == should_change;
-            println!("mutation\t{name}\tchanged={changed}\t{}", if ok { "ok" } else { "FAIL" });
-            if !ok {
-                failures.push(format!("mutation {name}"));
-            }
-        }
+    // With a fixed clock the window is the point of the run: an empty one
+    // compares nothing and must not pass.
+    if env.fixed_now.is_some() && first.is_empty() {
+        failures.push("the tick0 window is empty".into());
     }
 
     let mut cpus = Vec::with_capacity(ticks);
-    let mut prev_events = first.len();
+    let lane_len = |events: &[UsageEvent]| events.iter().filter(|e| e.client == env.kind).count();
+    let mut prev_lane = lane_len(&first);
     for i in 1..=ticks {
         let label = format!("tick{i}");
         env.append(&label, (ticks - i + 1) as i64);
@@ -313,13 +346,13 @@ fn bench_tail_tick() {
         let cpu = cpu_ms() - c;
         let events = report(&label, &tailer, cpu, w.elapsed().as_secs_f64() * 1000.0, parses_before);
         if env.append.is_some() {
-            let ok = events.len() > prev_events;
+            let ok = lane_len(&events) > prev_lane;
             println!("grow\t{label}\t{}", if ok { "ok" } else { "FAIL" });
             if !ok {
                 failures.push(format!("grow {label}"));
             }
         }
-        prev_events = events.len();
+        prev_lane = lane_len(&events);
         cpus.push(cpu);
     }
     cpus.sort_by(f64::total_cmp);
@@ -332,6 +365,11 @@ fn bench_tail_tick() {
             tailer.parse_count()
         );
     }
+    // Unchanged mode measures the skip path; a token that keeps moving would
+    // quietly turn every tick into a full parse.
+    if env.append.is_none() && tailer.parse_count() != 1 {
+        failures.push(format!("unchanged mode parsed {} times, expected 1", tailer.parse_count()));
+    }
     assert!(failures.is_empty(), "failed checks: {failures:?}");
 }
 
@@ -343,9 +381,14 @@ fn bench_tail_tick() {
 #[test]
 #[ignore]
 fn bench_graph_recompute() {
+    let _serial = BENCH_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let env = BenchEnv::read();
-    let iters: usize = std::env::var("BENCH_GRAPH_ITERS").ok().and_then(|v| v.parse().ok()).unwrap_or(10);
+    // Without an append the token never moves, and production would serve the
+    // cached graph instead of recomputing: nothing realistic to time.
+    assert!(env.append.is_some(), "the graph bench needs BENCH_APPEND");
+    let iters = BenchEnv::count("BENCH_GRAPH_ITERS", 10);
     let context = crate::LocalSourceContext::current();
+    let mut failures = Vec::new();
 
     // Warm the cache once so every measured iteration is a warm recompute.
     let (c, w) = (cpu_ms(), Instant::now());
@@ -356,6 +399,9 @@ fn bench_graph_recompute() {
         w.elapsed().as_secs_f64() * 1000.0,
         warm.is_ok()
     );
+    if let Err(e) = &warm {
+        failures.push(format!("warmup: {e}"));
+    }
 
     let (mut tokens, mut runs) = (Vec::new(), Vec::new());
     for i in 1..=iters {
@@ -371,6 +417,9 @@ fn bench_graph_recompute() {
             w.elapsed().as_secs_f64() * 1000.0,
             result.is_ok()
         );
+        if let Err(e) = &result {
+            failures.push(format!("iter{i}: {e}"));
+        }
         tokens.push(token_cpu);
         runs.push(run_cpu);
     }
@@ -386,6 +435,7 @@ fn bench_graph_recompute() {
             runs[iters - 1]
         );
     }
+    assert!(failures.is_empty(), "failed recomputes: {failures:?}");
 }
 
 #[test]
