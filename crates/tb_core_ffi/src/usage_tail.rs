@@ -63,8 +63,9 @@ pub struct UsageTailer {
     /// changed, the event window is still correct (rate queries re-filter by
     /// timestamp on read) and the tick skips the parse entirely.
     last_source_token: Mutex<Option<u64>>,
-    /// Ticks that ran the parse rather than the unchanged-token skip; lets a
-    /// benchmark tell the two paths apart without a second token probe.
+    /// Ticks that attempted the parse (whether it succeeded or failed) rather
+    /// than taking the unchanged-token skip; lets a benchmark tell a paid parse
+    /// from a skip without a second token probe.
     parses: AtomicUsize,
 }
 
@@ -77,8 +78,9 @@ impl UsageTailer {
         }
     }
 
-    // Only the benchmark reads it; the release lib would warn on an unused method.
-    #[cfg(test)]
+    // Only the benchmark reads it (macOS-only, see the `bench` mount below);
+    // anywhere else the method would be unused.
+    #[cfg(all(test, target_os = "macos"))]
     pub fn parse_count(&self) -> usize {
         self.parses.load(Ordering::Relaxed)
     }
@@ -122,12 +124,12 @@ impl UsageTailer {
             return self.events.lock().len();
         }
 
+        self.parses.fetch_add(1, Ordering::Relaxed);
         let parsed = match tokscale_core::parse_local_clients(options) {
             Ok(parsed) => parsed,
             Err(_) => return self.events.lock().len(),
         };
         *self.last_source_token.lock() = token;
-        self.parses.fetch_add(1, Ordering::Relaxed);
 
         let cutoff = clock() - EVENT_WINDOW_SECS * 1000;
         let mut next: Vec<UsageEvent> = parsed
@@ -235,9 +237,11 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-// Tail measurement harness for the CPU work (diagnosis only, all `#[ignore]`
-// except the digest's own mutation test).
-#[cfg(test)]
+// Tail measurement harness for the CPU work. The two benches are `#[ignore]`;
+// three small unit tests (digest mutations, record appending, source-line
+// selection) run in the normal suite. macOS only: it reads CPU through a
+// hand-declared getrusage with Darwin's layout.
+#[cfg(all(test, target_os = "macos"))]
 #[path = "usage_tail_bench.rs"]
 mod bench;
 
