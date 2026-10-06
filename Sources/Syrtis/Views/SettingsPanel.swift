@@ -1086,9 +1086,11 @@ struct SettingsPanel: View {
         section(CursorSync.Copy.title) {
             toggleRow(
                 CursorSync.Copy.toggle,
-                isOn: Binding(get: { cursorSyncOn }, set: { cursorSync.setEnabled($0) }))
+                isOn: Binding(
+                    get: { CursorSync.toggleShowsOn(enabled: cursorSyncOn, acknowledged: cursorNoticeAck) },
+                    set: { cursorSync.setEnabled($0) }))
             hint(CursorSync.Copy.privacy)
-            if cursorSyncOn {
+            if CursorSync.toggleShowsOn(enabled: cursorSyncOn, acknowledged: cursorNoticeAck) {
                 if let line = CursorSync.statusLine(
                     state: cursorSync.state, lastSuccessMs: cursorSync.lastSuccessMs)
                 {

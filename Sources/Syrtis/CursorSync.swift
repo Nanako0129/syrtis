@@ -28,6 +28,14 @@ enum CursorSync {
         defaults.bool(forKey: noticeKey)
     }
 
+    /// What the Settings toggle shows: on only when sync can actually run.
+    /// Before the notice is answered nothing syncs, so the default-on
+    /// preference alone must not read as "on" with every control inert;
+    /// turning the toggle on answers the notice (`setEnabled`).
+    static func toggleShowsOn(enabled: Bool, acknowledged: Bool) -> Bool {
+        enabled && acknowledged
+    }
+
     static func takeoverConfirmed(defaults: UserDefaults = .standard) -> Bool {
         defaults.bool(forKey: takeoverKey)
     }
@@ -157,6 +165,8 @@ final class CursorSyncController: ObservableObject {
     /// Bumped by every `reconfigure`; a sync result that comes back after a
     /// newer configuration is discarded, so a late result cannot undo an off.
     private var generation = 0
+    /// Set when a sync's result was discarded as stale; the sync reruns.
+    private var rerunPending = false
 
     /// Push the stored preferences into the core, then (re)start the schedule
     /// if sync is allowed. Called at launch and after every preference change.
@@ -197,32 +207,39 @@ final class CursorSyncController: ObservableObject {
         }
     }
 
-    /// One sync, off the main thread. Single-flight here as well as in the core.
-    /// ponytail: a sync already running when `reconfigure` restarts the loop
-    /// makes the new loop's first pass a no-op; the next tick covers it.
+    /// One sync, off the main thread. Single-flight here as well as in the core:
+    /// a request while a sync runs is dropped, since that sync's result is
+    /// current. A reconfigure during a sync makes its result stale; that result
+    /// is discarded and the sync reruns, so the new settings get a fresh result.
     func runSync(
         explicit: Bool, defaults: UserDefaults = .standard,
         arguments: [String] = CommandLine.arguments,
         sync: @escaping @Sendable (Bool) -> CursorSyncStatus? = { try? TBCore.cursorSync(explicit: $0) }
     ) async {
-        guard !syncing, CursorSync.shouldSync(defaults: defaults, arguments: arguments) else { return }
+        guard CursorSync.shouldSync(defaults: defaults, arguments: arguments) else { return }
+        if syncing { return }
         syncing = true
         defer { syncing = false }
-        let started = generation
-        let result = await Task.detached(priority: .utility) { sync(explicit) }.value
-        // A reconfigure (e.g. turning sync off) happened while this ran: its
-        // result describes a configuration that no longer applies.
-        guard started == generation, CursorSync.shouldSync(defaults: defaults, arguments: arguments)
-        else { return }
-        guard let result else { state = "error"; return }
-        state = result.state
-        lastSuccessMs = result.lastSuccessMs
-        // A completed walk already invalidated the core's caches; the Swift
-        // side only needs telling when the data changed.
-        if result.state == "ok", result.events != lastRefreshedEvents {
-            lastRefreshedEvents = result.events
-            Self.refreshModel()
-        }
+        repeat {
+            rerunPending = false
+            // Sync against the newest configuration the core has been given.
+            await configPush?.value
+            let started = generation
+            let result = await Task.detached(priority: .utility) { sync(explicit) }.value
+            // A reconfigure (e.g. turning sync off) happened while this ran:
+            // its result describes a configuration that no longer applies.
+            guard started == generation, CursorSync.shouldSync(defaults: defaults, arguments: arguments)
+            else { rerunPending = true; continue }
+            guard let result else { state = "error"; continue }
+            state = result.state
+            lastSuccessMs = result.lastSuccessMs
+            // A completed walk already invalidated the core's caches; the Swift
+            // side only needs telling when the data changed.
+            if result.state == "ok", result.events != lastRefreshedEvents {
+                lastRefreshedEvents = result.events
+                Self.refreshModel()
+            }
+        } while rerunPending && CursorSync.shouldSync(defaults: defaults, arguments: arguments)
     }
 
     /// The model's normal refresh: drop Swift scan caches and bump the

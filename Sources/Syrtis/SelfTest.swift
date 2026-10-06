@@ -17202,6 +17202,52 @@ enum SelfTest {
         }
         expect(cursorLate == .some(nil),
                "CURSOR-SYNC a sync result returning after sync was turned off is discarded; got \(String(describing: cursorLate))")
+        // A reconfigure during a sync reruns it (not a 30-minute gap), and
+        // "Sync Now" waits for the newest config push. Mutations: the
+        // in-flight request dropped instead of marking a rerun; `runSync` not
+        // awaiting `configPush`.
+        let cursorRerun: [String]? = awaitMainActorValue {
+            let suite = "tokenbar.selftest.cursorSyncRerun"
+            let defaults = UserDefaults(suiteName: suite)!
+            defer { defaults.removePersistentDomain(forName: suite) }
+            defaults.removePersistentDomain(forName: suite)
+            defaults.set(true, forKey: CursorSync.noticeKey)
+            let log = UncheckedBox<[String]>([])
+            let ok = try? JSONDecoder().decode(
+                CursorSyncStatus.self, from: Data(#"{"state":"ok","events":2,"lastSuccessMs":1}"#.utf8))
+            let slowSync: @Sendable (Bool) -> CursorSyncStatus? = { _ in
+                log.value.append("sync"); Thread.sleep(forTimeInterval: 0.2); return ok
+            }
+            let slowPush: @Sendable (String) -> Void = { _ in
+                Thread.sleep(forTimeInterval: 0.2); log.value.append("push")
+            }
+            let controller = CursorSyncController()
+            // Sync Now right after a reconfigure: the push must land first.
+            controller.reconfigure(refresh: false, defaults: defaults, arguments: ["Syrtis"], dir: "/x",
+                                   setConfig: slowPush, sync: slowSync)
+            await controller.runSync(explicit: true, defaults: defaults, arguments: ["Syrtis"], sync: slowSync)
+            let firstTwo = Array(log.value.prefix(2))
+            // A reconfigure while a sync runs: that result is discarded and a
+            // rerun follows, ending with a fresh state.
+            log.value = []
+            let running = Task { @MainActor in
+                await controller.runSync(explicit: true, defaults: defaults, arguments: ["Syrtis"], sync: slowSync)
+            }
+            try? await Task.sleep(nanoseconds: 50_000_000)
+            controller.reconfigure(refresh: false, defaults: defaults, arguments: ["Syrtis"], dir: "/x",
+                                   setConfig: { _ in }, sync: slowSync)
+            await running.value
+            let syncs = log.value.filter { $0 == "sync" }.count
+            return firstTwo + ["syncs=\(syncs >= 2)", "state=\(controller.state ?? "nil")"]
+        }
+        expect(cursorRerun == ["push", "sync", "syncs=true", "state=ok"],
+               "CURSOR-SYNC Sync Now waits for the config push, and a reconfigure mid-sync reruns it; got \(String(describing: cursorRerun))")
+        // Settings toggle shows on only when sync can run. Mutation: show the
+        // raw preference (default on) before the notice is answered.
+        expect(!CursorSync.toggleShowsOn(enabled: true, acknowledged: false)
+                   && CursorSync.toggleShowsOn(enabled: true, acknowledged: true)
+                   && !CursorSync.toggleShowsOn(enabled: false, acknowledged: true),
+               "CURSOR-SYNC the Settings toggle reads off until the notice is answered, then follows the preference")
         expect(cursorRefresh == [true, false, true],
                "CURSOR-SYNC a changed count refreshes, the same count does not, and off->on refreshes again; got \(String(describing: cursorRefresh))")
 
