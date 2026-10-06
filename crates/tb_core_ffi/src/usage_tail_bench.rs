@@ -1,5 +1,7 @@
-//! `cargo test --release --lib usage_tail::bench -- --ignored --nocapture`
-//! with HOME / TOKSCALE_CONFIG_DIR pointing at a disposable corpus.
+//! `cargo test --release --lib usage_tail::bench -- --ignored --nocapture --test-threads=1`
+//! with HOME / TOKSCALE_CONFIG_DIR pointing at a disposable corpus. One test at
+//! a time: CPU is read for the whole process, so a second bench running beside
+//! it would be counted in its numbers.
 //!
 //!   BENCH_NOW_MS       fixed clock, normally the corpus capture time
 //!   BENCH_TICKS        ticks after the first (default 20)
@@ -14,7 +16,7 @@ use chrono::{SecondsFormat, TimeZone, Utc};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
-use std::io::{BufRead, Write};
+use std::io::{BufRead, Read, Seek, SeekFrom, Write};
 use std::time::Instant;
 
 #[repr(C)]
@@ -89,21 +91,45 @@ fn mutants(events: &[UsageEvent]) -> Vec<(&'static str, bool, Vec<UsageEvent>)> 
     ]
 }
 
-fn last_line_with(path: &str, needles: &[&str]) -> String {
+fn last_line_with(path: &str, needles: &[&str], keep: impl Fn(&Value) -> bool) -> String {
     std::io::BufReader::new(std::fs::File::open(path).expect("open append target"))
         .lines()
         .map_while(Result::ok)
         .filter(|l| needles.iter().all(|n| l.contains(n)))
+        .filter(|l| serde_json::from_str::<Value>(l).is_ok_and(|v| keep(&v)))
         .last()
-        .unwrap_or_else(|| panic!("no line with {needles:?} in {path}"))
+        .unwrap_or_else(|| panic!("no matching line with {needles:?} in {path}"))
+}
+
+/// Appends `line` as its own record, adding the separator first when the
+/// file's last record has no trailing newline (otherwise the two would join
+/// into one invalid line).
+fn append_record(path: &str, line: &str) {
+    let mut f = std::fs::OpenOptions::new()
+        .read(true)
+        .append(true)
+        .open(path)
+        .expect("open append");
+    let mut last = [0u8; 1];
+    let unterminated = f.metadata().expect("stat append").len() > 0
+        && f.seek(SeekFrom::End(-1)).is_ok()
+        && f.read_exact(&mut last).is_ok()
+        && last[0] != b'\n';
+    if unterminated {
+        writeln!(f).expect("append separator");
+    }
+    writeln!(f, "{line}").expect("append");
 }
 
 /// A new line built from the file's latest usage-bearing one, with a fresh
 /// identity and `ts_ms` as its timestamp.
 fn synthesize(path: &str, kind: &str, tick: usize, ts_ms: i64) -> String {
     let source = match kind {
-        "claude" => last_line_with(path, &["\"type\":\"assistant\"", "\"usage\""]),
-        "codex" => last_line_with(path, &["\"token_count\"", "\"total_token_usage\""]),
+        // Claude by parsed fields, so key order and spacing do not matter.
+        "claude" => last_line_with(path, &["\"usage\""], |v| {
+            v["type"] == "assistant" && v["message"]["usage"].is_object()
+        }),
+        "codex" => last_line_with(path, &["\"token_count\"", "\"total_token_usage\""], |_| true),
         other => panic!("BENCH_APPEND_KIND {other}"),
     };
     let mut v: Value = serde_json::from_str(&source).expect("parse last line");
@@ -222,8 +248,7 @@ fn bench_tail_tick() {
         if let Some(path) = &append {
             let ts = clock() - ((ticks - i + 1) as i64) * 1000;
             let line = synthesize(path, &kind, i, ts);
-            let mut f = std::fs::OpenOptions::new().append(true).open(path).expect("open append");
-            writeln!(f, "{line}").expect("append");
+            append_record(path, &line);
         }
         let parses_before = tailer.parse_count();
         let (c, w) = (cpu_ms(), Instant::now());
@@ -280,8 +305,7 @@ fn bench_graph_recompute() {
     for i in 1..=iters {
         if let Some(path) = &append {
             let line = synthesize(path, &kind, 1000 + i, clock() - ((iters - i + 1) as i64) * 1000);
-            let mut f = std::fs::OpenOptions::new().append(true).open(path).expect("open append");
-            writeln!(f, "{line}").expect("append");
+            append_record(path, &line);
         }
         let c = cpu_ms();
         let _ = tokscale_core::local_source_change_token(&context.parse_options(None, None));
@@ -309,4 +333,31 @@ fn bench_graph_recompute() {
             runs[iters - 1]
         );
     }
+}
+
+#[test]
+fn append_record_keeps_records_on_separate_lines() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    for (before, after) in [("a", "a\nb\n"), ("a\n", "a\nb\n"), ("", "b\n")] {
+        let path = dir.path().join("f.jsonl");
+        std::fs::write(&path, before).expect("write");
+        append_record(path.to_str().expect("utf8 path"), "b");
+        assert_eq!(std::fs::read_to_string(&path).expect("read"), after, "{before:?}");
+    }
+}
+
+#[test]
+fn claude_source_line_is_chosen_by_fields_not_formatting() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("s.jsonl");
+    let lines = [
+        r#"{"type":"assistant","message":{"id":"m1","usage":{"input_tokens":1}}}"#,
+        r#"{"message": {"usage": {"input_tokens": 2}, "id": "m2"}, "type": "assistant"}"#,
+        r#"{"type":"user","message":{"usage":{"input_tokens":3}}}"#,
+    ];
+    std::fs::write(&path, lines.join("\n")).expect("write");
+    let line = last_line_with(path.to_str().expect("utf8 path"), &["\"usage\""], |v| {
+        v["type"] == "assistant" && v["message"]["usage"].is_object()
+    });
+    assert!(line.contains("\"m2\""), "{line}");
 }
