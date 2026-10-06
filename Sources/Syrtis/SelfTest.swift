@@ -17123,6 +17123,64 @@ enum SelfTest {
         expect(cursorGate?[4] == 1,
                "CURSOR-SYNC turning the preference off pushes enabled=false to the core")
 
+        // Ordering and refresh. Mutations: the config push not chained on the
+        // previous one (on/off land out of order); `lastRefreshedEvents` not
+        // reset on off (an off->on resync of the same count never refreshes).
+        let cursorOrder: [String]? = awaitMainActorValue {
+            let suite = "tokenbar.selftest.cursorSyncOrder"
+            let defaults = UserDefaults(suiteName: suite)!
+            defer { defaults.removePersistentDomain(forName: suite) }
+            defaults.removePersistentDomain(forName: suite)
+            defaults.set(true, forKey: CursorSync.noticeKey)
+            let pushes = UncheckedBox<[String]>([])
+            let slowOn: @Sendable (String) -> Void = { json in
+                if json.contains(#""enabled":true"#) { Thread.sleep(forTimeInterval: 0.3) }
+                pushes.value.append(json.contains(#""enabled":true"#) ? "on" : "off")
+            }
+            let none: @Sendable (Bool) -> CursorSyncStatus? = { _ in nil }
+            let controller = CursorSyncController()
+            controller.reconfigure(refresh: false, defaults: defaults, arguments: ["Syrtis"], dir: "/x",
+                                   setConfig: slowOn, sync: none)
+            defaults.set(false, forKey: CursorSync.enabledKey)
+            controller.reconfigure(refresh: false, defaults: defaults, arguments: ["Syrtis"], dir: "/x",
+                                   setConfig: slowOn, sync: none)
+            for _ in 0..<200 where pushes.value.count < 2 {
+                try? await Task.sleep(nanoseconds: 10_000_000)
+            }
+            return pushes.value
+        }
+        expect(cursorOrder == ["on", "off"],
+               "CURSOR-SYNC rapid on->off reaches the core in order, ending off; got \(String(describing: cursorOrder))")
+
+        let cursorRefresh: [Bool]? = awaitMainActorValue {
+            let suite = "tokenbar.selftest.cursorSyncRefresh"
+            let defaults = UserDefaults(suiteName: suite)!
+            defer { defaults.removePersistentDomain(forName: suite) }
+            defaults.removePersistentDomain(forName: suite)
+            defaults.set(true, forKey: CursorSync.noticeKey)
+            let ok = try? JSONDecoder().decode(
+                CursorSyncStatus.self, from: Data(#"{"state":"ok","events":7,"lastSuccessMs":1}"#.utf8))
+            let sync: @Sendable (Bool) -> CursorSyncStatus? = { _ in ok }
+            let generation = { UserDefaults.standard.integer(forKey: ClaudeExtraRoots.generationKey) }
+            let controller = CursorSyncController()
+            let g0 = generation()
+            await controller.runSync(explicit: true, defaults: defaults, arguments: ["Syrtis"], sync: sync)
+            let first = generation() != g0
+            let g1 = generation()
+            await controller.runSync(explicit: true, defaults: defaults, arguments: ["Syrtis"], sync: sync)
+            let sameAgain = generation() != g1
+            defaults.set(false, forKey: CursorSync.enabledKey)
+            controller.reconfigure(refresh: false, defaults: defaults, arguments: ["Syrtis"], dir: "/x",
+                                   setConfig: { _ in }, sync: sync)
+            defaults.set(true, forKey: CursorSync.enabledKey)
+            let g2 = generation()
+            await controller.runSync(explicit: true, defaults: defaults, arguments: ["Syrtis"], sync: sync)
+            let afterOffOn = generation() != g2
+            return [first, sameAgain, afterOffOn]
+        }
+        expect(cursorRefresh == [true, false, true],
+               "CURSOR-SYNC a changed count refreshes, the same count does not, and off->on refreshes again; got \(String(describing: cursorRefresh))")
+
         // Status -> copy, every state; and every new key in both catalogs.
         do {
             let now = Date(timeIntervalSince1970: 1_000_000)

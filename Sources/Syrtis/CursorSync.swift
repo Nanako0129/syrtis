@@ -150,6 +150,9 @@ final class CursorSyncController: ObservableObject {
     @Published private(set) var syncing = false
 
     private var loop: Task<Void, Never>?
+    /// The last config push. Each push waits for the one before it, so rapid
+    /// toggles reach the core in the order they were made.
+    private var configPush: Task<Void, Never>?
     private var lastRefreshedEvents: Int?
 
     /// Push the stored preferences into the core, then (re)start the schedule
@@ -170,9 +173,17 @@ final class CursorSyncController: ObservableObject {
         let json = CursorSync.configJSON(dir: dir, defaults: defaults, arguments: arguments)
         let run = CursorSync.shouldSync(defaults: defaults, arguments: arguments)
         loop?.cancel()
-        if !run { state = nil; lastSuccessMs = nil }
-        loop = Task { [weak self] in
+        // Off deletes the synced files, so the next completed sync must
+        // refresh even when it writes the same event count again.
+        if !run { state = nil; lastSuccessMs = nil; lastRefreshedEvents = nil }
+        let previous = configPush
+        let push = Task {
+            await previous?.value
             await Task.detached(priority: .utility) { setConfig(json) }.value
+        }
+        configPush = push
+        loop = Task { [weak self] in
+            await push.value
             if refresh { Self.refreshModel() }
             guard run else { return }
             while !Task.isCancelled {
