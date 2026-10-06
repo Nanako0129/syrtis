@@ -620,23 +620,20 @@ fn missing_login_is_not_signed_in() {
 
 // --- what is written ---------------------------------------------------------
 
+/// Exactly what tokscale-core's Cursor JSON parser reads (`CursorUsageEvent`,
+/// `CursorTokenUsage` at pin 8fc63ced).
 const ALLOWED_EVENT_FIELDS: &[&str] = &[
+    "conversationId",
     "timestamp",
     "model",
-    "kind",
-    "tokenUsage",
     "chargedCents",
-    "usageBasedCosts",
-    "requestsCosts",
-    "cursorTokenFee",
-    "isChargeable",
-    "isTokenBasedCall",
-    "conversationId",
+    "tokenUsage",
 ];
 const ALLOWED_TOKEN_FIELDS: &[&str] = &[
     "inputTokens",
     "outputTokens",
     "cacheReadTokens",
+    "cacheWriteTokens",
     "totalCents",
 ];
 
@@ -672,15 +669,57 @@ fn written_file_holds_only_the_parser_fields() {
     allowed_tokens.sort();
     assert_eq!(token_keys, allowed_tokens);
     assert_eq!(event["tokenUsage"]["totalCents"], 1.25);
-    assert_eq!(event["usageBasedCosts"], "$0.01");
+    assert_eq!(event["chargedCents"], 1.25);
     for forbidden in [
         "owningUser",
         "serviceAccountId",
         "subscriptionProductId",
         "customSubscriptionName",
+        "kind",
+        "usageBasedCosts",
+        "requestsCosts",
+        "cursorTokenFee",
+        "isChargeable",
+        "isTokenBasedCall",
+        "isHeadless",
     ] {
         assert!(!text.contains(forbidden), "{forbidden}");
     }
+}
+
+/// The engine coerces numeric strings, so a page carrying one must still
+/// sync (written back as a number); free text in a numeric field must not
+/// reach the file.
+#[test]
+fn numeric_strings_are_accepted_and_free_text_is_refused() {
+    let mut lenient = event("a");
+    lenient["chargedCents"] = "2.5".into();
+    lenient["tokenUsage"]["inputTokens"] = "10".into();
+    let body = serde_json::json!({"totalUsageEventsCount": 1, "usageEventsDisplay": [lenient]});
+    let f = fixture();
+    let (url, _) = serve(vec![json_ok(&body.to_string())]);
+    assert_eq!(
+        run_with(&f.db, &f.dir, &url, limits(), &|| true).stop.state,
+        State::Ok
+    );
+    let written: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(expected_file(&f.dir)).unwrap()).unwrap();
+    assert_eq!(written["usageEventsDisplay"][0]["chargedCents"], 2.5);
+    assert_eq!(
+        written["usageEventsDisplay"][0]["tokenUsage"]["inputTokens"],
+        10.0
+    );
+
+    let mut junk = event("a");
+    junk["chargedCents"] = "FREETEXTCANARY".into();
+    let body = serde_json::json!({"totalUsageEventsCount": 1, "usageEventsDisplay": [junk]});
+    let f = fixture();
+    let (url, _) = serve(vec![json_ok(&body.to_string())]);
+    assert_eq!(
+        run_with(&f.db, &f.dir, &url, limits(), &|| true),
+        stop(State::Error, Some("unexpected_response"))
+    );
+    assert!(!expected_file(&f.dir).exists());
 }
 
 #[cfg(unix)]

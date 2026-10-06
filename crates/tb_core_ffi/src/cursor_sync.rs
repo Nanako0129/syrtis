@@ -19,7 +19,7 @@
 //! - Redirects are never followed and production is https-only; any 3xx
 //!   (cursor.com sends an expired session to WorkOS) means `expired`.
 //! - The switch is in Rust, default off, and is re-read before every page (S-3).
-//! - Only the parser's fields are deserialised and written (S-6).
+//! - Only the engine parser's fields are deserialised and written (S-6).
 //! - Only a complete walk replaces the file; partial or failed walks leave it.
 
 use crate::cursor_desktop::{self, CursorLogin};
@@ -360,9 +360,11 @@ fn commit_file(
 }
 
 // ---------------------------------------------------------------------------
-// Wire types: only the parser's fields (S-6). Unknown fields — owningUser,
-// serviceAccountId, subscriptionProductId, customSubscriptionName, … — are
-// dropped by construction.
+// Wire types: exactly the fields the engine's Cursor JSON parser reads
+// (tokscale-core `sessions/cursor.rs`, `CursorUsageEvent` /
+// `CursorTokenUsage`, pin 8fc63ced), S-6. Everything else — owningUser,
+// serviceAccountId, subscriptionProductId, customSubscriptionName, kind,
+// cost breakdowns, flags — is dropped by construction.
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -372,51 +374,69 @@ struct Page {
     total_usage_events_count: Option<u64>,
 }
 
+/// The event timestamp: Unix ms as a string (observed) or a number; the
+/// engine accepts both.
 #[derive(Deserialize, Serialize)]
 #[serde(untagged)]
-enum Scalar {
+enum Timestamp {
     Text(String),
     Number(serde_json::Number),
+}
+
+/// A count or cents value. The engine coerces a number or a numeric string
+/// (`de_opt_*_lenient`), so both are accepted here; anything else (an object,
+/// a non-numeric string) fails the page rather than carrying free text into
+/// the file. Written back as a JSON number.
+#[derive(Serialize)]
+#[serde(transparent)]
+struct Num(serde_json::Number);
+
+impl<'de> Deserialize<'de> for Num {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::Error as _;
+        match serde_json::Value::deserialize(deserializer)? {
+            serde_json::Value::Number(number) => Ok(Num(number)),
+            serde_json::Value::String(text) => text
+                .trim()
+                .parse::<f64>()
+                .ok()
+                .and_then(serde_json::Number::from_f64)
+                .map(Num)
+                .ok_or_else(|| D::Error::custom("not a number")),
+            _ => Err(D::Error::custom("not a number")),
+        }
+    }
 }
 
 #[derive(Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct TokenUsage {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    input_tokens: Option<serde_json::Number>,
+    input_tokens: Option<Num>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    output_tokens: Option<serde_json::Number>,
+    output_tokens: Option<Num>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    cache_read_tokens: Option<serde_json::Number>,
+    cache_read_tokens: Option<Num>,
+    /// Read by the engine (`cache_write`), though absent on many events.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    total_cents: Option<serde_json::Number>,
+    cache_write_tokens: Option<Num>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    total_cents: Option<Num>,
 }
 
 #[derive(Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct Event {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    timestamp: Option<Scalar>,
+    conversation_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    timestamp: Option<Timestamp>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    kind: Option<String>,
+    charged_cents: Option<Num>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     token_usage: Option<TokenUsage>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    charged_cents: Option<serde_json::Number>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    usage_based_costs: Option<Scalar>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    requests_costs: Option<serde_json::Number>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    cursor_token_fee: Option<serde_json::Number>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    is_chargeable: Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    is_token_based_call: Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    conversation_id: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
