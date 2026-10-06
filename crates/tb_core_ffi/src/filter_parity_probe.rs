@@ -356,6 +356,7 @@ mod tests {
     fn context() -> LocalSourceContext {
         LocalSourceContext {
             home_dir: Some(PathBuf::from("fixture-home")),
+            use_env_roots: true,
         }
     }
 
@@ -621,6 +622,7 @@ mod tests {
         let result = run_with(
             &LocalSourceContext {
                 home_dir: Some(root.clone()),
+                use_env_roots: true,
             },
             &mut token,
             &mut graph_fn,

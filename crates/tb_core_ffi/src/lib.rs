@@ -68,12 +68,17 @@ pub(crate) fn user_home_dir() -> Option<PathBuf> {
 #[derive(Debug, Clone)]
 pub(crate) struct LocalSourceContext {
     home_dir: Option<PathBuf>,
+    /// Whether per-client root variables (CODEX_HOME and the like) may
+    /// override paths under `home_dir`. Always true for the app; the tail
+    /// benchmark pins a corpus home and must not let the environment widen it.
+    use_env_roots: bool,
 }
 
 impl LocalSourceContext {
     pub(crate) fn current() -> Self {
         Self {
             home_dir: user_home_dir(),
+            use_env_roots: true,
         }
     }
 
@@ -83,6 +88,18 @@ impl LocalSourceContext {
     pub(crate) fn for_home(home_dir: PathBuf) -> Self {
         Self {
             home_dir: Some(home_dir),
+            use_env_roots: true,
+        }
+    }
+
+    /// A captured benchmark corpus: sources under `home_dir`, without the
+    /// per-client root variables of the process running the benchmark. The
+    /// extra-scan-path registry still applies (empty in a test process).
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) fn for_corpus(home_dir: PathBuf) -> Self {
+        Self {
+            home_dir: Some(home_dir),
+            use_env_roots: false,
         }
     }
 
@@ -96,7 +113,7 @@ impl LocalSourceContext {
                 .home_dir
                 .as_ref()
                 .map(|path| path.to_string_lossy().into_owned()),
-            use_env_roots: true,
+            use_env_roots: self.use_env_roots,
             year,
             clients,
             scanner_settings: tokscale_core::scanner::ScannerSettings {
@@ -117,7 +134,7 @@ impl LocalSourceContext {
                 .home_dir
                 .as_ref()
                 .map(|path| path.to_string_lossy().into_owned()),
-            use_env_roots: true,
+            use_env_roots: self.use_env_roots,
             year,
             clients,
             scanner_settings: tokscale_core::scanner::ScannerSettings {
@@ -1709,6 +1726,7 @@ mod tests {
         let platform_home = PathBuf::from("platform-home");
         let context = LocalSourceContext {
             home_dir: select_user_home(None, Some(platform_home.clone())),
+            use_env_roots: true,
         };
         let year = Some("2026".to_string());
         let clients = Some(vec!["claude".to_string(), "codex".to_string()]);
