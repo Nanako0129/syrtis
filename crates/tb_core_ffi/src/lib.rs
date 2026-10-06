@@ -92,8 +92,9 @@ impl LocalSourceContext {
         }
     }
 
-    /// A captured benchmark corpus: only `home_dir`, never the per-client root
-    /// variables of the process running the benchmark.
+    /// A captured benchmark corpus: sources under `home_dir`, without the
+    /// per-client root variables of the process running the benchmark. The
+    /// extra-scan-path registry still applies (empty in a test process).
     #[cfg(all(test, target_os = "macos"))]
     pub(crate) fn for_corpus(home_dir: PathBuf) -> Self {
         Self {
