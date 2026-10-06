@@ -17268,10 +17268,17 @@ enum SelfTest {
             }
             try? await Task.sleep(nanoseconds: 100_000_000)
             defaults.set(true, forKey: CursorSync.takeoverKey)
+            // Slow too, so `running` always finishes before the new loop could
+            // sync on its own: only the stale-pass rerun can make it 2.
+            controller.reconfigure(refresh: false, defaults: defaults, arguments: ["Syrtis"], dir: "/x",
+                                   setConfig: { _ in Thread.sleep(forTimeInterval: 0.2) }, sync: sync)
+            await running.value
+            let count = syncs.value
+            // Stop the loop the second reconfigure started.
+            defaults.set(false, forKey: CursorSync.enabledKey)
             controller.reconfigure(refresh: false, defaults: defaults, arguments: ["Syrtis"], dir: "/x",
                                    setConfig: { _ in }, sync: sync)
-            await running.value
-            return syncs.value
+            return count
         }
         expect((cursorWait ?? 0) >= 2,
                "CURSOR-SYNC a settings change while a pass waits for the config push reruns the sync; got \(String(describing: cursorWait))")
