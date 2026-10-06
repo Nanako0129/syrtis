@@ -1,12 +1,8 @@
 //! Hermetic: temp SQLite fixtures, temp dirs, an in-process HTTP server on
 //! 127.0.0.1. No real HOME, no real Cursor database, no network.
 //!
-//! Post-C1 hook: once the engine pin carries the usage-events JSON parser,
-//! add the end-to-end test here — a synced file from `run` →
-//! `LocalSourceContext::for_home(..)` report → Cursor totals, with a CLI CSV
-//! of the same usage counted once under takeover and the CSV total with sync
-//! off (plan C2 acceptance). Until then nothing here asks the engine to parse
-//! the JSON.
+//! End to end (engine pin 8fc63ced and later, which parses usage-events
+//! JSON): `synced_file_reaches_the_report_once` at the bottom.
 
 use super::*;
 use base64::Engine as _;
@@ -1134,4 +1130,172 @@ fn local_source_context_carries_the_takeover_and_keeps_claude_roots() {
     assert!(!settings.extra_scan_paths.contains_key("cursor"));
     assert!(settings.excluded_scan_paths.is_empty());
     crate::extra_scan_paths::reset_for_test();
+}
+
+// --- end to end: synced file → engine report ---------------------------------
+
+/// Points the engine's cache and pricing at a temp dir for one test.
+/// `TOKSCALE_CONFIG_DIR` keeps the source cache out of the real
+/// `~/.config/tokscale`; `TOKSCALE_PRICING_CACHE_ONLY` keeps the report from
+/// fetching pricing, so every cost below is the one the files report.
+struct EngineEnv {
+    saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
+}
+
+impl EngineEnv {
+    fn set(config_dir: &Path) -> Self {
+        let keys = ["TOKSCALE_CONFIG_DIR", "TOKSCALE_PRICING_CACHE_ONLY"];
+        let saved = keys.iter().map(|k| (*k, std::env::var_os(k))).collect();
+        std::env::set_var("TOKSCALE_CONFIG_DIR", config_dir);
+        std::env::set_var("TOKSCALE_PRICING_CACHE_ONLY", "1");
+        Self { saved }
+    }
+}
+
+impl Drop for EngineEnv {
+    fn drop(&mut self) {
+        for (key, value) in &self.saved {
+            match value {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
+    }
+}
+
+/// Two events of one usage history. `chargedCents` differs from `totalCents`
+/// so the cost proves the engine took `totalCents`.
+fn e2e_event(
+    id: &str,
+    ts: &str,
+    input: i64,
+    output: i64,
+    cache_read: i64,
+    total_cents: f64,
+) -> serde_json::Value {
+    serde_json::json!({
+        "conversationId": id, "timestamp": ts, "model": "gpt-5",
+        "chargedCents": 1,
+        "tokenUsage": {"inputTokens": input, "outputTokens": output,
+                       "cacheReadTokens": cache_read, "totalCents": total_cents},
+        "owningUser": OWNING_CANARY,
+    })
+}
+
+/// The CLI's CSV of the same two events.
+const SAME_USAGE_CSV: &str = "Date,Kind,Model,Max Mode,Input (w/ Cache Write),Input (w/o Cache Write),Cache Read,Output Tokens,Total Tokens,Cost\n\
+\"2026-09-01T10:00:00.000Z\",\"Included\",\"gpt-5\",\"No\",\"0\",\"100\",\"30\",\"20\",\"150\",\"0.50\"\n\
+\"2026-09-01T11:00:00.000Z\",\"Included\",\"gpt-5\",\"No\",\"0\",\"200\",\"0\",\"40\",\"240\",\"0.25\"\n";
+
+/// (input, output, cache_read, cost, sorted session ids) of the Cursor rows.
+fn cursor_report(home: &Path, config: Option<Config>) -> (i64, i64, i64, f64, Vec<String>) {
+    set_thread_config_for_test(config);
+    let options = tokscale_core::ReportOptions {
+        group_by: tokscale_core::GroupBy::Session,
+        ..crate::LocalSourceContext::for_home(home.to_path_buf())
+            .report_options(None, Some(vec!["cursor".to_string()]))
+    };
+    set_thread_config_for_test(None);
+    let report = crate::RUNTIME
+        .block_on(tokscale_core::get_model_report(options))
+        .expect("model report");
+    let mut sessions: Vec<String> = report
+        .entries
+        .iter()
+        .map(|e| e.session_id.clone().unwrap_or_default())
+        .collect();
+    sessions.sort();
+    (
+        report.total_input,
+        report.total_output,
+        report.total_cache_read,
+        report.total_cost,
+        sessions,
+    )
+}
+
+#[test]
+fn synced_file_reaches_the_report_once() {
+    let _guard = lock();
+    let tmp = tempfile::tempdir().unwrap();
+    let _env = EngineEnv::set(&tmp.path().join("tokscale-config"));
+    let home = tmp.path().join("home");
+    let dir = home.join("Library/Application Support/test/cursor-cache");
+    std::fs::create_dir_all(&home).unwrap();
+    let db = signed_in_db(tmp.path(), &valid_token());
+
+    // Sync: two events through the local server into the real file format.
+    let body = serde_json::json!({
+        "totalUsageEventsCount": 2,
+        "usageEventsDisplay": [
+            e2e_event("conv-a", "1788256800000", 100, 20, 30, 50.0),
+            e2e_event("conv-b", "1788260400000", 200, 40, 0, 25.0),
+        ],
+    });
+    let (url, _) = serve(vec![json_ok(&body.to_string())]);
+    assert_eq!(
+        run_with(
+            &db,
+            &dir,
+            &url,
+            Limits {
+                page_size: 500,
+                ..limits()
+            },
+            &|| true
+        ),
+        Outcome {
+            stop: Stop::new(State::Ok, None),
+            events: 2
+        }
+    );
+    let synced = (300, 60, 30);
+    let synced_sessions = vec!["conv-a".to_string(), "conv-b".to_string()];
+    let on = |confirmed| Config {
+        enabled: true,
+        dir: Some(dir.clone()),
+        cli_takeover_confirmed: confirmed,
+    };
+
+    // No CLI files: the synced file alone, cost from totalCents (0.75), not
+    // chargedCents (0.02), and not estimated (pricing is unavailable here).
+    let (input, output, cache_read, cost, sessions) = cursor_report(&home, Some(on(false)));
+    assert_eq!((input, output, cache_read), synced);
+    assert!((cost - 0.75).abs() < 1e-9, "cost {cost}");
+    assert_eq!(sessions, synced_sessions);
+
+    // The CLI's CSV of the same usage appears.
+    let cli = home.join(".config/tokscale/cursor-cache");
+    std::fs::create_dir_all(&cli).unwrap();
+    std::fs::write(cli.join("usage.csv"), SAME_USAGE_CSV).unwrap();
+
+    // Sync off: the CSV alone, and it is the same usage (control for "once").
+    let csv = cursor_report(&home, Some(Config::default()));
+    assert_eq!(
+        (csv.0, csv.1, csv.2),
+        synced,
+        "the CSV fixture is not the same usage"
+    );
+    assert!((csv.3 - 0.75).abs() < 1e-9, "csv cost {}", csv.3);
+    assert!(
+        csv.4.iter().all(|s| !synced_sessions.contains(s)),
+        "{:?}",
+        csv.4
+    );
+
+    // Not confirmed (cliPresent): takeover off, the synced file is not added.
+    assert_eq!(cursor_report(&home, Some(on(false))), csv);
+
+    // Confirmed: counted once, and that once is the synced file.
+    let (input, output, cache_read, cost, sessions) = cursor_report(&home, Some(on(true)));
+    assert_eq!(
+        (input, output, cache_read),
+        synced,
+        "double counted or lost"
+    );
+    assert!((cost - 0.75).abs() < 1e-9, "cost {cost}");
+    assert_eq!(
+        sessions, synced_sessions,
+        "takeover did not switch to the synced file"
+    );
 }

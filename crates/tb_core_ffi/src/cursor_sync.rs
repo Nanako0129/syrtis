@@ -72,6 +72,10 @@ pub(crate) struct Config {
 static CONFIG: LazyLock<RwLock<Config>> = LazyLock::new(|| RwLock::new(Config::default()));
 
 pub(crate) fn config() -> Config {
+    #[cfg(test)]
+    if let Some(config) = THREAD_CONFIG.with(|c| c.borrow().clone()) {
+        return config;
+    }
     CONFIG
         .read()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -829,6 +833,19 @@ fn sync_with(
 
 #[cfg(test)]
 pub(crate) static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+// A registry seen only by the calling thread's `config()`, so a report test
+// (which builds its scan settings on its own thread) can turn the takeover
+// on without enabling it for other tests through the global one.
+#[cfg(test)]
+thread_local! {
+    static THREAD_CONFIG: std::cell::RefCell<Option<Config>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn set_thread_config_for_test(config: Option<Config>) {
+    THREAD_CONFIG.with(|c| *c.borrow_mut() = config);
+}
 
 #[cfg(test)]
 pub(crate) fn set_for_test(config: Config) {
