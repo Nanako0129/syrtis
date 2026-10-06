@@ -4,7 +4,7 @@ id: kb-architecture
 kind: canonical
 scope: repository
 read_when: changing Rust parsing, the C ABI, Swift models, reports, cache, or filters
-last_verified: 2026-10-06
+last_verified: 2026-10-07
 sources: [".gitmodules", "Package.swift", "Makefile", "Sources/CTB/include/ctb.h", "crates/tb_core_ffi", "crates/tb_core_ffi/src/agent_account_scope.rs", "crates/tb_core_ffi/src/agent_quota_duration.rs", "crates/tb_core_ffi/src/agent_quota_history.rs", "Sources/TokenBarCore", "Sources/Syrtis", "docs/knowledge/plans/provider-quota-pace.md", "vendor/README.md", "public tokscale-core commit bb9a2a9", "public Syrtis PR #114", "public TokenBar-Windows PR #12", "public TokenBar-Windows PR #20"]
 ---
 
@@ -261,6 +261,8 @@ Pricing metadata is refreshable rather than frozen for the process lifetime; the
 **Router 不進表。** OpenRouter、LiteLLM、opencode、Roo Code、Goose 用的是你自己的 key 或別人的訂閱，自己不賣方案。opencode 是唯一有例外處理的：它的 `auth.json` oauth 條目經 `opencodeSubscriptions` 上報，`routedSubscriptions` 據此判定它實際簽入哪個訂閱——那是宣告的事實，不是推論。其餘 router 沒有等價訊號，因此不建議。
 
 ## Swift presentation layer
+
+[`ContributionGraphView`](../../Sources/Syrtis/Charts/ContributionGraph3D.swift) 將一般捲動沿 responder chain 傳給頁面，只有 ⌘＋捲動由圖表接收並縮放；捏合沿用原有縮放。拖曳、平移與 hover 行為沿用既有實作，沒有點擊啟用狀態。三語提示說明捏合與 ⌘＋捲動；事件夾具驗證分階段捲動、一般滾輪、⌘＋滾輪與捏合。
 
 SwiftUI owns the seven dashboard lenses, settings, menu-bar title, quota icon, animation, and lifecycle of the popover and settings window. `DashboardModel` coordinates initial load, lazy hourly and Agents reports, year selection, snapshot reuse, stale-data retention, and poll cancellation. A process-lifetime `@MainActor` publication coordinator applies the Rust `publicationGeneration` guard across the popover and Settings models, snapshot restore, and TrayAnimator's independent poller before any payload or scalar is stored. Dashboard polling reconciles the accepted payload into the shared scalar, while TrayAnimator's payload getter prefers the coordinator's latest generated payload over an older result from its own poller. The persistent scalar participates in the tray icon signature, so that write triggers immediate gauge rendering and the app-level defaults observer refreshes the title; missing generations remain direct demo/legacy values and are not persisted. Settings reconciliation is keyed by generation plus selection/exclusions, or by generated timestamp plus resolved-scalar fingerprint for legacy payloads, so distinct payloads cannot collide on `generatedAt` alone. The app shell must stop hidden-window polling when the window is closed; otherwise an apparently idle menu-bar utility can keep rendering and consuming CPU.
 

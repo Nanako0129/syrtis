@@ -21,6 +21,30 @@ private final class UncheckedBox<Value>: @unchecked Sendable {
     init(_ value: Value) { self.value = value }
 }
 
+@MainActor
+private final class ChartEventReceiver: NSResponder {
+    var scrollEvent: NSEvent?
+    override func scrollWheel(with event: NSEvent) { scrollEvent = event }
+
+    static func scroll(
+        y: Int32 = 10, phase: CGScrollPhase? = nil,
+        precise: Bool = true, modifiers: CGEventFlags = []
+    ) -> NSEvent {
+        let event = CGEvent(
+            scrollWheelEvent2Source: nil, units: precise ? .pixel : .line,
+            wheelCount: 1, wheel1: y, wheel2: 0, wheel3: 0)!
+        event.setIntegerValueField(.scrollWheelEventScrollPhase, value: Int64(phase?.rawValue ?? 0))
+        event.flags = modifiers
+        return NSEvent(cgEvent: event)!
+    }
+}
+
+// AppKit has no public magnify-event constructor.
+private final class ChartMagnifyEvent: NSEvent {
+    override var type: NSEvent.EventType { .magnify }
+    override var magnification: CGFloat { 0.1 }
+}
+
 private actor ThrottleCallCounter {
     private(set) var count = 0
     func bump() { count += 1 }
@@ -9070,6 +9094,47 @@ enum SelfTest {
         }
         for (label, passed) in TBCore.filterParityContractChecks() {
             expect(passed, "filter parity: \(label)")
+        }
+
+        // Native scroll routing and pinch zoom; no window or system input needed.
+        do {
+            let defaults = UserDefaults.standard
+            // Restore the persisted value, not a temporary launch-argument override.
+            let savedCamera = defaults.persistentDomain(
+                forName: Bundle.main.bundleIdentifier ?? "Syrtis")?[OrbitRig.storageKey]
+            defer { defaults.set(savedCamera, forKey: OrbitRig.storageKey) }
+            defaults.removeObject(forKey: OrbitRig.storageKey)
+            let rig = OrbitRig()
+            rig.scale = 26
+            let chart = ContributionGraphView(frame: .zero)
+            chart.rig = rig
+            let receiver = ChartEventReceiver()
+            chart.nextResponder = receiver
+            let vertical = ChartEventReceiver.scroll(phase: .began)
+            expect(
+                vertical.hasPreciseScrollingDeltas && vertical.phase == .began,
+                "3D trackpad fixture carries a native scroll phase")
+            let pageEvents: [(String, NSEvent)] = [
+                ("vertical begin", vertical),
+                ("vertical change", ChartEventReceiver.scroll(phase: .changed)),
+                ("vertical end", ChartEventReceiver.scroll(y: 0, phase: .ended)),
+                ("plain wheel", ChartEventReceiver.scroll(precise: false)),
+            ]
+            for (label, event) in pageEvents {
+                receiver.scrollEvent = nil
+                chart.scrollWheel(with: event)
+                expect(
+                    receiver.scrollEvent === event && rig.scale == 26,
+                    "3D \(label) reaches the page unchanged without zooming")
+            }
+            receiver.scrollEvent = nil
+            chart.scrollWheel(with: ChartEventReceiver.scroll(precise: false, modifiers: .maskCommand))
+            expect(
+                receiver.scrollEvent == nil && rig.scale > 26,
+                "3D command-wheel zooms without reaching the page or requiring a click")
+            let beforePinch = rig.scale
+            chart.magnify(with: ChartMagnifyEvent())
+            expect(rig.scale < beforePinch, "3D pinch zooms without requiring a click")
         }
 
         // MARK: - FLAT-HEATMAP (contract suite; decision table in issue #157)

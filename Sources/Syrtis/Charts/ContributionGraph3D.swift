@@ -233,7 +233,7 @@ final class ContributionGraphView: SCNView {
                 owner: self, userInfo: nil))
     }
 
-    // Camera input: drag = orbit, right/option-drag = pan, scroll/pinch = zoom.
+    // Camera input: drag = orbit, right/option-drag = pan, command-scroll/pinch = zoom.
     override func mouseDragged(with event: NSEvent) {
         if event.modifierFlags.contains(.option) {
             rig.pan(dx: event.deltaX, dy: event.deltaY, viewHeightPx: bounds.height)
@@ -247,6 +247,10 @@ final class ContributionGraphView: SCNView {
     }
 
     override func scrollWheel(with event: NSEvent) {
+        guard event.modifierFlags.contains(.command) else {
+            nextResponder?.scrollWheel(with: event)
+            return
+        }
         rig.zoom(deltaY: event.scrollingDeltaY)
     }
 
@@ -389,6 +393,7 @@ struct ContributionGraph3D: View {
     var body: some View {
         ContributionGraphRepresentable(
             grid: grid, dark: colorScheme == .dark, holder: holder)
+            .help("Pinch or ⌘ + scroll to zoom.".localized)
             .overlay(alignment: .topTrailing) {
                 HStack(spacing: 4) {
                     button("Fit".localized) { holder.view?.fitToContent() }
