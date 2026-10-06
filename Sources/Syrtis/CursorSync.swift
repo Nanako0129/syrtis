@@ -222,9 +222,11 @@ final class CursorSyncController: ObservableObject {
         defer { syncing = false }
         repeat {
             rerunPending = false
+            // Read the generation BEFORE waiting: a settings change during the
+            // wait makes this pass stale (discarded and rerun below).
+            let started = generation
             // Sync against the newest configuration the core has been given.
             await configPush?.value
-            let started = generation
             let result = await Task.detached(priority: .utility) { sync(explicit) }.value
             // A reconfigure (e.g. turning sync off) happened while this ran:
             // its result describes a configuration that no longer applies.

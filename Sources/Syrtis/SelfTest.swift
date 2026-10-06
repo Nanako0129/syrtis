@@ -17248,6 +17248,33 @@ enum SelfTest {
                    && CursorSync.toggleShowsOn(enabled: true, acknowledged: true)
                    && !CursorSync.toggleShowsOn(enabled: false, acknowledged: true),
                "CURSOR-SYNC the Settings toggle reads off until the notice is answered, then follows the preference")
+        // A settings change while a pass waits for the previous push makes
+        // that pass stale. Mutation: read the generation after the wait.
+        let cursorWait: Int? = awaitMainActorValue {
+            let suite = "tokenbar.selftest.cursorSyncWait"
+            let defaults = UserDefaults(suiteName: suite)!
+            defer { defaults.removePersistentDomain(forName: suite) }
+            defaults.removePersistentDomain(forName: suite)
+            defaults.set(true, forKey: CursorSync.noticeKey)
+            let syncs = UncheckedBox<Int>(0)
+            let ok = try? JSONDecoder().decode(
+                CursorSyncStatus.self, from: Data(#"{"state":"ok","events":1,"lastSuccessMs":1}"#.utf8))
+            let sync: @Sendable (Bool) -> CursorSyncStatus? = { _ in syncs.value += 1; return ok }
+            let controller = CursorSyncController()
+            controller.reconfigure(refresh: false, defaults: defaults, arguments: ["Syrtis"], dir: "/x",
+                                   setConfig: { _ in Thread.sleep(forTimeInterval: 0.3) }, sync: sync)
+            let running = Task { @MainActor in
+                await controller.runSync(explicit: true, defaults: defaults, arguments: ["Syrtis"], sync: sync)
+            }
+            try? await Task.sleep(nanoseconds: 100_000_000)
+            defaults.set(true, forKey: CursorSync.takeoverKey)
+            controller.reconfigure(refresh: false, defaults: defaults, arguments: ["Syrtis"], dir: "/x",
+                                   setConfig: { _ in }, sync: sync)
+            await running.value
+            return syncs.value
+        }
+        expect((cursorWait ?? 0) >= 2,
+               "CURSOR-SYNC a settings change while a pass waits for the config push reruns the sync; got \(String(describing: cursorWait))")
         expect(cursorRefresh == [true, false, true],
                "CURSOR-SYNC a changed count refreshes, the same count does not, and off->on refreshes again; got \(String(describing: cursorRefresh))")
 

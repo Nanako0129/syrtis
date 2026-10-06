@@ -1121,7 +1121,7 @@ struct SettingsPanel: View {
                         .font(.caption)
                 }
                 .buttonStyle(.plain)
-                .disabled(cursorSync.syncing || !cursorNoticeAck)
+                .disabled(cursorSync.syncing)
                 .padding(.horizontal, 10)
             }
         }
