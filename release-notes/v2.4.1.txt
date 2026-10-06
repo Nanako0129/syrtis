@@ -1,0 +1,9 @@
+Fixes:
+- Syrtis kept more than half of a CPU core busy while the popover was open: the activity light redrew the whole popover up to about 120 times a second, and the popover's content ran unseen from launch. With demo data and the popover open, the main thread alone used 57.5% of one core before; the whole app now uses 2.1%. The short spike each time Syrtis rebuilds its usage totals (every Data refresh interval, or every 5 minutes while an agent is active if that is sooner) is unchanged. Thanks @miyago9267.
+- An unused Antigravity window read "Pace unavailable · invalid quota data", or started a new window on every update. It now reads "Learning reset duration" until you use it.
+- An Antigravity account on a paid Google AI plan was labeled Free. The card shows the paid plan's name, and agy's merged main card shows it too.
+- With automatic capture on, an account agy signed in to during a capture could be shown with the previous account's email.
+- An extra Claude account's window card counted usage of another configured account kept inside its folder.
+- The Grok tab now shows Grok Bot's window card when only Grok Bot is set up.
+- Switching off OpenCode under Settings -> Dashboard -> Agent limits no longer hides the other quota cards on the OpenCode tab.
+- OpenCode Go's "Rolling" window is now translated in Chinese.
