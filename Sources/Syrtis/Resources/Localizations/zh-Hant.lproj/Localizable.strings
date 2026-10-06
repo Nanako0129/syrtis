@@ -641,3 +641,22 @@
 "Couldn't save to the login keychain." = "無法存進登入鑰匙圈。";
 "Couldn't delete the copy from the login keychain." = "無法從登入鑰匙圈刪除副本。";
 "Something went wrong. Try again." = "發生錯誤，請再試一次。";
+
+/* Cursor usage sync (approved copy: .agent-local/plans/cursor-c3-copy.md) */
+"Cursor usage sync" = "Cursor 用量同步";
+"Sync Cursor usage from the Cursor app" = "從 Cursor App 同步用量";
+"To show your Cursor usage, Syrtis reads the login of the Cursor app on this Mac and sends it only to Cursor's usage service (cursor.com) to download your usage. Syrtis stores the date, model, token counts, cost and conversation ID of each request on this Mac; the login itself is never saved or logged. Turning this off deletes the downloaded usage." = "要顯示 Cursor 用量，Syrtis 會讀取這台 Mac 上 Cursor App 的登入資訊，只送到 Cursor 的用量服務（cursor.com）下載你的用量。Syrtis 會在這台 Mac 上存下每次請求的日期、模型、token 數、費用和對話 ID；登入資訊本身不會儲存或記錄。關閉這個選項會刪除已下載的用量。";
+"Continue" = "繼續";
+"Turn Off" = "關閉";
+"Last synced %@" = "上次同步：%@";
+"Only part of your usage was downloaded. Syrtis will try again." = "只下載到部分用量，Syrtis 會再試一次。";
+"Your Cursor login has expired. Open Cursor to refresh it." = "Cursor 的登入已過期，打開 Cursor 就會更新。";
+"Sign in to the Cursor app to sync your usage." = "在 Cursor App 登入後就能同步用量。";
+"Can't reach Cursor. Syrtis will try again." = "連不上 Cursor，Syrtis 會再試一次。";
+"Cursor usage couldn't be synced. Syrtis will try again later." = "無法同步 Cursor 用量，Syrtis 稍後會再試。";
+"Showing Cursor usage from tokscale CLI." = "目前顯示的是 tokscale CLI 的 Cursor 用量。";
+"Sync Now" = "立即同步";
+"Syncing…" = "同步中…";
+"You also have Cursor usage from tokscale CLI on this Mac. Use Syrtis's own sync instead? Choose this only if it's the same Cursor account, or that account's usage will no longer be shown." = "這台 Mac 上也有 tokscale CLI 的 Cursor 用量。要改用 Syrtis 自己的同步嗎？只有在是同一個 Cursor 帳號時才選，否則那個帳號的用量就不會再顯示。";
+"Use Syrtis Sync" = "改用 Syrtis 同步";
+"Keep tokscale CLI Data" = "保留 tokscale CLI 的資料";
