@@ -17178,6 +17178,30 @@ enum SelfTest {
             let afterOffOn = generation() != g2
             return [first, sameAgain, afterOffOn]
         }
+        // A sync result that returns after sync was turned off is discarded.
+        // Mutation: drop the generation/shouldSync check after the await.
+        let cursorLate: String?? = awaitMainActorValue {
+            let suite = "tokenbar.selftest.cursorSyncLate"
+            let defaults = UserDefaults(suiteName: suite)!
+            defer { defaults.removePersistentDomain(forName: suite) }
+            defaults.removePersistentDomain(forName: suite)
+            defaults.set(true, forKey: CursorSync.noticeKey)
+            let ok = try? JSONDecoder().decode(
+                CursorSyncStatus.self, from: Data(#"{"state":"ok","events":3,"lastSuccessMs":1}"#.utf8))
+            let slow: @Sendable (Bool) -> CursorSyncStatus? = { _ in Thread.sleep(forTimeInterval: 0.3); return ok }
+            let controller = CursorSyncController()
+            let running = Task { @MainActor in
+                await controller.runSync(explicit: true, defaults: defaults, arguments: ["Syrtis"], sync: slow)
+            }
+            try? await Task.sleep(nanoseconds: 50_000_000)
+            defaults.set(false, forKey: CursorSync.enabledKey)
+            controller.reconfigure(refresh: false, defaults: defaults, arguments: ["Syrtis"], dir: "/x",
+                                   setConfig: { _ in }, sync: slow)
+            await running.value
+            return controller.state
+        }
+        expect(cursorLate == .some(nil),
+               "CURSOR-SYNC a sync result returning after sync was turned off is discarded; got \(String(describing: cursorLate))")
         expect(cursorRefresh == [true, false, true],
                "CURSOR-SYNC a changed count refreshes, the same count does not, and off->on refreshes again; got \(String(describing: cursorRefresh))")
 

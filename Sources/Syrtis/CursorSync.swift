@@ -154,6 +154,9 @@ final class CursorSyncController: ObservableObject {
     /// toggles reach the core in the order they were made.
     private var configPush: Task<Void, Never>?
     private var lastRefreshedEvents: Int?
+    /// Bumped by every `reconfigure`; a sync result that comes back after a
+    /// newer configuration is discarded, so a late result cannot undo an off.
+    private var generation = 0
 
     /// Push the stored preferences into the core, then (re)start the schedule
     /// if sync is allowed. Called at launch and after every preference change.
@@ -173,6 +176,7 @@ final class CursorSyncController: ObservableObject {
         let json = CursorSync.configJSON(dir: dir, defaults: defaults, arguments: arguments)
         let run = CursorSync.shouldSync(defaults: defaults, arguments: arguments)
         loop?.cancel()
+        generation &+= 1
         // Off deletes the synced files, so the next completed sync must
         // refresh even when it writes the same event count again.
         if !run { state = nil; lastSuccessMs = nil; lastRefreshedEvents = nil }
@@ -204,7 +208,12 @@ final class CursorSyncController: ObservableObject {
         guard !syncing, CursorSync.shouldSync(defaults: defaults, arguments: arguments) else { return }
         syncing = true
         defer { syncing = false }
+        let started = generation
         let result = await Task.detached(priority: .utility) { sync(explicit) }.value
+        // A reconfigure (e.g. turning sync off) happened while this ran: its
+        // result describes a configuration that no longer applies.
+        guard started == generation, CursorSync.shouldSync(defaults: defaults, arguments: arguments)
+        else { return }
         guard let result else { state = "error"; return }
         state = result.state
         lastSuccessMs = result.lastSuccessMs
