@@ -1044,3 +1044,55 @@ fn cli_file_detection_errs_toward_asking() {
     std::fs::write(cli.join("usage.json"), "{}").unwrap();
     assert!(cli_has_cursor_files(&cli));
 }
+
+/// The one test that sets the global registry with a complete file. That file
+/// holds zero events, and other tests' homes have no CLI Cursor files, so the
+/// moment it is visible to a concurrent test it changes no total.
+#[test]
+fn local_source_context_carries_the_takeover_and_keeps_claude_roots() {
+    let _guard = lock();
+    let _extra = crate::extra_scan_paths::TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    let claude = home.path().join("claude-extra");
+    crate::extra_scan_paths::set_from_json(&serde_json::json!({ "claude": [claude] }).to_string())
+        .unwrap();
+    let dir = home.path().join("sync");
+    write_complete_file(&dir);
+    let context = crate::LocalSourceContext::for_home(home.path().to_path_buf());
+    let cli = home.path().join(".config/tokscale/cursor-cache");
+
+    set_for_test(Config {
+        enabled: true,
+        dir: Some(dir.clone()),
+        cli_takeover_confirmed: false,
+    });
+    for settings in [
+        context.report_options(None, None).scanner_settings,
+        context.parse_options(None, None).scanner_settings,
+    ] {
+        assert_eq!(
+            settings.extra_scan_paths["claude"],
+            std::slice::from_ref(&claude)
+        );
+        assert_eq!(
+            settings.extra_scan_paths["cursor"],
+            std::slice::from_ref(&dir)
+        );
+        assert_eq!(
+            settings.excluded_scan_paths["cursor"],
+            std::slice::from_ref(&cli)
+        );
+    }
+    // Control: sync off → the context is exactly the registry's.
+    set_for_test(Config::default());
+    let settings = context.report_options(None, None).scanner_settings;
+    assert_eq!(
+        settings.extra_scan_paths["claude"],
+        std::slice::from_ref(&claude)
+    );
+    assert!(!settings.extra_scan_paths.contains_key("cursor"));
+    assert!(settings.excluded_scan_paths.is_empty());
+    crate::extra_scan_paths::reset_for_test();
+}

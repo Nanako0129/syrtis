@@ -227,6 +227,29 @@ char *tb_antigravity_auto_capture(const char *removed_keys_json);
 // this reads no Grok Bot Keychain item.
 char *tb_set_keychain_consent(const char *json);
 
+// Configure Cursor desktop sync. `json` is
+// `{"enabled":bool,"dir":"<absolute dir>","cliTakeoverConfirmed":bool}`;
+// `dir` (the caller passes `<Application Support>/<bundle id>/cursor-cache`) is
+// required while enabled and must be absolute, without `..`, and outside
+// `~/.config/tokscale`. Full replace, in-memory, default off: the caller
+// re-applies the stored answer at launch. Turning sync off (or moving `dir`)
+// deletes the Syrtis usage files from the dir no longer in use. Success data
+// is `{"enabled","dir","cliTakeoverConfirmed","removedFiles":N}`; invalid
+// input is an error and leaves the registry unchanged. While enabled with a
+// complete synced file, and the tokscale CLI's Cursor dir holds no usage files
+// (or `cliTakeoverConfirmed`), reports read Cursor from the sync dir only.
+char *tb_set_cursor_sync(const char *json);
+
+// Sync Cursor usage from the signed-in Cursor desktop app now. Blocking
+// (SQLite read + network, up to 10 min): never call on the main thread.
+// `user_initiated` non-zero = the user's "Sync now". Single-flight: a call
+// made while one runs waits for it and returns its status. Success data is
+// `{"state":"ok|partial|expired|notSignedIn|offline|error|disabled|cliPresent",
+// "events":N,"lastSuccessMs":ms|null,"reason"?:"<fixed code>"}`. `cliPresent`
+// = the walk completed but tokscale CLI Cursor files exist and the takeover is
+// not confirmed. `reason` codes name no account and never carry the token.
+char *tb_cursor_sync(int32_t user_initiated);
+
 // Release a string returned by any tb_* entry point.
 void tb_free(char *p);
 
