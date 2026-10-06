@@ -3,6 +3,25 @@
     <channel>
         <title>TokenBar updates</title>
         <item>
+            <title>2.5.0</title>
+            <pubDate>Tue, 06 Oct 2026 20:27:34 +0000</pubDate>
+            <link>https://github.com/Nanako0129/syrtis/releases/tag/v2.5.0</link>
+            <sparkle:version>1537</sparkle:version>
+            <sparkle:shortVersionString>2.5.0</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
+            <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
+            <description><![CDATA[<b>Features:</b>
+<ul>
+<li>Cursor usage without the tokscale CLI: Syrtis downloads your usage itself, using the Cursor app's login on this Mac. A card on the Overview asks first (only if Cursor is installed); after Continue it syncs at launch and every 30 minutes. The login goes only to cursor.com and is never saved; Syrtis stores the date, model, token counts, cost and conversation ID of each request, and turning it off deletes them. Settings -&gt; General -&gt; Cursor usage sync has the switch and Sync Now. If the tokscale CLI already has Cursor data, Settings asks before Syrtis uses its own sync, so usage is counted once.</li>
+</ul>
+<b>Fixes:</b>
+<ul>
+<li>Cursor usage synced by a recent tokscale CLI (saved as usage.json) is now read. Thanks @whes1015.</li>
+</ul>
+]]></description>
+            <enclosure url="https://github.com/Nanako0129/syrtis/releases/download/v2.5.0/Syrtis.app.tar.gz" length="13886014" type="application/octet-stream" sparkle:edSignature="ShukEzCMYcIHrSbOBzHDwgcDFPBM5PpFgF1HNawrpQW4uQ9MqcRMDtVFqnW4IMBfwZcq98D0i4pA386CesfvAw=="/>
+        </item>
+        <item>
             <title>2.4.1</title>
             <pubDate>Tue, 06 Oct 2026 18:52:49 +0000</pubDate>
             <link>https://github.com/Nanako0129/syrtis/releases/tag/v2.4.1</link>
@@ -100,35 +119,6 @@
 </ul>
 ]]></description>
             <enclosure url="https://github.com/Nanako0129/syrtis/releases/download/v2.2.0/Syrtis.app.tar.gz" length="13107591" type="application/octet-stream" sparkle:edSignature="emdig/UEObUC8IjZ0JHz7la0ZE+3N+HKyLWSWwB4Y1c3voYOiRgCPs3AWSsJTI3FdIWBaMnUZUJY8Kxyx5oMDA=="/>
-        </item>
-        <item>
-            <title>2.1.0</title>
-            <pubDate>Sun, 27 Sep 2026 19:43:56 +0000</pubDate>
-            <link>https://github.com/Nanako0129/syrtis/releases/tag/v2.1.0</link>
-            <sparkle:version>1366</sparkle:version>
-            <sparkle:shortVersionString>2.1.0</sparkle:shortVersionString>
-            <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
-            <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
-            <description><![CDATA[<b>Features:</b>
-<ul>
-<li>A card offers to attribute your usage to subscriptions. Until usage is attributed, a subscription's window history lists 0 tokens and $0.00 for every window. When nothing is attributed yet, a card at the top of Overview and of the Quota view on every client tab lists the suggested assignments and applies them in one click; "Set up manually…" opens Settings → Usage attribution, and "Not now" hides the card for good.</li>
-<li>Grok Build models are listed under one name. grok-4.6-build and grok-4.6 were two rows for one model; Models, Monthly, Daily and the Grok quota card now list grok-4.6 and grok-4.7 once each. Totals are unchanged.</li>
-<li>The menu bar gauge turns grey once the reading it shows is more than 30 minutes old, and takes its color back with the next fresh reading.</li>
-</ul>
-<b>Fixes:</b>
-<ul>
-<li>Setting the clock back could erase quota history. Loading dropped a whole series when it held readings stamped later than the current time, and a poll that recorded anything then saved the loss. With the clock set back 10 minutes on a copy of a real history file, the previous version dropped 10,163 readings to 3,780 in memory; this version drops only the 4 readings stamped in the future. Repairs made while loading are now written back once.</li>
-<li>The window history said "Quota history could not be read. It will be retried." for good for sources that record no history, such as Antigravity read through agy. It now shows that no earlier windows are recorded.</li>
-<li>Model prices stopped updating while you were idle. While the dashboard is open, the model report is now fetched again once it is an hour old.</li>
-<li>A signed-in agy that Syrtis could not find started a login shell on every refresh. It now runs at most once every 15 minutes.</li>
-<li>Claude credential errors now name their cause, and none includes credential content. A Keychain credential with a character outside printable ASCII is now read.</li>
-<li>A malformed Codex token could skip the refresh check; its expiry is no longer trusted. Thanks @snowman12320.</li>
-<li>Quota history that failed to load was described as never recorded; Past windows and the heatmap now say it could not be read and will be retried.</li>
-<li>On macOS 27 in light mode, the separators in the glass panel are lighter.</li>
-</ul>
-<p>Thanks: @snowman12320</p>
-]]></description>
-            <enclosure url="https://github.com/Nanako0129/syrtis/releases/download/v2.1.0/Syrtis.app.tar.gz" length="11370210" type="application/octet-stream" sparkle:edSignature="loZMq4/PHlAPjeawqyE1j0A78qHzJz8CpdeQtxwrobcTBmxk/tTjgMt+0JHVIaYsxGhkj9UEsvQyZMptTK9gCQ=="/>
         </item>
         <item>
             <title>1.1.1</title>
