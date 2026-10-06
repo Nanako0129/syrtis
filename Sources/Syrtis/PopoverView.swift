@@ -660,24 +660,16 @@ struct PopoverView: View {
 
     /// Network-LED behavior: steady dim gray when idle, and when tokens are
     /// flowing, a green light that flickers irregularly like a router's
-    /// activity light — mostly lit, with brief pseudo-random off-blinks
-    /// (hash of the 90ms time slot, denser at higher rates).
+    /// activity light — mostly lit, with brief pseudo-random off-blinks,
+    /// denser at higher rates. The flicker runs in Core Animation
+    /// (`ActivityLED`) so it does not re-render the popover every frame.
     @ViewBuilder private var activityLED: some View {
         let rate = tokensPerMin ?? 0
         if rate > 0 {
-            TimelineView(.periodic(from: .now, by: 0.09)) { timeline in
-                let slot = UInt64(timeline.date.timeIntervalSinceReferenceDate / 0.09)
-                let hash = (slot &* 0x9E37_79B9_7F4A_7C15) >> 33
-                // Blink-off chance grows with the rate: ~25% near idle,
-                // ~45% at 1M tok/min — busier traffic, busier light.
-                let offChance = 25 + min(20, Int(rate / 50_000))
-                let lit = Int(hash % 100) >= offChance
-                Circle()
-                    .fill(Color.green)
-                    .frame(width: 6, height: 6)
-                    .opacity(lit ? 1 : 0.25)
-                    .shadow(color: .green.opacity(lit ? 0.8 : 0), radius: 2)
-            }
+            // Blink-off chance grows with the rate: ~25% near idle,
+            // ~45% at 1M tok/min — busier traffic, busier light.
+            ActivityLED(offChance: 25 + min(20, Int(rate / 50_000)))
+                .frame(width: 6, height: 6)
         } else {
             Circle()
                 .fill(.secondary.opacity(0.4))

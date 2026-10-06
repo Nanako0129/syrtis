@@ -45,7 +45,13 @@ final class StatusItemController: NSObject {
         super.init()
 
         popover.behavior = .transient
-        let host = NSHostingController(rootView: AnyView(PopoverView(routeMemory: routeMemory).environmentObject(chrome)))
+        // Start on the same placeholder a close swaps in: presentPopover()
+        // installs the live view on every open. A live PopoverView here kept
+        // its .task polls and its view graph running, hidden, from launch until
+        // the first close — measured at over half a core with the old
+        // TimelineView LED in a demo run that never opened the popover.
+        let host = NSHostingController(rootView: AnyView(
+            Color.clear.frame(width: chrome.width, height: chrome.minHeight)))
         self.host = host
         // The SwiftUI root has a fixed frame; let the popover keep our size
         // instead of chasing intrinsic-size updates. The real size is set per
