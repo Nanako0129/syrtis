@@ -3859,7 +3859,7 @@ fn sync_directory_with_mode(_mode: StorageMode, directory: &Path) -> io::Result<
     sync_directory(directory)
 }
 
-fn sync_directory(directory: &Path) -> io::Result<()> {
+pub(crate) fn sync_directory(directory: &Path) -> io::Result<()> {
     File::open(directory)?.sync_all()
 }
 
@@ -3867,7 +3867,7 @@ fn ensure_real_directory_with_mode(_mode: StorageMode, directory: &Path) -> io::
     ensure_real_directory(directory)
 }
 
-fn ensure_real_directory(directory: &Path) -> io::Result<()> {
+pub(crate) fn ensure_real_directory(directory: &Path) -> io::Result<()> {
     match fs::symlink_metadata(directory) {
         Ok(metadata) if metadata.file_type().is_dir() => {}
         Ok(_) => {
@@ -3908,7 +3908,7 @@ fn open_history_lock(_mode: StorageMode, path: &Path) -> Result<File, HistoryErr
     Ok(file)
 }
 
-fn open_owner_only(path: &Path) -> io::Result<File> {
+pub(crate) fn open_owner_only(path: &Path) -> io::Result<File> {
     let mut create = OpenOptions::new();
     create.read(true).write(true).create_new(true);
     #[cfg(unix)]

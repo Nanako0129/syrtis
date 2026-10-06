@@ -27,6 +27,7 @@ mod agent_usage;
 mod agents_report;
 mod claude_config_dirs;
 mod cursor_desktop;
+mod cursor_sync;
 mod extra_scan_paths;
 mod filter_parity_probe;
 mod hourly_report;
