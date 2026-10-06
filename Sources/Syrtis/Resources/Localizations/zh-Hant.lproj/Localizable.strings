@@ -645,7 +645,7 @@
 /* Cursor usage sync (approved copy: .agent-local/plans/cursor-c3-copy.md) */
 "Cursor usage sync" = "Cursor 用量同步";
 "Sync Cursor usage from the Cursor app" = "從 Cursor App 同步用量";
-"To show your Cursor usage, Syrtis reads the login of the Cursor app on this Mac and sends it only to Cursor's usage service (cursor.com) to download your usage. Syrtis stores the date, model, token counts and cost of each request on this Mac; the login itself is never saved or logged. Turning this off deletes the downloaded usage." = "要顯示 Cursor 用量，Syrtis 會讀取這台 Mac 上 Cursor App 的登入資訊，只送到 Cursor 的用量服務（cursor.com）下載你的用量。Syrtis 會在這台 Mac 上存下每次請求的日期、模型、token 數和費用；登入資訊本身不會儲存或記錄。關閉這個選項會刪除已下載的用量。";
+"To show your Cursor usage, Syrtis reads the login of the Cursor app on this Mac and sends it only to Cursor's usage service (cursor.com) to download your usage. Syrtis stores the date, model, token counts, cost and conversation ID of each request on this Mac; the login itself is never saved or logged. Turning this off deletes the downloaded usage." = "要顯示 Cursor 用量，Syrtis 會讀取這台 Mac 上 Cursor App 的登入資訊，只送到 Cursor 的用量服務（cursor.com）下載你的用量。Syrtis 會在這台 Mac 上存下每次請求的日期、模型、token 數、費用和對話 ID；登入資訊本身不會儲存或記錄。關閉這個選項會刪除已下載的用量。";
 "Continue" = "繼續";
 "Turn Off" = "關閉";
 "Last synced %@" = "上次同步：%@";

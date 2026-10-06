@@ -96,7 +96,7 @@ enum CursorSync {
     enum Copy {
         static let title = "Cursor usage sync"
         static let toggle = "Sync Cursor usage from the Cursor app"
-        static let privacy = "To show your Cursor usage, Syrtis reads the login of the Cursor app on this Mac and sends it only to Cursor's usage service (cursor.com) to download your usage. Syrtis stores the date, model, token counts and cost of each request on this Mac; the login itself is never saved or logged. Turning this off deletes the downloaded usage."
+        static let privacy = "To show your Cursor usage, Syrtis reads the login of the Cursor app on this Mac and sends it only to Cursor's usage service (cursor.com) to download your usage. Syrtis stores the date, model, token counts, cost and conversation ID of each request on this Mac; the login itself is never saved or logged. Turning this off deletes the downloaded usage."
         static let `continue` = "Continue"
         static let turnOff = "Turn Off"
         static let lastSynced = "Last synced %@"
