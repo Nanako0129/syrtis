@@ -109,13 +109,32 @@ pub(crate) fn normalized_stored_string(value: &str) -> Option<String> {
 /// Cursor user ids look like `user_...` (20+ alphanumerics). Scan for the
 /// first occurrence rather than depending on the surrounding JSON shape.
 pub(crate) fn extract_user_id(text: &str) -> Option<String> {
-    let start = text.find("user_")?;
-    let rest = &text[start + "user_".len()..];
-    let len = rest
-        .char_indices()
-        .take_while(|(_, c)| c.is_ascii_alphanumeric())
-        .map(|(i, c)| i + c.len_utf8())
-        .last()
-        .unwrap_or(0);
-    (len >= 20).then(|| format!("user_{}", &rest[..len]))
+    // Every `user_` occurrence, not only the first: a key such as `"user_id"`
+    // before the real id must not hide it (it feeds the S-1 account check).
+    text.match_indices("user_").find_map(|(start, _)| {
+        let rest = &text[start + "user_".len()..];
+        let len = rest
+            .char_indices()
+            .take_while(|(_, c)| c.is_ascii_alphanumeric())
+            .map(|(i, c)| i + c.len_utf8())
+            .last()
+            .unwrap_or(0);
+        (len >= 20).then(|| format!("user_{}", &rest[..len]))
+    })
+}
+
+#[cfg(test)]
+mod extract_user_id_tests {
+    use super::extract_user_id;
+
+    #[test]
+    fn a_short_user_prefix_before_the_real_id_does_not_hide_it() {
+        let id = "user_01ABCDEFGHIJKLMNOPQRSTUV";
+        assert_eq!(
+            extract_user_id(&format!(r#"{{"user_id":"x","sub":"{id}"}}"#)).as_deref(),
+            Some(id)
+        );
+        // Control: no qualifying occurrence at all.
+        assert_eq!(extract_user_id(r#"{"user_id":"user_short"}"#), None);
+    }
 }
