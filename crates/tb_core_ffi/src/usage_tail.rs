@@ -12,6 +12,7 @@ use chrono::{Duration, Local, TimeZone};
 use parking_lot::Mutex;
 use serde::Serialize;
 use std::collections::HashMap;
+#[cfg(all(test, target_os = "macos"))]
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -64,8 +65,9 @@ pub struct UsageTailer {
     /// timestamp on read) and the tick skips the parse entirely.
     last_source_token: Mutex<Option<u64>>,
     /// Ticks that attempted the parse (whether it succeeded or failed) rather
-    /// than taking the unchanged-token skip; lets a benchmark tell a paid parse
-    /// from a skip without a second token probe.
+    /// than taking the unchanged-token skip; lets the benchmark tell a paid
+    /// parse from a skip without a second token probe. Test builds only.
+    #[cfg(all(test, target_os = "macos"))]
     parses: AtomicUsize,
 }
 
@@ -74,12 +76,11 @@ impl UsageTailer {
         Self {
             events: Mutex::new(Vec::new()),
             last_source_token: Mutex::new(None),
+            #[cfg(all(test, target_os = "macos"))]
             parses: AtomicUsize::new(0),
         }
     }
 
-    // Only the benchmark reads it (macOS-only, see the `bench` mount below);
-    // anywhere else the method would be unused.
     #[cfg(all(test, target_os = "macos"))]
     pub fn parse_count(&self) -> usize {
         self.parses.load(Ordering::Relaxed)
@@ -89,14 +90,15 @@ impl UsageTailer {
     /// window. Returns the number of events now in the window (cheap to compute
     /// and only used as a "did anything happen" hint by callers).
     pub fn tick(&self) -> usize {
-        self.tick_with_clock(now_ms)
+        self.tick_with(&crate::LocalSourceContext::current(), now_ms)
     }
 
-    /// `tick` with the wall clock injected, so a benchmark on a captured corpus
-    /// sees the same window on every run. Production passes `now_ms`, read at
-    /// the same three points as before: the `since` date, `modified_after`, and
+    /// `tick` with its sources and wall clock injected, so a benchmark can pin
+    /// a captured corpus and a fixed time and see the same window on every
+    /// run. Production passes the current context and `now_ms`, read at the
+    /// same three points as before: the `since` date, `modified_after`, and
     /// the event cutoff after the parse.
-    pub fn tick_with_clock(&self, clock: impl Fn() -> i64) -> usize {
+    pub fn tick_with(&self, context: &crate::LocalSourceContext, clock: impl Fn() -> i64) -> usize {
         // `since` is date-granular; reach back one day so a sub-hour window that
         // straddles midnight still sees yesterday's tail.
         let now_local = Local
@@ -112,7 +114,6 @@ impl UsageTailer {
         // only files active within the window — plus a small margin for write
         // latency and clock skew — are re-parsed each tick.
         let window_reach_ms = (EVENT_WINDOW_SECS + 300) * 1000;
-        let context = crate::LocalSourceContext::current();
         let mut options = context.parse_options(None, None);
         options.since = Some(since);
         options.modified_after = Some((clock() - window_reach_ms) as u64);
@@ -124,6 +125,7 @@ impl UsageTailer {
             return self.events.lock().len();
         }
 
+        #[cfg(all(test, target_os = "macos"))]
         self.parses.fetch_add(1, Ordering::Relaxed);
         let parsed = match tokscale_core::parse_local_clients(options) {
             Ok(parsed) => parsed,
@@ -238,9 +240,9 @@ fn now_ms() -> i64 {
 }
 
 // Tail measurement harness for the CPU work. The two benches are `#[ignore]`;
-// three small unit tests (digest mutations, record appending, source-line
-// selection) run in the normal suite. macOS only: it reads CPU through a
-// hand-declared getrusage with Darwin's layout.
+// its small unit tests (digest, record appending, source-line selection, the
+// corpus guard, count parsing) run in the normal suite. macOS only: it reads
+// CPU through a hand-declared getrusage with Darwin's layout.
 #[cfg(all(test, target_os = "macos"))]
 #[path = "usage_tail_bench.rs"]
 mod bench;

@@ -215,6 +215,7 @@ mod tests {
     fn context_for(home: &Path) -> LocalSourceContext {
         LocalSourceContext {
             home_dir: Some(home.to_path_buf()),
+            use_env_roots: true,
         }
     }
 
