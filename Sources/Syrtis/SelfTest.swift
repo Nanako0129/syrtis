@@ -4624,6 +4624,16 @@ enum SelfTest {
         expect(TraceBucket.totalRate(rateRows, hidden: ["claude"]) == 400, "rate hiding canonical claude drops claude-code rows")
         expect(TraceBucket.totalRate(rateRows, hidden: ["claude", "codex"]) == 0, "rate all-hidden is zero")
 
+        // The live-rate LED's flicker moved from a per-frame TimelineView to a
+        // Core Animation pattern; it must still flicker, and blink off more
+        // often at a higher rate.
+        let calmLED = ActivityLED.pattern(offChance: 25)
+        let busyLED = ActivityLED.pattern(offChance: 45)
+        expect(calmLED.count == ActivityLED.slotCount && calmLED.contains(true) && calmLED.contains(false),
+               "LED pattern flickers")
+        expect(busyLED.filter { !$0 }.count > calmLED.filter { !$0 }.count,
+               "LED blinks off more at a higher rate")
+
         // Trace id canonicalization (issue #36): raw tail ids fold to the
         // registry's short ids via EXPLICIT aliases only — a mixed set drops
         // only the hidden client, and already-canonical ids pass through. There
