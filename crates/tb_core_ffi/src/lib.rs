@@ -26,6 +26,8 @@ mod agent_quota_history;
 mod agent_usage;
 mod agents_report;
 mod claude_config_dirs;
+mod cursor_desktop;
+mod cursor_sync;
 mod extra_scan_paths;
 mod filter_parity_probe;
 mod hourly_report;
@@ -103,6 +105,22 @@ impl LocalSourceContext {
         }
     }
 
+    /// The registry's extra roots plus the Cursor sync takeover
+    /// (`cursor_sync::apply_takeover`), which adds the sync dir and excludes
+    /// the CLI's Cursor root only under the takeover conditions.
+    fn scanner_settings(&self) -> tokscale_core::scanner::ScannerSettings {
+        let mut settings = tokscale_core::scanner::ScannerSettings {
+            extra_scan_paths: extra_scan_paths::snapshot(),
+            ..Default::default()
+        };
+        cursor_sync::apply_takeover(
+            &mut settings,
+            &cursor_sync::config(),
+            self.home_dir.as_deref(),
+        );
+        settings
+    }
+
     pub(crate) fn report_options(
         &self,
         year: Option<String>,
@@ -116,10 +134,7 @@ impl LocalSourceContext {
             use_env_roots: self.use_env_roots,
             year,
             clients,
-            scanner_settings: tokscale_core::scanner::ScannerSettings {
-                extra_scan_paths: extra_scan_paths::snapshot(),
-                ..Default::default()
-            },
+            scanner_settings: self.scanner_settings(),
             ..Default::default()
         }
     }
@@ -137,10 +152,7 @@ impl LocalSourceContext {
             use_env_roots: self.use_env_roots,
             year,
             clients,
-            scanner_settings: tokscale_core::scanner::ScannerSettings {
-                extra_scan_paths: extra_scan_paths::snapshot(),
-                ..Default::default()
-            },
+            scanner_settings: self.scanner_settings(),
             ..Default::default()
         }
     }
@@ -1466,6 +1478,61 @@ fn invalidate_scan_caches() {
     // Unstamping is enough to force the next tick; `in_flight` still guards
     // against a second parse starting while one is running.
     lock_tick().last = None;
+}
+
+/// Configure Cursor desktop sync (see the `cursor_sync` module doc). `json` is
+/// `{"enabled":bool,"dir":"<absolute dir>","cliTakeoverConfirmed":bool}`;
+/// `dir` is required while enabled and must be absolute, without `..`, and
+/// outside `~/.config/tokscale`. Full replace; in-memory, default off, so the
+/// caller re-applies it at launch. Turning sync off (or moving `dir`) deletes
+/// the Syrtis usage files from the dir no longer in use. Success data is
+/// `{"enabled","dir","cliTakeoverConfirmed","removedFiles":N}`; invalid input
+/// is an error and leaves the registry unchanged. Invalidates the scan
+/// caches, since the takeover depends on every field.
+///
+/// # Safety
+/// `json` must be NULL or a valid NUL-terminated UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn tb_set_cursor_sync(json: *const c_char) -> *mut c_char {
+    guarded("tb_set_cursor_sync", || {
+        envelope(unsafe { set_cursor_sync_from_c(json) })
+    })
+}
+
+/// # Safety
+/// `json` must be NULL or a valid NUL-terminated UTF-8 string.
+unsafe fn set_cursor_sync_from_c(json: *const c_char) -> Result<serde_json::Value, String> {
+    if json.is_null() {
+        return Err("cursor sync payload must not be NULL".to_string());
+    }
+    let raw = unsafe { CStr::from_ptr(json) }
+        .to_str()
+        .map_err(|_| "cursor sync payload is not valid UTF-8".to_string())?;
+    let result = cursor_sync::set_from_json(raw, user_home_dir().as_deref())?;
+    invalidate_scan_caches();
+    Ok(result)
+}
+
+/// Run one Cursor desktop sync now. Blocking (SQLite read + network, up to
+/// 10 min): never call on the main thread. `user_initiated` non-zero = the user's
+/// "Sync now" (10 min budget); zero = background (10 min until a complete
+/// file exists, then 60 s). Single-flight: a call made while one runs waits
+/// for it and returns its status. Success data is
+/// `{"state":"ok|partial|expired|notSignedIn|offline|error|disabled|cliPresent",
+/// "events":N,"lastSuccessMs":ms|null,"reason"?:"<fixed code>"}`; `events` is
+/// the count written by this call (0 unless it completed), `lastSuccessMs` the
+/// complete file's mtime. `cliPresent` = the walk completed but CLI Cursor
+/// files exist and the user has not confirmed the takeover.
+#[no_mangle]
+pub extern "C" fn tb_cursor_sync(user_initiated: i32) -> *mut c_char {
+    guarded("tb_cursor_sync", || {
+        let (status, changed) =
+            cursor_sync::sync_now(user_initiated != 0, user_home_dir().as_deref());
+        if changed {
+            invalidate_scan_caches();
+        }
+        envelope(Ok(status))
+    })
 }
 
 /// Release a string returned by any tb_* entry point.

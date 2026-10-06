@@ -162,6 +162,27 @@ public struct KeychainConsentResult: Decodable, Equatable, Sendable {
     public let rejected: [RejectedKeychainConsent]
 }
 
+/// Result of `tb_set_cursor_sync`.
+public struct CursorSyncConfigResult: Decodable, Equatable, Sendable {
+    public let enabled: Bool
+    public let dir: String?
+    public let cliTakeoverConfirmed: Bool
+    /// Syrtis usage files deleted because sync was turned off or moved.
+    public let removedFiles: Int
+}
+
+/// Result of `tb_cursor_sync`.
+public struct CursorSyncStatus: Decodable, Equatable, Sendable {
+    /// `ok | partial | expired | notSignedIn | offline | error | disabled | cliPresent`.
+    public let state: String
+    /// Events written by this call; 0 unless it completed.
+    public let events: Int
+    /// The complete synced file's mtime, if one exists.
+    public let lastSuccessMs: Int64?
+    /// A fixed diagnostic code (e.g. `rate_limited`); never account data.
+    public let reason: String?
+}
+
 /// Thin Swift facade over the tb_core_ffi staticlib. All calls are blocking;
 /// invoke from a background thread/actor in app code. `agentUsage()` is also
 /// network-bound.
@@ -514,6 +535,19 @@ public enum TBCore {
     /// untouched.
     public static func setKeychainConsent(json: String) throws -> KeychainConsentResult {
         try unwrap(json.withCString { tb_set_keychain_consent($0) })
+    }
+
+    /// Configure Cursor desktop sync: `{"enabled","dir","cliTakeoverConfirmed"}`.
+    /// In-memory and default off in the core, so the app re-applies it at
+    /// launch. Turning it off deletes the synced usage files.
+    public static func setCursorSync(json: String) throws -> CursorSyncConfigResult {
+        try unwrap(json.withCString { tb_set_cursor_sync($0) })
+    }
+
+    /// One Cursor desktop sync. Blocking (SQLite + network, up to 10 min):
+    /// never call on the main thread. Single-flight in the core.
+    public static func cursorSync(explicit: Bool) throws -> CursorSyncStatus {
+        try unwrap(tb_cursor_sync(explicit ? 1 : 0))
     }
 
     /// OAuth quota cards for codex/claude/antigravity/copilot/grok/grok-bot. Network-bound;
