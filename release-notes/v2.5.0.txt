@@ -1,0 +1,5 @@
+Features:
+- Cursor usage without the tokscale CLI: Syrtis downloads your usage itself, using the Cursor app's login on this Mac. A card on the Overview asks first (only if Cursor is installed); after Continue it syncs at launch and every 30 minutes. The login goes only to cursor.com and is never saved; Syrtis stores the date, model, token counts, cost and conversation ID of each request, and turning it off deletes them. Settings -> General -> Cursor usage sync has the switch and Sync Now. If the tokscale CLI already has Cursor data, Settings asks before Syrtis uses its own sync, so usage is counted once.
+
+Fixes:
+- Cursor usage synced by a recent tokscale CLI (saved as usage.json) is now read. Thanks @whes1015.
