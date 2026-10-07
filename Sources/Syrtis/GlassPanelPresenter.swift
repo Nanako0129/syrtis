@@ -84,6 +84,8 @@ final class GlassPanelPresenter {
         layout(height: height, animate: false)
         generation += 1
         panel.alphaValue = 0
+        // Match the NSPopover path so trackpad magnify events reach the panel.
+        NSApp.activate(ignoringOtherApps: true)
         panel.makeKeyAndOrderFront(nil)
         // Pay the first SwiftUI layout + draw (measured 65-125 ms) while the
         // panel is invisible, then animate on the next turn. Measured: more
