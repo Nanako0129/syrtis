@@ -234,7 +234,9 @@ char *tb_set_keychain_consent(const char *json);
 // `~/.config/tokscale`. Full replace, in-memory, default off: the caller
 // re-applies the stored answer at launch. Turning sync off (or moving `dir`)
 // deletes the Syrtis usage files from the dir no longer in use. Success data
-// is `{"enabled","dir","cliTakeoverConfirmed","removedFiles":N}`; invalid
+// is `{"enabled","dir","cliTakeoverConfirmed","removedFiles":N,
+// "cleanupFailed":bool}` (some of those files could not be deleted, or the
+// dir could not be examined); invalid
 // input is an error and leaves the registry unchanged. While enabled with a
 // complete synced file, and the tokscale CLI's Cursor dir holds no usage files
 // (or `cliTakeoverConfirmed`), reports read Cursor from the sync dir only.

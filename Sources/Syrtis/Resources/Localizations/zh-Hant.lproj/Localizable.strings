@@ -660,6 +660,7 @@
 "You also have Cursor usage from tokscale CLI on this Mac. Use Syrtis's own sync instead? Choose this only if it's the same Cursor account, or that account's usage will no longer be shown." = "這台 Mac 上也有 tokscale CLI 的 Cursor 用量。要改用 Syrtis 自己的同步嗎？只有在是同一個 Cursor 帳號時才選，否則那個帳號的用量就不會再顯示。";
 "Use Syrtis Sync" = "改用 Syrtis 同步";
 "Keep tokscale CLI Data" = "保留 tokscale CLI 的資料";
+"Cursor sync is off, but some downloaded usage couldn't be deleted. Restart Syrtis to retry." = "Cursor 同步已關閉，但有部分已下載的用量無法刪除。重新啟動 Syrtis 即可再試。";
 "Glass tint" = "玻璃深淺";
 "Makes the popover's glass less see-through, so its text stays readable over the windows behind it." = "讓視窗的玻璃不那麼透明，背後有其他視窗時文字也看得清楚。";
 "Text hard to read over the windows behind this one? Make the glass less see-through here. You can change it later in Quick settings at the top right." = "背後有其他視窗時，文字不好讀嗎？可以在這裡把玻璃調得不那麼透明，之後也能在右上角的快速設定調整。";

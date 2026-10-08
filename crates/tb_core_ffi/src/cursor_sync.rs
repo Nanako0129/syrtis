@@ -142,15 +142,20 @@ pub(crate) fn set_from_json(raw: &str, home: Option<&Path>) -> Result<serde_json
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         std::mem::replace(&mut *guard, new.clone())
     };
-    let mut removed = 0;
+    let (mut removed, mut cleanup_failed) = (0, false);
+    let mut clean = |dir: &Path| {
+        let (count, failed) = remove_usage_files_locked(dir);
+        removed += count;
+        cleanup_failed |= failed;
+    };
     if let Some(old_dir) = old.dir.as_deref() {
         if !new.enabled || new.dir.as_deref() != Some(old_dir) {
-            removed += remove_usage_files_locked(old_dir);
+            clean(old_dir);
         }
     }
     if let Some(new_dir) = new.dir.as_deref() {
         if !new.enabled && old.dir.as_deref() != Some(new_dir) {
-            removed += remove_usage_files_locked(new_dir);
+            clean(new_dir);
         }
     }
     Ok(serde_json::json!({
@@ -158,6 +163,7 @@ pub(crate) fn set_from_json(raw: &str, home: Option<&Path>) -> Result<serde_json
         "dir": new.dir.as_deref().map(|d| d.to_string_lossy()),
         "cliTakeoverConfirmed": new.cli_takeover_confirmed,
         "removedFiles": removed,
+        "cleanupFailed": cleanup_failed,
     }))
 }
 
@@ -265,34 +271,58 @@ fn complete_file(dir: &Path) -> Option<(PathBuf, SystemTime)> {
 // Files.
 
 /// Delete Syrtis usage files (and temp leftovers) in `dir` except `keep`.
-/// Never touches anything else. Caller holds the dir lock.
-fn remove_usage_files(dir: &Path, keep: Option<&str>) -> usize {
+/// Never touches anything else. Caller holds the dir lock. Returns the count
+/// removed and whether any of ours could not be (or the dir not be read).
+fn remove_usage_files(dir: &Path, keep: Option<&str>) -> (usize, bool) {
     let Ok(entries) = std::fs::read_dir(dir) else {
-        return 0;
+        return (0, true);
     };
-    entries
-        .flatten()
-        .filter(|entry| {
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            let ours = (name.starts_with("usage.") && name.ends_with(".json"))
-                || name.starts_with(TEMP_FILE_PREFIX);
-            ours && Some(name.as_ref()) != keep
-        })
-        .filter(|entry| std::fs::remove_file(entry.path()).is_ok())
-        .count()
+    let (mut removed, mut failed) = (0, false);
+    for entry in entries {
+        let Ok(entry) = entry else {
+            failed = true;
+            continue;
+        };
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !is_ours(&name) || Some(name.as_ref()) == keep {
+            continue;
+        }
+        match std::fs::remove_file(entry.path()) {
+            Ok(()) => removed += 1,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => failed = true,
+        }
+    }
+    (removed, failed)
 }
 
-fn remove_usage_files_locked(dir: &Path) -> usize {
+fn is_ours(name: &str) -> bool {
+    (name.starts_with("usage.") && name.ends_with(".json")) || name.starts_with(TEMP_FILE_PREFIX)
+}
+
+/// `(removed, failed)`. A missing dir, or one that is not a real directory,
+/// holds nothing of ours: nothing to delete, not a failure. A dir that cannot
+/// be examined, or whose files of ours cannot be deleted, is a failure.
+fn remove_usage_files_locked(dir: &Path) -> (usize, bool) {
     // Only a real directory: never follow a symlink to delete elsewhere.
-    if !std::fs::symlink_metadata(dir).is_ok_and(|m| m.is_dir()) {
-        return 0;
+    match std::fs::symlink_metadata(dir) {
+        Ok(meta) if meta.is_dir() => {}
+        Ok(_) => return (0, false),
+        Err(error) => return (0, error.kind() != std::io::ErrorKind::NotFound),
     }
-    let Ok(lock) = crate::agent_quota_history::open_owner_only(&dir.join(LOCK_FILE_NAME)) else {
-        return 0;
-    };
-    if lock.lock_exclusive().is_err() {
-        return 0;
+    let locked = crate::agent_quota_history::open_owner_only(&dir.join(LOCK_FILE_NAME))
+        .ok()
+        .filter(|lock| lock.lock_exclusive().is_ok());
+    if locked.is_none() {
+        // No lock, no delete; a failure only if something of ours is there.
+        // An entry that cannot be read counts as ours (fail closed).
+        let holds_ours = std::fs::read_dir(dir).map_or(true, |mut entries| {
+            entries.any(|entry| {
+                entry.map_or(true, |entry| is_ours(&entry.file_name().to_string_lossy()))
+            })
+        });
+        return (0, holds_ours);
     }
     remove_usage_files(dir, None)
 }
@@ -359,7 +389,7 @@ fn commit_file(
     }
     // The rename is the commit point; a failed dir fsync cannot undo it.
     let _ = crate::agent_quota_history::sync_directory(dir);
-    remove_usage_files(dir, Some(&final_name));
+    let _ = remove_usage_files(dir, Some(&final_name));
     Ok(())
 }
 
