@@ -17269,7 +17269,10 @@ enum SelfTest {
             let running = Task { @MainActor in
                 await controller.runSync(explicit: true, defaults: defaults, arguments: ["Syrtis"], sync: sync)
             }
-            try? await Task.sleep(nanoseconds: 100_000_000)
+            // Checkpoint: past the initial guards and waiting on the push.
+            for _ in 0..<200 where !controller.syncing {
+                try? await Task.sleep(nanoseconds: 5_000_000)
+            }
             defaults.set(true, forKey: CursorSync.takeoverKey)
             // The new loop's own sync is dropped while `running` holds the
             // single flight, so one sync means the rerun sent it.
@@ -17302,7 +17305,10 @@ enum SelfTest {
             let running = Task { @MainActor in
                 await controller.runSync(explicit: true, defaults: defaults, arguments: ["Syrtis"], sync: sync)
             }
-            try? await Task.sleep(nanoseconds: 50_000_000)
+            // Checkpoint: past the initial guards and waiting on the push.
+            for _ in 0..<200 where !controller.syncing {
+                try? await Task.sleep(nanoseconds: 5_000_000)
+            }
             defaults.set(false, forKey: CursorSync.enabledKey)
             controller.reconfigure(refresh: false, defaults: defaults, arguments: ["Syrtis"], dir: "/x",
                                    setConfig: { _ in nil }, sync: sync)

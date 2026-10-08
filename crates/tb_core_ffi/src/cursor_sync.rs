@@ -316,10 +316,11 @@ fn remove_usage_files_locked(dir: &Path) -> (usize, bool) {
         .filter(|lock| lock.lock_exclusive().is_ok());
     if locked.is_none() {
         // No lock, no delete; a failure only if something of ours is there.
-        let holds_ours = std::fs::read_dir(dir).map_or(true, |entries| {
-            entries
-                .flatten()
-                .any(|entry| is_ours(&entry.file_name().to_string_lossy()))
+        // An entry that cannot be read counts as ours (fail closed).
+        let holds_ours = std::fs::read_dir(dir).map_or(true, |mut entries| {
+            entries.any(|entry| {
+                entry.map_or(true, |entry| is_ours(&entry.file_name().to_string_lossy()))
+            })
         });
         return (0, holds_ours);
     }
