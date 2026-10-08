@@ -702,6 +702,14 @@ struct SettingsPanel: View {
             .glassCard(cornerRadius: 8)
             hint("You can also drag the bottom edge of the popover. Auto uses about 60% of your screen height.")
         }
+
+        section("Glass tint") {
+            GlassTintSlider()
+            .padding(.horizontal, 10)
+            .padding(.vertical, 8)
+            .glassCard(cornerRadius: 8)
+            hint("Makes the popover's glass less see-through, so its text stays readable over the windows behind it.")
+        }
     }
 
     @ViewBuilder

@@ -27,6 +27,8 @@ struct PopoverView: View {
     @State private var tokensPerMin: Double?
     /// True while Cmd has been held alone for a beat — shows shortcut pins.
     @State private var cmdHeld = false
+    /// Quick settings card under the header (#490), toggled by the header button.
+    @State private var showQuickSettings = false
     @State private var keyMonitor: Any?
     @State private var flagsMonitor: Any?
     @State private var cmdHintTask: Task<Void, Never>?
@@ -214,6 +216,12 @@ struct PopoverView: View {
     var body: some View {
         VStack(spacing: 0) {
             header
+            if showQuickSettings {
+                QuickSettingsCard()
+                    .padding(.horizontal, 12)
+                    .padding(.bottom, 8)
+                    .transition(.opacity.combined(with: .move(edge: .top)))
+            }
             if BridgeBuild.isActive && !bridgeDismissed {
                 bridgeBanner
             }
@@ -495,6 +503,9 @@ struct PopoverView: View {
             Spacer()
             liveRateBadge
             yearMenu
+            if GlassTintSlider.glassAvailable {
+                quickSettingsButton
+            }
             refreshButton
         }
         .padding(.horizontal, 16)
@@ -584,6 +595,20 @@ struct PopoverView: View {
     /// a disabled plain button dims its label. Pressing Refresh during a scan
     /// only supersedes it with another full scan anyway, so the consistency is
     /// worth more than the interruption.
+    private var quickSettingsButton: some View {
+        Button {
+            withAnimation(.easeOut(duration: 0.15)) { showQuickSettings.toggle() }
+        } label: {
+            Image(systemName: "slider.horizontal.3")
+                .font(.system(size: 11, weight: .medium))
+                .foregroundStyle(showQuickSettings ? AnyShapeStyle(.tint) : AnyShapeStyle(.secondary))
+                .frame(width: 16, height: 16)
+        }
+        .buttonStyle(.plain)
+        .help("Quick settings".localized)
+        .accessibilityLabel("Quick settings".localized)
+    }
+
     private var refreshButton: some View {
         Button {
             Task { await model.refresh() }

@@ -660,3 +660,7 @@
 "Use Syrtis Sync" = "改用 Syrtis 同步";
 "Keep tokscale CLI Data" = "保留 tokscale CLI 的数据";
 "Cursor sync is off, but some downloaded usage couldn't be deleted. Restart Syrtis to retry." = "Cursor 同步已关闭，但有部分已下载的用量无法删除。重启 Syrtis 即可再试。";
+"Glass tint" = "玻璃深浅";
+"Makes the popover's glass less see-through, so its text stays readable over the windows behind it." = "让窗口的玻璃不那么透明，背后有其他窗口时文字也看得清楚。";
+"Text hard to read over the windows behind this one? Make the glass less see-through here. You can change it later in Quick settings at the top right." = "背后有其他窗口时，文字不好读吗？可以在这里把玻璃调得不那么透明，之后也能在右上角的快速设置调整。";
+"Quick settings" = "快速设置";
