@@ -119,7 +119,7 @@ enum CursorSync {
         static let cliQuestion = "You also have Cursor usage from tokscale CLI on this Mac. Use Syrtis's own sync instead? Choose this only if it's the same Cursor account, or that account's usage will no longer be shown."
         static let useSyrtis = "Use Syrtis Sync"
         static let keepCLI = "Keep tokscale CLI Data"
-        static let cleanupFailed = "Cursor sync is off, but some downloaded usage couldn't be deleted. Turn sync on and off again to retry."
+        static let cleanupFailed = "Cursor sync is off, but some downloaded usage couldn't be deleted. Restart Syrtis to retry."
 
         static var all: [String] {
             [title, toggle, privacy, `continue`, turnOff, lastSynced, partial, expired, notSignedIn,
