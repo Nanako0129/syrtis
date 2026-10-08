@@ -17065,6 +17065,25 @@ enum SelfTest {
             defaults.removePersistentDomain(forName: suite)
         }
 
+        // Glass tint (#490). Mutation: drop the clamp or the scale.
+        expect(GlassPanelStyle.glassTintOpacity(0) == 0
+                   && GlassPanelStyle.glassTintOpacity(1) == GlassPanelStyle.maxGlassTint
+                   && GlassPanelStyle.glassTintOpacity(0.5) == GlassPanelStyle.maxGlassTint / 2
+                   && GlassPanelStyle.glassTintOpacity(-1) == 0 && GlassPanelStyle.glassTintOpacity(3) == GlassPanelStyle.maxGlassTint
+                   && GlassPanelStyle.glassTintOpacity(.nan) == 0,
+               "GLASS-TINT slider 0...1 maps to 0...maxGlassTint, clamped, default 0 is the untinted shipping glass")
+        // Glass tint guide card. Mutation: ignore `dismissed`.
+        expect(GlassTintGuideCardView.visible(dismissed: false, glassAvailable: true, userRuntime: true)
+                   && !GlassTintGuideCardView.visible(dismissed: true, glassAvailable: true, userRuntime: true)
+                   && !GlassTintGuideCardView.visible(dismissed: false, glassAvailable: false, userRuntime: true)
+                   && !GlassTintGuideCardView.visible(dismissed: false, glassAvailable: true, userRuntime: false),
+               "GLASS-TINT guide card shows until Done, only with the glass panel and in a user session")
+        for locale in ["zh-Hant", "zh-Hans"] {
+            expect(["Glass tint", "Makes the popover's glass less see-through, so its text stays readable over the windows behind it.", GlassTintGuideCardView.copyBody, "Quick settings"]
+                       .allSatisfy { AppLanguage.localizedString($0, locale: locale, bundle: .tokenBarResources) != nil },
+                   "GLASS-TINT copy present in \(locale)")
+        }
+
         // Cursor sync: the gates in the production entry points, observed by
         // injecting the FFI calls (a real call would touch the network).
         let cursorGate: [Int]? = awaitMainActorValue {

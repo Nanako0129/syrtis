@@ -250,6 +250,21 @@ enum GlassPanelStyle {
     static let lightSecondaryText = Color.black.opacity(0.70)
     static let lightTertiaryText = Color.black.opacity(0.50)
     static let lightCardScrim = Color.black.opacity(0.04)
+    /// Settings › Glass tint (#490). `.regular` glass follows the content behind
+    /// it: in dark mode over a light window the panel turns light grey while the
+    /// text keeps its dark-mode colours (the reporter's teal wordmark nearly
+    /// vanished), and the reverse in light mode. The slider lays black (dark
+    /// mode) or white (light mode) over the glass so the panel stays on its own
+    /// mode's side. Default 0 is the shipping look: an always-on black 0.25 was
+    /// tried earlier and rejected, so the user chooses.
+    static let glassTintKey = "tokenbar.glass.tint"
+    /// Full slider = 0.5 opacity: enough to hold the mode against any window
+    /// behind it on the maintainer's check, while the glass still blurs through.
+    static let maxGlassTint = 0.5
+    /// Slider value (0...1, clamped) → tint opacity.
+    static func glassTintOpacity(_ amount: Double) -> Double {
+        min(max(amount.isFinite ? amount : 0, 0), 1) * maxGlassTint
+    }
     /// Hover tooltips under the panel: .regular glass over a scrim that keeps
     /// the text legible. 0.20 read too see-through; 0.35 is the second round.
     /// The glass was .clear until #398: it barely blurs, so a tooltip over a
@@ -318,6 +333,7 @@ extension EnvironmentValues {
 /// which washed secondary text out in light mode.
 struct GlassPanelSurface: ViewModifier {
     @Environment(\.colorScheme) private var colorScheme
+    @AppStorage(GlassPanelStyle.glassTintKey) private var glassTint = 0.0
 
     func body(content: Content) -> some View {
         let shape = RoundedRectangle(cornerRadius: GlassPanelStyle.cornerRadius)
@@ -326,11 +342,20 @@ struct GlassPanelSurface: ViewModifier {
                 .clipShape(shape)
                 .background {
                     Rectangle().fill(.clear)
-                        .glassEffect(.regular, in: .rect(cornerRadius: GlassPanelStyle.cornerRadius))
+                        .glassEffect(
+                            glass,
+                            in: .rect(cornerRadius: GlassPanelStyle.cornerRadius))
                 }
         } else {
             content
         }
+    }
+
+    @available(macOS 26.0, *)
+    private var glass: Glass {
+        let opacity = GlassPanelStyle.glassTintOpacity(glassTint)
+        guard opacity > 0 else { return .regular }
+        return .regular.tint((colorScheme == .dark ? Color.black : Color.white).opacity(opacity))
     }
 
     @ViewBuilder
