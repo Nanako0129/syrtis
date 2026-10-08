@@ -1123,6 +1123,12 @@ struct SettingsPanel: View {
                 .buttonStyle(.plain)
                 .disabled(cursorSync.syncing)
                 .padding(.horizontal, 10)
+            } else if cursorSync.cleanupFailed {
+                // The copy says sync is off, so only while the switch shows off.
+                Text(CursorSync.Copy.cleanupFailed.localized)
+                    .font(.caption2)
+                    .foregroundStyle(Color.orange)
+                    .fixedSize(horizontal: false, vertical: true)
             }
         }
     }

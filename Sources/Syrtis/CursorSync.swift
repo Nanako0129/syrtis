@@ -119,10 +119,11 @@ enum CursorSync {
         static let cliQuestion = "You also have Cursor usage from tokscale CLI on this Mac. Use Syrtis's own sync instead? Choose this only if it's the same Cursor account, or that account's usage will no longer be shown."
         static let useSyrtis = "Use Syrtis Sync"
         static let keepCLI = "Keep tokscale CLI Data"
+        static let cleanupFailed = "Cursor sync is off, but some downloaded usage couldn't be deleted. Turn sync on and off again to retry."
 
         static var all: [String] {
             [title, toggle, privacy, `continue`, turnOff, lastSynced, partial, expired, notSignedIn,
-             offline, error, cliPresent, syncNow, syncing, cliQuestion, useSyrtis, keepCLI]
+             offline, error, cliPresent, syncNow, syncing, cliQuestion, useSyrtis, keepCLI, cleanupFailed]
         }
     }
 
@@ -156,6 +157,11 @@ final class CursorSyncController: ObservableObject {
     @Published private(set) var state: String?
     @Published private(set) var lastSuccessMs: Int64?
     @Published private(set) var syncing = false
+    /// The last off push could not delete every downloaded file. Kept while
+    /// sync is on (the copy says sync is off, so Settings hides it then);
+    /// reset when the next off push starts and set from its outcome. Not
+    /// persisted: the launch push of an off preference runs the cleanup again.
+    @Published private(set) var cleanupFailed = false
 
     private var loop: Task<Void, Never>?
     /// The last config push. Each push waits for the one before it, so rapid
@@ -177,7 +183,7 @@ final class CursorSyncController: ObservableObject {
         refresh: Bool, defaults: UserDefaults = .standard,
         arguments: [String] = CommandLine.arguments,
         dir: String? = CursorSync.syncDirectory(),
-        setConfig: @escaping @Sendable (String) -> Void = { _ = try? TBCore.setCursorSync(json: $0) },
+        setConfig: @escaping @Sendable (String) -> Bool? = { (try? TBCore.setCursorSync(json: $0))?.cleanupFailed },
         sync: @escaping @Sendable (Bool) -> CursorSyncStatus? = { try? TBCore.cursorSync(explicit: $0) }
     ) {
         // Test modes make no core call at all: turning off deletes files, and
@@ -189,11 +195,16 @@ final class CursorSyncController: ObservableObject {
         generation &+= 1
         // Off deletes the synced files, so the next completed sync must
         // refresh even when it writes the same event count again.
-        if !run { state = nil; lastSuccessMs = nil; lastRefreshedEvents = nil }
+        // An off push retries the cleanup: hide the last failure until it reports.
+        if !run { state = nil; lastSuccessMs = nil; lastRefreshedEvents = nil; cleanupFailed = false }
         let previous = configPush
-        let push = Task {
+        let push = Task { [weak self] in
             await previous?.value
-            await Task.detached(priority: .utility) { setConfig(json) }.value
+            let failed = await Task.detached(priority: .utility) { setConfig(json) }.value
+            // Only an off push's outcome sets it (the copy says sync is off; an
+            // on push deletes only when the dir moves, fixed per bundle here).
+            // nil is a rejected push.
+            if !run, let failed { self?.cleanupFailed = failed }
         }
         configPush = push
         loop = Task { [weak self] in
@@ -227,6 +238,9 @@ final class CursorSyncController: ObservableObject {
             let started = generation
             // Sync against the newest configuration the core has been given.
             await configPush?.value
+            // Turned off (or reconfigured) during that wait: send nothing.
+            guard started == generation, CursorSync.shouldSync(defaults: defaults, arguments: arguments)
+            else { rerunPending = true; continue }
             let result = await Task.detached(priority: .utility) { sync(explicit) }.value
             // A reconfigure (e.g. turning sync off) happened while this ran:
             // its result describes a configuration that no longer applies.

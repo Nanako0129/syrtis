@@ -987,6 +987,7 @@ fn set_validates_and_disable_deletes_only_usage_files() {
     }
     let off = set(serde_json::json!({"enabled": false, "dir": dir})).unwrap();
     assert_eq!(off["removedFiles"], 2);
+    assert_eq!(off["cleanupFailed"], false);
     assert!(!synced.exists() && !temp.exists());
     assert!(
         unrelated.exists(),
@@ -994,6 +995,82 @@ fn set_validates_and_disable_deletes_only_usage_files() {
     );
     assert!(!config().enabled);
     set_for_test(Config::default());
+}
+
+#[cfg(unix)]
+#[test]
+fn disable_reports_a_cleanup_it_could_not_finish() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let _guard = lock();
+    set_for_test(Config::default());
+    let home = tempfile::tempdir().unwrap();
+    let dir = home.path().join("cursor-cache");
+    std::fs::create_dir_all(&dir).unwrap();
+    let set = |enabled: bool| {
+        set_from_json(
+            &serde_json::json!({"enabled": enabled, "dir": dir}).to_string(),
+            Some(home.path()),
+        )
+        .unwrap()
+    };
+    set(true);
+    let synced = dir.join("usage.not-complete.json");
+    std::fs::write(&synced, "x").unwrap();
+    // The lock file exists already, so only the delete itself is refused.
+    std::fs::write(dir.join(LOCK_FILE_NAME), "").unwrap();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let off = set(false);
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(
+        synced.exists(),
+        "fixture: the delete must have been refused"
+    );
+    assert_eq!(off["cleanupFailed"], true);
+    assert_eq!(off["removedFiles"], 0);
+
+    // Turning it on and off again retries, and a clean pass clears the flag.
+    assert_eq!(set(true)["cleanupFailed"], false);
+    let retried = set(false);
+    assert_eq!(retried["cleanupFailed"], false);
+    assert_eq!(retried["removedFiles"], 1);
+    assert!(!synced.exists());
+    set_for_test(Config::default());
+}
+
+#[cfg(unix)]
+#[test]
+fn cleanup_without_a_lock_fails_only_when_files_of_ours_remain() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let mode = |path: &Path, mode: u32| {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap()
+    };
+    let home = tempfile::tempdir().unwrap();
+    let dir = home.path().join("cursor-cache");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("keep.txt"), "x").unwrap();
+
+    // Read-only, no lock file (it cannot be created) and nothing of ours.
+    mode(&dir, 0o500);
+    let empty = remove_usage_files_locked(&dir);
+    mode(&dir, 0o700);
+    assert_eq!(empty, (0, false), "nothing of ours: not a failure");
+
+    // Same, with a synced file left behind (control).
+    std::fs::write(dir.join("usage.x.json"), "x").unwrap();
+    mode(&dir, 0o500);
+    let stuck = remove_usage_files_locked(&dir);
+    mode(&dir, 0o700);
+    assert_eq!(stuck, (0, true));
+
+    // A dir that cannot even be examined is a failure, not "missing".
+    mode(home.path(), 0o000);
+    let unreadable = remove_usage_files_locked(&dir);
+    mode(home.path(), 0o700);
+    assert_eq!(unreadable, (0, true));
+    assert_eq!(
+        remove_usage_files_locked(&home.path().join("absent")),
+        (0, false)
+    );
 }
 
 // --- takeover ------------------------------------------------------------------

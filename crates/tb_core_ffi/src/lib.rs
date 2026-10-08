@@ -1486,7 +1486,9 @@ fn invalidate_scan_caches() {
 /// outside `~/.config/tokscale`. Full replace; in-memory, default off, so the
 /// caller re-applies it at launch. Turning sync off (or moving `dir`) deletes
 /// the Syrtis usage files from the dir no longer in use. Success data is
-/// `{"enabled","dir","cliTakeoverConfirmed","removedFiles":N}`; invalid input
+/// `{"enabled","dir","cliTakeoverConfirmed","removedFiles":N,"cleanupFailed":bool}`
+/// (`cleanupFailed`: some of those files could not be deleted, or the dir
+/// could not be examined); invalid input
 /// is an error and leaves the registry unchanged. Invalidates the scan
 /// caches, since the takeover depends on every field.
 ///

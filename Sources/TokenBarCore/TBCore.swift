@@ -169,6 +169,8 @@ public struct CursorSyncConfigResult: Decodable, Equatable, Sendable {
     public let cliTakeoverConfirmed: Bool
     /// Syrtis usage files deleted because sync was turned off or moved.
     public let removedFiles: Int
+    /// Some of those files could not be deleted.
+    public let cleanupFailed: Bool
 }
 
 /// Result of `tb_cursor_sync`.
