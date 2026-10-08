@@ -99,6 +99,7 @@ struct OnboardingSetupCards: View {
             AnimationPaceOnboardingCardView()
             AttributionOnboardingCardView(modelReport: modelReport, agentUsage: agentUsage)
             CursorSyncNoticeCardView()
+            GlassTintGuideCardView()
             OnboardingCardContainer(visible: loginAvailable && shows(.login, loginAnswered)) {
                 LoginCard()
             }
