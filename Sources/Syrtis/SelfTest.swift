@@ -924,6 +924,171 @@ private struct DashboardModelTestObservation: Sendable {
 }
 
 enum SelfTest {
+    /// Opt-in WindowServer check; the normal selftest remains UI-free.
+    @MainActor static func runChartInput() -> Never {
+        setvbuf(stdout, nil, _IONBF, 0)
+        guard #available(macOS 27.0, *), CommandLine.arguments.contains("--demo") else {
+            print("chart input selftest requires macOS 27+ and --demo")
+            exit(2)
+        }
+        let previousApp = NSWorkspace.shared.frontmostApplication
+        let app = NSApplication.shared
+        _ = NotificationCenter.default.addObserver(
+            forName: NSApplication.didFinishLaunchingNotification, object: app, queue: .main
+        ) { _ in
+            Task { @MainActor in
+                NSApp.setActivationPolicy(.accessory)
+                exit(await chartInputChecks(previousApp: previousApp))
+            }
+        }
+        app.run()
+        exit(1)
+    }
+
+    @MainActor private static func chartInputChecks(previousApp: NSRunningApplication?) async
+        -> Int32
+    {
+        var failures: Int32 = 0
+        func expect(_ condition: Bool, _ label: String) {
+            print("\(condition ? "ok  " : "FAIL") chart input: \(label)")
+            if !condition { failures += 1 }
+        }
+        func waitUntil(_ condition: () -> Bool) async -> Bool {
+            let deadline = Date().addingTimeInterval(5)
+            while !condition(), Date() < deadline {
+                try? await Task.sleep(for: .milliseconds(20))
+            }
+            return condition()
+        }
+        func findChart(in view: NSView) -> ContributionGraphView? {
+            if let chart = view as? ContributionGraphView { return chart }
+            return view.subviews.lazy.compactMap { findChart(in: $0) }.first
+        }
+        guard let previousApp,
+            previousApp.processIdentifier != ProcessInfo.processInfo.processIdentifier
+        else {
+            expect(false, "test requires another foreground app")
+            return failures
+        }
+        let defaults = UserDefaults.standard
+        let domain = Bundle.main.bundleIdentifier ?? "Syrtis"
+        let saved = defaults.persistentDomain(forName: domain)
+        var arguments = defaults.volatileDomain(forName: UserDefaults.argumentDomain)
+        arguments.merge([
+            "tokenbar.chart.view": "3d", ClientTray.activeTabKey: ClientTray.overviewTab,
+            ClientTray.activeViewKey: AppView.overview.rawValue, "tokenbar.views.hidden": "",
+            "tokenbar.dashboard.year": "", OverviewCard.hiddenKey: "", PopoverChrome.heightKey: 560,
+        ]) { _, test in test }
+        defaults.setVolatileDomain(arguments, forName: UserDefaults.argumentDomain)
+        DemoData.ignoreLocalVisibility()
+        let controller = StatusItemController()
+        controller.updateTitle("Input test")
+        defer {
+            controller.tearDown()
+            if let saved {
+                defaults.setPersistentDomain(saved, forName: domain)
+            } else {
+                defaults.removePersistentDomain(forName: domain)
+            }
+            previousApp.activate(options: [])
+        }
+        // A nonactivating panel can set isActive without becoming frontmost.
+        let ownPID = ProcessInfo.processInfo.processIdentifier
+        NSApp.activate(ignoringOtherApps: true)
+        guard
+            await waitUntil({
+                NSApp.isActive
+                    && NSWorkspace.shared.frontmostApplication?.processIdentifier == ownPID
+            })
+        else {
+            expect(false, "test setup can activate the app")
+            return failures
+        }
+        NSApp.yieldActivation(to: previousApp)
+        previousApp.activate(options: [])
+        guard
+            await waitUntil({
+                !NSApp.isActive
+                    && NSWorkspace.shared.frontmostApplication?.processIdentifier
+                        == previousApp.processIdentifier
+            })
+        else {
+            expect(false, "starts inactive")
+            return failures
+        }
+        expect(true, "starts inactive")
+        controller.showPopover()
+        guard
+            await waitUntil({
+                NSApp.isActive
+                    && NSWorkspace.shared.frontmostApplication?.processIdentifier == ownPID
+            })
+        else {
+            expect(false, "presentation activates the app")
+            return failures
+        }
+        expect(true, "presentation activates the app")
+        var chart: ContributionGraphView?
+        _ = await waitUntil {
+            chart = NSApp.windows.compactMap { $0.contentView.flatMap(findChart) }.first
+            return chart?.bounds.height ?? 0 > 0
+        }
+        guard let chart, let window = chart.window, let scrollView = chart.enclosingScrollView
+        else {
+            expect(false, "real dashboard hosts the 3D chart in its ScrollView")
+            return failures
+        }
+        // The new status item may not have a menu-bar position yet.
+        window.center()
+        expect(
+            await waitUntil({
+                window is GlassPanel && window.isKeyWindow && window.alphaValue == 1
+                    && window.contentView?.layer?.animationKeys()?.isEmpty != false
+            }),
+            "chart belongs to the presented key glass panel")
+        let point = chart.convert(
+            NSPoint(x: chart.visibleRect.midX, y: chart.visibleRect.midY), to: nil)
+        let screenPoint = window.convertPoint(toScreen: point)
+        chart.rig.scale = 26
+        chart.rig.apply()
+        let beforeScroll = scrollView.contentView.bounds.origin
+        let beforeScale = chart.rig.scale
+        for _ in 0..<3 {
+            let scroll = CGEvent(
+                scrollWheelEvent2Source: nil, units: .line,
+                wheelCount: 1, wheel1: -3, wheel2: 0, wheel3: 0)!
+            scroll.flags = []
+            scroll.location = CGPoint(
+                x: screenPoint.x, y: CGDisplayBounds(CGMainDisplayID()).height - screenPoint.y)
+            chart.scrollWheel(with: NSEvent(cgEvent: scroll)!)
+            try? await Task.sleep(for: .milliseconds(100))
+        }
+        _ = await waitUntil {
+            scrollView.contentView.bounds.origin != beforeScroll
+                || chart.rig.scale != beforeScale || !window.isVisible
+        }
+        guard window.isVisible, window.isKeyWindow, chart.window === window else {
+            expect(
+                false,
+                "test interrupted: panel visible=\(window.isVisible), key=\(window.isKeyWindow), "
+                    + "chart attached=\(chart.window === window); avoid switching windows")
+            return 1
+        }
+        expect(
+            scrollView.contentView.bounds.origin.y > beforeScroll.y,
+            "ordinary scroll moves the page")
+        expect(chart.rig.scale == beforeScale, "ordinary scroll preserves chart zoom")
+        let beforePinch = chart.rig.scale
+        let beforePinchScroll = scrollView.contentView.bounds.origin
+        chart.magnify(with: ChartMagnifyEvent())
+        expect(chart.rig.scale < beforePinch, "hosted chart handles magnify after presentation")
+        expect(
+            scrollView.contentView.bounds.origin == beforePinchScroll,
+            "magnify preserves page position")
+        print("chart input selftest \(failures == 0 ? "passed" : "failed")")
+        return failures == 0 ? 0 : 1
+    }
+
     @MainActor static func run() -> Never {
         var failures = 0
         func expect(_ condition: @autoclosure () -> Bool, _ label: String) {
