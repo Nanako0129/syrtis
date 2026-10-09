@@ -27,8 +27,9 @@ public enum ClientRegistry {
         // 70% "Codex Desktop", 4% CLI). `copilot` merges the CLI/VS Code OTel
         // export with the desktop app's ~/.copilot/data.db. `cursor` is not a
         // session parser at all — it reads Cursor's account usage export CSV,
-        // which bills IDE, cursor-agent and cloud agents into one undifferentiated
-        // ledger.
+        // which bills IDE, cursor-agent and cloud agents into one ledger. The one
+        // split is engine #69: events whose model starts with `grok-bot` are
+        // logged under `grok-bot` instead.
         "codex": ("Codex", "#9ca3af"),
         "copilot": ("Copilot", "#1f2937"),
         "cursor": ("Cursor", "#0ea5e9"),
@@ -211,9 +212,8 @@ public enum ClientRegistry {
 
     // MARK: - Grouped tabs
 
-    /// Tabs that group more than one client id under a single top tab: one
-    /// member carries local session usage, the other only a cloud quota with
-    /// no usage of its own. Single table backing `tabSlice`, `tabClients`, and
+    /// Tabs that group more than one client id under a single top tab, each
+    /// member keeping its own quota card and usage identity. Single table backing `tabSlice`, `tabClients`, and
     /// `tabLabel` — three separate ternaries is how a second group (Antigravity
     /// IDE + CLI, alongside Grok Build + Bot) would drift from the first.
     private static let tabGroups: [String: (members: [String], label: String)] = [
@@ -234,8 +234,8 @@ public enum ClientRegistry {
     }
 
     /// Client ids behind a top tab. The "grok" tab is a group: Grok Build
-    /// (local CLI session logs) and Grok Bot (Cursor-billed cloud quota) are
-    /// different data sources shown as two sections under one tab. Same
+    /// (local CLI session logs) and Grok Bot (its own quota, plus the usage
+    /// engine #69 splits out of Cursor's ledger) are different data sources shown as two sections under one tab. Same
     /// arrangement for "antigravity": the CLI carries the usage, the IDE
     /// client carries the quota.
     public static func tabSlice(_ id: String) -> [String] {
@@ -252,17 +252,21 @@ public enum ClientRegistry {
 
     /// Quota curves use provider ids, never the grouped navigation ids alone.
     /// Keep local clients for loading/error cards and add quota-only providers.
-    /// A present client is folded to its tab before slicing, so a member with
-    /// local records (`antigravity-cli`) brings its whole group: otherwise,
-    /// before the first payload or with Antigravity unconfigured, the tab's
-    /// card fell to `antigravity-cli`, which has no quota history (Windows #219).
+    /// A present client is folded to the subscription it spends (`quotaOwner`)
+    /// before slicing, so `antigravity-cli` with local records brings its whole
+    /// group: otherwise, before the first payload or with Antigravity
+    /// unconfigured, the tab's card fell to `antigravity-cli`, which has no
+    /// quota history (Windows #219). Not to its tab: once engine #69 made Grok
+    /// Bot's usage local, folding `grok-bot` to `grok` put the tab id itself in
+    /// the list and a Bot-only user's Grok tab drew Grok Build's card, which has
+    /// no window (same fix as Syrtis-Windows #246, 0956928).
     public static func quotaClients(
         present: [String], quotaIds: [String], tabHidden: Set<String>,
         orderRaw: String
     ) -> [String] {
         let hidden = hiddenTabClients(tabHidden)
         var seen = Set<String>()
-        let ids = (present.map { memberToTabId[$0] ?? $0 }.flatMap(tabSlice) + quotaIds)
+        let ids = (present.map(quotaOwner).flatMap(tabSlice) + quotaIds)
             .filter { !hidden.contains($0) && seen.insert($0).inserted }
         return orderedClients(ids, orderRaw: orderRaw)
     }
@@ -279,7 +283,7 @@ public enum ClientRegistry {
     }
 
     /// Expand a hidden set so group members follow their tab: hiding the
-    /// "grok" tab also hides the quota-only "grok-bot" row (which has no tab
+    /// "grok" tab also hides the "grok-bot" row (which has no tab
     /// of its own to hide), and likewise "antigravity" / "antigravity-cli".
     /// Explicit member entries (e.g. "grok-bot" alone) pass through unchanged,
     /// so an independent limits-toggle on a member row keeps working.
@@ -422,10 +426,9 @@ public enum ClientRegistry {
     /// either kind of lookup hits. Idempotent, and a no-op for every ungrouped
     /// client.
     ///
-    /// Grok has the same shape and never showed it: `grok-bot` publishes no
-    /// local usage, so no contribution row carries its id and the client-id half
-    /// had nothing to get wrong. `antigravity-cli` does publish usage, which is
-    /// what made the omission visible.
+    /// Grok has the same shape: since engine #69, `grok-bot` publishes usage
+    /// too, so its contribution rows rely on this expansion exactly as
+    /// `antigravity-cli`'s do. Antigravity is where the omission first showed.
     ///
     /// Tab visibility only. `limitsHidden` stays member-specific in both
     /// directions — each member keeps its own quota card under the shared tab,

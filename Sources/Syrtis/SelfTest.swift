@@ -2075,6 +2075,19 @@ enum SelfTest {
                 sourceClient: "cursor", provider: "xai",
                 subscriptionClients: ["grok"]) == .assigned("cursor"),
             "cursor's bundled grok is cursor's own spend")
+        // D6 (grok-bot plan): a Grok Bot row is Grok Bot's own spend, and the plan never competes for another
+        // client's xai rows. Mutation: drop `ownRowsOnlySubscriptions` from `owners` -> the codex|xai row with both
+        // grok and grok-bot subscribed becomes ambiguous (nil) instead of .assigned("grok").
+        expect(
+            UsageAttributionSettings.suggestionTarget(
+                sourceClient: "grok-bot", provider: "xai",
+                subscriptionClients: ["grok", "grok-bot"]) == .assigned("grok-bot"),
+            "a grok-bot xai row is Grok Bot's own spend")
+        expect(
+            UsageAttributionSettings.suggestionTarget(
+                sourceClient: "codex", provider: "xai",
+                subscriptionClients: ["grok", "grok-bot"]) == .assigned("grok"),
+            "xai reached from another client still spends grok, not grok-bot, when both are subscribed")
         // The two policies contradict each other, so no provider may appear in
         // both — otherwise which one wins depends on the order of the branches.
         expect(
@@ -19775,6 +19788,14 @@ enum SelfTest {
         expect(wcpGate("antigravity", present: ["antigravity-cli"], quota: wcpCliOnlyQuota)
                    == "antigravity/antigravity",
                "WCP2-gate antigravity-cli records alone: the tab's card is antigravity's, never antigravity-cli's; got \(wcpCliOnlyQuota)")
+        // Grok Bot-only with its usage now local (engine #69 attributes Cursor's Grok Bot events to grok-bot): the
+        // tab's card stays Grok Bot's. Folding a present member to its tab (grok-bot -> grok) put "grok" itself in
+        // quotaClients and the gate picked Grok Build's card, which has no window (found by W5-7 reading #499).
+        // Mutation: fold present through memberToTabId again.
+        let wcpBotOnlyQuota = ClientRegistry.quotaClients(
+            present: ["grok-bot"], quotaIds: ["grok-bot"], tabHidden: [], orderRaw: "")
+        expect(wcpGate("grok", present: ["grok-bot"], quota: wcpBotOnlyQuota) == "grok-bot/grok-bot",
+               "WCP2-gate Grok Bot usage alone: the Grok tab's card is Grok Bot's; got \(wcpGate("grok", present: ["grok-bot"], quota: wcpBotOnlyQuota)) from \(wcpBotOnlyQuota)")
         expect(wcpGate("claude", present: ["claude"], quota: ["claude"]) == "claude/claude",
                "WCP2-gate control: a tab with local records gets both, the same id")
         expect(wcpGate("claude", present: ["claude"], quota: ["claude"], excluded: ["claude"]) == "nil/nil"
