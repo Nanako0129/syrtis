@@ -645,17 +645,28 @@ final class TrayAnimator {
         }
     }
 
-    /// What both poll loops await before a quota fetch. Off: nothing reaches
-    /// the core. On: the marker is read and a changed login forgets the
-    /// current account before the fetch; the returned capture attempt runs on
-    /// its own.
+    /// What both poll loops await before a quota fetch. Off: the capture
+    /// machinery does not run (no marker query); only the stored binding is
+    /// handed to the core, whose live marker check decides whether it is used.
+    /// On: the marker is read and a changed login forgets the current account
+    /// first, THEN the binding is handed over, so a cleared binding reaches
+    /// the core before the fetch; the returned capture attempt runs on its own.
+    /// `setBinding` is the test seam (default: the real core call; it holds no
+    /// secret and an invalid binding is cleared by the core).
     @discardableResult
     static func prepareAntigravityAutoCapture(
         defaults: UserDefaults = .standard,
-        autoCapture: AntigravityAutoCapture? = nil
+        autoCapture: AntigravityAutoCapture? = nil,
+        setBinding: (String?, String?) -> Void = { _ = try? TBCore.setAntigravityBinding(key: $0, marker: $1) }
     ) async -> Task<Void, Never>? {
-        guard defaults.bool(forKey: AntigravityAutoCapture.enabledKey) else { return nil }
-        return await (autoCapture ?? .shared).prepareForFetch()
+        let capture = autoCapture ?? .shared
+        guard defaults.bool(forKey: AntigravityAutoCapture.enabledKey) else {
+            setBinding(capture.currentAgyKey, capture.currentAgyMarker)
+            return nil
+        }
+        let task = await capture.prepareForFetch()
+        setBinding(capture.currentAgyKey, capture.currentAgyMarker)
+        return task
     }
 
     /// The raw tokens/min value from the last load poll — exposed so the

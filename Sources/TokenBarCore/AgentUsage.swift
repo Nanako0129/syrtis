@@ -545,6 +545,10 @@ public struct AgentUsageSnapshot: Decodable, Sendable {
     /// Antigravity primary on the agy route only: agy's login-item date read
     /// just before this card was fetched. Display-only (Antigravity dedup).
     public let agyLoginMarker: String?
+    /// Antigravity primary substituted from the bound captured account's OAuth
+    /// result (`source == "oauth"`): that account's key. Absent on every other
+    /// card. No secret; compared by Antigravity dedup only.
+    public let boundAccountKey: String?
     /// Swift-only, never decoded: the captured account whose recorded history
     /// this card's windows answer from. Set only by `adoptingHistory(of:)`
     /// (Antigravity dedup merging the agy-route primary with its captured
@@ -556,7 +560,7 @@ public struct AgentUsageSnapshot: Decodable, Sendable {
 
     private enum CodingKeys: String, CodingKey {
         case clientId, accountKey, source, updatedAt, identity, windows, credits, error,
-            transportDiagnostic, agyLoginMarker
+            transportDiagnostic, agyLoginMarker, boundAccountKey
     }
 
     public init(from decoder: Decoder) throws {
@@ -572,6 +576,7 @@ public struct AgentUsageSnapshot: Decodable, Sendable {
         self.transportDiagnostic = try? container.decode(
             AgentUsageTransportDiagnostic.self, forKey: .transportDiagnostic)
         self.agyLoginMarker = try container.decodeIfPresent(String.self, forKey: .agyLoginMarker)
+        self.boundAccountKey = try container.decodeIfPresent(String.self, forKey: .boundAccountKey)
     }
 
     /// Backend `source` values that mean "this card is waiting on the user",
@@ -924,6 +929,7 @@ extension AgentUsageSnapshot {
         error = other.error
         transportDiagnostic = other.transportDiagnostic
         agyLoginMarker = other.agyLoginMarker
+        boundAccountKey = other.boundAccountKey
         self.historyAccountKey = historyAccountKey ?? other.historyAccountKey
     }
 }
