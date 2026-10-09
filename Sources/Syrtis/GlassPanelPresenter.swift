@@ -363,7 +363,7 @@ extension EnvironmentValues {
 /// which washed secondary text out in light mode.
 struct GlassPanelSurface: ViewModifier {
     @Environment(\.colorScheme) private var colorScheme
-    @AppStorage(GlassPanelStyle.glassTintKey) private var glassTint = 0.0
+    @ObservedObject private var glassTint = GlassTint.shared
 
     func body(content: Content) -> some View {
         let shape = RoundedRectangle(cornerRadius: GlassPanelStyle.cornerRadius)
@@ -383,7 +383,7 @@ struct GlassPanelSurface: ViewModifier {
 
     @available(macOS 26.0, *)
     private var glass: Glass {
-        let opacity = GlassPanelStyle.glassTintOpacity(glassTint)
+        let opacity = GlassPanelStyle.glassTintOpacity(glassTint.value)
         guard opacity > 0 else { return .regular }
         return .regular.tint((colorScheme == .dark ? Color.black : Color.white).opacity(opacity))
     }
