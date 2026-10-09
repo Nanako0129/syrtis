@@ -3,6 +3,28 @@
     <channel>
         <title>TokenBar updates</title>
         <item>
+            <title>2.6.0</title>
+            <pubDate>Fri, 09 Oct 2026 16:44:36 +0000</pubDate>
+            <link>https://github.com/Nanako0129/syrtis/releases/tag/v2.6.0</link>
+            <sparkle:version>1559</sparkle:version>
+            <sparkle:shortVersionString>2.6.0</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
+            <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
+            <description><![CDATA[<b>Features:</b>
+<ul>
+<li>Glass tint (macOS 27): a slider tints the popover's glass, darker in dark mode and lighter in light mode, so its text stays readable over the windows behind it. It's in Settings -&gt; Dashboard -&gt; Glass tint and in Quick settings (slider icon at the top right of the popover). Thanks @Lanternko.</li>
+<li>Scrolling over the 3D chart now scrolls the page; pinch or Command + scroll zooms, and a hint on the chart says so. On macOS 27, closing the popover returns you to the app you were in. Thanks @blankhoney.</li>
+</ul>
+<b>Fixes:</b>
+<ul>
+<li>Reset on the 3D chart now returns to the starting angle.</li>
+<li>Option-drag and right-drag on the 3D chart now follow the pointer up and down.</li>
+<li>Turning off Cursor usage sync while a sync was waiting to start no longer sends a request, and Settings now says when the downloaded usage couldn't be deleted (restart Syrtis to retry).</li>
+</ul>
+]]></description>
+            <enclosure url="https://github.com/Nanako0129/syrtis/releases/download/v2.6.0/Syrtis.app.tar.gz" length="13928157" type="application/octet-stream" sparkle:edSignature="AMJ5KxLY2F8+zo2t79/CsYuD4h9hQ+o/G8tE2i8v2iyuklUN0kKqKpP54NVy5wAhJyiObyYMCbCHDTVienQ+BQ=="/>
+        </item>
+        <item>
             <title>2.5.0</title>
             <pubDate>Tue, 06 Oct 2026 20:27:34 +0000</pubDate>
             <link>https://github.com/Nanako0129/syrtis/releases/tag/v2.5.0</link>
@@ -93,32 +115,6 @@
 <p>The first scan after updating takes longer if you use Kiro or Pi, while their sessions are read again.</p>
 ]]></description>
             <enclosure url="https://github.com/Nanako0129/syrtis/releases/download/v2.3.0/Syrtis.app.tar.gz" length="13582364" type="application/octet-stream" sparkle:edSignature="frdMze9L2cyZjjd1lnHXM+TMfrPcCVua+jcD3b41eVhLBFdvfidLQfUvJhw/RCNUgHz9DG+3AxBQe9uFKK+nAQ=="/>
-        </item>
-        <item>
-            <title>2.2.0</title>
-            <pubDate>Mon, 28 Sep 2026 15:00:41 +0000</pubDate>
-            <link>https://github.com/Nanako0129/syrtis/releases/tag/v2.2.0</link>
-            <sparkle:version>1407</sparkle:version>
-            <sparkle:shortVersionString>2.2.0</sparkle:shortVersionString>
-            <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
-            <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
-            <description><![CDATA[<b>Features:</b>
-<ul>
-<li>Releases are signed with a Developer ID and notarized by Apple. macOS opens a downloaded Syrtis without a Gatekeeper warning, and the Homebrew cask no longer removes the quarantine flag. Installed copies update in the app as before.</li>
-<li>Each release has an installer DMG (Syrtis-2.2.0.dmg) on the release page. In-app updates and the Homebrew cask keep using the tar.gz.</li>
-<li>A new animated menu bar icon, Sand shoal: sand falls onto a dune while a current carries grains away, at 24 fps in four levels set by the live token rate (50K, 300K and 1.5M tokens per minute at the default pace). Suggested on Discord by charliie.</li>
-<li>Animated icons follow a new speed curve: 2 fps up to 50K tokens per minute, then a log curve to 40 fps at 3M. A pace choice under Settings -&gt; Menubar icon scales it: Light reaches full speed at 600K, Moderate (the default) at 3M, Heavy at about 10M.</li>
-<li>Setup cards at the top of the Overview cover agent tabs, the menu bar icon and text, animation pace, usage attribution, start at login and the Discord profile. Existing users see them once too; "Skip setup" answers the rest. The Discord card replaces the launch-time Discord alert and does not turn the profile on.</li>
-</ul>
-<b>Fixes:</b>
-<ul>
-<li>With no quota reading, the menu bar gauge looked like a full allowance. It is now drawn faded with a diagonal slash.</li>
-<li>A reading more than 30 minutes old greyed the gauge but not the "Quota left" title; the title now turns the same grey.</li>
-<li>A new Settings page, or a new tab or view in the dashboard, now starts at the top instead of keeping the previous scroll position.</li>
-<li>Two Settings hints described behavior the app does not have: Data refresh and the Overview card order. The Settings hints were rewritten in plainer language.</li>
-</ul>
-]]></description>
-            <enclosure url="https://github.com/Nanako0129/syrtis/releases/download/v2.2.0/Syrtis.app.tar.gz" length="13107591" type="application/octet-stream" sparkle:edSignature="emdig/UEObUC8IjZ0JHz7la0ZE+3N+HKyLWSWwB4Y1c3voYOiRgCPs3AWSsJTI3FdIWBaMnUZUJY8Kxyx5oMDA=="/>
         </item>
         <item>
             <title>1.1.1</title>
