@@ -1,0 +1,8 @@
+Features:
+- Glass tint (macOS 27): a slider tints the popover's glass, darker in dark mode and lighter in light mode, so its text stays readable over the windows behind it. It's in Settings -> Dashboard -> Glass tint and in Quick settings (slider icon at the top right of the popover). Thanks @Lanternko.
+- Scrolling over the 3D chart now scrolls the page; pinch or Command + scroll zooms, and a hint on the chart says so. On macOS 27, closing the popover returns you to the app you were in. Thanks @blankhoney.
+
+Fixes:
+- Reset on the 3D chart now returns to the starting angle.
+- Option-drag and right-drag on the 3D chart now follow the pointer up and down.
+- Turning off Cursor usage sync while a sync was waiting to start no longer sends a request, and Settings now says when the downloaded usage couldn't be deleted (restart Syrtis to retry).
