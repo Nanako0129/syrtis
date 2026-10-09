@@ -107,7 +107,7 @@ final class OrbitRig {
         azimuth -= Double(dx) * 0.01 * 0.7 // OrbitControls rotateSpeed 0.7
         elevation += Double(dy) * 0.01 * 0.7
         apply()
-        persist()
+        persistSoon()
     }
 
     func pan(dx: CGFloat, dy: CGFloat, viewHeightPx: CGFloat) {
@@ -121,21 +121,44 @@ final class OrbitRig {
         target -= right * Double(dx) * worldPerPixel
         target += up * Double(dy) * worldPerPixel
         apply()
-        persist()
+        persistSoon()
     }
 
     func zoom(deltaY: CGFloat) {
         scale *= exp(Double(deltaY) * 0.02)
         apply()
-        persist()
+        persistSoon()
     }
 
     // MARK: Persistence
 
+    /// Writing the camera on every drag, scroll or pinch event starved the chart of input: each UserDefaults
+    /// write wakes the app's three `didChangeNotification` observers on the main thread (the notification names
+    /// no key), and AppKit coalesced the drag events in the meantime. Measured on the maintainer's Mac
+    /// (2026-10-10, a throwaway probe build): 4-26 input events per 2 s with a write per event, up to 151 without,
+    /// and the drag felt smooth only without. So gestures save once, `saveDelay` after the last change.
+    static let saveDelay: TimeInterval = 0.5
+    private var pendingSave: DispatchWorkItem?
+
+    private var encoded: String {
+        [azimuth, elevation, scale, target.x, target.y, target.z].map { String($0) }.joined(separator: ",")
+    }
+
+    /// Save now (Fit, Reset), dropping a gesture's pending save so it cannot overwrite this camera later.
     func persist() {
-        let values = [azimuth, elevation, scale, target.x, target.y, target.z]
-        let raw = values.map { String($0) }.joined(separator: ",")
-        UserDefaults.standard.set(raw, forKey: Self.storageKey)
+        pendingSave?.cancel()
+        pendingSave = nil
+        UserDefaults.standard.set(encoded, forKey: Self.storageKey)
+    }
+
+    /// Save once the gesture has paused. The value is captured now, so the write still happens if the chart is
+    /// torn down (the popover closed) before the delay ends.
+    func persistSoon() {
+        pendingSave?.cancel()
+        let raw = encoded
+        let save = DispatchWorkItem { UserDefaults.standard.set(raw, forKey: OrbitRig.storageKey) }
+        pendingSave = save
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.saveDelay, execute: save)
     }
 
     /// True when a saved camera was restored (skip the initial auto-fit).
