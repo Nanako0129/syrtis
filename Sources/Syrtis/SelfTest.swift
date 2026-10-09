@@ -17298,6 +17298,23 @@ enum SelfTest {
                    && GlassPanelStyle.glassTintOpacity(-1) == 0 && GlassPanelStyle.glassTintOpacity(3) == GlassPanelStyle.maxGlassTint
                    && GlassPanelStyle.glassTintOpacity(.nan) == 0,
                "GLASS-TINT slider 0...1 maps to 0...maxGlassTint, clamped, default 0 is the untinted shipping glass")
+        // Dragging the slider writes the default once, after the drag pauses (a write per step stuttered).
+        // Mutation: write in `didSet` instead of scheduling -> the burst writes at once.
+        let tintSave: [Bool]? = awaitMainActorValue {
+            let suite = "tokenbar.selftest.glassTintSave"
+            let defaults = UserDefaults(suiteName: suite)!
+            defer { defaults.removePersistentDomain(forName: suite) }
+            defaults.removePersistentDomain(forName: suite)
+            let tint = GlassTint(defaults: defaults)
+            for step in 1...20 { tint.value = Double(step) / 40 }
+            let noWriteWhileDragging = defaults.object(forKey: GlassPanelStyle.glassTintKey) == nil
+            try? await Task.sleep(nanoseconds: UInt64((GlassTint.saveDelay + 0.3) * 1e9))
+            let savedOnPause = defaults.double(forKey: GlassPanelStyle.glassTintKey) == 0.5
+            let reread = GlassTint(defaults: defaults).value == 0.5
+            return [noWriteWhileDragging, savedOnPause, reread]
+        }
+        expect(tintSave == [true, true, true],
+               "GLASS-TINT no save while dragging, one save of the last value once it pauses, read back on the next launch; got \(String(describing: tintSave))")
         // Glass tint guide card. Mutation: ignore `dismissed`.
         expect(GlassTintGuideCardView.visible(dismissed: false, glassAvailable: true, userRuntime: true)
                    && !GlassTintGuideCardView.visible(dismissed: true, glassAvailable: true, userRuntime: true)
