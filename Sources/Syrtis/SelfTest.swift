@@ -9248,6 +9248,8 @@ enum SelfTest {
             let defaults = UserDefaults.standard
             let saved = defaults.object(forKey: OrbitRig.storageKey)
             defer { defaults.set(saved, forKey: OrbitRig.storageKey) }
+            // Earlier 3D checks leave a gesture save queued (one queue for every rig): land it before clearing.
+            OrbitRig.flushPendingSave()
             defaults.removeObject(forKey: OrbitRig.storageKey)
             let rig = OrbitRig()
             for _ in 0..<20 {
@@ -9265,10 +9267,23 @@ enum SelfTest {
             let resetAzimuth = rig.azimuth
             try? await Task.sleep(nanoseconds: UInt64((OrbitRig.saveDelay + 0.3) * 1e9))
             let afterReset = OrbitRig()
-            return [noWriteDuringGesture, savedOnPause, abs(afterReset.azimuth - resetAzimuth) < 1e-9]
+            // The chart closed mid-delay and reopened at once: the new rig restores the closed chart's gesture,
+            // and its own Reset is not overwritten when the old save's delay ends.
+            // Mutation: pendingSave per rig (not static) or no flush at init.
+            let closing = OrbitRig()
+            closing.orbit(dx: 60, dy: 0)
+            let reopened = OrbitRig()
+            let reopenSeesGesture = abs(reopened.azimuth - closing.azimuth) < 1e-9
+            reopened.resetAngle()
+            reopened.persist()
+            let reopenedAzimuth = reopened.azimuth
+            try? await Task.sleep(nanoseconds: UInt64((OrbitRig.saveDelay + 0.3) * 1e9))
+            let afterOldDelay = OrbitRig()
+            return [noWriteDuringGesture, savedOnPause, abs(afterReset.azimuth - resetAzimuth) < 1e-9,
+                    reopenSeesGesture, abs(afterOldDelay.azimuth - reopenedAzimuth) < 1e-9]
         }
-        expect(cameraSave == [true, true, true],
-               "3D camera: no save while a gesture runs, one save once it pauses, and Fit/Reset's save is not overwritten; got \(String(describing: cameraSave))")
+        expect(cameraSave == [true, true, true, true, true],
+               "3D camera: no save while a gesture runs, one save once it pauses, Fit/Reset's save is not overwritten, and a chart reopened within the delay restores the gesture and keeps its own Reset; got \(String(describing: cameraSave))")
 
         // MARK: - FLAT-HEATMAP (contract suite; decision table in issue #157)
         //

@@ -87,6 +87,8 @@ final class OrbitRig {
         camera.zNear = -1000
         camera.zFar = 1000
         cameraNode.camera = camera
+        // A chart closed mid-delay leaves its gesture's save queued: land it first, so this rig restores it.
+        Self.flushPendingSave()
         restore()
         apply()
     }
@@ -138,7 +140,17 @@ final class OrbitRig {
     /// (2026-10-10, a throwaway probe build): 4-26 input events per 2 s with a write per event, up to 151 without,
     /// and the drag felt smooth only without. So gestures save once, `saveDelay` after the last change.
     static let saveDelay: TimeInterval = 0.5
-    private var pendingSave: DispatchWorkItem?
+    /// One pending save for every rig: a chart reopened within `saveDelay` gets a new rig, and its Fit/Reset
+    /// must still cancel the closed chart's queued save (CodeRabbit on #498).
+    private static var pendingSave: (work: DispatchWorkItem, raw: String)?
+
+    /// Write a queued gesture save now, if any.
+    static func flushPendingSave() {
+        guard let pending = pendingSave else { return }
+        pending.work.cancel()
+        pendingSave = nil
+        UserDefaults.standard.set(pending.raw, forKey: storageKey)
+    }
 
     private var encoded: String {
         [azimuth, elevation, scale, target.x, target.y, target.z].map { String($0) }.joined(separator: ",")
@@ -146,18 +158,23 @@ final class OrbitRig {
 
     /// Save now (Fit, Reset), dropping a gesture's pending save so it cannot overwrite this camera later.
     func persist() {
-        pendingSave?.cancel()
-        pendingSave = nil
+        Self.pendingSave?.work.cancel()
+        Self.pendingSave = nil
         UserDefaults.standard.set(encoded, forKey: Self.storageKey)
     }
 
     /// Save once the gesture has paused. The value is captured now, so the write still happens if the chart is
     /// torn down (the popover closed) before the delay ends.
     func persistSoon() {
-        pendingSave?.cancel()
+        Self.pendingSave?.work.cancel()
         let raw = encoded
-        let save = DispatchWorkItem { UserDefaults.standard.set(raw, forKey: OrbitRig.storageKey) }
-        pendingSave = save
+        let save = DispatchWorkItem {
+            MainActor.assumeIsolated {
+                OrbitRig.pendingSave = nil
+                UserDefaults.standard.set(raw, forKey: OrbitRig.storageKey)
+            }
+        }
+        Self.pendingSave = (save, raw)
         DispatchQueue.main.asyncAfter(deadline: .now() + Self.saveDelay, execute: save)
     }
 
