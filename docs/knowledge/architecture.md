@@ -167,7 +167,7 @@ Pricing and quota are separate flows. Shared-engine tokscale pricing resolves mo
 | Tray quota selection | Swift `QuotaResolver` | Select from already decoded windows by `clientId|cardId`；do not make a second provider request |
 | Linear pace policy | Swift `TokenBarCore` | Use Rust-owned positive `durationSeconds` only for explicit Linear mode or `learningHistory`；never revive `learningDuration`、`unavailable` or legacy payloads from `windowMinutes` |
 
-Grok Bot 是獨立的 quota-only provider（`grok-bot`）；它沒有 Syrtis 可解析的本機 session logs，不把雲端 Bot 額度當作 Grok Build 的 token usage。Swift 在 `grok` 分頁透過 `ClientRegistry.tabSlice` 顯示 Build 與 Bot 的獨立額度卡，Overview 與 Quota lens 共用此成員清單。隱藏分頁會排除整組，Agent limits 的開關仍逐 client 生效；相同排除集合用於卡片、Overview 摘要與選單列 Auto。既有 Claude 多帳號列的獨立身分與顯示規則保持不變。
+Grok Bot 是獨立的 provider（`grok-bot`）；它的額度與 Grok Build 分開，用量則來自 Cursor usage-events：engine #69 把 model 以 `grok-bot` 開頭的事件記在 `grok-bot` 底下，不再算進 `cursor`。Bot 額度不當作 Grok Build 的 token usage。Swift 在 `grok` 分頁透過 `ClientRegistry.tabSlice` 顯示 Build 與 Bot 的獨立額度卡，Overview 與 Quota lens 共用此成員清單。隱藏分頁會排除整組，Agent limits 的開關仍逐 client 生效；相同排除集合用於卡片、Overview 摘要與選單列 Auto。既有 Claude 多帳號列的獨立身分與顯示規則保持不變。
 
 分頁名單合併本機用量 client 與已設定的 quota provider，再將 Bot 對應到 Grok 分頁；純設定提示不建立空分頁。額度圖表由 `DashboardModel.configureQuotaVisibility` 接收可見性設定，隨每次額度 publication 重新選取 provider，無須等待本機用量紀錄。分組 Quota lens 顯示各 provider 的歷史摘要與熱圖；本機用量不存在時顯示明確空狀態，不執行虛構的 usage join。隱藏或移除額度會清除對應曲線與衍生圖表；Claude 額外帳號仍保有獨立可見性。
 
@@ -244,6 +244,7 @@ Pricing metadata is refreshable rather than frozen for the process lifetime; the
 | `cursor` | Cursor | `anthropic`, `openai`, `google`, `xai`, `own`, `moonshot`, `zhipu` | high | [來源](https://cursor.com/docs/models-and-pricing) |
 | `droid` | Factory Droid | `anthropic`, `openai`, `google`, `moonshot`, `zhipu`, `open-weights` | high | [來源](https://factory.ai/pricing) |
 | `grok` | Grok (SuperGrok / X Premium+) | `xai` | high | [來源](https://x.ai/news/grok-build-cli) |
+| `grok-bot` | Grok Bot | `xai`（只涵蓋自己的列，見 `ownRowsOnlySubscriptions`） | high | 維護者 D6，2026-10-10 |
 | `junie` | JetBrains Junie | `openai`, `anthropic`, `google`, `xai`, `amazon` | high | [來源](https://www.jetbrains.com/help/ai-assistant/supported-llms.html) |
 | `kilo`／`kilocode` | Kilo Code | `anthropic`, `openai`, `google`, `xai`, `deepseek`, `moonshot`, `minimax`, `zhipu`, `alibaba`, `open-weights` | medium | [來源](https://kilo.ai/) |
 | `kimi` | Kimi for Coding | `moonshot` | high | [來源](https://www.moonshot.ai/) |
