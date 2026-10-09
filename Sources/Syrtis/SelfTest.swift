@@ -9194,6 +9194,25 @@ enum SelfTest {
             let beforePinch = rig.scale
             chart.magnify(with: ChartMagnifyEvent())
             expect(rig.scale < beforePinch, "3D pinch zooms without requiring a click")
+            // The hint hides on a zoom step only. Mutation: drop the
+            // zero-delta guard in scrollWheel.
+            var zoomSignals = 0
+            chart.onZoom = { zoomSignals += 1 }
+            chart.scrollWheel(with: ChartEventReceiver.scroll(y: 0, phase: .mayBegin, modifiers: .maskCommand))
+            let afterTouch = zoomSignals
+            chart.scrollWheel(with: ChartEventReceiver.scroll(phase: .began, modifiers: .maskCommand))
+            expect(
+                afterTouch == 0 && zoomSignals == 1,
+                "3D hint hides on a zoom step, not on a ⌘ touch with no delta; got \(afterTouch), \(zoomSignals)")
+            chart.onZoom = nil
+            // Reset restores the starting angle. Mutation: empty resetAngle.
+            rig.orbit(dx: 120, dy: 40)
+            let rotated = rig.azimuth != OrbitRig.defaultAzimuth
+            rig.resetAngle()
+            expect(
+                rotated && rig.azimuth == OrbitRig.defaultAzimuth
+                    && rig.elevation == OrbitRig.defaultElevation,
+                "3D Reset restores the starting angle")
         }
 
         // MARK: - FLAT-HEATMAP (contract suite; decision table in issue #157)

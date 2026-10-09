@@ -72,8 +72,10 @@ final class OrbitRig {
     let cameraNode = SCNNode()
     let camera = SCNCamera()
     var target = simd_double3(0, 0, 0)
-    var azimuth: Double = .pi / 4
-    var elevation: Double = atan2(0.45, sqrt(2.0) * 0.7) // ~24.6° (tsx start pos)
+    static let defaultAzimuth: Double = .pi / 4
+    static let defaultElevation: Double = atan2(0.45, sqrt(2.0) * 0.7) // ~24.6° (tsx start pos)
+    var azimuth = OrbitRig.defaultAzimuth
+    var elevation = OrbitRig.defaultElevation
     private let distance: Double = 150 // irrelevant to ortho size; clears clipping
     var scale: Double = 26 // orthographicScale = half view height, world units
     private let minScale: Double = 0.6 // ≈ tsx maxZoom 80 at a ~300px view
@@ -148,6 +150,12 @@ final class OrbitRig {
 
     static var hasSavedCamera: Bool {
         UserDefaults.standard.string(forKey: storageKey) != nil
+    }
+
+    /// Back to the starting viewpoint; Reset then fits the zoom to it.
+    func resetAngle() {
+        azimuth = Self.defaultAzimuth
+        elevation = Self.defaultElevation
     }
 
     static func clearSavedCamera() {
@@ -275,11 +283,15 @@ final class ContributionGraphView: SCNView {
             nextResponder?.scrollWheel(with: event)
             return
         }
+        // A zero-delta event (a trackpad touch before it moves) zooms nothing
+        // and must not hide the hint.
+        guard event.scrollingDeltaY != 0 else { return }
         rig.zoom(deltaY: event.scrollingDeltaY)
         onZoom?()
     }
 
     override func magnify(with event: NSEvent) {
+        guard event.magnification != 0 else { return }
         rig.zoom(deltaY: -event.magnification * 60)
         onZoom?()
     }
@@ -443,6 +455,7 @@ struct ContributionGraph3D: View {
                     }
                     button("Reset".localized, help: "Reset the camera angle and zoom.") {
                         OrbitRig.clearSavedCamera()
+                        holder.view?.rig.resetAngle()
                         holder.view?.fitToContent()
                     }
                 }
