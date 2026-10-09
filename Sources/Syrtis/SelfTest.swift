@@ -17247,6 +17247,13 @@ enum SelfTest {
                    && !GlassTintGuideCardView.visible(dismissed: false, glassAvailable: false, userRuntime: true)
                    && !GlassTintGuideCardView.visible(dismissed: false, glassAvailable: true, userRuntime: false),
                "GLASS-TINT guide card shows until Done, only with the glass panel and in a user session")
+        // The controls appear only where StatusItemController builds the glass
+        // panel (macOS 27+); on 14–26 the popover has no glass to tint.
+        // Mutation: `>= 26` (the #491 bug: a slider that did nothing on 26).
+        expect(!GlassTintSlider.glassAvailable(on: OperatingSystemVersion(majorVersion: 26, minorVersion: 9, patchVersion: 0))
+                   && GlassTintSlider.glassAvailable(on: OperatingSystemVersion(majorVersion: 27, minorVersion: 0, patchVersion: 0))
+                   && !GlassTintSlider.glassAvailable(on: OperatingSystemVersion(majorVersion: 14, minorVersion: 0, patchVersion: 0)),
+               "GLASS-TINT controls only on macOS 27+, where the glass panel exists")
         for locale in ["zh-Hant", "zh-Hans"] {
             expect(["Glass tint", "Makes the popover's glass less see-through, so its text stays readable over the windows behind it.", GlassTintGuideCardView.copyBody, "Quick settings"]
                        .allSatisfy { AppLanguage.localizedString($0, locale: locale, bundle: .tokenBarResources) != nil },
