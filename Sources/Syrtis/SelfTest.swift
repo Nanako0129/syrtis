@@ -9241,6 +9241,50 @@ enum SelfTest {
                    "3D pan: dragging right moves the target left, so the chart follows the pointer; got \(rightward)")
         }
 
+        // 3D camera saves wait for the gesture to pause: a UserDefaults write per event starved the drag of input.
+        // Mutations: orbit/zoom call persist() (the burst writes at once); persist() keeps the pending save (an
+        // older camera overwrites the one Fit/Reset just saved).
+        let cameraSave: [Bool]? = awaitMainActorValue {
+            let defaults = UserDefaults.standard
+            let saved = defaults.object(forKey: OrbitRig.storageKey)
+            defer { defaults.set(saved, forKey: OrbitRig.storageKey) }
+            // Earlier 3D checks leave a gesture save queued (one queue for every rig): land it before clearing.
+            OrbitRig.flushPendingSave()
+            defaults.removeObject(forKey: OrbitRig.storageKey)
+            let rig = OrbitRig()
+            for _ in 0..<20 {
+                rig.orbit(dx: 5, dy: 1)
+                rig.zoom(deltaY: 1)
+            }
+            let noWriteDuringGesture = defaults.string(forKey: OrbitRig.storageKey) == nil
+            try? await Task.sleep(nanoseconds: UInt64((OrbitRig.saveDelay + 0.3) * 1e9))
+            let restored = OrbitRig()
+            let savedOnPause = abs(restored.azimuth - rig.azimuth) < 1e-9 && abs(restored.scale - rig.scale) < 1e-9
+            // A gesture still pending when Fit/Reset saves must not land afterwards.
+            rig.orbit(dx: 40, dy: 0)
+            rig.resetAngle()
+            rig.persist()
+            let resetAzimuth = rig.azimuth
+            try? await Task.sleep(nanoseconds: UInt64((OrbitRig.saveDelay + 0.3) * 1e9))
+            let afterReset = OrbitRig()
+            // The chart closed mid-delay and reopened at once: the new rig restores the closed chart's gesture,
+            // and its own Reset is not overwritten when the old save's delay ends.
+            // Mutation: pendingSave per rig (not static) or no flush at init.
+            let closing = OrbitRig()
+            closing.orbit(dx: 60, dy: 0)
+            let reopened = OrbitRig()
+            let reopenSeesGesture = abs(reopened.azimuth - closing.azimuth) < 1e-9
+            reopened.resetAngle()
+            reopened.persist()
+            let reopenedAzimuth = reopened.azimuth
+            try? await Task.sleep(nanoseconds: UInt64((OrbitRig.saveDelay + 0.3) * 1e9))
+            let afterOldDelay = OrbitRig()
+            return [noWriteDuringGesture, savedOnPause, abs(afterReset.azimuth - resetAzimuth) < 1e-9,
+                    reopenSeesGesture, abs(afterOldDelay.azimuth - reopenedAzimuth) < 1e-9]
+        }
+        expect(cameraSave == [true, true, true, true, true],
+               "3D camera: no save while a gesture runs, one save once it pauses, Fit/Reset's save is not overwritten, and a chart reopened within the delay restores the gesture and keeps its own Reset; got \(String(describing: cameraSave))")
+
         // MARK: - FLAT-HEATMAP (contract suite; decision table in issue #157)
         //
         // Six contracts, one table/grid each, replacing the append-only
