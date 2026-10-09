@@ -18,9 +18,15 @@ struct GlassTintSlider: View {
         }
     }
 
-    /// The tint only does anything where the glass panel exists.
+    /// The tint only does anything where the glass panel exists, and
+    /// StatusItemController creates it only on macOS 27+. Before that the
+    /// popover is an NSPopover with no `.glassEffect` surface to tint.
     static var glassAvailable: Bool {
-        if #available(macOS 26.0, *) { return true } else { return false }
+        glassAvailable(on: ProcessInfo.processInfo.operatingSystemVersion)
+    }
+
+    static func glassAvailable(on version: OperatingSystemVersion) -> Bool {
+        version.majorVersion >= 27
     }
 }
 
