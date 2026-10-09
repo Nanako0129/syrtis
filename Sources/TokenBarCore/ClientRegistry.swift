@@ -252,17 +252,21 @@ public enum ClientRegistry {
 
     /// Quota curves use provider ids, never the grouped navigation ids alone.
     /// Keep local clients for loading/error cards and add quota-only providers.
-    /// A present client is folded to its tab before slicing, so a member with
-    /// local records (`antigravity-cli`) brings its whole group: otherwise,
-    /// before the first payload or with Antigravity unconfigured, the tab's
-    /// card fell to `antigravity-cli`, which has no quota history (Windows #219).
+    /// A present client is folded to the subscription it spends (`quotaOwner`)
+    /// before slicing, so `antigravity-cli` with local records brings its whole
+    /// group: otherwise, before the first payload or with Antigravity
+    /// unconfigured, the tab's card fell to `antigravity-cli`, which has no
+    /// quota history (Windows #219). Not to its tab: once engine #69 made Grok
+    /// Bot's usage local, folding `grok-bot` to `grok` put the tab id itself in
+    /// the list and a Bot-only user's Grok tab drew Grok Build's card, which has
+    /// no window (same fix as Syrtis-Windows #246, 0956928).
     public static func quotaClients(
         present: [String], quotaIds: [String], tabHidden: Set<String>,
         orderRaw: String
     ) -> [String] {
         let hidden = hiddenTabClients(tabHidden)
         var seen = Set<String>()
-        let ids = (present.map { memberToTabId[$0] ?? $0 }.flatMap(tabSlice) + quotaIds)
+        let ids = (present.map(quotaOwner).flatMap(tabSlice) + quotaIds)
             .filter { !hidden.contains($0) && seen.insert($0).inserted }
         return orderedClients(ids, orderRaw: orderRaw)
     }

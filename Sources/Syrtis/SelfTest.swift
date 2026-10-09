@@ -19744,6 +19744,14 @@ enum SelfTest {
         expect(wcpGate("antigravity", present: ["antigravity-cli"], quota: wcpCliOnlyQuota)
                    == "antigravity/antigravity",
                "WCP2-gate antigravity-cli records alone: the tab's card is antigravity's, never antigravity-cli's; got \(wcpCliOnlyQuota)")
+        // Grok Bot-only with its usage now local (engine #69 attributes Cursor's Grok Bot events to grok-bot): the
+        // tab's card stays Grok Bot's. Folding a present member to its tab (grok-bot -> grok) put "grok" itself in
+        // quotaClients and the gate picked Grok Build's card, which has no window (found by W5-7 reading #499).
+        // Mutation: fold present through memberToTabId again.
+        let wcpBotOnlyQuota = ClientRegistry.quotaClients(
+            present: ["grok-bot"], quotaIds: ["grok-bot"], tabHidden: [], orderRaw: "")
+        expect(wcpGate("grok", present: ["grok-bot"], quota: wcpBotOnlyQuota) == "grok-bot/grok-bot",
+               "WCP2-gate Grok Bot usage alone: the Grok tab's card is Grok Bot's; got \(wcpGate("grok", present: ["grok-bot"], quota: wcpBotOnlyQuota)) from \(wcpBotOnlyQuota)")
         expect(wcpGate("claude", present: ["claude"], quota: ["claude"]) == "claude/claude",
                "WCP2-gate control: a tab with local records gets both, the same id")
         expect(wcpGate("claude", present: ["claude"], quota: ["claude"], excluded: ["claude"]) == "nil/nil"
