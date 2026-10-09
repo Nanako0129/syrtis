@@ -4,7 +4,7 @@ id: kb-verification
 kind: canonical
 scope: repository
 read_when: changing runtime code, running a local build or UX acceptance, parser output, cache behavior, FFI contracts, or this knowledge tree
-last_verified: 2026-10-08
+last_verified: 2026-10-09
 sources: [".github/workflows/ci.yml", ".github/workflows/ci-release.yml", "Makefile", "Package.swift", "scripts/bundle.sh", "Sources/Syrtis/ClientTray.swift", "Sources/Syrtis/StatusItemController.swift", "Sources/Syrtis/MenuBarTextColor.swift", "Sources/Syrtis/Views/AgentIconView.swift", "Sources/Syrtis/Views/SettingsPanel.swift", "Sources/Syrtis/SelfTest.swift", "Sources/CrossCheckHarness/main.swift", "Sources/TokenBarCore/AgentUsage.swift", "Sources/Syrtis/ClaudeExtraRoots.swift", "crates/tb_core_ffi/src/agent_account_scope.rs", "crates/tb_core_ffi/src/agent_quota_history.rs", "crates/tb_core_ffi/src/agent_kiro.rs", "crates/tb_core_ffi/src/kiro_integrations.rs", "crates/tb_core_ffi/src/extra_scan_paths.rs", "docs/knowledge/plans/provider-quota-pace.md", "docs/knowledge/plans/codex-historical-pace-v2.md", "public TokenBar-Windows PR #7", "public Syrtis PR #114", "public TokenBar-Windows PR #12", "AGENTS.md", "memory-derived hermetic verification practice", "memory-derived local build indexing incident"]
 ---
 
@@ -129,7 +129,7 @@ Live account-scope smoke必須在hermetic security suite通過後才執行，且
 
 ## Local build and UX acceptance
 
-`make selftest-chart-input` 是 macOS 27+ 桌面上的獨立 GUI gate，不併入無介面的 `make selftest`。它以 `--demo` 啟動真實 `StatusItemController`／`PopoverView`，先確認另一個應用程式位於前景，再驗證顯示面板會讓受測應用程式成為系統前景並取得 key window；將原生滾輪夾具送入已掛載圖表的 `scrollWheel` 後，真實 `NSScrollView` 必須移動，且不能改變圖表縮放。呈現後的捏合 handler 另驗證縮放與頁面位置。測試會短暫佔用前景，外部點擊或切換視窗會使它報錯；結束時移除測試視窗與狀態列項目、還原偏好及前景應用程式。這個 gate 驗證輸入處理與真實 responder 鏈，不合成系統的滑鼠／觸控板事件投遞，仍須搭配下述實機驗收。
+3D 圖表的原生事件夾具放在正常 `make selftest`，驗證 `.mayBegin`／`.began` 的路由鎖存、途中改變 ⌘、直接捲動接續慣性、取消／結束事件與獨立滑鼠滾輪。這些無介面測試不證明系統的觸控板事件投遞。實機驗收須從真正的選單列 session 開啟面板，確認捏合、頁面捲動與 hover 清除，以及 Esc 後回到原應用程式輸入、Settings 交接、點擊其他應用程式、狀態列項目交接和快速關閉重開時的焦點。
 
 > **⚠️ `make run` 與 bundle 讀的不是同一個 `UserDefaults` 網域。** `swift run Syrtis`（`make run` 就是它）產出裸執行檔、沒有 `CFBundleIdentifier`，`UserDefaults.standard` 因此落在行程名網域 **`Syrtis`**；bundle 用 **`com.nyanako.tokenbar`**（背景見本文件上方 bundle identity 段落）。兩份偏好互不可見，且裸執行檔那一份會隨開發過程被寫入，內容與使用者實際設定無關。
 >

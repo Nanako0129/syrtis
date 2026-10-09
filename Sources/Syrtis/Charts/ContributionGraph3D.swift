@@ -199,6 +199,8 @@ final class ContributionGraphView: SCNView {
     var needsInitialFit = false
     private var tooltip: NSTextField!
     private var hoveredNode: SCNNode?
+    private var scrollZoom: Bool?
+    private var scrollPhase: NSEvent.Phase = []
 
     override func layout() {
         super.layout()
@@ -247,7 +249,27 @@ final class ContributionGraphView: SCNView {
     }
 
     override func scrollWheel(with event: NSEvent) {
-        guard event.modifierFlags.contains(.command) else {
+        var zoom = event.modifierFlags.contains(.command)
+        if !event.phase.isEmpty || !event.momentumPhase.isEmpty {
+            let starts = event.phase.contains(.mayBegin) || event.phase.contains(.began)
+            // mayBegin -> began is one gesture; direct ended can precede momentum.
+            if scrollZoom == nil || (starts && !scrollPhase.contains(.mayBegin)) {
+                scrollZoom = zoom
+            }
+            zoom = scrollZoom ?? zoom
+            scrollPhase = event.phase
+        }
+        defer {
+            // Deliver terminal events to the same responder before forgetting the route.
+            if event.phase.contains(.cancelled) || event.momentumPhase.contains(.ended)
+                || event.momentumPhase.contains(.cancelled)
+            {
+                scrollZoom = nil
+                scrollPhase = []
+            }
+        }
+        guard zoom else {
+            clearHover()
             nextResponder?.scrollWheel(with: event)
             return
         }
@@ -393,7 +415,6 @@ struct ContributionGraph3D: View {
     var body: some View {
         ContributionGraphRepresentable(
             grid: grid, dark: colorScheme == .dark, holder: holder)
-            .help("Pinch or ⌘ + scroll to zoom.".localized)
             .overlay(alignment: .topTrailing) {
                 HStack(spacing: 4) {
                     button("Fit".localized) { holder.view?.fitToContent() }
@@ -414,6 +435,7 @@ struct ContributionGraph3D: View {
             .padding(.vertical, 3)
             .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 5))
             .overlay(RoundedRectangle(cornerRadius: 5).strokeBorder(.quaternary))
+            .help("Pinch or ⌘ + scroll to zoom.".localized)
     }
 }
 

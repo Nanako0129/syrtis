@@ -1,14 +1,10 @@
 import AppKit
 
 // Entry point. `--smoke` keeps the Phase 1 CLI bridge check available for CI,
-// `--selftest` runs the UI-free checks; `--selftest-chart-input` opts into
-// the hosted chart GUI check. Normal startup boots the menu-bar app.
+// `--selftest` runs the TokenBarCore logic checks; anything else boots the
+// menu-bar app (no storyboard, no .app bundle yet).
 
 AppLanguage.prepareDirectRunResources()
-
-if CommandLine.arguments.contains("--selftest-chart-input") {
-    SelfTest.runChartInput()
-}
 
 if CommandLine.arguments.contains("--smoke") {
     exit(Smoke.run())

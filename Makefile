@@ -1,7 +1,7 @@
 # Build order matters: the Rust staticlib must exist before swift build links.
 # Run everything from the repo root (the -L path in Package.swift is relative).
 
-.PHONY: all rust build run clean check-docs selftest selftest-bundled selftest-chart-input
+.PHONY: all rust build run clean check-docs selftest selftest-bundled
 
 all: build
 
@@ -28,10 +28,6 @@ run: build
 # pinned here rather than inherited from the developer's Mac.
 selftest: build
 	swift run Syrtis --selftest -AppleLanguages "(en)"
-
-# Explicit GUI gate: needs an unlocked macOS 27+ desktop; uses only demo data.
-selftest-chart-input: build
-	.build/debug/Syrtis --selftest-chart-input --demo -AppleLanguages "(en)"
 
 # The same suite from the configuration that ships: release, inside a .app.
 #

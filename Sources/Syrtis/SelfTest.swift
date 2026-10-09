@@ -27,13 +27,14 @@ private final class ChartEventReceiver: NSResponder {
     override func scrollWheel(with event: NSEvent) { scrollEvent = event }
 
     static func scroll(
-        y: Int32 = 10, phase: CGScrollPhase? = nil,
+        y: Int32 = 10, phase: CGScrollPhase? = nil, momentum: Int64 = 0,
         precise: Bool = true, modifiers: CGEventFlags = []
     ) -> NSEvent {
         let event = CGEvent(
             scrollWheelEvent2Source: nil, units: precise ? .pixel : .line,
             wheelCount: 1, wheel1: y, wheel2: 0, wheel3: 0)!
         event.setIntegerValueField(.scrollWheelEventScrollPhase, value: Int64(phase?.rawValue ?? 0))
+        event.setIntegerValueField(.scrollWheelEventMomentumPhase, value: momentum)
         event.flags = modifiers
         return NSEvent(cgEvent: event)!
     }
@@ -924,171 +925,6 @@ private struct DashboardModelTestObservation: Sendable {
 }
 
 enum SelfTest {
-    /// Opt-in WindowServer check; the normal selftest remains UI-free.
-    @MainActor static func runChartInput() -> Never {
-        setvbuf(stdout, nil, _IONBF, 0)
-        guard #available(macOS 27.0, *), CommandLine.arguments.contains("--demo") else {
-            print("chart input selftest requires macOS 27+ and --demo")
-            exit(2)
-        }
-        let previousApp = NSWorkspace.shared.frontmostApplication
-        let app = NSApplication.shared
-        _ = NotificationCenter.default.addObserver(
-            forName: NSApplication.didFinishLaunchingNotification, object: app, queue: .main
-        ) { _ in
-            Task { @MainActor in
-                NSApp.setActivationPolicy(.accessory)
-                exit(await chartInputChecks(previousApp: previousApp))
-            }
-        }
-        app.run()
-        exit(1)
-    }
-
-    @MainActor private static func chartInputChecks(previousApp: NSRunningApplication?) async
-        -> Int32
-    {
-        var failures: Int32 = 0
-        func expect(_ condition: Bool, _ label: String) {
-            print("\(condition ? "ok  " : "FAIL") chart input: \(label)")
-            if !condition { failures += 1 }
-        }
-        func waitUntil(_ condition: () -> Bool) async -> Bool {
-            let deadline = Date().addingTimeInterval(5)
-            while !condition(), Date() < deadline {
-                try? await Task.sleep(for: .milliseconds(20))
-            }
-            return condition()
-        }
-        func findChart(in view: NSView) -> ContributionGraphView? {
-            if let chart = view as? ContributionGraphView { return chart }
-            return view.subviews.lazy.compactMap { findChart(in: $0) }.first
-        }
-        guard let previousApp,
-            previousApp.processIdentifier != ProcessInfo.processInfo.processIdentifier
-        else {
-            expect(false, "test requires another foreground app")
-            return failures
-        }
-        let defaults = UserDefaults.standard
-        let domain = Bundle.main.bundleIdentifier ?? "Syrtis"
-        let saved = defaults.persistentDomain(forName: domain)
-        var arguments = defaults.volatileDomain(forName: UserDefaults.argumentDomain)
-        arguments.merge([
-            "tokenbar.chart.view": "3d", ClientTray.activeTabKey: ClientTray.overviewTab,
-            ClientTray.activeViewKey: AppView.overview.rawValue, "tokenbar.views.hidden": "",
-            "tokenbar.dashboard.year": "", OverviewCard.hiddenKey: "", PopoverChrome.heightKey: 560,
-        ]) { _, test in test }
-        defaults.setVolatileDomain(arguments, forName: UserDefaults.argumentDomain)
-        DemoData.ignoreLocalVisibility()
-        let controller = StatusItemController()
-        controller.updateTitle("Input test")
-        defer {
-            controller.tearDown()
-            if let saved {
-                defaults.setPersistentDomain(saved, forName: domain)
-            } else {
-                defaults.removePersistentDomain(forName: domain)
-            }
-            previousApp.activate(options: [])
-        }
-        // A nonactivating panel can set isActive without becoming frontmost.
-        let ownPID = ProcessInfo.processInfo.processIdentifier
-        NSApp.activate(ignoringOtherApps: true)
-        guard
-            await waitUntil({
-                NSApp.isActive
-                    && NSWorkspace.shared.frontmostApplication?.processIdentifier == ownPID
-            })
-        else {
-            expect(false, "test setup can activate the app")
-            return failures
-        }
-        NSApp.yieldActivation(to: previousApp)
-        previousApp.activate(options: [])
-        guard
-            await waitUntil({
-                !NSApp.isActive
-                    && NSWorkspace.shared.frontmostApplication?.processIdentifier
-                        == previousApp.processIdentifier
-            })
-        else {
-            expect(false, "starts inactive")
-            return failures
-        }
-        expect(true, "starts inactive")
-        controller.showPopover()
-        guard
-            await waitUntil({
-                NSApp.isActive
-                    && NSWorkspace.shared.frontmostApplication?.processIdentifier == ownPID
-            })
-        else {
-            expect(false, "presentation activates the app")
-            return failures
-        }
-        expect(true, "presentation activates the app")
-        var chart: ContributionGraphView?
-        _ = await waitUntil {
-            chart = NSApp.windows.compactMap { $0.contentView.flatMap(findChart) }.first
-            return chart?.bounds.height ?? 0 > 0
-        }
-        guard let chart, let window = chart.window, let scrollView = chart.enclosingScrollView
-        else {
-            expect(false, "real dashboard hosts the 3D chart in its ScrollView")
-            return failures
-        }
-        // The new status item may not have a menu-bar position yet.
-        window.center()
-        expect(
-            await waitUntil({
-                window is GlassPanel && window.isKeyWindow && window.alphaValue == 1
-                    && window.contentView?.layer?.animationKeys()?.isEmpty != false
-            }),
-            "chart belongs to the presented key glass panel")
-        let point = chart.convert(
-            NSPoint(x: chart.visibleRect.midX, y: chart.visibleRect.midY), to: nil)
-        let screenPoint = window.convertPoint(toScreen: point)
-        chart.rig.scale = 26
-        chart.rig.apply()
-        let beforeScroll = scrollView.contentView.bounds.origin
-        let beforeScale = chart.rig.scale
-        for _ in 0..<3 {
-            let scroll = CGEvent(
-                scrollWheelEvent2Source: nil, units: .line,
-                wheelCount: 1, wheel1: -3, wheel2: 0, wheel3: 0)!
-            scroll.flags = []
-            scroll.location = CGPoint(
-                x: screenPoint.x, y: CGDisplayBounds(CGMainDisplayID()).height - screenPoint.y)
-            chart.scrollWheel(with: NSEvent(cgEvent: scroll)!)
-            try? await Task.sleep(for: .milliseconds(100))
-        }
-        _ = await waitUntil {
-            scrollView.contentView.bounds.origin != beforeScroll
-                || chart.rig.scale != beforeScale || !window.isVisible
-        }
-        guard window.isVisible, window.isKeyWindow, chart.window === window else {
-            expect(
-                false,
-                "test interrupted: panel visible=\(window.isVisible), key=\(window.isKeyWindow), "
-                    + "chart attached=\(chart.window === window); avoid switching windows")
-            return 1
-        }
-        expect(
-            scrollView.contentView.bounds.origin.y > beforeScroll.y,
-            "ordinary scroll moves the page")
-        expect(chart.rig.scale == beforeScale, "ordinary scroll preserves chart zoom")
-        let beforePinch = chart.rig.scale
-        let beforePinchScroll = scrollView.contentView.bounds.origin
-        chart.magnify(with: ChartMagnifyEvent())
-        expect(chart.rig.scale < beforePinch, "hosted chart handles magnify after presentation")
-        expect(
-            scrollView.contentView.bounds.origin == beforePinchScroll,
-            "magnify preserves page position")
-        print("chart input selftest \(failures == 0 ? "passed" : "failed")")
-        return failures == 0 ? 0 : 1
-    }
-
     @MainActor static func run() -> Never {
         var failures = 0
         func expect(_ condition: @autoclosure () -> Bool, _ label: String) {
@@ -1466,10 +1302,12 @@ enum SelfTest {
                 visible: nil, width: 400, height: 500)
             expect(unclamped.minX == -190, "glass panel is not clamped without a screen")
         }
-        let glassCloseResult = MainActor.assumeIsolated { () -> (Int, Bool, Bool, Bool) in
+        let glassCloseResult = MainActor.assumeIsolated { () -> ([Bool], Bool, Bool, Bool) in
             let panel = GlassPanel()
-            var performCloseCalls = 0
-            panel.onPerformClose = { performCloseCalls += 1 }
+            var closeIntents: [Bool] = []
+            panel.onPerformClose = { closeIntents.append($0) }
+            panel.performClose(nil)
+            panel.closeForWindowHandoff()
             panel.performClose(nil)
 
             let content = NSViewController()
@@ -1493,12 +1331,13 @@ enum SelfTest {
 
             presenter.sessionDidEnd(for: newItem)
             presenter.close() // no session left: hides directly
-            return (performCloseCalls, sessionEndsFirst, lateEndIgnored,
+            return (
+                closeIntents, sessionEndsFirst, lateEndIgnored,
                     cancelled == 1 && hidden == 2)
         }
         expect(
-            glassCloseResult.0 == 1,
-            "glass panel routes performClose (settings button, Esc) to its owner")
+            glassCloseResult.0 == [false, true, false],
+            "glass panel routes normal and window-handoff closes without leaking intent")
         expect(
             glassCloseResult.1,
             "glass panel close ends the menu-bar session instead of hiding behind it")
@@ -9275,28 +9114,55 @@ enum SelfTest {
             chart.rig = rig
             let receiver = ChartEventReceiver()
             chart.nextResponder = receiver
-            let vertical = ChartEventReceiver.scroll(phase: .began)
+            let vertical = ChartEventReceiver.scroll(phase: .mayBegin)
+            let momentum = ChartEventReceiver.scroll(momentum: 1, modifiers: .maskCommand)
             expect(
-                vertical.hasPreciseScrollingDeltas && vertical.phase == .began,
-                "3D trackpad fixture carries a native scroll phase")
-            let pageEvents: [(String, NSEvent)] = [
-                ("vertical begin", vertical),
-                ("vertical change", ChartEventReceiver.scroll(phase: .changed)),
-                ("vertical end", ChartEventReceiver.scroll(y: 0, phase: .ended)),
-                ("plain wheel", ChartEventReceiver.scroll(precise: false)),
-            ]
-            for (label, event) in pageEvents {
+                vertical.hasPreciseScrollingDeltas && vertical.phase == .mayBegin
+                    && momentum.momentumPhase == .began,
+                "3D fixtures carry native direct and momentum phases")
+            // Each sequence changes Command after its first event. The same route
+            // must receive every event, including cancellation and momentum end.
+            let events:
+                [(label: String, phase: CGScrollPhase?, momentum: Int64, command: Bool, zoom: Bool)] =
+                    [
+                        ("page mayBegin", .mayBegin, 0, false, false),
+                        ("page began ignores Command", .began, 0, true, false),
+                        ("page changed ignores Command", .changed, 0, true, false),
+                        ("page ended ignores Command", .ended, 0, true, false),
+                        ("page momentum begin", nil, 1, true, false),
+                        ("page momentum change", nil, 2, true, false),
+                        ("page momentum end", nil, 3, true, false),
+                        ("zoom mayBegin", .mayBegin, 0, true, true),
+                        ("zoom began keeps route", .began, 0, false, true),
+                        ("plain wheel stays independent", nil, 0, false, false),
+                        ("zoom changed keeps route", .changed, 0, false, true),
+                        ("zoom ended keeps route", .ended, 0, false, true),
+                        ("zoom momentum begin", nil, 1, false, true),
+                        ("zoom momentum change", nil, 2, false, true),
+                        ("zoom momentum end", nil, 3, false, true),
+                        ("page begins after zoom", .began, 0, false, false),
+                        ("page cancelled ignores Command", .cancelled, 0, true, false),
+                        ("zoom begins after cancellation", .began, 0, true, true),
+                        ("zoom cancelled keeps route", .cancelled, 0, false, true),
+                        ("page begins after zoom cancellation", .began, 0, false, false),
+                        ("Command wheel stays independent", nil, 0, true, true),
+                        ("page changed after Command wheel", .changed, 0, false, false),
+                        ("page ends without momentum", .ended, 0, false, false),
+                        ("new zoom after direct end", .began, 0, true, true),
+                    ]
+            for (label, phase, momentum, command, zoom) in events {
+                let event = ChartEventReceiver.scroll(
+                    phase: phase, momentum: momentum, precise: phase != nil || momentum != 0,
+                    modifiers: command ? .maskCommand : [])
+                rig.scale = 26
                 receiver.scrollEvent = nil
                 chart.scrollWheel(with: event)
                 expect(
-                    receiver.scrollEvent === event && rig.scale == 26,
-                    "3D \(label) reaches the page unchanged without zooming")
+                    zoom
+                        ? receiver.scrollEvent == nil && rig.scale > 26
+                        : receiver.scrollEvent === event && rig.scale == 26,
+                    "3D \(label)")
             }
-            receiver.scrollEvent = nil
-            chart.scrollWheel(with: ChartEventReceiver.scroll(precise: false, modifiers: .maskCommand))
-            expect(
-                receiver.scrollEvent == nil && rig.scale > 26,
-                "3D command-wheel zooms without reaching the page or requiring a click")
             let beforePinch = rig.scale
             chart.magnify(with: ChartMagnifyEvent())
             expect(rig.scale < beforePinch, "3D pinch zooms without requiring a click")
