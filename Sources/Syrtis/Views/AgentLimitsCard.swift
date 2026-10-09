@@ -233,6 +233,14 @@ struct AgentLimitsCard: View {
         "grok-bot": ["Weekly"],
     ]
 
+    /// Placeholder rows stand in for windows that have not arrived. Under an
+    /// error with no windows they only repeated "No data" below the red text,
+    /// so that card shows the header and the error alone, as the Windows card
+    /// does. Called only when the card has no windows.
+    nonisolated static func showsPlaceholders(_ snapshot: AgentUsageSnapshot?) -> Bool {
+        snapshot?.error == nil
+    }
+
     /// Every client id that can show a row in the multi-agent Agent-limits
     /// card. Thin wrapper over `ClientRegistry.knownLimitsClients` (the one
     /// implementation) that supplies this card's placeholder-row keys, so the
@@ -813,7 +821,7 @@ struct AgentLimitsCard: View {
                             windowRow(window, row: row, brand: style.color)
                                 .id("\(key):\(window.cardId)")
                         }
-                    } else {
+                    } else if Self.showsPlaceholders(snapshot) {
                         ForEach(Self.placeholderRows[id] ?? ["Limit"], id: \.self) { label in
                             placeholderRow(label, brand: style.color)
                         }

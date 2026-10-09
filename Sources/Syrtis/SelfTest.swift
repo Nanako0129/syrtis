@@ -4208,6 +4208,13 @@ enum SelfTest {
         expect(learningEstimate?.expectedUsedPercent == 50,
             "learningHistory historical mode uses Linear estimate")
 
+        // A limits card with no windows: placeholder rows only without an error; an error card is header + red
+        // text alone. Mutation: return true -> the error case shows "No data" rows again.
+        let placeholderCases = try! JSONDecoder().decode(AgentUsagePayload.self, from: Data(#"{"generatedAt":"t","publicationGeneration":1,"agents":[{"clientId":"antigravity","source":"agy","updatedAt":"t","windows":[],"error":"agy timed out"},{"clientId":"codex","source":"oauth","updatedAt":"t","windows":[]}]}"#.utf8)).agents
+        expect(placeholderCases.map(AgentLimitsCard.showsPlaceholders) == [false, true]
+                   && AgentLimitsCard.showsPlaceholders(nil),
+               "LIMITS-CARD error with no windows draws no placeholder rows; no error or no snapshot still does")
+
         // Stage 5D UI presentation: typed state copy and mode gates are pure
         // helper behavior, so these contracts do not depend on SwiftUI layout.
         for mode in [PaceMode.historical, PaceMode.linear] {
