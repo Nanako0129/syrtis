@@ -9072,6 +9072,32 @@ enum SelfTest {
             expect(passed, "filter parity: \(label)")
         }
 
+        // 3D pan follows the pointer (option- or right-drag). AppKit deltaY is
+        // positive downward. Mutation: the vertical sign (the shipped bug had
+        // `target -= up * dy`, so the chart moved against the drag).
+        MainActor.assumeIsolated {
+            let defaults = UserDefaults.standard
+            let saved = defaults.object(forKey: OrbitRig.storageKey)
+            defer { defaults.set(saved, forKey: OrbitRig.storageKey) }
+            defaults.removeObject(forKey: OrbitRig.storageKey)
+            let rig = OrbitRig()
+            let t = rig.cameraNode.simdWorldTransform
+            let right = SIMD3<Double>(Double(t.columns.0.x), Double(t.columns.0.y), Double(t.columns.0.z))
+            let up = SIMD3<Double>(Double(t.columns.1.x), Double(t.columns.1.y), Double(t.columns.1.z))
+            @MainActor func along(_ axis: SIMD3<Double>) -> Double { (rig.target * axis).sum() }
+            rig.target = .zero
+            rig.pan(dx: 0, dy: 10, viewHeightPx: 100)
+            let down = (up: along(up), right: along(right))
+            rig.target = .zero
+            rig.pan(dx: 10, dy: 0, viewHeightPx: 100)
+            let rightward = (up: along(up), right: along(right))
+            // The camera transform is Float: the other axis reads ~1e-6, not 0.
+            expect(down.up > 0 && abs(down.right) < 1e-3,
+                   "3D pan: dragging down moves the target up, so the chart follows the pointer; got \(down)")
+            expect(rightward.right < 0 && abs(rightward.up) < 1e-3,
+                   "3D pan: dragging right moves the target left, so the chart follows the pointer; got \(rightward)")
+        }
+
         // MARK: - FLAT-HEATMAP (contract suite; decision table in issue #157)
         //
         // Six contracts, one table/grid each, replacing the append-only
