@@ -165,6 +165,18 @@ char *tb_set_claude_config_dirs(const char *json);
 // ^[0-9a-f]{64}$, or it repeats a key. Malformed JSON is the error
 // `invalid_accounts_json` and leaves the registry unchanged. No secret.
 char *tb_set_antigravity_accounts(const char *json);
+// Bind agy's current account for the next tb_agent_usage calls:
+// {"key":"<64 lowercase hex>","marker":"<agy login marker>"} sets, NULL or
+// {"key":null} clears. marker is the mdat value tb_antigravity_login_marker
+// returns for a present login (0x<hex>  "<YYYYMMDDhhmmss>Z\000"); "present",
+// "absent" and anything else are refused. Success data: {"bound":true|false}.
+// Any other input clears the binding first, then fails with a fixed code
+// (invalid_binding_json, invalid_key, invalid_marker); the input is never
+// echoed. While the key is a registered captured account and agy's live
+// marker equals the bound one before and after the fetch, the primary
+// Antigravity card takes that account's OAuth result (source "oauth", with
+// agyLoginMarker and boundAccountKey) instead of running agy. No secret.
+char *tb_set_antigravity_binding(const char *json);
 // Copy agy's current Google login into a Syrtis-owned login-keychain item
 // (service com.nyanako.tokenbar.antigravity-account, account = key). agy's
 // own item is read once and never written. Blocking (keychain + network):

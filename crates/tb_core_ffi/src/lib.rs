@@ -1227,6 +1227,30 @@ pub unsafe extern "C" fn tb_set_antigravity_accounts(json: *const c_char) -> *mu
     })
 }
 
+/// Bind agy's current account for the next agent-usage fetches (plan E).
+/// `json` is `{"key":"<64 lowercase hex>","marker":"<agy login marker>"}` to
+/// set, or NULL / `{"key":null}` to clear. `marker` is exactly the `mdat`
+/// value `tb_antigravity_login_marker` returns for a present login
+/// (`0x<hex>  "<YYYYMMDDhhmmss>Z\000"`); `"present"`, `"absent"` and anything
+/// else are refused. Success data is `{"bound":true|false}`. Any other input
+/// clears the binding first, then fails with one fixed code
+/// (`invalid_binding_json`, `invalid_key`, `invalid_marker`); the input is
+/// never echoed. While the key is a registered captured account and agy's
+/// live marker equals the bound one before and after the fetch, the primary
+/// Antigravity card takes that account's OAuth result (source `oauth`, with
+/// `agyLoginMarker` and `boundAccountKey`) instead of running agy. Holds no
+/// secret.
+///
+/// # Safety
+/// `json` must be NULL or a valid NUL-terminated string.
+#[no_mangle]
+pub unsafe extern "C" fn tb_set_antigravity_binding(json: *const c_char) -> *mut c_char {
+    guarded("tb_set_antigravity_binding", || {
+        let raw = (!json.is_null()).then(|| unsafe { CStr::from_ptr(json) }.to_bytes());
+        envelope(agent_antigravity::set_antigravity_binding(raw))
+    })
+}
+
 /// Copy agy's current Google login into a Syrtis-owned login-keychain item
 /// (service `com.nyanako.tokenbar.antigravity-account`, account = key). Reads
 /// agy's item once through `/usr/bin/security` and never writes it; proves the
@@ -2989,6 +3013,37 @@ mod tests {
         let clear = CString::new("[]").unwrap();
         unsafe { take(tb_set_antigravity_accounts(clear.as_ptr())) };
         assert!(agent_antigravity::captured_accounts().is_empty());
+
+        // Plan E binding: NULL and {"key":null} clear with ok; a bad input is
+        // one fixed code with no echo of the input (S6; the module tests cover
+        // every code and that each clears first).
+        let s = unsafe { take(tb_set_antigravity_binding(std::ptr::null())) };
+        assert_eq!(s, r#"{"data":{"bound":false},"ok":true}"#);
+        let marker = r#"0x32303236303932333137343035365A00  \"20260923174056Z\\000\""#;
+        let bound = CString::new(format!(r#"{{"key":"{key}","marker":"{marker}"}}"#)).unwrap();
+        let s = unsafe { take(tb_set_antigravity_binding(bound.as_ptr())) };
+        assert_eq!(s, r#"{"data":{"bound":true},"ok":true}"#);
+        assert!(agent_antigravity::antigravity_binding().is_some());
+        for (bad, code) in [
+            (r#"{"key":"CANARY","marker":"present"}"#.to_string(), "invalid_key"),
+            (format!(r#"{{"key":"{key}","marker":"CANARY"}}"#), "invalid_marker"),
+            (r#"{"key":"CANARY" "marker"#.to_string(), "invalid_binding_json"),
+        ] {
+            unsafe { take(tb_set_antigravity_binding(bound.as_ptr())) };
+            let bad = CString::new(bad).unwrap();
+            let s = unsafe { take(tb_set_antigravity_binding(bad.as_ptr())) };
+            assert_eq!(s, format!(r#"{{"err":"{code}","ok":false}}"#));
+            assert!(!s.contains("CANARY"), "got: {s}");
+            assert!(agent_antigravity::antigravity_binding().is_none());
+        }
+        let not_utf8 = CString::new(vec![b'{', 0xff, b'}']).unwrap();
+        let s = unsafe { take(tb_set_antigravity_binding(not_utf8.as_ptr())) };
+        assert_eq!(s, r#"{"err":"invalid_binding_json","ok":false}"#);
+        unsafe { take(tb_set_antigravity_binding(bound.as_ptr())) };
+        let clear = CString::new(r#"{"key":null}"#).unwrap();
+        let s = unsafe { take(tb_set_antigravity_binding(clear.as_ptr())) };
+        assert_eq!(s, r#"{"data":{"bound":false},"ok":true}"#);
+        assert!(agent_antigravity::antigravity_binding().is_none());
 
         // A NULL or malformed key is refused before `security` could start.
         let s = unsafe { take(tb_antigravity_remove(std::ptr::null())) };
