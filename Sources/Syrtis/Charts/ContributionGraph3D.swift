@@ -115,8 +115,11 @@ final class OrbitRig {
         let t = cameraNode.simdWorldTransform
         let right = simd_double3(Double(t.columns.0.x), Double(t.columns.0.y), Double(t.columns.0.z))
         let up = simd_double3(Double(t.columns.1.x), Double(t.columns.1.y), Double(t.columns.1.z))
+        // The chart follows the pointer. AppKit's deltaY grows downward, so a
+        // drag down moves the target up (the content down), and a drag right
+        // moves it left.
         target -= right * Double(dx) * worldPerPixel
-        target -= up * Double(dy) * worldPerPixel
+        target += up * Double(dy) * worldPerPixel
         apply()
         persist()
     }
