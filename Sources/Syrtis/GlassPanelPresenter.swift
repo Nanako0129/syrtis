@@ -25,7 +25,9 @@ final class GlassPanelPresenter {
     private var eventMonitors: [Any] = []
     /// A reopen invalidates both the old close fade and queued focus return.
     private var generation = 0
-    private var previousApp: NSRunningApplication?
+    /// The app to hand activation back to on close. Not private: SelfTest
+    /// checks that a window handoff clears it.
+    var previousApp: NSRunningApplication?
 
     /// Called once the panel is ordered out, so the owner can swap the live
     /// view for a placeholder and stop its `.task` loops.

@@ -58,13 +58,19 @@ final class SettingsWindowController {
         scrollingTo destination: Destination? = nil, from popoverWindow: NSWindow? = nil
     ) {
         if let popover = popoverWindow ?? NSApp.keyWindow, popover !== window {
-            if let panel = popover as? GlassPanel {
-                panel.closeForWindowHandoff()
-            } else {
-                popover.performClose(nil)
-            }
+            Self.closeForHandoff(popover)
         }
         DispatchQueue.main.async { self.show(scrollingTo: destination) }
+    }
+
+    /// The glass panel closes as a window handoff, so focus stays with
+    /// Settings instead of returning to the app the panel was opened from.
+    static func closeForHandoff(_ popover: NSWindow) {
+        if let panel = popover as? GlassPanel {
+            panel.closeForWindowHandoff()
+        } else {
+            popover.performClose(nil)
+        }
     }
 
     func show(scrollingTo destination: Destination? = nil) {

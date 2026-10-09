@@ -1335,6 +1335,30 @@ enum SelfTest {
                 closeIntents, sessionEndsFirst, lateEndIgnored,
                     cancelled == 1 && hidden == 2)
         }
+        // Settings handoff: the glass panel closes as a handoff, and the
+        // presenter then drops its return target. A normal close keeps it for
+        // the deferred restore. Mutations: route the panel through
+        // performClose; ignore `preservingActivation`.
+        let glassHandoff = MainActor.assumeIsolated { () -> [Bool] in
+            let panel = GlassPanel()
+            var intents: [Bool] = []
+            panel.onPerformClose = { intents.append($0) }
+            SettingsWindowController.closeForHandoff(panel)
+
+            let content = NSViewController()
+            content.view = NSView()
+            let presenter = GlassPanelPresenter(contentViewController: content)
+            defer { presenter.tearDown() }
+            presenter.previousApp = NSRunningApplication.current
+            presenter.close(preservingActivation: false)
+            let keptOnClose = presenter.previousApp != nil
+            presenter.previousApp = NSRunningApplication.current
+            presenter.close(preservingActivation: true)
+            return intents + [keptOnClose, presenter.previousApp == nil]
+        }
+        expect(
+            glassHandoff == [true, true, true],
+            "Settings closes the glass panel as a handoff, which drops the focus return target; got \(glassHandoff)")
         expect(
             glassCloseResult.0 == [false, true, false],
             "glass panel routes normal and window-handoff closes without leaking intent")
@@ -9140,10 +9164,14 @@ enum SelfTest {
                         ("zoom momentum begin", nil, 1, false, true),
                         ("zoom momentum change", nil, 2, false, true),
                         ("zoom momentum end", nil, 3, false, true),
+                        // Not a start phase: only the reset on momentum end
+                        // keeps the finished zoom route from carrying over.
+                        ("page changed after zoom momentum end", .changed, 0, false, false),
                         ("page begins after zoom", .began, 0, false, false),
                         ("page cancelled ignores Command", .cancelled, 0, true, false),
                         ("zoom begins after cancellation", .began, 0, true, true),
                         ("zoom cancelled keeps route", .cancelled, 0, false, true),
+                        ("page changed after zoom cancellation", .changed, 0, false, false),
                         ("page begins after zoom cancellation", .began, 0, false, false),
                         ("Command wheel stays independent", nil, 0, true, true),
                         ("page changed after Command wheel", .changed, 0, false, false),
