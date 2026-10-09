@@ -169,6 +169,9 @@ public enum UsageAttributionSettings {
         "claude": ["anthropic"],
         "codex": ["openai"],
         "grok": ["xai"],
+        // Grok Bot's own plan (maintainer D6, 2026-10-10): its rows are its own spend. It covers only its own
+        // rows — see `ownRowsOnlySubscriptions` — so it never competes for xai usage logged by another client.
+        "grok-bot": ["xai"],
         "kimi": ["moonshot"],
         "micode": ["minimax"],
 
@@ -387,12 +390,18 @@ public enum UsageAttributionSettings {
         return authed.isEmpty ? [:] : ["opencode": authed]
     }
 
+    /// Subscriptions that cover only the rows their own client logged and take no part in suggestions for another
+    /// client's rows. Grok Bot's plan is spent by Grok Bot alone; letting it also accept `xai` reached from elsewhere
+    /// would make every cross-client xai row ambiguous between `grok` and `grok-bot` whenever both are subscribed,
+    /// and the existing `.assigned("grok")` suggestion would disappear (found on Windows E2 review).
+    public static let ownRowsOnlySubscriptions: Set<String> = ["grok-bot"]
+
     public static func suggestionTarget(
         sourceClient: String, provider: String, subscriptionClients: [String],
         routedSubscriptions: RoutedSubscriptions = [:]
     ) -> UsageAttribution.State? {
         let owners = subscriptionClients.filter {
-            subscriptionProviderMap[$0]?.contains(provider) == true
+            !ownRowsOnlySubscriptions.contains($0) && subscriptionProviderMap[$0]?.contains(provider) == true
         }
         // A client talking to its own provider is the plainest reading, and
         // stays unambiguous even when another subscription also accepts it.

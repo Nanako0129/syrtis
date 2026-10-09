@@ -2075,6 +2075,19 @@ enum SelfTest {
                 sourceClient: "cursor", provider: "xai",
                 subscriptionClients: ["grok"]) == .assigned("cursor"),
             "cursor's bundled grok is cursor's own spend")
+        // D6 (grok-bot plan): a Grok Bot row is Grok Bot's own spend, and the plan never competes for another
+        // client's xai rows. Mutation: drop `ownRowsOnlySubscriptions` from `owners` -> the codex|xai row with both
+        // grok and grok-bot subscribed becomes ambiguous (nil) instead of .assigned("grok").
+        expect(
+            UsageAttributionSettings.suggestionTarget(
+                sourceClient: "grok-bot", provider: "xai",
+                subscriptionClients: ["grok", "grok-bot"]) == .assigned("grok-bot"),
+            "a grok-bot xai row is Grok Bot's own spend")
+        expect(
+            UsageAttributionSettings.suggestionTarget(
+                sourceClient: "codex", provider: "xai",
+                subscriptionClients: ["grok", "grok-bot"]) == .assigned("grok"),
+            "xai reached from another client still spends grok, not grok-bot, when both are subscribed")
         // The two policies contradict each other, so no provider may appear in
         // both — otherwise which one wins depends on the order of the branches.
         expect(
