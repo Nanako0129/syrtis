@@ -72,8 +72,10 @@ final class OrbitRig {
     let cameraNode = SCNNode()
     let camera = SCNCamera()
     var target = simd_double3(0, 0, 0)
-    var azimuth: Double = .pi / 4
-    var elevation: Double = atan2(0.45, sqrt(2.0) * 0.7) // ~24.6° (tsx start pos)
+    static let defaultAzimuth: Double = .pi / 4
+    static let defaultElevation: Double = atan2(0.45, sqrt(2.0) * 0.7) // ~24.6° (tsx start pos)
+    var azimuth = OrbitRig.defaultAzimuth
+    var elevation = OrbitRig.defaultElevation
     private let distance: Double = 150 // irrelevant to ortho size; clears clipping
     var scale: Double = 26 // orthographicScale = half view height, world units
     private let minScale: Double = 0.6 // ≈ tsx maxZoom 80 at a ~300px view
@@ -153,6 +155,12 @@ final class OrbitRig {
         UserDefaults.standard.string(forKey: storageKey) != nil
     }
 
+    /// Back to the starting viewpoint; Reset then fits the zoom to it.
+    func resetAngle() {
+        azimuth = Self.defaultAzimuth
+        elevation = Self.defaultElevation
+    }
+
     static func clearSavedCamera() {
         UserDefaults.standard.removeObject(forKey: storageKey)
     }
@@ -202,6 +210,10 @@ final class ContributionGraphView: SCNView {
     var needsInitialFit = false
     private var tooltip: NSTextField!
     private var hoveredNode: SCNNode?
+    private var scrollZoom: Bool?
+    private var scrollPhase: NSEvent.Phase = []
+    /// Called on every zoom step (⌘ + scroll, pinch); hides the zoom hint.
+    var onZoom: (() -> Void)?
 
     override func layout() {
         super.layout()
@@ -236,7 +248,7 @@ final class ContributionGraphView: SCNView {
                 owner: self, userInfo: nil))
     }
 
-    // Camera input: drag = orbit, right/option-drag = pan, scroll/pinch = zoom.
+    // Camera input: drag = orbit, right/option-drag = pan, command-scroll/pinch = zoom.
     override func mouseDragged(with event: NSEvent) {
         if event.modifierFlags.contains(.option) {
             rig.pan(dx: event.deltaX, dy: event.deltaY, viewHeightPx: bounds.height)
@@ -250,11 +262,41 @@ final class ContributionGraphView: SCNView {
     }
 
     override func scrollWheel(with event: NSEvent) {
+        var zoom = event.modifierFlags.contains(.command)
+        if !event.phase.isEmpty || !event.momentumPhase.isEmpty {
+            let starts = event.phase.contains(.mayBegin) || event.phase.contains(.began)
+            // mayBegin -> began is one gesture; direct ended can precede momentum.
+            if scrollZoom == nil || (starts && !scrollPhase.contains(.mayBegin)) {
+                scrollZoom = zoom
+            }
+            zoom = scrollZoom ?? zoom
+            scrollPhase = event.phase
+        }
+        defer {
+            // Deliver terminal events to the same responder before forgetting the route.
+            if event.phase.contains(.cancelled) || event.momentumPhase.contains(.ended)
+                || event.momentumPhase.contains(.cancelled)
+            {
+                scrollZoom = nil
+                scrollPhase = []
+            }
+        }
+        guard zoom else {
+            clearHover()
+            nextResponder?.scrollWheel(with: event)
+            return
+        }
+        // A zero-delta event (a trackpad touch before it moves) zooms nothing
+        // and must not hide the hint.
+        guard event.scrollingDeltaY != 0 else { return }
         rig.zoom(deltaY: event.scrollingDeltaY)
+        onZoom?()
     }
 
     override func magnify(with event: NSEvent) {
+        guard event.magnification != 0 else { return }
         rig.zoom(deltaY: -event.magnification * 60)
+        onZoom?()
     }
 
     func fitToContent() {
@@ -386,28 +428,68 @@ private func buildGridNode(
 struct ContributionGraph3D: View {
     let grid: TokenBarCore.GridLayout
 
+    /// The zoom hint on the chart's top leading corner.
+    enum ZoomHint {
+        /// Quick enough not to trail the zoom that hides it.
+        static let fadeDuration = 0.2
+        /// Long enough that it does not come back between pinches of one
+        /// zoom session, short enough to remind a later visitor.
+        static let idleDelay: Duration = .seconds(8)
+    }
+
     @State private var holder = GraphHolder()
+    @State private var hintVisible = true
+    @State private var hintReturn: Task<Void, Never>?
     @Environment(\.colorScheme) private var colorScheme
 
     var body: some View {
         ContributionGraphRepresentable(
-            grid: grid, dark: colorScheme == .dark, holder: holder)
-            .overlay(alignment: .topTrailing) {
+            grid: grid, dark: colorScheme == .dark, holder: holder, onZoom: zoomed)
+            .overlay(alignment: .top) {
                 HStack(spacing: 4) {
-                    button("Fit".localized) { holder.view?.fitToContent() }
-                    button("Reset".localized) {
+                    chip(Text("Pinch or ⌘ + scroll to zoom".localized))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .opacity(hintVisible ? 1 : 0)
+                        .allowsHitTesting(false)
+                    Spacer(minLength: 6)
+                    button("Fit".localized, help: "Zoom to show the whole chart.") {
+                        holder.view?.fitToContent()
+                    }
+                    button("Reset".localized, help: "Reset the camera angle and zoom.") {
                         OrbitRig.clearSavedCamera()
+                        holder.view?.rig.resetAngle()
                         holder.view?.fitToContent()
                     }
                 }
                 .padding(6)
             }
+            .onDisappear { hintReturn?.cancel() }
     }
 
-    private func button(_ label: String, action: @escaping () -> Void) -> some View {
-        Button(label, action: action)
+    /// Hides the hint while the user zooms; it fades back after `idleDelay`
+    /// without a zoom.
+    private func zoomed() {
+        if hintVisible {
+            withAnimation(.easeOut(duration: ZoomHint.fadeDuration)) { hintVisible = false }
+        }
+        hintReturn?.cancel()
+        hintReturn = Task { @MainActor in
+            try? await Task.sleep(for: ZoomHint.idleDelay)
+            guard !Task.isCancelled else { return }
+            withAnimation(.easeIn(duration: ZoomHint.fadeDuration)) { hintVisible = true }
+        }
+    }
+
+    private func button(_ label: String, help: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) { chip(Text(label).fontWeight(.medium)) }
             .buttonStyle(.plain)
-            .font(.caption2.weight(.medium))
+            .help(help.localized)
+    }
+
+    private func chip(_ text: Text) -> some View {
+        text
+            .font(.caption2)
             .padding(.horizontal, 7)
             .padding(.vertical, 3)
             .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 5))
@@ -425,6 +507,7 @@ private struct ContributionGraphRepresentable: NSViewRepresentable {
     let grid: TokenBarCore.GridLayout
     let dark: Bool
     let holder: GraphHolder
+    let onZoom: () -> Void
 
     func makeNSView(context: Context) -> ContributionGraphView {
         let view = ContributionGraphView(frame: .zero)
@@ -456,6 +539,7 @@ private struct ContributionGraphRepresentable: NSViewRepresentable {
         view.rendersContinuously = false // render on demand
         view.setupTooltip()
         holder.view = view
+        view.onZoom = onZoom
 
         installGrid(into: view, context: context)
 
@@ -465,6 +549,7 @@ private struct ContributionGraphRepresentable: NSViewRepresentable {
     }
 
     func updateNSView(_ view: ContributionGraphView, context: Context) {
+        view.onZoom = onZoom
         let signature = gridSignature
         if context.coordinator.signature != signature {
             installGrid(into: view, context: context)

@@ -21,6 +21,31 @@ private final class UncheckedBox<Value>: @unchecked Sendable {
     init(_ value: Value) { self.value = value }
 }
 
+@MainActor
+private final class ChartEventReceiver: NSResponder {
+    var scrollEvent: NSEvent?
+    override func scrollWheel(with event: NSEvent) { scrollEvent = event }
+
+    static func scroll(
+        y: Int32 = 10, phase: CGScrollPhase? = nil, momentum: Int64 = 0,
+        precise: Bool = true, modifiers: CGEventFlags = []
+    ) -> NSEvent {
+        let event = CGEvent(
+            scrollWheelEvent2Source: nil, units: precise ? .pixel : .line,
+            wheelCount: 1, wheel1: y, wheel2: 0, wheel3: 0)!
+        event.setIntegerValueField(.scrollWheelEventScrollPhase, value: Int64(phase?.rawValue ?? 0))
+        event.setIntegerValueField(.scrollWheelEventMomentumPhase, value: momentum)
+        event.flags = modifiers
+        return NSEvent(cgEvent: event)!
+    }
+}
+
+// AppKit has no public magnify-event constructor.
+private final class ChartMagnifyEvent: NSEvent {
+    override var type: NSEvent.EventType { .magnify }
+    override var magnification: CGFloat { 0.1 }
+}
+
 private actor ThrottleCallCounter {
     private(set) var count = 0
     func bump() { count += 1 }
@@ -1277,10 +1302,12 @@ enum SelfTest {
                 visible: nil, width: 400, height: 500)
             expect(unclamped.minX == -190, "glass panel is not clamped without a screen")
         }
-        let glassCloseResult = MainActor.assumeIsolated { () -> (Int, Bool, Bool, Bool) in
+        let glassCloseResult = MainActor.assumeIsolated { () -> ([Bool], Bool, Bool, Bool) in
             let panel = GlassPanel()
-            var performCloseCalls = 0
-            panel.onPerformClose = { performCloseCalls += 1 }
+            var closeIntents: [Bool] = []
+            panel.onPerformClose = { closeIntents.append($0) }
+            panel.performClose(nil)
+            panel.closeForWindowHandoff()
             panel.performClose(nil)
 
             let content = NSViewController()
@@ -1304,12 +1331,37 @@ enum SelfTest {
 
             presenter.sessionDidEnd(for: newItem)
             presenter.close() // no session left: hides directly
-            return (performCloseCalls, sessionEndsFirst, lateEndIgnored,
+            return (
+                closeIntents, sessionEndsFirst, lateEndIgnored,
                     cancelled == 1 && hidden == 2)
         }
+        // Settings handoff: the glass panel closes as a handoff, and the
+        // presenter then drops its return target. A normal close keeps it for
+        // the deferred restore. Mutations: route the panel through
+        // performClose; ignore `preservingActivation`.
+        let glassHandoff = MainActor.assumeIsolated { () -> [Bool] in
+            let panel = GlassPanel()
+            var intents: [Bool] = []
+            panel.onPerformClose = { intents.append($0) }
+            SettingsWindowController.closeForHandoff(panel)
+
+            let content = NSViewController()
+            content.view = NSView()
+            let presenter = GlassPanelPresenter(contentViewController: content)
+            defer { presenter.tearDown() }
+            presenter.previousApp = NSRunningApplication.current
+            presenter.close(preservingActivation: false)
+            let keptOnClose = presenter.previousApp != nil
+            presenter.previousApp = NSRunningApplication.current
+            presenter.close(preservingActivation: true)
+            return intents + [keptOnClose, presenter.previousApp == nil]
+        }
         expect(
-            glassCloseResult.0 == 1,
-            "glass panel routes performClose (settings button, Esc) to its owner")
+            glassHandoff == [true, true, true],
+            "Settings closes the glass panel as a handoff, which drops the focus return target; got \(glassHandoff)")
+        expect(
+            glassCloseResult.0 == [false, true, false],
+            "glass panel routes normal and window-handoff closes without leaking intent")
         expect(
             glassCloseResult.1,
             "glass panel close ends the menu-bar session instead of hiding behind it")
@@ -9070,6 +9122,97 @@ enum SelfTest {
         }
         for (label, passed) in TBCore.filterParityContractChecks() {
             expect(passed, "filter parity: \(label)")
+        }
+
+        // Native scroll routing and pinch zoom; no window or system input needed.
+        do {
+            let defaults = UserDefaults.standard
+            // Restore the persisted value, not a temporary launch-argument override.
+            let savedCamera = defaults.persistentDomain(
+                forName: Bundle.main.bundleIdentifier ?? "Syrtis")?[OrbitRig.storageKey]
+            defer { defaults.set(savedCamera, forKey: OrbitRig.storageKey) }
+            defaults.removeObject(forKey: OrbitRig.storageKey)
+            let rig = OrbitRig()
+            rig.scale = 26
+            let chart = ContributionGraphView(frame: .zero)
+            chart.rig = rig
+            let receiver = ChartEventReceiver()
+            chart.nextResponder = receiver
+            let vertical = ChartEventReceiver.scroll(phase: .mayBegin)
+            let momentum = ChartEventReceiver.scroll(momentum: 1, modifiers: .maskCommand)
+            expect(
+                vertical.hasPreciseScrollingDeltas && vertical.phase == .mayBegin
+                    && momentum.momentumPhase == .began,
+                "3D fixtures carry native direct and momentum phases")
+            // Each sequence changes Command after its first event. The same route
+            // must receive every event, including cancellation and momentum end.
+            let events:
+                [(label: String, phase: CGScrollPhase?, momentum: Int64, command: Bool, zoom: Bool)] =
+                    [
+                        ("page mayBegin", .mayBegin, 0, false, false),
+                        ("page began ignores Command", .began, 0, true, false),
+                        ("page changed ignores Command", .changed, 0, true, false),
+                        ("page ended ignores Command", .ended, 0, true, false),
+                        ("page momentum begin", nil, 1, true, false),
+                        ("page momentum change", nil, 2, true, false),
+                        ("page momentum end", nil, 3, true, false),
+                        ("zoom mayBegin", .mayBegin, 0, true, true),
+                        ("zoom began keeps route", .began, 0, false, true),
+                        ("plain wheel stays independent", nil, 0, false, false),
+                        ("zoom changed keeps route", .changed, 0, false, true),
+                        ("zoom ended keeps route", .ended, 0, false, true),
+                        ("zoom momentum begin", nil, 1, false, true),
+                        ("zoom momentum change", nil, 2, false, true),
+                        ("zoom momentum end", nil, 3, false, true),
+                        // Not a start phase: only the reset on momentum end
+                        // keeps the finished zoom route from carrying over.
+                        ("page changed after zoom momentum end", .changed, 0, false, false),
+                        ("page begins after zoom", .began, 0, false, false),
+                        ("page cancelled ignores Command", .cancelled, 0, true, false),
+                        ("zoom begins after cancellation", .began, 0, true, true),
+                        ("zoom cancelled keeps route", .cancelled, 0, false, true),
+                        ("page changed after zoom cancellation", .changed, 0, false, false),
+                        ("page begins after zoom cancellation", .began, 0, false, false),
+                        ("Command wheel stays independent", nil, 0, true, true),
+                        ("page changed after Command wheel", .changed, 0, false, false),
+                        ("page ends without momentum", .ended, 0, false, false),
+                        ("new zoom after direct end", .began, 0, true, true),
+                    ]
+            for (label, phase, momentum, command, zoom) in events {
+                let event = ChartEventReceiver.scroll(
+                    phase: phase, momentum: momentum, precise: phase != nil || momentum != 0,
+                    modifiers: command ? .maskCommand : [])
+                rig.scale = 26
+                receiver.scrollEvent = nil
+                chart.scrollWheel(with: event)
+                expect(
+                    zoom
+                        ? receiver.scrollEvent == nil && rig.scale > 26
+                        : receiver.scrollEvent === event && rig.scale == 26,
+                    "3D \(label)")
+            }
+            let beforePinch = rig.scale
+            chart.magnify(with: ChartMagnifyEvent())
+            expect(rig.scale < beforePinch, "3D pinch zooms without requiring a click")
+            // The hint hides on a zoom step only. Mutation: drop the
+            // zero-delta guard in scrollWheel.
+            var zoomSignals = 0
+            chart.onZoom = { zoomSignals += 1 }
+            chart.scrollWheel(with: ChartEventReceiver.scroll(y: 0, phase: .mayBegin, modifiers: .maskCommand))
+            let afterTouch = zoomSignals
+            chart.scrollWheel(with: ChartEventReceiver.scroll(phase: .began, modifiers: .maskCommand))
+            expect(
+                afterTouch == 0 && zoomSignals == 1,
+                "3D hint hides on a zoom step, not on a ⌘ touch with no delta; got \(afterTouch), \(zoomSignals)")
+            chart.onZoom = nil
+            // Reset restores the starting angle. Mutation: empty resetAngle.
+            rig.orbit(dx: 120, dy: 40)
+            let rotated = rig.azimuth != OrbitRig.defaultAzimuth
+            rig.resetAngle()
+            expect(
+                rotated && rig.azimuth == OrbitRig.defaultAzimuth
+                    && rig.elevation == OrbitRig.defaultElevation,
+                "3D Reset restores the starting angle")
         }
 
         // 3D pan follows the pointer (option- or right-drag). AppKit deltaY is

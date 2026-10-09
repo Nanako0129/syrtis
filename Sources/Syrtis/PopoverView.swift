@@ -906,7 +906,7 @@ struct PopoverView: View {
                 .help("A new version is ready — click to install")
             }
             Button {
-                openSettingsWindow(from: NSApp.keyWindow)
+                SettingsWindowController.shared.showFromPopover()
             } label: {
                 Image(systemName: "gearshape")
             }
@@ -981,21 +981,6 @@ struct PopoverView: View {
         cmdHeld = false
     }
 
-    /// Settings live in their own window now; the transient popover closes
-    /// itself on the way (programmatic window swaps don't count as the
-    /// outside click that would normally dismiss it). Present on the NEXT
-    /// runloop turn: showing the window in the same turn as the popover's
-    /// animated close puts both vibrant windows in one CoreAnimation
-    /// transaction and the native switch thumbs lose their first frame (blue
-    /// track, no knob) until a later window-level invalidation. Launching with
-    /// `--settings` has no popover and never showed the artifact.
-    private func openSettingsWindow(from popoverWindow: NSWindow?) {
-        popoverWindow?.performClose(nil)
-        DispatchQueue.main.async {
-            SettingsWindowController.shared.show()
-        }
-    }
-
     /// Returns true when the event was consumed.
     private func handleKeyDown(_ event: NSEvent) -> Bool {
         if event.keyCode == 53 { // Esc closes the popover
@@ -1017,7 +1002,7 @@ struct PopoverView: View {
             let step = chars == "]" ? 1 : tabs.count - 1
             clientTab.wrappedValue = tabs[(current + step) % tabs.count]
         case ",":
-            openSettingsWindow(from: event.window)
+            SettingsWindowController.shared.showFromPopover(from: event.window)
         case "w":
             event.window?.performClose(nil)
         case "q":

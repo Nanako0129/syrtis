@@ -4,7 +4,7 @@ id: kb-verification
 kind: canonical
 scope: repository
 read_when: changing runtime code, running a local build or UX acceptance, parser output, cache behavior, FFI contracts, or this knowledge tree
-last_verified: 2026-09-27
+last_verified: 2026-10-09
 sources: [".github/workflows/ci.yml", ".github/workflows/ci-release.yml", "Makefile", "Package.swift", "scripts/bundle.sh", "Sources/Syrtis/ClientTray.swift", "Sources/Syrtis/StatusItemController.swift", "Sources/Syrtis/MenuBarTextColor.swift", "Sources/Syrtis/Views/AgentIconView.swift", "Sources/Syrtis/Views/SettingsPanel.swift", "Sources/Syrtis/SelfTest.swift", "Sources/CrossCheckHarness/main.swift", "Sources/TokenBarCore/AgentUsage.swift", "Sources/Syrtis/ClaudeExtraRoots.swift", "crates/tb_core_ffi/src/agent_account_scope.rs", "crates/tb_core_ffi/src/agent_quota_history.rs", "crates/tb_core_ffi/src/agent_kiro.rs", "crates/tb_core_ffi/src/kiro_integrations.rs", "crates/tb_core_ffi/src/extra_scan_paths.rs", "docs/knowledge/plans/provider-quota-pace.md", "docs/knowledge/plans/codex-historical-pace-v2.md", "public TokenBar-Windows PR #7", "public Syrtis PR #114", "public TokenBar-Windows PR #12", "AGENTS.md", "memory-derived hermetic verification practice", "memory-derived local build indexing incident"]
 ---
 
@@ -128,6 +128,8 @@ Live account-scope smoke必須在hermetic security suite通過後才執行，且
 | Local Clippy | `cargo clippy --workspace --all-targets` passes, including test-only targets |
 
 ## Local build and UX acceptance
+
+3D 圖表的原生事件夾具放在正常 `make selftest`，驗證 `.mayBegin`／`.began` 的路由鎖存、途中改變 ⌘、直接捲動接續慣性、取消／結束事件與獨立滑鼠滾輪；也驗證 Settings 交接時玻璃面板走 `SettingsWindowController.closeForHandoff`，以及 presenter 因此清除返回目標。這些無介面測試不證明系統的觸控板事件投遞。實機驗收須從真正的選單列 session 開啟面板，確認捏合、頁面捲動與 hover 清除，以及 Esc 後回到原應用程式輸入、Settings 交接、點擊其他應用程式、狀態列項目交接和快速關閉重開時的焦點。
 
 > **⚠️ `make run` 與 bundle 讀的不是同一個 `UserDefaults` 網域。** `swift run Syrtis`（`make run` 就是它）產出裸執行檔、沒有 `CFBundleIdentifier`，`UserDefaults.standard` 因此落在行程名網域 **`Syrtis`**；bundle 用 **`com.nyanako.tokenbar`**（背景見本文件上方 bundle identity 段落）。兩份偏好互不可見，且裸執行檔那一份會隨開發過程被寫入，內容與使用者實際設定無關。
 >

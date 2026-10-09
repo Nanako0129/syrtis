@@ -664,3 +664,7 @@
 "Makes the popover's glass less see-through, so its text stays readable over the windows behind it." = "让窗口的玻璃不那么透明，背后有其他窗口时文字也看得清楚。";
 "Text hard to read over the windows behind this one? Make the glass less see-through here. You can change it later in Quick settings at the top right." = "背后有其他窗口时，文字不好读吗？可以在这里把玻璃调得不那么透明，之后也能在右上角的快速设置调整。";
 "Quick settings" = "快速设置";
+
+"Pinch or ⌘ + scroll to zoom" = "捏合或按住 ⌘ 滚动可缩放";
+"Zoom to show the whole chart." = "缩放到能看到整张图。";
+"Reset the camera angle and zoom." = "重设视角与缩放。";

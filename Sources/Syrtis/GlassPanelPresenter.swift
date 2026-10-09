@@ -23,9 +23,11 @@ final class GlassPanelPresenter {
     /// from the item that owns the current session.
     private weak var sessionOwner: AnyObject?
     private var eventMonitors: [Any] = []
-    /// Bumped on every present so a close fade that finishes after a reopen
-    /// doesn't order the reopened panel out.
+    /// A reopen invalidates both the old close fade and queued focus return.
     private var generation = 0
+    /// The app to hand activation back to on close. Not private: SelfTest
+    /// checks that a window handoff clears it.
+    var previousApp: NSRunningApplication?
 
     /// Called once the panel is ordered out, so the owner can swap the live
     /// view for a placeholder and stop its `.task` loops.
@@ -47,7 +49,9 @@ final class GlassPanelPresenter {
             layer.cornerCurve = .continuous
             layer.masksToBounds = true
         }
-        panel.onPerformClose = { [weak self] in self?.close() }
+        panel.onPerformClose = { [weak self] preservingActivation in
+            self?.close(preservingActivation: preservingActivation)
+        }
     }
 
     var hasSession: Bool { cancelSession != nil }
@@ -61,7 +65,9 @@ final class GlassPanelPresenter {
 
     /// Ends the menu bar session when there is one (its end callback then
     /// calls `sessionDidEnd`), otherwise hides directly.
-    func close() {
+    func close(preservingActivation: Bool = false) {
+        // Settings opens on the next turn, so record the handoff before closing.
+        if preservingActivation { previousApp = nil }
         if let cancelSession { cancelSession() } else { hide() }
     }
 
@@ -75,7 +81,7 @@ final class GlassPanelPresenter {
     /// Hides without ending a session — for handing the panel over to a
     /// session another item just began.
     func dismiss() {
-        hide()
+        hide(restoringActivation: false)
     }
 
     /// `layout` must already have the live content installed.
@@ -84,6 +90,14 @@ final class GlassPanelPresenter {
         layout(height: height, animate: false)
         generation += 1
         panel.alphaValue = 0
+        if previousApp == nil,
+            let frontmost = NSWorkspace.shared.frontmostApplication,
+            frontmost.processIdentifier != ProcessInfo.processInfo.processIdentifier
+        {
+            previousApp = frontmost
+        }
+        // Match the NSPopover path so trackpad magnify events reach the panel.
+        NSApp.activate(ignoringOtherApps: true)
         panel.makeKeyAndOrderFront(nil)
         // Pay the first SwiftUI layout + draw (measured 65-125 ms) while the
         // panel is invisible, then animate on the next turn. Measured: more
@@ -126,15 +140,31 @@ final class GlassPanelPresenter {
     }
 
     func tearDown() {
+        previousApp = nil
         removeEventMonitors()
         panel.orderOut(nil)
         panel.contentViewController = nil
     }
 
-    private func hide() {
+    private func hide(restoringActivation: Bool = true) {
         removeEventMonitors()
         anchor = nil
         let generation = generation
+        if restoringActivation {
+            // Defer one turn for menu-bar handoffs, not until the fade finishes.
+            // A new present keeps the return target and invalidates this close.
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.generation == generation, !self.isShown else { return }
+                let previousApp = self.previousApp
+                self.previousApp = nil
+                guard let previousApp, !previousApp.isTerminated,
+                    NSWorkspace.shared.frontmostApplication?.processIdentifier
+                        == ProcessInfo.processInfo.processIdentifier
+                else { return }
+                NSApp.yieldActivation(to: previousApp)
+                previousApp.activate(options: [])
+            }
+        }
         let finish = { [weak self] in
             MainActor.assumeIsolated {
                 guard let self, self.generation == generation else { return }
@@ -154,7 +184,7 @@ final class GlassPanelPresenter {
         fade.toValue = 0
         fade.duration = GlassPanelStyle.closeDuration
         fade.timingFunction = CAMediaTimingFunction(name: .easeIn)
-        layer.opacity = 0 // model value; the animation shows the fade
+        layer.opacity = 0  // model value; the animation shows the fade
         layer.add(fade, forKey: Self.closeAnimationKey)
         CATransaction.commit()
     }
@@ -214,7 +244,7 @@ final class GlassPanelPresenter {
                     if let self, let window = event.window, window !== self.panel,
                        window.level.rawValue < NSWindow.Level.statusBar.rawValue
                     {
-                        self.close()
+                        self.close(preservingActivation: true)
                     }
                 }
                 return event
@@ -558,10 +588,12 @@ final class GlassPanel: NSPanel {
 
     override var canBecomeKey: Bool { true }
 
-    /// PopoverView closes its window with performClose (the settings button,
-    /// Esc), which a borderless panel ignores for lack of a close button.
-    var onPerformClose: (() -> Void)?
-    override func performClose(_ sender: Any?) { onPerformClose?() }
+    /// Route normal closes and Settings handoffs to the presenter; a
+    /// borderless panel has no standard close button.
+    var onPerformClose: ((Bool) -> Void)?
+    override func performClose(_ sender: Any?) { onPerformClose?(false) }
+
+    func closeForWindowHandoff() { onPerformClose?(true) }
 }
 
 /// The popover's horizontal separators: a quieter hairline than the system

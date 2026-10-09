@@ -50,16 +50,27 @@ final class SettingsWindowController {
     }
 
     /// For a control inside the popover: close the popover first, then show
-    /// on the next runloop turn, as the popover's own gear button does
-    /// (`PopoverView.openSettingsWindow`). Showing in the same turn as the
+    /// on the next runloop turn. Showing in the same turn as the
     /// popover's animated close puts both vibrant windows in one CoreAnimation
     /// transaction and the native switch thumbs lose their first frame; and
     /// leaving the popover open keeps its polling running behind Settings.
-    func showFromPopover(scrollingTo destination: Destination? = nil) {
-        if let popover = NSApp.keyWindow, popover !== window {
-            popover.performClose(nil)
+    func showFromPopover(
+        scrollingTo destination: Destination? = nil, from popoverWindow: NSWindow? = nil
+    ) {
+        if let popover = popoverWindow ?? NSApp.keyWindow, popover !== window {
+            Self.closeForHandoff(popover)
         }
         DispatchQueue.main.async { self.show(scrollingTo: destination) }
+    }
+
+    /// The glass panel closes as a window handoff, so focus stays with
+    /// Settings instead of returning to the app the panel was opened from.
+    static func closeForHandoff(_ popover: NSWindow) {
+        if let panel = popover as? GlassPanel {
+            panel.closeForWindowHandoff()
+        } else {
+            popover.performClose(nil)
+        }
     }
 
     func show(scrollingTo destination: Destination? = nil) {

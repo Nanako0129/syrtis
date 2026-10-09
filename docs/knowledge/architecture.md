@@ -4,7 +4,7 @@ id: kb-architecture
 kind: canonical
 scope: repository
 read_when: changing Rust parsing, the C ABI, Swift models, reports, cache, or filters
-last_verified: 2026-10-06
+last_verified: 2026-10-09
 sources: [".gitmodules", "Package.swift", "Makefile", "Sources/CTB/include/ctb.h", "crates/tb_core_ffi", "crates/tb_core_ffi/src/agent_account_scope.rs", "crates/tb_core_ffi/src/agent_quota_duration.rs", "crates/tb_core_ffi/src/agent_quota_history.rs", "Sources/TokenBarCore", "Sources/Syrtis", "docs/knowledge/plans/provider-quota-pace.md", "vendor/README.md", "public tokscale-core commit bb9a2a9", "public Syrtis PR #114", "public TokenBar-Windows PR #12", "public TokenBar-Windows PR #20"]
 ---
 
@@ -261,6 +261,8 @@ Pricing metadata is refreshable rather than frozen for the process lifetime; the
 **Router 不進表。** OpenRouter、LiteLLM、opencode、Roo Code、Goose 用的是你自己的 key 或別人的訂閱，自己不賣方案。opencode 是唯一有例外處理的：它的 `auth.json` oauth 條目經 `opencodeSubscriptions` 上報，`routedSubscriptions` 據此判定它實際簽入哪個訂閱——那是宣告的事實，不是推論。其餘 router 沒有等價訊號，因此不建議。
 
 ## Swift presentation layer
+
+[`ContributionGraphView`](../../Sources/Syrtis/Charts/ContributionGraph3D.swift) 在手勢開始時決定頁面捲動或 ⌘＋縮放，沿用至慣性結束；沒有 phase 的滑鼠滾輪逐事件判斷。轉發頁面捲動前清除 hover 與日期提示，三語縮放提示顯示在圖表左上、與 Fit／Reset 同一列，縮放（捏合或 ⌘＋捲動）時淡出，閒置 `ZoomHint.idleDelay` 後淡入；Fit／Reset 的 help 說明按鈕本身的作用。捏合、拖曳與平移沿用既有 handler，沒有點擊啟用狀態。macOS 27+ 的 [`GlassPanelPresenter`](../../Sources/Syrtis/GlassPanelPresenter.swift) 保留 `.nonactivatingPanel` 樣式，但顯示時明確啟用應用程式，讓 AppKit 投遞捏合事件。Presenter 記錄原前景應用程式，正常關閉後歸還焦點；Settings 或既有自有視窗交接保留啟用，使用者已切到外部應用程式時不搶回。狀態列項目交接保留原返回目標（依程式碼；新舊項目 session 回呼的先後未經實機驗證），generation guard 取消快速重開後的舊歸還。實機驗收另行確認事件傳遞與焦點，無介面夾具只驗證 handler 路由。
 
 SwiftUI owns the seven dashboard lenses, settings, menu-bar title, quota icon, animation, and lifecycle of the popover and settings window. `DashboardModel` coordinates initial load, lazy hourly and Agents reports, year selection, snapshot reuse, stale-data retention, and poll cancellation. A process-lifetime `@MainActor` publication coordinator applies the Rust `publicationGeneration` guard across the popover and Settings models, snapshot restore, and TrayAnimator's independent poller before any payload or scalar is stored. Dashboard polling reconciles the accepted payload into the shared scalar, while TrayAnimator's payload getter prefers the coordinator's latest generated payload over an older result from its own poller. The persistent scalar participates in the tray icon signature, so that write triggers immediate gauge rendering and the app-level defaults observer refreshes the title; missing generations remain direct demo/legacy values and are not persisted. Settings reconciliation is keyed by generation plus selection/exclusions, or by generated timestamp plus resolved-scalar fingerprint for legacy payloads, so distinct payloads cannot collide on `generatedAt` alone. The app shell must stop hidden-window polling when the window is closed; otherwise an apparently idle menu-bar utility can keep rendering and consuming CPU.
 
