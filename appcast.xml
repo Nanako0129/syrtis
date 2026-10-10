@@ -3,6 +3,28 @@
     <channel>
         <title>TokenBar updates</title>
         <item>
+            <title>2.7.0</title>
+            <pubDate>Sat, 10 Oct 2026 02:05:42 +0000</pubDate>
+            <link>https://github.com/Nanako0129/syrtis/releases/tag/v2.7.0</link>
+            <sparkle:version>1576</sparkle:version>
+            <sparkle:shortVersionString>2.7.0</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
+            <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
+            <description><![CDATA[<b>Features:</b>
+<ul>
+<li>Grok Bot usage now appears on the Grok Build &amp; Bot tab instead of the Cursor tab. If you had assigned Cursor's xAI usage to Grok Bot by hand, check that choice.</li>
+<li>When Syrtis knows which captured account agy is signed into, the main Antigravity card reads that account's quota (label OAUTH) instead of running agy. If agy's sign-in changes, that round runs agy as before.</li>
+</ul>
+<b>Fixes:</b>
+<ul>
+<li>Rotating, panning or zooming the 3D chart no longer stutters.</li>
+<li>Dragging the Glass tint slider no longer stutters.</li>
+<li>A limits card with an error no longer shows empty "No data" rows under the message.</li>
+</ul>
+]]></description>
+            <enclosure url="https://github.com/Nanako0129/syrtis/releases/download/v2.7.0/Syrtis.app.tar.gz" length="14009335" type="application/octet-stream" sparkle:edSignature="7UX2KYRlsBbEF6YZdOUzdpq7WoKiwMwEsko7mOGXtQ8DBJHBlGGwGXWqt/dpRg1QGR/lEd4Xt7uWP4OPPCSoDA=="/>
+        </item>
+        <item>
             <title>2.6.0</title>
             <pubDate>Fri, 09 Oct 2026 16:44:36 +0000</pubDate>
             <link>https://github.com/Nanako0129/syrtis/releases/tag/v2.6.0</link>
@@ -86,35 +108,6 @@
 </ul>
 ]]></description>
             <enclosure url="https://github.com/Nanako0129/syrtis/releases/download/v2.4.0/Syrtis.app.tar.gz" length="13695419" type="application/octet-stream" sparkle:edSignature="HrIVfawZvaC5MA5kcFqgZQSjkXgXZxHZkx4sPCQQDZFhVB8ISeE8jqzIQP16eISPhpJ9Or6/QFDTI9ekP8GGAw=="/>
-        </item>
-        <item>
-            <title>2.3.0</title>
-            <pubDate>Sat, 03 Oct 2026 02:36:40 +0000</pubDate>
-            <link>https://github.com/Nanako0129/syrtis/releases/tag/v2.3.0</link>
-            <sparkle:version>1442</sparkle:version>
-            <sparkle:shortVersionString>2.3.0</sparkle:shortVersionString>
-            <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
-            <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
-            <description><![CDATA[<b>Features:</b>
-<ul>
-<li>Eight more agents are tracked: ZCode, Augment Code, Hindsight, Muse Code, Reasonix, Kimchi, Senpi and Oh My Pi. Hindsight usage appears only after you run tokscale hindsight sync from the upstream tokscale CLI. Kimi Work sessions now count toward Kimi.</li>
-<li>Oh My Pi is counted on its own instead of as Pi. Its usage moves from Pi to Oh My Pi and totals stay the same, except that a record present in both ~/.pi and ~/.omp now counts once for each.</li>
-<li>More Antigravity accounts, each with its own quota card labeled by email: Settings -&gt; General -&gt; Antigravity accounts -&gt; "Capture current agy login". The copy is kept in this Mac's login keychain; Remove deletes only that copy. Capturing each account agy signs into automatically is off by default.</li>
-<li>Less memory on scans with a warm cache: peak 329.0 to 301.9 MiB (-8.2%) for all agents on the maintainer's usage, and 88% less for Cursor alone, 32% less for Claude, 29% less for Codex. Results are the same.</li>
-</ul>
-<b>Fixes:</b>
-<ul>
-<li>Long GPT-5.4 to GPT-6 requests (input and cached input over 272K tokens) are now priced at the long-context rate for the whole request, as OpenAI bills them. On the maintainer's usage: Codex gpt-5.6-sol $5,901.37 to $6,397.37, Codex gpt-6-astra $196.53 to $320.60, Claude Code gpt-5.6-sol $355.25 to $449.17, OpenCode gpt-5.4 $79.94 to $86.29. Token counts did not change.</li>
-<li>OpenRouter prices were taken from the half-price Flex tier for 32 Gemini 3.x, GPT-5.x and GPT-6.x models; they now use the listed rate, from the next price refresh. gpt-5.6-sol-pro is now priced at OpenRouter's Fast tier, twice its standard rate.</li>
-<li>Kiro requests that report credits are now priced at $0.04 per credit.</li>
-<li>kimi-for-coding is priced as Kimi K2.7 Code instead of K2.5, Kimi Work's k2d6-agent and k3-agent no longer take Grok 4.20's rates, and k3, k3-256k and claude-opus-41 now have a price.</li>
-<li>A Pi session file that begins with a byte-order mark is now read instead of skipped.</li>
-<li>Grok and Antigravity tabs now end with the window history table, like the other tabs.</li>
-<li>The "Quota summary" switch under Settings' Overview cards is now translated in Chinese.</li>
-</ul>
-<p>The first scan after updating takes longer if you use Kiro or Pi, while their sessions are read again.</p>
-]]></description>
-            <enclosure url="https://github.com/Nanako0129/syrtis/releases/download/v2.3.0/Syrtis.app.tar.gz" length="13582364" type="application/octet-stream" sparkle:edSignature="frdMze9L2cyZjjd1lnHXM+TMfrPcCVua+jcD3b41eVhLBFdvfidLQfUvJhw/RCNUgHz9DG+3AxBQe9uFKK+nAQ=="/>
         </item>
         <item>
             <title>1.1.1</title>
