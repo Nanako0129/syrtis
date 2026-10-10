@@ -1,0 +1,8 @@
+Features:
+- Grok Bot usage now appears on the Grok Build & Bot tab instead of the Cursor tab. If you had assigned Cursor's xAI usage to Grok Bot by hand, check that choice.
+- When Syrtis knows which captured account agy is signed into, the main Antigravity card reads that account's quota (label OAUTH) instead of running agy. If agy's sign-in changes, that round runs agy as before.
+
+Fixes:
+- Rotating, panning or zooming the 3D chart no longer stutters.
+- Dragging the Glass tint slider no longer stutters.
+- A limits card with an error no longer shows empty "No data" rows under the message.
