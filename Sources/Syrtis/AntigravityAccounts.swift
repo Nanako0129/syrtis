@@ -167,7 +167,8 @@ extension AntigravityAccounts {
 ///
 /// Trigger: before each quota fetch, both poll loops await
 /// `TrayAnimator.prepareAntigravityAutoCapture`, which runs `prepareForFetch()`
-/// only when the toggle is on. `poll()` reads agy's login
+/// only when the toggle is on (it also hands the binding to the core, toggle on
+/// or off). `poll()` reads agy's login
 /// marker (attributes only, no secret) and, when it differs from the last
 /// marker attempted, runs ONE automatic capture in the core. The marker is
 /// recorded before the attempt, so a failure is not retried until the marker
@@ -228,7 +229,12 @@ final class AntigravityAutoCapture: ObservableObject {
     /// relaunches: a hash and a keychain modification date, no secret. Safe to
     /// restore without re-reading agy's login, because dedup also requires the
     /// primary card to have been fetched under that same marker, and any agy
-    /// sign-in change since moves the marker.
+    /// sign-in change since moves the marker. The same holds for the core: it
+    /// fills the primary from the bound captured account only after reading
+    /// agy's live marker before AND after the fetch and finding it equal to
+    /// this one (`TrayAnimator.prepareAntigravityAutoCapture` hands the binding
+    /// over before every fetch, toggle on or off), so a stale binding restored
+    /// here can never substitute another login's data.
     static let currentKey = "tokenbar.antigravity.currentAgy"
 
     private func persistCurrent() {
@@ -504,16 +510,23 @@ final class AntigravityAutoCapture: ObservableObject {
 /// (the agy route) and once as its captured card. This drops the captured
 /// card and labels the primary with its email, ONLY when all of these hold:
 /// - `currentAgyKey` is set (verified for the current agy login marker);
-/// - the primary Antigravity snapshot (`accountKey == nil`) came from the agy
-///   route (`source == "agy"`) and has no error, so it is agy's account;
+/// - the primary Antigravity snapshot (`accountKey == nil`) has no error, was
+///   fetched under `currentAgyMarker`, and is agy's account: either it came
+///   from the agy route (`source == "agy"`), or the core substituted the bound
+///   captured account's OAuth result for the agy run (`source == "oauth"` with
+///   `boundAccountKey == currentAgyKey`). The second route's safety rests on
+///   the core's live pre/post marker check as well as on the marker equality
+///   here; the marker stays an opaque string in Swift. An `oauth_creds.json`
+///   primary has neither a marker nor a `boundAccountKey` and is never merged;
 /// - a captured snapshot carries that key.
 /// Otherwise (IDE `cli` or `oauth` source) both are shown. Any error on the
 /// primary (e.g. agy timed out) leaves both cards: a failed card carries source
 /// "oauth" and no login marker, so it cannot be bound to agy's account.
 ///
 /// The primary keeps its own windows and values (gauge, tray, selection), but
-/// the agy route has no trusted history identity, so its windows carry no
-/// history key. When the captured account's snapshot has no error, the merged
+/// the agy route and the substituted route have no trusted history identity
+/// (the substituted primary carries no history scope; the captured card
+/// records the history once), so its windows carry no history key. When the captured account's snapshot has no error, the merged
 /// primary adopts that account's pace status, historical pace and the window
 /// duration they describe (the engine clears the agy primary's duration with
 /// the `accountScope` mark) per matching card id, and records it as
@@ -540,8 +553,15 @@ enum AntigravityDedup {
         var agents = payload.agents
         let primary = agents[primaryIndex]
         let captured = agents[capturedIndex]
-        guard primary.error == nil, primary.source == "agy",
-              primary.agyLoginMarker == marker else { return payload }
+        guard primary.error == nil, primary.agyLoginMarker == marker else { return payload }
+        // "agy": fetched by running agy. "oauth" with a marker AND a
+        // boundAccountKey naming this very account: the core substituted the
+        // bound captured account's OAuth result for the agy run (it checked
+        // the live marker before and after). An `oauth_creds.json` or failed
+        // card carries neither and never merges.
+        guard primary.source == "agy"
+            || (primary.source == "oauth" && primary.boundAccountKey == key)
+        else { return payload }
         var merged = primary
         if let label = captured.identity?.email {
             // The agy route carries no plan; the captured snapshot is the same

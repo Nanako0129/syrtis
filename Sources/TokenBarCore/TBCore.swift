@@ -118,6 +118,11 @@ public struct AntigravityCapturedAccount: Decodable, Equatable, Sendable {
     }
 }
 
+/// Success data of `tb_set_antigravity_binding`.
+package struct AntigravityBindingResult: Decodable {
+    package let bound: Bool
+}
+
 /// Success data of `tb_antigravity_remove`.
 package struct AntigravityRemoved: Decodable {
     package let removed: Bool
@@ -482,6 +487,24 @@ public enum TBCore {
     /// and leaves the registry unchanged. Holds no secret.
     public static func setAntigravityAccounts(json: String) throws -> AntigravityAccountsResult {
         try unwrap(json.withCString { tb_set_antigravity_accounts($0) })
+    }
+
+    /// Tell the core which captured account agy is signed into and the login
+    /// marker it was confirmed under (both opaque here; no secret). Rust
+    /// validates them and, when the live marker still matches, fills the
+    /// primary Antigravity card from that account's OAuth result instead of
+    /// running agy. A nil key or marker clears the binding (NULL). Rust also
+    /// clears it on any invalid input and throws `bridge(<fixed code>)`.
+    @discardableResult
+    public static func setAntigravityBinding(key: String?, marker: String?) throws -> Bool {
+        guard let key, let marker else {
+            let r: AntigravityBindingResult = try unwrap(tb_set_antigravity_binding(nil))
+            return r.bound
+        }
+        let json = String(
+            decoding: try JSONEncoder().encode(["key": key, "marker": marker]), as: UTF8.self)
+        let r: AntigravityBindingResult = try unwrap(json.withCString { tb_set_antigravity_binding($0) })
+        return r.bound
     }
 
     /// Copy agy's current Google login into a Syrtis-owned login-keychain

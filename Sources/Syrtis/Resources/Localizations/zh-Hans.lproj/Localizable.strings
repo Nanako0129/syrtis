@@ -627,7 +627,7 @@
 "When on, Syrtis copies the sign-in of each account agy signs into to this Mac's login keychain: once when you turn this on, then whenever agy's sign-in changes. Turning it off keeps the copies. An account you remove stays removed until you press Capture." = "开启后，agy 登录的每个账户，Syrtis 都会把它的登录复制到这台 Mac 的登录钥匙串：开启时一次，之后 agy 的登录每次改变时一次。关闭后已有的副本会保留。你移除的账户不会再被自动加回，除非你点按“捕获”。";
 "Automatic capture is paused because the login keychain didn't answer. Press Capture to resume." = "登录钥匙串没有响应，自动捕获已暂停。点按“捕获”即可恢复。";
 "Automatic capture is unavailable on this Mac." = "这台 Mac 无法使用自动捕获。";
-"Turn this on to keep agy's current account merged into one card. With it off, a Capture merges it only until agy next refreshes its sign-in, usually within an hour." = "开启后，agy 当前登录的账号会一直合并为一张卡。关闭时，按「捕获」的合并只维持到 agy 下次更新登录，通常不到一小时。";
+"Turn this on to keep reading agy's current account through its captured sign-in, shown as one OAUTH card, so Syrtis rarely needs to run agy. With it off, a Capture lasts only until agy next refreshes its sign-in (usually within an hour); after that the main card runs agy again." = "开启后，agy 当前登录的账号会一直用捕获的登录读取额度，合并为一张标示 OAUTH 的卡，Syrtis 很少需要运行 agy。关闭时，按「捕获」的效果只维持到 agy 下次更新登录，通常不到一小时，之后主卡会改回运行 agy。";
 "Remove deletes only the copy on this Mac. Google still accepts it until you revoke access in Google Account → third-party access, which also signs Antigravity out of that account." = "移除只会删除这台 Mac 上的副本。在你到“Google 账号 → 第三方访问权限”撤销访问之前，Google 仍会接受它；撤销也会让 Antigravity 退出该账户。";
 "Couldn't read agy's login. Check that agy is signed in, and allow access if macOS asks." = "无法读取 agy 的登录。请确认 agy 已登录；macOS 询问时请允许访问。";
 "agy's saved login is in a format Syrtis doesn't recognize." = "agy 保存的登录格式 Syrtis 无法识别。";

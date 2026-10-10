@@ -18539,6 +18539,23 @@ enum SelfTest {
         expect(
             (try? TBCore.setAntigravityAccounts(json: "[]"))?.registeredCount == 0,
             "AG-4 an empty list clears the registry")
+        // E2: the binding setter. Clearing is `bound: false`; a non-mdat marker
+        // (a test fake, "present") is refused and clears (fail closed).
+        expect((try? TBCore.setAntigravityBinding(key: nil, marker: nil)) == false,
+               "AG-E2 the binding setter clears with NULL")
+        var agBindCode: String?
+        do { try TBCore.setAntigravityBinding(key: agKey, marker: "m1") } catch let TBCoreError.bridge(c) {
+            agBindCode = c
+        } catch {}
+        expect(agBindCode == "invalid_marker", "AG-E2 the binding setter refuses a non-mdat marker")
+        let agBoundJSON = #"{"clientId":"antigravity","source":"oauth","updatedAt":"t","windows":[]"#
+        let agBoundDecoded = try? JSONDecoder().decode(AgentUsageSnapshot.self, from: Data(
+            (agBoundJSON + #","boundAccountKey":"\#(agKey)"}"#).utf8))
+        let agBoundAbsent = try? JSONDecoder().decode(AgentUsageSnapshot.self, from: Data(
+            (agBoundJSON + "}").utf8))
+        expect(agBoundDecoded?.boundAccountKey == agKey && agBoundAbsent != nil
+                   && agBoundAbsent?.boundAccountKey == nil,
+               "AG-E2 boundAccountKey decodes when present and is nil when absent")
         for bad in ["not-a-key", String(repeating: "AB", count: 32), agKey + "0"] {
             var code: String?
             do { try TBCore.antigravityRemove(key: bad) } catch let TBCoreError.bridge(c) {
@@ -18604,6 +18621,30 @@ enum SelfTest {
                 await ac.poll()
                 check("AG-5 a new marker makes exactly one more attempt",
                       fake.read { $0.attempts } == 2)
+            }
+
+            // E2: the binding reaches the core before every fetch. Off: the
+            // stored binding is still handed over (the core's live marker
+            // check decides). On, after a login change: the binding handed
+            // over is already cleared. (The real setter is not called here.)
+            do {
+                let fake = AGAutoFake(key: agKey, label: agEmail)
+                let (ac, defaults) = fresh(fake)
+                await ac.manualCapture()
+                var sent: [(String?, String?)] = []
+                await TrayAnimator.prepareAntigravityAutoCapture(
+                    defaults: defaults, autoCapture: ac, setBinding: { sent.append(($0, $1)) })
+                check("AG-E2 toggle off: the stored binding is handed to the core",
+                      ac.currentAgyKey == agKey && sent.count == 1
+                          && sent[0].0 == agKey && sent[0].1 == "m1")
+                defaults.set(true, forKey: AntigravityAutoCapture.enabledKey)
+                fake.write { $0.marker = "m-switched" }
+                sent = []
+                let attempt = await TrayAnimator.prepareAntigravityAutoCapture(
+                    defaults: defaults, autoCapture: ac, setBinding: { sent.append(($0, $1)) })
+                check("AG-E2 toggle on: a login change clears the binding before it is handed over",
+                      sent.count == 1 && sent[0].0 == nil)
+                await attempt?.value
             }
 
             // Single flight: a poll while an attempt is in flight neither
@@ -20086,6 +20127,35 @@ enum SelfTest {
         expect(wcpMerge(wcpMerged).agents.count == 1
                    && wcpPrimary(wcpMerge(wcpMerged))?.historyAccountKey == wcpAgyKey,
                "WCP2-merge the dedup stays idempotent")
+
+        // E2: the substituted primary (source "oauth", marker, boundAccountKey).
+        func wcpOAuthPayload(marker: String?, bound: String?, error: String? = nil) -> AgentUsagePayload {
+            let m = marker.map { #""agyLoginMarker":"\#($0)","# } ?? ""
+            let b = bound.map { #""boundAccountKey":"\#($0)","# } ?? ""
+            let e = error.map { #","error":"\#($0)""# } ?? ""
+            return try! JSONDecoder().decode(AgentUsagePayload.self, from: Data("""
+                {"generatedAt":"t","publicationGeneration":9,"agents":[
+                {"clientId":"antigravity",\(m)\(b)"source":"oauth","updatedAt":"t",
+                 "identity":{"email":"k@example.com","plan":"Google AI Pro"},
+                 "windows":[\(wcpAgyUnscoped)]\(e)},
+                {"clientId":"antigravity","accountKey":"\(wcpAgyKey)","source":"oauth","updatedAt":"t",
+                 "identity":{"email":"k@example.com","plan":"Google AI Pro"},
+                 "windows":[\(wcpAgyKAvailable)]}]}
+                """.utf8))
+        }
+        let wcpT8 = wcpMerge(wcpOAuthPayload(marker: "m1", bound: wcpAgyKey))
+        expect(wcpT8.agents.count == 1 && wcpPrimary(wcpT8)?.historyAccountKey == wcpAgyKey
+                   && wcpPrimary(wcpT8)?.source == "oauth"
+                   && wcpPrimary(wcpT8)?.windows.first?.paceStatus.state == .available,
+               "WCP2-oauth T8 a substituted primary with the matching marker and boundAccountKey merges into one card, history under the captured key")
+        expect(wcpMerge(wcpOAuthPayload(marker: "m0", bound: wcpAgyKey)).agents.count == 2,
+               "WCP2-oauth T9 a substituted primary under another marker is not merged")
+        expect(wcpMerge(wcpOAuthPayload(marker: nil, bound: nil)).agents.count == 2,
+               "WCP2-oauth T12 an oauth_creds.json primary (no marker, no boundAccountKey) is not merged")
+        expect(wcpMerge(wcpOAuthPayload(marker: "m1", bound: String(repeating: "ab", count: 32))).agents.count == 2,
+               "WCP2-oauth T15 a boundAccountKey other than the current key is not merged")
+        expect(wcpMerge(wcpOAuthPayload(marker: "m1", bound: wcpAgyKey, error: "boom")).agents.count == 2,
+               "WCP2-oauth an errored substituted primary is not merged")
         for (name, raw) in [
             ("K errored", wcpAgyPayload(primary: [wcpAgyUnscoped], captured: [wcpAgyKAvailable],
                                         capturedError: "boom")),

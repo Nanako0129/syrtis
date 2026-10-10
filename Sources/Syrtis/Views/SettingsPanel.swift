@@ -1203,7 +1203,7 @@ struct SettingsPanel: View {
                 // rewrites its login item when it refreshes its sign-in
                 // (measured: about hourly), because the marker moves and
                 // Syrtis may not re-read agy's login to confirm the account.
-                hint("Turn this on to keep agy's current account merged into one card. With it off, a Capture merges it only until agy next refreshes its sign-in, usually within an hour.")
+                hint("Turn this on to keep reading agy's current account through its captured sign-in, shown as one OAUTH card, so Syrtis rarely needs to run agy. With it off, a Capture lasts only until agy next refreshes its sign-in (usually within an hour); after that the main card runs agy again.")
             }
             hint("When on, Syrtis copies the sign-in of each account agy signs into to this Mac's login keychain: once when you turn this on, then whenever agy's sign-in changes. Turning it off keeps the copies. An account you remove stays removed until you press Capture.")
             hint("To add another Google account:\n1. Sign agy in to that account.\n2. Press Capture current agy login.\n3. Sign agy back in to your main account.")
