@@ -17317,6 +17317,40 @@ enum SelfTest {
             "PI-ROOTS every new Settings copy key exists in zh-Hant and zh-Hans "
                 + "(English is the key): \(piCopyMissing)")
 
+        // ACCOUNTS-PAGE: the sidebar carries the Accounts page between Usage
+        // attribution and General, and every new or moved-into-popover copy key
+        // is translated (English is the key). The Claude / Antigravity
+        // controls moved out of General; their behavior is unchanged.
+        expect(
+            SettingsPanel.Page.allCases.map(\.rawValue)
+                == ["Menu bar", "Dashboard", "Usage attribution", "Accounts", "General", "About"],
+            "ACCOUNTS-PAGE sidebar order: Accounts sits between Usage attribution and General")
+        let accountsCopyKeys = [
+            "Accounts",
+            "Extra accounts join your totals.",
+            "Capture a Google account agy signs into.",
+            "More details",
+            "For another Claude account, run Claude Code with CLAUDE_CONFIG_DIR set to its own folder and add that folder here. Its usage joins your totals; accounts aren't shown separately.",
+            "To add another Google account:\n1. Sign agy in to that account.\n2. Press Capture current agy login.\n3. Sign agy back in to your main account.",
+            "Capture reads agy's saved Google login once when you press the button, and once each time agy's sign-in changes while automatic capture is on. The copy is kept in this Mac's login keychain. Syrtis uses it only with Google's token service and Cloud Code quota service, and its requests identify as Antigravity.",
+            "When on, Syrtis copies the sign-in of each account agy signs into to this Mac's login keychain: once when you turn this on, then whenever agy's sign-in changes. Turning it off keeps the copies. An account you remove stays removed until you press Capture.",
+            "Turn this on to keep reading agy's current account through its captured sign-in, shown as one OAUTH card, so Syrtis rarely needs to run agy. With it off, a Capture lasts only until agy next refreshes its sign-in (usually within an hour); after that the main card runs agy again.",
+            "Remove deletes only the copy on this Mac. Google still accepts it until you revoke access in Google Account → third-party access, which also signs Antigravity out of that account.",
+        ]
+        var accountsCopyMissing: [String] = []
+        for key in accountsCopyKeys {
+            for locale in ["zh-Hant", "zh-Hans"] {
+                let value = AppLanguage.localizedString(
+                    key, locale: locale, bundle: .tokenBarResources)
+                if value == nil || value == key {
+                    accountsCopyMissing.append("\(locale): \(key.prefix(24))")
+                }
+            }
+        }
+        expect(
+            accountsCopyMissing.isEmpty,
+            "ACCOUNTS-PAGE every Accounts copy key exists in zh-Hant and zh-Hans: \(accountsCopyMissing)")
+
         // MARK: - M3: a Claude card is addressed by (clientId, accountKey)
 
         // Two Claude accounts sharing `clientId == "claude"`, listed EXTRA

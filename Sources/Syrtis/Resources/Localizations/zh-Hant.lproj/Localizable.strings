@@ -250,7 +250,6 @@
 "Could not save this classification: existing attribution data is invalid or foreign." = "無法儲存這項分類：現有的歸屬資料無效或來自其他格式。";
 "Could not save this classification: the attribution entry limit was reached." = "無法儲存這項分類：已達歸屬項目上限。";
 "Could not save this classification: the new value is too large or unsupported." = "無法儲存這項分類：新值太大或不受支援。";
-"Claude accounts" = "Claude 帳號";
 
 /* ===== 設定：選項 ===== */
 "Launch at login" = "登入時開啟";
@@ -623,7 +622,10 @@
 "macOS did not add Syrtis to your login items. Check System Settings → General → Login Items." = "macOS 沒有把 Syrtis 加入登入項目。請到「系統設定 → 一般 → 登入項目」查看。";
 
 /* ===== 設定：Antigravity 帳號 ===== */
-"Antigravity accounts" = "Antigravity 帳號";
+"Accounts" = "帳號";
+"Extra accounts join your totals." = "額外的帳號會併入你的總計。";
+"Capture a Google account agy signs into." = "擷取 agy 登入的 Google 帳號。";
+"More details" = "詳細說明";
 "Antigravity account" = "Antigravity 帳號";
 "Capture current agy login" = "擷取 agy 目前的登入";
 "Capturing…" = "擷取中…";

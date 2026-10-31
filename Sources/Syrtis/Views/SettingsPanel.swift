@@ -10,6 +10,7 @@ struct SettingsPanel: View {
         case menuBar = "Menu bar"
         case dashboard = "Dashboard"
         case usageAttribution = "Usage attribution"
+        case accounts = "Accounts"
         case general = "General"
         case about = "About"
 
@@ -22,6 +23,7 @@ struct SettingsPanel: View {
             case .menuBar: "menubar.rectangle"
             case .dashboard: "chart.bar.xaxis"
             case .usageAttribution: "arrow.triangle.branch"
+            case .accounts: "person.2"
             case .general: "gearshape"
             case .about: "info.circle"
             }
@@ -227,6 +229,8 @@ struct SettingsPanel: View {
                     tabsUniverse: tabsUniverse)
             case .usageAttribution:
                 usageAttributionPage()
+            case .accounts:
+                accountsPage()
             case .general:
                 generalPage()
             case .about:
@@ -1041,11 +1045,7 @@ struct SettingsPanel: View {
         }
         .id(SettingsWindowController.Destination.discordAnchor)
 
-        claudeExtraRootsSection()
-
         piExtraRootsSection()
-
-        antigravityAccountsSection()
 
         cursorSyncSection()
 
@@ -1066,6 +1066,15 @@ struct SettingsPanel: View {
         }
     }
 
+    /// Multi-account management. Each section keeps one line of description;
+    /// the rest lives behind its ⓘ (see `infoSection`).
+    @ViewBuilder
+    private func accountsPage() -> some View {
+        claudeExtraRootsSection()
+
+        antigravityAccountsSection()
+    }
+
     /// A second (or further) Claude account isolated with `CLAUDE_CONFIG_DIR`
     /// is otherwise invisible to Syrtis's scan (see `docs/knowledge/
     /// architecture.md`'s extra-scan-paths section). Each config dir here
@@ -1073,7 +1082,12 @@ struct SettingsPanel: View {
     /// single reported total — there is no per-account breakdown.
     @ViewBuilder
     private func claudeExtraRootsSection() -> some View {
-        section("Claude accounts") {
+        infoSection(
+            "Claude", summary: "Extra accounts join your totals.",
+            details: {
+                hint("For another Claude account, run Claude Code with CLAUDE_CONFIG_DIR set to its own folder and add that folder here. Its usage joins your totals; accounts aren't shown separately.")
+            }
+        ) {
             ForEach(claudeExtraRoots, id: \.self) { path in
                 row(path) {
                     HStack(spacing: 6) {
@@ -1115,7 +1129,6 @@ struct SettingsPanel: View {
                 hint("%lld path(s) can't be scanned and weren't added.".localized(
                     claudeHint.rejected))
             }
-            hint("For another Claude account, run Claude Code with CLAUDE_CONFIG_DIR set to its own folder and add that folder here. Its usage joins your totals; accounts aren't shown separately.")
         }
         .onAppear { refreshMissingClaudeRoots() }
     }
@@ -1235,7 +1248,20 @@ struct SettingsPanel: View {
     private func antigravityAccountsSection() -> some View {
         let accounts = AntigravityAccounts.decode(antigravityAccountsRaw)
         let busy = antigravityAutoCapture.busy
-        section("Antigravity accounts") {
+        infoSection(
+            "Antigravity", summary: "Capture a Google account agy signs into.",
+            details: {
+                hint("To add another Google account:\n1. Sign agy in to that account.\n2. Press Capture current agy login.\n3. Sign agy back in to your main account.")
+                hint("Capture reads agy's saved Google login once when you press the button, and once each time agy's sign-in changes while automatic capture is on. The copy is kept in this Mac's login keychain. Syrtis uses it only with Google's token service and Cloud Code quota service, and its requests identify as Antigravity.")
+                hint("When on, Syrtis copies the sign-in of each account agy signs into to this Mac's login keychain: once when you turn this on, then whenever agy's sign-in changes. Turning it off keeps the copies. An account you remove stays removed until you press Capture.")
+                // Without it a manual Capture's merge lasts only until agy
+                // rewrites its login item when it refreshes its sign-in
+                // (measured: about hourly), because the marker moves and
+                // Syrtis may not re-read agy's login to confirm the account.
+                hint("Turn this on to keep reading agy's current account through its captured sign-in, shown as one OAUTH card, so Syrtis rarely needs to run agy. With it off, a Capture lasts only until agy next refreshes its sign-in (usually within an hour); after that the main card runs agy again.")
+                hint("Remove deletes only the copy on this Mac. Google still accepts it until you revoke access in Google Account → third-party access, which also signs Antigravity out of that account.")
+            }
+        ) {
             ForEach(accounts, id: \.key) { account in
                 row(account.label) {
                     Button {
@@ -1282,17 +1308,6 @@ struct SettingsPanel: View {
                     .foregroundStyle(.orange)
                     .fixedSize(horizontal: false, vertical: true)
             }
-            if !antigravityAutoCaptureOn {
-                // Without it a manual Capture's merge lasts only until agy
-                // rewrites its login item when it refreshes its sign-in
-                // (measured: about hourly), because the marker moves and
-                // Syrtis may not re-read agy's login to confirm the account.
-                hint("Turn this on to keep reading agy's current account through its captured sign-in, shown as one OAUTH card, so Syrtis rarely needs to run agy. With it off, a Capture lasts only until agy next refreshes its sign-in (usually within an hour); after that the main card runs agy again.")
-            }
-            hint("When on, Syrtis copies the sign-in of each account agy signs into to this Mac's login keychain: once when you turn this on, then whenever agy's sign-in changes. Turning it off keeps the copies. An account you remove stays removed until you press Capture.")
-            hint("To add another Google account:\n1. Sign agy in to that account.\n2. Press Capture current agy login.\n3. Sign agy back in to your main account.")
-            hint("Capture reads agy's saved Google login once when you press the button, and once each time agy's sign-in changes while automatic capture is on. The copy is kept in this Mac's login keychain. Syrtis uses it only with Google's token service and Cloud Code quota service, and its requests identify as Antigravity.")
-            hint("Remove deletes only the copy on this Mac. Google still accepts it until you revoke access in Google Account → third-party access, which also signs Antigravity out of that account.")
         }
     }
 
@@ -1494,6 +1509,25 @@ struct SettingsPanel: View {
         }
     }
 
+    /// `section` with a one-line description under the header and the long
+    /// explanation behind an ⓘ popover. State notices stay in `content`.
+    private func infoSection(
+        _ label: String, summary: String,
+        @ViewBuilder details: () -> some View,
+        @ViewBuilder content: () -> some View
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 4) {
+                Text(label.localized.uppercased())
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(.tertiary)
+                SettingsInfoButton(details: details())
+            }
+            hint(summary)
+            content()
+        }
+    }
+
     private func row(_ label: String, @ViewBuilder trailing: () -> some View) -> some View {
         HStack {
             Text(label.localized)
@@ -1582,6 +1616,31 @@ struct SettingsPanel: View {
             .font(.caption2)
             .foregroundStyle(.tertiary)
             .fixedSize(horizontal: false, vertical: true)
+    }
+}
+
+/// ⓘ next to a section header; the popover holds the long explanation.
+private struct SettingsInfoButton<Details: View>: View {
+    /// Wide enough that the longest paragraph wraps to a handful of lines
+    /// instead of a tall narrow column.
+    private static var popoverWidth: CGFloat { 280 }
+
+    let details: Details
+    @State private var shown = false
+
+    var body: some View {
+        Button { shown.toggle() } label: {
+            Image(systemName: "info.circle")
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
+        }
+        .buttonStyle(.plain)
+        .help("More details".localized)
+        .popover(isPresented: $shown, arrowEdge: .bottom) {
+            VStack(alignment: .leading, spacing: 8) { details }
+                .frame(width: Self.popoverWidth, alignment: .leading)
+                .padding(12)
+        }
     }
 }
 
