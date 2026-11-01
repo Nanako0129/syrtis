@@ -165,8 +165,9 @@ final class CursorSyncController: ObservableObject {
     /// reset when the next off push starts and set from its outcome. Not
     /// persisted: the launch push of an off preference runs the cleanup again.
     @Published private(set) var cleanupFailed = false
-    /// The switch was turned on and the confirmation is open. The only path to
-    /// an enabled switch from the UI goes through this and `confirmEnable()`.
+    /// The Settings switch was turned on and its confirmation is open. It gates
+    /// that switch only: `confirmEnable()` enables nothing unless this is set.
+    /// The Overview notice answers through `answerNotice`, a separate path.
     @Published private(set) var confirmPending = false
 
     private var loop: Task<Void, Never>?

@@ -17903,7 +17903,10 @@ enum SelfTest {
             let partial = try? JSONDecoder().decode(
                 CursorSyncStatus.self, from: Data(#"{"state":"partial","events":0,"lastSuccessMs":null}"#.utf8))
             let sync: @Sendable (Bool) -> CursorSyncStatus? = { _ in syncCalls.value += 1; return partial }
-            // CONSENT-CONFIRM: the path the Settings switch calls. Turning it on
+            // CONSENT-CONFIRM: drives the controller methods only. The
+            // SettingsPanel wiring (popover isPresented setter -> cancelEnable,
+            // Continue -> confirmEnable, the row's onDisappear -> cancelEnable)
+            // has no seam and is not observed here. Turning the switch on
             // enables and acknowledges nothing until confirmEnable(); cancel
             // leaves everything as it was. Run from the shipped default (keys
             // absent: enabled reads true, notice false) and from an explicit off.
@@ -17920,7 +17923,7 @@ enum SelfTest {
                 let en = CursorSync.enabled(defaults: d), ack = CursorSync.noticeAcknowledged(defaults: d)
                 return (CursorSync.toggleShowsOn(enabled: en, acknowledged: ack), en, ack, c.confirmPending)
             }
-            let consent: [(String, Bool)]? = { () -> [(String, Bool)] in
+            let consent: [(String, Bool)] = { () -> [(String, Bool)] in
                 var ok: [(String, Bool)] = []
                 for start in [nil, false] as [Bool?] {
                     let tag = start == nil ? "default" : "off"
@@ -17930,13 +17933,14 @@ enum SelfTest {
                     let cancelled = consentState(start) { c, d, a in
                         c.switchChanged(to: true, defaults: d, arguments: a); c.cancelEnable()
                     }
-                    ok.append(("\(tag): cancel enables nothing", !cancelled.pending && !cancelled.shown && !cancelled.ack))
+                    ok.append(("\(tag): cancel enables nothing", !cancelled.pending && !cancelled.shown && !cancelled.ack
+                        && cancelled.enabled == (start ?? true)))
                     let confirmed = consentState(start) { c, d, a in
                         c.switchChanged(to: true, defaults: d, arguments: a); c.confirmEnable(defaults: d, arguments: a)
                     }
                     ok.append(("\(tag): confirm enables and acknowledges", !confirmed.pending && confirmed.shown && confirmed.ack))
                     let unasked = consentState(start) { c, d, a in c.confirmEnable(defaults: d, arguments: a) }
-                    ok.append(("\(tag): confirm without asking does nothing", !unasked.shown && !unasked.ack))
+                    ok.append(("\(tag): confirm without asking does nothing", !unasked.shown && !unasked.ack && unasked.enabled == (start ?? true)))
                 }
                 let off = consentState(true) { c, d, a in
                     c.switchChanged(to: true, defaults: d, arguments: a); c.confirmEnable(defaults: d, arguments: a)
@@ -17946,8 +17950,8 @@ enum SelfTest {
                 return ok
             }()
             expect(
-                consent?.allSatisfy(\.1) == true,
-                "CONSENT-CONFIRM Settings switch gate: \(consent?.filter { !$0.1 }.map(\.0) ?? ["no result"])")
+                consent.allSatisfy(\.1),
+                "CONSENT-CONFIRM Settings switch gate: \(consent.filter { !$0.1 }.map(\.0))")
             let controller = CursorSyncController()
             // 1. Notice not acknowledged -> no sync.
             await controller.runSync(explicit: true, defaults: defaults, arguments: ["Syrtis"], sync: sync)

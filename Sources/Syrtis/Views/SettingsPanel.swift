@@ -1701,37 +1701,24 @@ private struct SettingsInfoButton<Details: View>: View {
     /// Grace after the pointer leaves the icon or the popover, so crossing the
     /// gap between them does not close it.
     private static var leaveGrace: Duration { .milliseconds(200) }
-    /// A transient popover dismisses itself on the mouse-down outside it, which
-    /// for a click on the icon comes before the button's action and would make
-    /// that action reopen it. A dismissal this recent, with the pointer over
-    /// the icon, counts as the same click and keeps it closed. Not exercised
-    /// in a GUI; the failure mode is a reopen, not a lost popover.
-    private static var sameClickWindow: TimeInterval { 0.3 }
-
     let section: String
 
     let details: Details
     @State private var shown = false
-    /// Opened by click or keyboard: stays until dismissed (click again, Escape,
-    /// or click outside), regardless of the pointer.
+    /// Opened by click or keyboard: stays open regardless of the pointer until
+    /// Escape or a click elsewhere closes it.
     @State private var pinned = false
     @State private var overIcon = false
     @State private var overContent = false
     @State private var pending: Task<Void, Never>?
-    @State private var dismissedOverIcon = Date.distantPast
 
     var body: some View {
-        // Mechanism: a popover driven by `.onHover`, not `.help()`, because a
-        // system tooltip does not lay out multi-paragraph text with a bold
-        // caption. Click / Space / Return pin it open; Escape closes it.
+        // Hover opens the popover; a click / Space / Return pins it open;
+        // Escape or a click elsewhere closes it.
         Button {
             pending?.cancel()
-            if shown || Date().timeIntervalSince(dismissedOverIcon) < Self.sameClickWindow {
-                shown = false
-            } else {
-                pinned = true
-                shown = true
-            }
+            pinned = true
+            shown = true
         } label: {
             Image(systemName: "info.circle")
                 .font(.caption2)
@@ -1756,7 +1743,6 @@ private struct SettingsInfoButton<Details: View>: View {
             if !now {
                 pinned = false
                 overContent = false
-                if overIcon { dismissedOverIcon = Date() }
             }
         }
         .onDisappear {
