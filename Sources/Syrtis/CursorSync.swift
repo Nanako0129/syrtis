@@ -183,7 +183,6 @@ final class CursorSyncController: ObservableObject {
     /// The last config push. Each push waits for the one before it, so rapid
     /// toggles reach the core in the order they were made.
     private var configPush: Task<Void, Never>?
-    private var lastRefreshedEvents: Int?
     /// Bumped by every `reconfigure`; a sync result that comes back after a
     /// newer configuration is discarded, so a late result cannot undo an off.
     private var generation = 0
@@ -210,10 +209,8 @@ final class CursorSyncController: ObservableObject {
         let run = CursorSync.shouldSync(defaults: defaults, arguments: arguments)
         loop?.cancel()
         generation &+= 1
-        // Off deletes the synced files, so the next completed sync must
-        // refresh even when it writes the same event count again.
         // An off push retries the cleanup: hide the last failure until it reports.
-        if !run { state = nil; lastSuccessMs = nil; lastRefreshedEvents = nil; cleanupFailed = false }
+        if !run { state = nil; lastSuccessMs = nil; cleanupFailed = false }
         let previous = configPush
         let push = Task { [weak self] in
             await previous?.value
@@ -277,13 +274,12 @@ final class CursorSyncController: ObservableObject {
             guard let result else { state = "error"; continue }
             state = result.state
             lastSuccessMs = result.lastSuccessMs
-            // A completed walk already invalidated the core's caches; the Swift
-            // side only needs telling when the data changed. `changed`, not
-            // the headline: one profile can write while another fails.
-            if result.changed, result.events != lastRefreshedEvents {
-                lastRefreshedEvents = result.events
-                Self.refreshModel()
-            }
+            // A round that wrote a file already invalidated the core's
+            // caches; refresh the views on `changed`, not on the headline (one
+            // profile can write while another fails) and not on the event
+            // count (another profile can write the same count). The cost is a
+            // view reload after every sync that wrote, at most every 30 min.
+            if result.changed { Self.refreshModel() }
         } while rerunPending && CursorSync.shouldSync(defaults: defaults, arguments: arguments)
     }
 

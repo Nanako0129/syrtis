@@ -178,7 +178,7 @@ public struct CursorSyncConfigResult: Decodable, Equatable, Sendable {
 
     public let enabled: Bool
     /// `<HOME>/Library/Application Support/<bundle id>`, derived by the core;
-    /// nil when an off push's appDir was refused (nothing cleaned there).
+    /// nil when an off push's appDir failed the checks (left untouched).
     public let appDir: String?
     /// The default profile first, then each added one.
     public let profiles: [ProfileDir]

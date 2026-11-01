@@ -245,22 +245,25 @@ char *tb_set_keychain_consent(const char *json);
 // id and the added Cursor profiles (`--user-data-dir` roots, each with a
 // caller-made uppercase UUID), never a directory or a database path. The
 // core derives `appDir` = `<HOME>/Library/Application Support/<bundleId>`
-// (refused when a symlink, not a directory, or under `~/.config/tokscale`):
+// (refused unless absent or, followed through a symlink, a directory owned
+// by the current user; refused under `~/.config/tokscale`):
 // the implicit default profile syncs into `<appDir>/cursor-cache`, each added
 // one into `<appDir>/cursor-profiles/<id>` and reads
 // `<root>/User/globalStorage/state.vscdb`. Full replace, in-memory, default
 // off: the caller re-applies the stored answer at launch. Turning sync off
 // deletes the Syrtis usage files from every profile dir; while on, dirs of
 // profiles no longer listed are cleaned. An off push is always accepted and
-// turns the takeover off; it cleans only an appDir passing the checks above
-// (else `appDir` is null). An own-uid symlinked appDir whose target is a real
-// directory is accepted. Success data is `{"enabled","appDir":str|null,
+// turns the takeover off; an appDir failing the checks above is `null` and
+// left untouched, and the appDir in use until then is re-checked before it
+// is cleaned. Success data is `{"enabled","appDir":str|null,
 // "profiles":[{"id","dir"}],"cliTakeoverConfirmed","removedFiles":N,
 // "cleanupFailed":bool,"cleanupFailedProfiles":[id]}`; each id is `default`
 // or `<UUID>` (that profile's files could not all be deleted),
 // `cursor-profiles` (the parent folder of the added profiles could not be
-// read), or `appDir` (an off push's appDir was refused, nothing cleaned).
-// Other invalid input is an error and leaves the registry unchanged. While enabled with a complete
+// read), or `appDir` (the appDir in use until this push now fails the
+// checks, so files may be left there; a refused appDir never used before is
+// not reported). Other invalid input is an error and leaves the registry
+// unchanged. While enabled with a complete
 // synced file, and the tokscale CLI's Cursor dir holds no usage files (or
 // `cliTakeoverConfirmed`), reports read Cursor from the newest synced file of
 // each account only.
@@ -276,8 +279,11 @@ char *tb_set_cursor_sync(const char *json);
 // "profiles":[{"id","state","events","lastSuccessMs","reason"?,
 // "duplicateOf"?}]}`. `changed`: some profile wrote its file (scan caches
 // were invalidated; refresh views whatever the headline state). A profile
-// whose account an earlier profile already synced this round is `duplicate`
-// with `duplicateOf` = that profile's id; a failed walk covers nothing.
+// whose account an earlier profile already covered this round is `duplicate`
+// with `duplicateOf` = that profile's id. A walk covers its account when it
+// synced or failed for the whole account (rate_limited, offline, partial,
+// other server errors); an expired session or a failed write covers nothing,
+// so the next profile on the account tries its own session.
 // `cliPresent` = a walk completed but tokscale CLI Cursor files exist and the
 // takeover is not confirmed; it carries no `reason`. `reason` codes name no
 // account and never carry the token.

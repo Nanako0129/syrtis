@@ -1592,8 +1592,9 @@ fn invalidate_scan_caches() {
 /// Configure Cursor desktop sync (see the `cursor_sync` module doc). `json` is
 /// `{"enabled":bool,"bundleId":"<reverse DNS>","profiles":[{"id":"<UUID>","root":"/abs"}],
 /// "cliTakeoverConfirmed":bool}`. Rust derives `appDir` =
-/// `<HOME>/Library/Application Support/<bundleId>` (refused when it is a
-/// symlink, not a directory, or resolves under `~/.config/tokscale`); the
+/// `<HOME>/Library/Application Support/<bundleId>` (refused unless absent
+/// or, followed through a symlink, a directory owned by the current user;
+/// refused when it resolves under `~/.config/tokscale`); the
 /// implicit default profile syncs into `<appDir>/cursor-cache` and reads
 /// Cursor's fixed `state.vscdb`, each added profile into
 /// `<appDir>/cursor-profiles/<id>` and reads `<root>/User/globalStorage/state.vscdb`.
@@ -1601,15 +1602,16 @@ fn invalidate_scan_caches() {
 /// launch. Turning sync off deletes the Syrtis usage files from every profile
 /// dir; while on, dirs of profiles no longer listed are cleaned and removed.
 /// An off push (`"enabled":false`) is always accepted and turns the takeover
-/// off, whatever else it carries; it cleans only an appDir that passes the
-/// checks above (`appDir` is then null). An own-uid symlinked appDir whose
-/// target is a real directory is accepted. Success data is
+/// off, whatever else it carries; an appDir failing the checks above is
+/// `null` and left untouched, and the appDir in use until then is re-checked
+/// before it is cleaned. Success data is
 /// `{"enabled","appDir":str|null,"profiles":[{"id","dir"}],
 /// "cliTakeoverConfirmed","removedFiles":N,"cleanupFailed":bool,
 /// "cleanupFailedProfiles":[id]}`, each id one of `default` / `<UUID>` (that
 /// profile's files could not all be deleted), `cursor-profiles` (the parent
-/// folder of the added profiles could not be read), or `appDir` (an off
-/// push's appDir was refused, so nothing in it was cleaned). Other invalid
+/// folder of the added profiles could not be read), or `appDir` (the appDir
+/// in use until this push now fails the checks, so files may be left there;
+/// a refused appDir never used before is not reported). Other invalid
 /// input is an error and leaves the registry unchanged. Invalidates the scan caches, since the
 /// takeover depends on every field.
 ///
@@ -1649,8 +1651,10 @@ unsafe fn set_cursor_sync_from_c(json: *const c_char) -> Result<serde_json::Valu
 /// the scan caches were invalidated and views must refresh, whatever the
 /// headline state.
 /// The top-level `state` is `ok` when every profile is `ok` or `duplicate`
-/// (the account was already synced this round by the profile `duplicateOf`;
-/// a failed walk covers nothing), else the
+/// (the account was already covered this round by the profile `duplicateOf`:
+/// synced, or failed for the whole account — rate_limited, offline,
+/// partial, other server errors; an expired session or a failed write
+/// covers nothing), else the
 /// first other profile state (a `notSignedIn` profile is skipped while
 /// another synced); `events` sums this call's writes, `lastSuccessMs` is the
 /// newest complete file. `cliPresent` = a walk completed but CLI Cursor files

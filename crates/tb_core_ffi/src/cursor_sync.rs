@@ -2,7 +2,8 @@
 //!
 //! Data flow, per Cursor profile (the default one plus each added
 //! `--user-data-dir` root, walked one at a time): its `state.vscdb`
-//! (read-only; `cursor_desktop::read_login_checked` for an added profile) → access token + its
+//! (read-only; `cursor_desktop::read_login_checked`, after resolving a
+//! symlink for the default profile only) → access token + its
 //! own JWT `sub` → POST `get-filtered-usage-events` on cursor.com, full
 //! history, paginated → a trimmed JSON file `usage.<hmac>.json` in that
 //! profile's Syrtis-owned dir (`<appDir>/cursor-cache` for the default,
@@ -27,8 +28,12 @@
 //! - Only a complete walk replaces the file; partial or failed walks leave it.
 //! - Swift passes a bundle id and `(uuid, root)` pairs, never a directory or a
 //!   database path; Rust derives both (CMP-520 B2). `sub` never crosses the
-//!   FFI: a profile whose account another profile already walked reports
-//!   only that profile's id (`duplicateOf`).
+//!   FFI: a profile whose account an earlier profile already covered this
+//!   round reports only that profile's id (`duplicateOf`). A walk covers its
+//!   account when it synced, or failed in a way a second session would only
+//!   repeat (rate_limited, offline, partial, any other server error); it does
+//!   not when the failure belongs to that session or that profile
+//!   (`expired`, a failed write) — then the next profile tries its own.
 
 use crate::cursor_desktop::{self, CursorLogin};
 use fs2::FileExt as _;
@@ -80,8 +85,8 @@ const PROFILES_DIR_NAME: &str = "cursor-profiles";
 /// The default profile's id in statuses and results; not a UUID, so it can
 /// never collide with an added profile's.
 const DEFAULT_PROFILE_ID: &str = "default";
-/// `cleanupFailedProfiles` entry: an off push whose appDir was refused, so
-/// nothing in it was cleaned.
+/// `cleanupFailedProfiles` entry: the appDir in use until this push no
+/// longer passes `check_app_dir`, so nothing in it was cleaned.
 const APP_DIR_FAILURE: &str = "appDir";
 /// Bounds the per-sync work one config can ask for.
 const MAX_PROFILES: usize = 32;
@@ -243,12 +248,18 @@ fn app_dir_for(bundle_id: &str, home: Option<&Path>) -> Result<PathBuf, String> 
     }
     let home = home.ok_or_else(|| "cursor sync needs a home directory".to_string())?;
     let app_dir = home.join("Library/Application Support").join(bundle_id);
-    match std::fs::symlink_metadata(&app_dir) {
-        Ok(meta) if meta.is_dir() => {}
-        // Earlier releases accepted a symlinked app dir: keep that when it
-        // leads to a real directory owned by this user.
-        Ok(meta) if meta.file_type().is_symlink() && own_real_dir(&app_dir) => {}
-        Ok(_) => return Err("cursor sync app dir is not a real directory".to_string()),
+    check_app_dir(&app_dir, home)?;
+    Ok(app_dir)
+}
+
+/// An appDir Syrtis may write into or clean: absent, or (followed through a
+/// symlink, as earlier releases allowed) a directory owned by this user;
+/// never inside the tokscale CLI's tree. Re-run on an old appDir before
+/// cleaning it, since it may have changed since it was accepted.
+fn check_app_dir(app_dir: &Path, home: &Path) -> Result<(), String> {
+    match std::fs::symlink_metadata(app_dir) {
+        Ok(_) if own_real_dir(app_dir) => {}
+        Ok(_) => return Err("cursor sync app dir is not a directory of this user".to_string()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(_) => return Err("cursor sync app dir cannot be examined".to_string()),
     }
@@ -256,13 +267,13 @@ fn app_dir_for(bundle_id: &str, home: Option<&Path>) -> Result<PathBuf, String> 
     // there would be dropped by the takeover's own exclusion), including
     // through a symlinked ancestor.
     let tokscale = home.join(".config/tokscale");
-    if app_dir.starts_with(&tokscale) || resolved(&app_dir).starts_with(resolved(&tokscale)) {
+    if app_dir.starts_with(&tokscale) || resolved(app_dir).starts_with(resolved(&tokscale)) {
         return Err("cursor sync app dir must not be inside ~/.config/tokscale".to_string());
     }
-    Ok(app_dir)
+    Ok(())
 }
 
-/// `path` resolves to a directory owned by the current user.
+/// `path`, followed through symlinks, is a directory owned by this user.
 fn own_real_dir(path: &Path) -> bool {
     let Ok(meta) = std::fs::metadata(path) else {
         return false;
@@ -289,11 +300,9 @@ fn validate_root(raw: &str) -> Result<PathBuf, String> {
 }
 
 /// An off push is always accepted: it turns sync (and so the takeover) off
-/// whatever else it carries. Only its bundle id is read, and only an appDir
-/// that passes `app_dir_for` is cleaned; `Err` here means it was refused
-/// and nothing in it is touched (reported as `appDir` in
-/// `cleanupFailedProfiles`).
-fn parse_off(raw: &str, home: Option<&Path>) -> Option<(Config, Result<(), ()>)> {
+/// whatever else it carries. Only its bundle id is read; an appDir that
+/// fails `app_dir_for` becomes `None`, and nothing in it is touched.
+fn parse_off(raw: &str, home: Option<&Path>) -> Option<Config> {
     let value: serde_json::Value = serde_json::from_str(raw).ok()?;
     if value.get("enabled") != Some(&serde_json::Value::Bool(false)) {
         return None;
@@ -302,18 +311,15 @@ fn parse_off(raw: &str, home: Option<&Path>) -> Option<(Config, Result<(), ()>)>
         .get("bundleId")
         .and_then(serde_json::Value::as_str)
         .unwrap_or_default();
-    let app_dir = app_dir_for(bundle_id, home).ok();
-    let checked = if app_dir.is_some() { Ok(()) } else { Err(()) };
-    let config = Config {
+    Some(Config {
         enabled: false,
-        app_dir,
+        app_dir: app_dir_for(bundle_id, home).ok(),
         profiles: Vec::new(),
         cli_takeover_confirmed: value
             .get("cliTakeoverConfirmed")
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false),
-    };
-    Some((config, checked))
+    })
 }
 
 fn parse_config(raw: &str, home: Option<&Path>) -> Result<Config, String> {
@@ -347,9 +353,9 @@ fn parse_config(raw: &str, home: Option<&Path>) -> Result<Config, String> {
 /// sync off deletes our files from every profile dir; while on, dirs of
 /// profiles no longer listed (orphans) are emptied of our files and removed.
 pub(crate) fn set_from_json(raw: &str, home: Option<&Path>) -> Result<serde_json::Value, String> {
-    let (new, app_dir_checked) = match parse_off(raw, home) {
+    let new = match parse_off(raw, home) {
         Some(off) => off,
-        None => (parse_config(raw, home)?, Ok(())),
+        None => parse_config(raw, home)?,
     };
     let old = {
         let mut guard = CONFIG
@@ -358,12 +364,15 @@ pub(crate) fn set_from_json(raw: &str, home: Option<&Path>) -> Result<serde_json
         std::mem::replace(&mut *guard, new.clone())
     };
     let mut cleanup = Cleanup::default();
-    if app_dir_checked.is_err() {
-        cleanup.failed.push(APP_DIR_FAILURE.to_string());
-    }
+    // The appDir in use until now (files may be left there) is cleaned only
+    // if it still passes the checks; otherwise it is reported. A refused new
+    // appDir with no earlier one has nothing of ours: no failure.
     if let Some(old_app) = old.app_dir.as_deref() {
         if new.app_dir.as_deref() != Some(old_app) {
-            cleanup.everything(old_app);
+            match home.map(|home| check_app_dir(old_app, home)) {
+                Some(Ok(())) => cleanup.everything(old_app),
+                _ => cleanup.failed.push(APP_DIR_FAILURE.to_string()),
+            }
         }
     }
     match (new.app_dir.as_deref(), new.enabled) {
@@ -389,7 +398,10 @@ pub(crate) fn set_from_json(raw: &str, home: Option<&Path>) -> Result<serde_json
 #[derive(Default)]
 struct Cleanup {
     removed: usize,
-    /// Profile ids (`default` or a UUID) whose files could not all be deleted.
+    /// What could not be fully cleaned: a profile id (`default` or a UUID)
+    /// whose files could not all be deleted, `cursor-profiles` (that parent
+    /// folder could not be read), or `appDir` (the previous appDir was
+    /// refused, so nothing in it was cleaned).
     failed: Vec<String>,
 }
 
@@ -808,7 +820,7 @@ pub(crate) enum State {
     Error,
     Disabled,
     CliPresent,
-    /// The account was already walked this round from an earlier profile.
+    /// The account was already covered this round by an earlier profile.
     Duplicate,
 }
 
@@ -834,7 +846,7 @@ struct Outcome {
     stop: Stop,
     events: usize,
     /// For `Duplicate`: the index (in this round's slots) of the profile that
-    /// already walked the same account. Never the account itself.
+    /// already covered the same account. Never the account itself.
     duplicate_of: Option<usize>,
 }
 
@@ -1050,12 +1062,12 @@ async fn walk(
 /// One profile's sync, start to finish. `enabled` is the live switch (and,
 /// in production, "this profile is still configured as when the round
 /// started"). `claim(stem, false)` returns the index of an earlier profile
-/// whose walk of the same account already succeeded this round;
-/// `claim(stem, true)` records this one after its file is committed. A
-/// failed walk claims nothing, so a later profile on the account tries its
-/// own session. `checked`: an added profile, read with
-/// `read_login_checked`; the default profile keeps `read_login` (follows a
-/// symlinked `state.vscdb`, as every release did).
+/// that already covered the same account this round; `claim(stem, true)`
+/// records this one: after its file is committed, or after a walk failure
+/// that is not this session's own (see the module doc). `checked`: an added
+/// profile, read with `read_login_checked` (a symlinked database refused);
+/// the default profile follows a symlinked `state.vscdb`, as every release
+/// did, and checks the resolved file (`read_login_resolved`).
 async fn run(
     target: &Target<'_>,
     db_path: &Path,
@@ -1076,7 +1088,7 @@ async fn run(
     let read = if checked {
         cursor_desktop::read_login_checked(db_path)
     } else {
-        cursor_desktop::read_login(db_path).map_err(|_| "login_unreadable")
+        cursor_desktop::read_login_resolved(db_path)
     };
     let login = match read {
         Ok(Some(login)) => login,
@@ -1095,7 +1107,7 @@ async fn run(
     let Some(stem) = (target.file_stem)(&user) else {
         return stopped(Stop::error("key_unavailable"));
     };
-    // B1: an account already synced this round from an earlier profile is
+    // B1: an account already covered this round by an earlier profile is
     // not walked again (saves requests, avoids 429); its file name is the
     // same, so the takeover keeps one copy.
     if let Some(first) = claim(&stem, false) {
@@ -1115,7 +1127,15 @@ async fn run(
     drop(login);
     let events = match walk(target, &cookie, limits, enabled).await {
         Ok(events) => events,
-        Err(stop) => return stopped(stop),
+        Err(stop) => {
+            // Only this session's refusal leaves the account to the next
+            // profile on it; a rate limit, outage or other server error would
+            // only be repeated by a second session (429 amplification).
+            if stop.state != State::Expired {
+                claim(&stem, true);
+            }
+            return stopped(stop);
+        }
     };
     drop(cookie);
     match commit_file(dir, &stem, &events, enabled) {

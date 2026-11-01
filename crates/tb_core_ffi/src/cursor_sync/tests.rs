@@ -1086,7 +1086,8 @@ fn base_validation_rejects_bad_bundle_ids_and_app_dirs() {
         !one.starts_with(&two) && !two.starts_with(&one),
         "{one:?} {two:?}"
     );
-    // An off push there is accepted but cleans nothing, and says so.
+    // An off push there is accepted but cleans nothing; with no earlier
+    // appDir nothing of ours can be left, so no failure is reported.
     let off = set_in(
         tricky.path(),
         serde_json::json!({"enabled": false, "bundleId": "com.example.x"}),
@@ -1094,7 +1095,30 @@ fn base_validation_rejects_bad_bundle_ids_and_app_dirs() {
     .unwrap();
     assert_eq!(off["enabled"], false);
     assert_eq!(off["appDir"], serde_json::Value::Null);
-    assert_eq!(off["cleanupFailedProfiles"], serde_json::json!(["appDir"]));
+    assert_eq!(off["cleanupFailed"], false);
+
+    // Item 6: a real (not symlinked) appDir owned by another user is refused
+    // like a symlink to one. Reached through a symlinked ancestor onto a
+    // root-owned framework dir whose name is a valid bundle id.
+    #[cfg(target_os = "macos")]
+    {
+        let framework = Path::new("/System/Library/Frameworks/AppKit.framework");
+        if crate::cursor_desktop::current_uid() != 0 && framework.is_dir() {
+            let foreign = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(foreign.path().join("Library")).unwrap();
+            std::os::unix::fs::symlink(
+                "/System/Library/Frameworks",
+                foreign.path().join("Library/Application Support"),
+            )
+            .unwrap();
+            assert!(set_in(
+                foreign.path(),
+                serde_json::json!({"enabled": true, "bundleId": "AppKit.framework"})
+            )
+            .is_err());
+            assert_eq!(config(), Config::default());
+        }
+    }
     set_for_test(Config::default());
 }
 
@@ -1144,6 +1168,7 @@ fn an_off_push_is_always_accepted() {
     assert!(!temp.exists());
 
     // A symlinked appDir pointing at a file: accepted, nothing cleaned there.
+    // The appDir in use before (a valid, absent one) was cleaned: no failure.
     #[cfg(unix)]
     {
         let target = home.path().join("plain-file");
@@ -1156,11 +1181,8 @@ fn an_off_push_is_always_accepted() {
         )
         .unwrap();
         assert!(!config().enabled);
-        assert_eq!(result["cleanupFailed"], true);
-        assert_eq!(
-            result["cleanupFailedProfiles"],
-            serde_json::json!(["appDir"])
-        );
+        assert_eq!(result["appDir"], serde_json::Value::Null);
+        assert_eq!(result["cleanupFailed"], false);
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "x");
     }
     set_for_test(Config::default());
@@ -2356,6 +2378,14 @@ fn a_symlinked_default_database_still_syncs() {
     let status = sync_round(&link, &url, &registry);
     assert_eq!(states(&status), ["ok", "error:db_symlink"]);
     assert_eq!(seen.lock().unwrap().len(), 1);
+    // The default's symlink target is checked: one to a directory is
+    // refused with the fixed reason (a foreign owner:
+    // `cursor_desktop::checked_open_tests`).
+    let to_dir = tmp.path().join("dir-link.vscdb");
+    std::os::unix::fs::symlink(tmp.path(), &to_dir).unwrap();
+    let status = sync_round(&to_dir, &url, &registry);
+    assert_eq!(states(&status)[0], "error:db_not_file");
+    assert_eq!(seen.lock().unwrap().len(), 1);
 }
 
 /// FIX 5: when the round becomes `cliPresent`, no other profile's reason
@@ -2378,4 +2408,101 @@ fn cli_present_carries_no_other_reason() {
         (status["state"].as_str(), status.get("reason")),
         (Some("cliPresent"), None)
     );
+}
+
+/// Round 2, items 1 and 2: the appDir in use until now is re-checked before
+/// an off push cleans it. Replaced by a symlink into a tokscale-like folder,
+/// nothing there is touched (no delete, no lock file) and the skipped
+/// cleanup is reported. With no earlier appDir, a refused one (dangling
+/// symlink, or no HOME) reports no failure.
+#[cfg(unix)]
+#[test]
+fn an_off_push_never_cleans_a_previous_app_dir_that_now_fails_the_checks() {
+    let _guard = lock();
+    set_for_test(Config::default());
+    let home = tempfile::tempdir().unwrap();
+    let app = app_dir_in(home.path());
+    std::fs::create_dir_all(&app).unwrap();
+    set_in(
+        home.path(),
+        serde_json::json!({"enabled": true, "bundleId": BUNDLE}),
+    )
+    .unwrap();
+    // Keep the old appDir but off while the outside file exists, so no other
+    // test's takeover can see it; the cleanup branch reads only the appDir.
+    set_for_test(Config {
+        enabled: false,
+        ..config()
+    });
+    let outside = home.path().join(".config/tokscale/scratch");
+    let outside_file = outside.join("cursor-cache").join(hex_name('a'));
+    std::fs::create_dir_all(outside_file.parent().unwrap()).unwrap();
+    std::fs::write(&outside_file, "x").unwrap();
+    std::fs::remove_dir(&app).unwrap();
+    std::os::unix::fs::symlink(&outside, &app).unwrap();
+
+    let result = set_in(
+        home.path(),
+        serde_json::json!({"enabled": false, "bundleId": BUNDLE}),
+    )
+    .unwrap();
+    assert!(!config().enabled);
+    assert_eq!(result["appDir"], serde_json::Value::Null);
+    assert_eq!(result["cleanupFailed"], true);
+    assert_eq!(
+        result["cleanupFailedProfiles"],
+        serde_json::json!(["appDir"])
+    );
+    assert!(
+        outside_file.exists(),
+        "a file outside the checked appDir was deleted"
+    );
+    assert_eq!(
+        std::fs::read_dir(outside_file.parent().unwrap())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>(),
+        [hex_name('a')],
+        "something (a lock file) was created outside"
+    );
+
+    // No earlier appDir: a dangling symlink, then no HOME at all.
+    for (home, bundle) in [(Some(home.path()), "com.example.dangling"), (None, BUNDLE)] {
+        set_for_test(Config::default());
+        if let Some(home) = home {
+            std::os::unix::fs::symlink(
+                home.join("nowhere"),
+                home.join("Library/Application Support/com.example.dangling"),
+            )
+            .unwrap();
+        }
+        let result = set_from_json(
+            &serde_json::json!({"enabled": false, "bundleId": bundle}).to_string(),
+            home,
+        )
+        .unwrap();
+        assert_eq!(result["cleanupFailed"], false, "{bundle}");
+        assert_eq!(result["cleanupFailedProfiles"], serde_json::json!([]));
+    }
+    set_for_test(Config::default());
+}
+
+/// Round 2, item 4: an account-wide failure (429) still covers the account
+/// for the round, so a second profile on it sends nothing.
+#[test]
+fn a_rate_limited_account_is_not_retried_from_another_profile() {
+    let _guard = lock();
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let default_db = login_db(&tmp.path().join("default"), &valid_token(), USER);
+    let root = profile_root(tmp.path(), "b", &valid_token(), USER);
+    let registry = RwLock::new(multi(&home, true, vec![profile(PROFILE_A, &root)]));
+    let (url, seen) = serve(vec![
+        http("429 Too Many Requests", "application/json", "{}"),
+        json_ok(&page(1, &["a"])),
+    ]);
+    let status = sync_round(&default_db, &url, &registry);
+    assert_eq!(states(&status), ["error:rate_limited", "duplicate"]);
+    assert_eq!(seen.lock().unwrap().len(), 1, "the 429 was repeated from B");
 }

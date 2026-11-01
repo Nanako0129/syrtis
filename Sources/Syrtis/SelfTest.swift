@@ -17912,8 +17912,8 @@ enum SelfTest {
                "CURSOR-SYNC turning the preference off pushes enabled=false to the core")
 
         // Ordering and refresh. Mutations: the config push not chained on the
-        // previous one (on/off land out of order); `lastRefreshedEvents` not
-        // reset on off (an off->on resync of the same count never refreshes).
+        // previous one (on/off land out of order); a refresh gated on the event
+        // count (a second round that wrote the same count never refreshes).
         let cursorOrder: [String]? = awaitMainActorValue {
             let suite = "tokenbar.selftest.cursorSyncOrder"
             let defaults = UserDefaults(suiteName: suite)!
@@ -18229,8 +18229,8 @@ enum SelfTest {
         }
         expect(cursorRejected == [CursorSync.Copy.configRejected.localized, "syncs=0"],
                "CURSOR-SYNC a refused config shows the rejected line and syncs nothing; got \(String(describing: cursorRejected))")
-        expect(cursorRefresh == [true, false, true],
-               "CURSOR-SYNC a changed count refreshes, the same count does not, and off->on refreshes again; got \(String(describing: cursorRefresh))")
+        expect(cursorRefresh == [true, true, true],
+               "CURSOR-SYNC every round that wrote refreshes, including two in a row with the same count, and after off->on; got \(String(describing: cursorRefresh))")
         // CMP-520 FIX 1: one profile wrote while another failed — the
         // headline is `error`, but the core changed the data, so the
         // dashboard refreshes. Mutation: refresh only on `state == "ok"`.
