@@ -441,7 +441,7 @@ enum ClaudeExtraRoots {
     /// client's roots. `ExtraScanRoots.apply` is the coordinator that builds
     /// the complete payload; this type owns the install machinery (the quota
     /// registry, applied-payload marker, generation, cache invalidation, and
-    /// quota wake) that both clients share.
+    /// quota wake) that every client's apply shares.
     ///
     /// **Never runs the setter on the calling actor.** The core probes every
     /// configured path with `read_dir`, and an unmounted external volume or a

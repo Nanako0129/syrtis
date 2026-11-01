@@ -121,7 +121,7 @@ struct SettingsPanel: View {
     /// until the first probe lands, so a row shows no warning rather than a
     /// wrong one while the answer is still unknown.
     @State private var missingClaudeRoots: Set<String> = []
-    /// Additional Pi roots, same lifecycle as the Claude list above. The two
+    /// Additional Pi roots, same lifecycle as the Claude list above. The lists
     /// are applied together because `tb_set_extra_scan_paths` is full-replace.
     @State private var piExtraRoots: [String] = ExtraScanRoots.Pi.load()
     @State private var piExtraRootsResult: ExtraScanPathsResult?

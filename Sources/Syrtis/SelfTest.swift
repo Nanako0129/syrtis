@@ -17157,8 +17157,11 @@ enum SelfTest {
                 from: Data(ExtraScanRoots.currentPayload(dshDefaults: d).utf8))
             expect(
                 applied["dsh"] == [dshRoot],
-                "DSH-ROOTS the saved DSH folders reach the payload apply() sends to the core "
-                    + "(mutation: apply building its payload with dshRoots: [])")
+                "DSH-ROOTS the saved DSH folders reach ExtraScanRoots.currentPayload, the only "
+                    + "payload provider apply() passes to the core (mutation: currentPayload "
+                    + "building with dshRoots: [])")
+        } else {
+            expect(false, "DSH-ROOTS could not create the scratch UserDefaults suite, so the apply-path check did not run")
         }
 
         // The upgrade case: with no Pi roots configured the payload must be

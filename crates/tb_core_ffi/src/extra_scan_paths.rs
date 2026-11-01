@@ -957,8 +957,11 @@ mod tests {
     }
 
     // A16: the same once-check through the lanes the app shows (a15 covers the
-    // parse count lane): `tb_graph`'s `simple_lane!` path and `tb_window_usage`.
-    // The step time is recent so neither report's date handling drops it.
+    // parse count lane): the graph's `simple_lane!` path and `tb_window_usage`.
+    // The graph is driven through `generate_local_graph_report_local_only`
+    // because the entry `tb_graph` calls (`generate_local_graph_report`) loads
+    // pricing, which can touch the network; both reach the same
+    // `generate_graph_with_loaded_pricing`, so the lane and its dedup are shared.
     #[test]
     fn a16_dsh_duplicate_across_roots_counts_once_in_graph_and_window_lanes() {
         let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
