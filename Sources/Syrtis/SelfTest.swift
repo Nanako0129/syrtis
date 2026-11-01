@@ -17345,6 +17345,9 @@ enum SelfTest {
                 .allSatisfy(agyDetails.contains)
                 && AccountsCopy.claudeDetails.contains("CLAUDE_CONFIG_DIR")
                 && AccountsCopy.antigravityDetails.count == 5
+                && AccountsCopy.antigravityGeneral.last == AccountsCopy.remove
+                && AccountsCopy.autoToggleGroup(autoCaptureOn: true) == [AccountsCopy.autoOn]
+                && AccountsCopy.autoToggleGroup(autoCaptureOn: false) == [AccountsCopy.autoOn, AccountsCopy.autoOff]
                 && AccountsCopy.page == SettingsPanel.Page.accounts.rawValue,
             "ACCOUNTS-PAGE Antigravity details keep the keychain / token-service / revoke facts and Claude details keep the CLAUDE_CONFIG_DIR instructions")
 

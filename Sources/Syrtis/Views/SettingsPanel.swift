@@ -1249,19 +1249,16 @@ struct SettingsPanel: View {
         infoSection(
             AccountsCopy.antigravity, summary: AccountsCopy.antigravitySummary,
             details: {
-                hint(AccountsCopy.recipe)
-                hint(AccountsCopy.captureReads)
-                // Names the toggle the next paragraphs refer to.
+                ForEach(AccountsCopy.antigravityGeneral, id: \.self) { hint($0) }
+                // Last, so the paragraphs under the caption read as that
+                // switch's. `autoOff` is shown only while the switch is off:
+                // without it a manual Capture's merge lasts only until agy
+                // rewrites its login item when it refreshes its sign-in
+                // (measured: about hourly), because the marker moves and
+                // Syrtis may not re-read agy's login to confirm the account.
                 Text(AccountsCopy.autoToggle.localized)
                     .font(.caption2.weight(.semibold))
-                hint(AccountsCopy.autoOn)
-                // Shown only while the switch is off. Without it a manual
-                // Capture's merge lasts only until agy rewrites its login item
-                // when it refreshes its sign-in (measured: about hourly),
-                // because the marker moves and Syrtis may not re-read agy's
-                // login to confirm the account.
-                if !antigravityAutoCaptureOn { hint(AccountsCopy.autoOff) }
-                hint(AccountsCopy.remove)
+                ForEach(AccountsCopy.autoToggleGroup(autoCaptureOn: antigravityAutoCaptureOn), id: \.self) { hint($0) }
             }
         ) {
             ForEach(accounts, id: \.key) { account in
@@ -1640,7 +1637,15 @@ enum AccountsCopy {
     static let autoOff = "Turn this on to keep reading agy's current account through its captured sign-in, shown as one OAUTH card, so Syrtis rarely needs to run agy. With it off, a Capture lasts only until agy next refreshes its sign-in (usually within an hour); after that the main card runs agy again."
     static let remove = "Remove deletes only the copy on this Mac. Google still accepts it until you revoke access in Google Account → third-party access, which also signs Antigravity out of that account."
 
-    static let antigravityDetails = [recipe, captureReads, autoOn, autoOff, remove]
+    /// Popover order: general paragraphs first, then the toggle group last so
+    /// "When on" / "this" follow the caption naming the switch.
+    static let antigravityGeneral = [recipe, captureReads, remove]
+    /// Paragraphs under the toggle caption; `autoOff` only while it is off.
+    static func autoToggleGroup(autoCaptureOn: Bool) -> [String] {
+        autoCaptureOn ? [autoOn] : [autoOn, autoOff]
+    }
+    /// Every Antigravity paragraph, for presence checks.
+    static let antigravityDetails = antigravityGeneral + [autoOn, autoOff]
     /// Every string that has a translation; the product names `claude` and
     /// `antigravity` are intentionally the same in every language.
     static let translated = [page, moreDetails, claudeSummary, claudeDetails,
