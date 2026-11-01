@@ -1724,6 +1724,7 @@ dependencies = [
  "tokio",
  "tokscale-core",
  "tower-service",
+ "zstd",
 ]
 
 [[package]]

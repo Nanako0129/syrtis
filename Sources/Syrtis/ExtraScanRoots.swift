@@ -4,8 +4,8 @@ import TokenBarCore
 /// The single coordinator that builds one `tb_set_extra_scan_paths` payload
 /// from every client's configured roots. The setter is full-replace, so a
 /// payload for one client alone would silently clear the others; Claude's
-/// expanded roots and the additional Pi roots therefore always travel
-/// together.
+/// expanded roots and the additional Pi and DSH roots therefore always
+/// travel together.
 ///
 /// The engine's `pi` lane scans `*.jsonl` under each root with the same parser
 /// it uses for `~/.pi/agent/sessions`. A usage-only export (session header plus
@@ -68,7 +68,40 @@ enum ExtraScanRoots {
         }
     }
 
-    /// The complete payload for both clients.
+    /// Additional DeepSeek Harness session folders (`<DSH_HOME>/sessions`),
+    /// persisted exactly as configured. The engine's `dsh` lane walks each root
+    /// for `session*.jsonl.zstd` like `~/.dsh/sessions`, and its cross-file
+    /// dedup key carries no session id or root, so one session reachable under
+    /// two roots counts once. Same path rules as Pi: recursive walk, so the
+    /// same too-broad roots are refused.
+    enum Dsh {
+        static let storageKey = "tokenbar.dsh.extraRoots"
+
+        static func load() -> [String] {
+            guard let raw = UserDefaults.standard.string(forKey: storageKey),
+                let data = raw.data(using: .utf8),
+                let paths = try? JSONDecoder().decode([String].self, from: data)
+            else { return [] }
+            return paths
+        }
+
+        static func save(_ paths: [String]) {
+            let data = (try? JSONEncoder().encode(standardizedUnique(paths))) ?? Data("[]".utf8)
+            UserDefaults.standard.set(
+                String(data: data, encoding: .utf8) ?? "[]", forKey: storageKey)
+        }
+
+        static func isMissing(_ path: String) -> Bool { Pi.isMissing(path) }
+        static func isRejectedRoot(_ path: String) -> Bool { Pi.isRejectedRoot(path) }
+        static func missingRoots(
+            in paths: [String],
+            then completion: @escaping @Sendable @MainActor (Set<String>) -> Void
+        ) {
+            Pi.missingRoots(in: paths, then: completion)
+        }
+    }
+
+    /// The complete payload for all clients.
     ///
     /// With no Pi roots this returns `ClaudeExtraRoots.payloadJSON` unchanged
     /// byte-for-byte. That is not cosmetic: `appliedKey` stores the last
@@ -82,13 +115,22 @@ enum ExtraScanRoots {
     /// than a dictionary so its byte order is stable across launches. The
     /// engine reads a full object, and both keys are always present together:
     /// omitting one would clear that client's roots.
-    static func payloadJSON(claudeConfigDirs: [String], piRoots: [String]) -> String {
+    ///
+    /// `pi` and `dsh` appear only when non-empty: the setter is full-replace, so
+    /// an absent key already means "no roots for that client", and omitting
+    /// them keeps every pre-DSH payload byte-identical.
+    static func payloadJSON(
+        claudeConfigDirs: [String], piRoots: [String], dshRoots: [String] = []
+    ) -> String {
         let piPaths = standardizedUnique(piRoots)
-        guard !piPaths.isEmpty else {
+        let dshPaths = standardizedUnique(dshRoots)
+        guard !piPaths.isEmpty || !dshPaths.isEmpty else {
             return ClaudeExtraRoots.payloadJSON(claudeConfigDirs)
         }
-        let claudePaths = ClaudeExtraRoots.expandedPaths(claudeConfigDirs)
-        return "{\"claude\":\(encode(claudePaths)),\"pi\":\(encode(piPaths))}"
+        var json = "{\"claude\":\(encode(ClaudeExtraRoots.expandedPaths(claudeConfigDirs)))"
+        if !piPaths.isEmpty { json += ",\"pi\":\(encode(piPaths))" }
+        if !dshPaths.isEmpty { json += ",\"dsh\":\(encode(dshPaths))" }
+        return json + "}"
     }
 
     /// One client's share of a merged apply result, for the per-section hints
@@ -128,7 +170,7 @@ enum ExtraScanRoots {
             scanPayload: {
                 payloadJSON(
                     claudeConfigDirs: ClaudeExtraRoots.load(),
-                    piRoots: Pi.load())
+                    piRoots: Pi.load(), dshRoots: Dsh.load())
             },
             then: completion)
     }

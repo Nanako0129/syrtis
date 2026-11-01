@@ -40,6 +40,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // full-replace and one merged payload carries both clients.
     private var lastExtraRootsRaw = UserDefaults.standard.string(forKey: ClaudeExtraRoots.storageKey) ?? ""
     private var lastPiExtraRootsRaw = UserDefaults.standard.string(forKey: ExtraScanRoots.Pi.storageKey) ?? ""
+    private var lastDshExtraRootsRaw = UserDefaults.standard.string(forKey: ExtraScanRoots.Dsh.storageKey) ?? ""
     // The Discord presence client, or nil whenever this process may not connect
     // (switched off, or a demo/test run). Only makeDiscordClient creates it.
     private var discord: DiscordIPCClient?
@@ -408,11 +409,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 forKey: ClaudeExtraRoots.storageKey) ?? ""
             let piExtraRootsRaw = UserDefaults.standard.string(
                 forKey: ExtraScanRoots.Pi.storageKey) ?? ""
+            let dshExtraRootsRaw = UserDefaults.standard.string(
+                forKey: ExtraScanRoots.Dsh.storageKey) ?? ""
             if extraRootsRaw != self.lastExtraRootsRaw
                 || piExtraRootsRaw != self.lastPiExtraRootsRaw
+                || dshExtraRootsRaw != self.lastDshExtraRootsRaw
             {
                 self.lastExtraRootsRaw = extraRootsRaw
                 self.lastPiExtraRootsRaw = piExtraRootsRaw
+                self.lastDshExtraRootsRaw = dshExtraRootsRaw
                 ExtraScanRoots.apply()
             }
 

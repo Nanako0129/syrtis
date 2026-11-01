@@ -17166,6 +17166,36 @@ enum SelfTest {
             "PI-ROOTS repeated Pi roots are standardized and deduplicated before "
                 + "the wire, so one folder cannot enter the scan twice")
 
+        let piHomeForDsh = FileManager.default.homeDirectoryForCurrentUser.path
+        let dshRoot = "/Volumes/dsh-home/sessions"
+        let dshWithPi = ExtraScanRoots.payloadJSON(
+            claudeConfigDirs: [], piRoots: [piRootA], dshRoots: [dshRoot, "\(dshRoot)/"])
+        let dshWithPiDecoded = try! JSONDecoder().decode(
+            [String: [String]].self, from: Data(dshWithPi.utf8))
+        let dshOnlyDecoded = try! JSONDecoder().decode(
+            [String: [String]].self,
+            from: Data(
+                ExtraScanRoots.payloadJSON(
+                    claudeConfigDirs: [], piRoots: [], dshRoots: [dshRoot]).utf8))
+        expect(
+            dshWithPiDecoded["dsh"] == [dshRoot] && dshWithPiDecoded["pi"] == [piRootA]
+                && dshOnlyDecoded["dsh"] == [dshRoot] && dshOnlyDecoded["claude"] == []
+                && dshOnlyDecoded["pi"] == nil
+                && ExtraScanRoots.payloadJSON(claudeConfigDirs: [], piRoots: [], dshRoots: [])
+                    == ClaudeExtraRoots.payloadJSON([])
+                && ExtraScanRoots.payloadJSON(claudeConfigDirs: [], piRoots: [piRootA])
+                    == ExtraScanRoots.payloadJSON(
+                        claudeConfigDirs: [], piRoots: [piRootA], dshRoots: []),
+            "DSH-ROOTS the payload carries a deduplicated \"dsh\" list next to Pi's, "
+                + "a DSH-only payload still carries Claude, and with no DSH roots the "
+                + "payload is byte-identical to the pre-DSH one (mutation: dropping the "
+                + "\"dsh\" key, which the setter would then read as a clear)")
+        expect(
+            ExtraScanRoots.Dsh.storageKey != ExtraScanRoots.Pi.storageKey
+                && ExtraScanRoots.Dsh.isRejectedRoot(piHomeForDsh)
+                && !ExtraScanRoots.Dsh.isRejectedRoot("\(piHomeForDsh)/.dsh-copy/sessions"),
+            "DSH-ROOTS DSH has its own storage key and refuses a home-wide root")
+
         // Path shape: home, root and every ancestor of home are refused, because
         // a Pi root is walked recursively as-is; a missing path is kept (and
         // warned about) because it can become a directory later. Files are
@@ -17348,6 +17378,9 @@ enum SelfTest {
             ["login keychain", "token service and Cloud Code quota service", "revoke access in Google Account"]
                 .allSatisfy(agyDetails.contains)
                 && AccountsCopy.claudeDetails.contains("CLAUDE_CONFIG_DIR")
+                && AccountsCopy.dsh == "DeepSeek Harness"
+                && AccountsCopy.dshDetails.contains("<DSH_HOME>/sessions")
+                && AccountsCopy.translated.contains(AccountsCopy.dshSummary)
                 && AccountsCopy.antigravityDetails.count == 5
                 && ["reads the login of the Cursor app", "sends it only to Cursor's usage service (cursor.com)",
                     "date, model, token counts, cost and conversation ID", "the login itself is never saved or logged",

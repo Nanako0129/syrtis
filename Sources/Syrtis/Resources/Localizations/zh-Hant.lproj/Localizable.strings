@@ -625,6 +625,8 @@
 /* ===== 設定：Antigravity 帳號 ===== */
 "Accounts" = "帳號";
 "Extra accounts join your totals." = "額外的帳號會併入你的總計。";
+"Add another DSH home's sessions folder; its usage joins your totals." = "加入另一個 DSH home 的 sessions 資料夾；其用量會併入你的總計。";
+"Add the sessions folder of another DeepSeek Harness home, such as <DSH_HOME>/sessions. Its usage joins your DSH totals; homes aren't shown separately, and a session found in two folders counts once." = "加入另一個 DeepSeek Harness home 的 sessions 資料夾，例如 <DSH_HOME>/sessions。其用量會併入你的 DSH 總計，不會分開顯示；同一個工作階段出現在兩個資料夾時只計一次。";
 "Capture a Google account agy signs into." = "擷取 agy 登入的 Google 帳號。";
 "More details" = "詳細說明";
 "Antigravity account" = "Antigravity 帳號";
