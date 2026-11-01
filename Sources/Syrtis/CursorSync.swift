@@ -11,8 +11,9 @@ enum CursorSync {
     /// Default ON (plan D3); `object(forKey:) as? Bool` so an absent key and an
     /// explicit off are different things.
     static let enabledKey = "tokenbar.cursorSync.enabled"
-    /// The one-time privacy notice was answered (Continue, Turn Off, or turning
-    /// the Settings toggle on, which shows the same paragraph beside it).
+    /// The one-time privacy notice was answered (Continue or Turn Off on the
+    /// Overview card, or Continue in the confirmation the Settings switch opens
+    /// when turned on; both show the same paragraph).
     static let noticeKey = "tokenbar.cursorSync.noticeAcknowledged"
     /// D6: the user chose Syrtis's own sync over CLI Cursor files already on
     /// this Mac. Persisted per installation; "Keep tokscale CLI Data" clears it.
@@ -31,7 +32,8 @@ enum CursorSync {
     /// What the Settings toggle shows: on only when sync can actually run.
     /// Before the notice is answered nothing syncs, so the default-on
     /// preference alone must not read as "on" with every control inert;
-    /// turning the toggle on answers the notice (`setEnabled`).
+    /// turning the toggle on asks for confirmation first
+    /// (`CursorSyncController.switchChanged`), and confirming answers the notice.
     static func toggleShowsOn(enabled: Bool, acknowledged: Bool) -> Bool {
         enabled && acknowledged
     }
@@ -106,6 +108,7 @@ enum CursorSync {
         static let toggle = "Sync Cursor usage from the Cursor app"
         static let privacy = "To show your Cursor usage, Syrtis reads the login of the Cursor app on this Mac and sends it only to Cursor's usage service (cursor.com) to download your usage. Syrtis stores the date, model, token counts, cost and conversation ID of each request on this Mac; the login itself is never saved or logged. Turning this off deletes the downloaded usage."
         static let `continue` = "Continue"
+        static let cancel = "Cancel"
         static let turnOff = "Turn Off"
         static let lastSynced = "Last synced %@"
         static let partial = "Only part of your usage was downloaded. Syrtis will try again."
@@ -122,7 +125,7 @@ enum CursorSync {
         static let cleanupFailed = "Cursor sync is off, but some downloaded usage couldn't be deleted. Restart Syrtis to retry."
 
         static var all: [String] {
-            [title, toggle, privacy, `continue`, turnOff, lastSynced, partial, expired, notSignedIn,
+            [title, toggle, privacy, `continue`, cancel, turnOff, lastSynced, partial, expired, notSignedIn,
              offline, error, cliPresent, syncNow, syncing, cliQuestion, useSyrtis, keepCLI, cleanupFailed]
         }
     }
@@ -162,6 +165,9 @@ final class CursorSyncController: ObservableObject {
     /// reset when the next off push starts and set from its outcome. Not
     /// persisted: the launch push of an off preference runs the cleanup again.
     @Published private(set) var cleanupFailed = false
+    /// The switch was turned on and the confirmation is open. The only path to
+    /// an enabled switch from the UI goes through this and `confirmEnable()`.
+    @Published private(set) var confirmPending = false
 
     private var loop: Task<Void, Never>?
     /// The last config push. Each push waits for the one before it, so rapid
@@ -270,25 +276,37 @@ final class CursorSyncController: ObservableObject {
 
     // MARK: - Actions behind the controls
 
-    /// Settings switch. Off applies at once. On does not enable anything: it
-    /// returns true so the caller shows the privacy paragraph in a
-    /// confirmation, and only `setEnabled(true)` (the confirm button) enables.
-    /// Cancelling or dismissing the confirmation simply never calls it.
+    /// Settings switch. Off applies at once. On enables nothing: it sets
+    /// `confirmPending`, which opens the confirmation carrying the privacy
+    /// paragraph. Only `confirmEnable()` enables.
     func switchChanged(
         to on: Bool, defaults: UserDefaults = .standard,
         arguments: [String] = CommandLine.arguments
-    ) -> Bool {
-        if on { return true }
-        setEnabled(false, defaults: defaults, arguments: arguments)
-        return false
+    ) {
+        if on {
+            confirmPending = true
+        } else {
+            confirmPending = false
+            setEnabled(false, defaults: defaults, arguments: arguments)
+        }
     }
 
-    /// Enables (or disables) and, when enabling, answers the notice: the
-    /// privacy paragraph was shown in the confirmation that led here
-    /// (`SettingsPanel.cursorSyncSection`); keep the two together.
-    func setEnabled(
-        _ on: Bool, defaults: UserDefaults = .standard,
-        arguments: [String] = CommandLine.arguments
+    /// Continue in the confirmation: enables and answers the notice, because
+    /// the privacy paragraph was shown in the confirmation that led here.
+    /// Does nothing unless the switch asked first.
+    func confirmEnable(
+        defaults: UserDefaults = .standard, arguments: [String] = CommandLine.arguments
+    ) {
+        guard confirmPending else { return }
+        confirmPending = false
+        setEnabled(true, defaults: defaults, arguments: arguments)
+    }
+
+    /// Cancel, Escape, clicking away or leaving the page: enables nothing.
+    func cancelEnable() { confirmPending = false }
+
+    private func setEnabled(
+        _ on: Bool, defaults: UserDefaults, arguments: [String]
     ) {
         defaults.set(on, forKey: CursorSync.enabledKey)
         if on { defaults.set(true, forKey: CursorSync.noticeKey) }

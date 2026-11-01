@@ -137,7 +137,6 @@ struct SettingsPanel: View {
     @AppStorage(CursorSync.enabledKey) private var cursorSyncOn = true
     @AppStorage(CursorSync.takeoverKey) private var cursorTakeover = false
     @AppStorage(CursorSync.noticeKey) private var cursorNoticeAck = false
-    @State private var cursorConfirmShown = false
     /// 0 = auto (≈60% of the screen). The popover's drag handle writes the
     /// same key, so the two stay in sync.
     @AppStorage(PopoverChrome.heightKey) private var popoverHeight = 0.0
@@ -1196,30 +1195,34 @@ struct SettingsPanel: View {
         ) {
             // Consent: turning the switch on opens a confirmation carrying the
             // privacy paragraph; nothing is enabled until Continue. Cancel,
-            // Escape or clicking away leaves the switch off.
+            // Escape, clicking away or leaving the page leaves the switch off.
+            // All state lives in the controller (`confirmPending`).
             toggleRow(
                 CursorSync.Copy.toggle,
                 isOn: Binding(
                     get: { CursorSync.toggleShowsOn(enabled: cursorSyncOn, acknowledged: cursorNoticeAck) },
-                    set: { if cursorSync.switchChanged(to: $0) { cursorConfirmShown = true } }))
-                .popover(isPresented: $cursorConfirmShown, arrowEdge: .bottom) {
+                    set: { cursorSync.switchChanged(to: $0) }))
+                .popover(
+                    isPresented: Binding(
+                        get: { cursorSync.confirmPending },
+                        set: { if !$0 { cursorSync.cancelEnable() } }),
+                    arrowEdge: .bottom
+                ) {
                     VStack(alignment: .leading, spacing: 10) {
                         hint(CursorSync.Copy.privacy)
                         HStack {
                             Spacer()
-                            Button("Cancel".localized) { cursorConfirmShown = false }
+                            Button(CursorSync.Copy.cancel.localized) { cursorSync.cancelEnable() }
                                 .keyboardShortcut(.cancelAction)
-                            Button(CursorSync.Copy.continue.localized) {
-                                cursorConfirmShown = false
-                                cursorSync.setEnabled(true)
-                            }
-                            .keyboardShortcut(.defaultAction)
+                            // No default-action shortcut: Return must not consent.
+                            Button(CursorSync.Copy.continue.localized) { cursorSync.confirmEnable() }
                         }
                         .controlSize(.small)
                     }
                     .frame(width: 280, alignment: .leading)
                     .padding(12)
                 }
+                .onDisappear { cursorSync.cancelEnable() }
             if CursorSync.toggleShowsOn(enabled: cursorSyncOn, acknowledged: cursorNoticeAck) {
                 if let line = CursorSync.statusLine(
                     state: cursorSync.state, lastSuccessMs: cursorSync.lastSuccessMs)
@@ -1698,6 +1701,12 @@ private struct SettingsInfoButton<Details: View>: View {
     /// Grace after the pointer leaves the icon or the popover, so crossing the
     /// gap between them does not close it.
     private static var leaveGrace: Duration { .milliseconds(200) }
+    /// A transient popover dismisses itself on the mouse-down outside it, which
+    /// for a click on the icon comes before the button's action and would make
+    /// that action reopen it. A dismissal this recent, with the pointer over
+    /// the icon, counts as the same click and keeps it closed. Not exercised
+    /// in a GUI; the failure mode is a reopen, not a lost popover.
+    private static var sameClickWindow: TimeInterval { 0.3 }
 
     let section: String
 
@@ -1709,6 +1718,7 @@ private struct SettingsInfoButton<Details: View>: View {
     @State private var overIcon = false
     @State private var overContent = false
     @State private var pending: Task<Void, Never>?
+    @State private var dismissedOverIcon = Date.distantPast
 
     var body: some View {
         // Mechanism: a popover driven by `.onHover`, not `.help()`, because a
@@ -1716,7 +1726,7 @@ private struct SettingsInfoButton<Details: View>: View {
         // caption. Click / Space / Return pin it open; Escape closes it.
         Button {
             pending?.cancel()
-            if shown && pinned {
+            if shown || Date().timeIntervalSince(dismissedOverIcon) < Self.sameClickWindow {
                 shown = false
             } else {
                 pinned = true
@@ -1743,7 +1753,17 @@ private struct SettingsInfoButton<Details: View>: View {
             }
         }
         .onChange(of: shown) { _, now in
-            if !now { pinned = false; overContent = false }
+            if !now {
+                pinned = false
+                overContent = false
+                if overIcon { dismissedOverIcon = Date() }
+            }
+        }
+        .onDisappear {
+            pending?.cancel()
+            overIcon = false
+            overContent = false
+            shown = false
         }
         .popover(isPresented: $shown, arrowEdge: .bottom) {
             VStack(alignment: .leading, spacing: 8) { details }

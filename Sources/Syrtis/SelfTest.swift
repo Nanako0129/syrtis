@@ -17318,8 +17318,10 @@ enum SelfTest {
 
         // ACCOUNTS-PAGE: the sidebar carries the Accounts page between Usage
         // attribution and General, and every new or moved-into-popover copy key
-        // is translated (English is the key). The Claude / Antigravity
-        // controls moved out of General; their behavior is unchanged.
+        // is translated (English is the key). Claude, Antigravity, Pi and Cursor
+        // moved out of General; their behavior is unchanged. Which sections each
+        // page builder includes is not asserted: the builders are private view
+        // functions with no seam, and a source-text scan would not be a guard.
         expect(
             SettingsPanel.Page.allCases.map(\.rawValue)
                 == ["Menu bar", "Dashboard", "Usage attribution", "Accounts", "General", "About"],
@@ -17901,25 +17903,51 @@ enum SelfTest {
             let partial = try? JSONDecoder().decode(
                 CursorSyncStatus.self, from: Data(#"{"state":"partial","events":0,"lastSuccessMs":null}"#.utf8))
             let sync: @Sendable (Bool) -> CursorSyncStatus? = { _ in syncCalls.value += 1; return partial }
-            // CONSENT-CONFIRM: turning the switch on enables nothing until confirmed.
-            do {
+            // CONSENT-CONFIRM: the path the Settings switch calls. Turning it on
+            // enables and acknowledges nothing until confirmEnable(); cancel
+            // leaves everything as it was. Run from the shipped default (keys
+            // absent: enabled reads true, notice false) and from an explicit off.
+            @MainActor func consentState(
+                _ start: Bool?, _ steps: (CursorSyncController, UserDefaults, [String]) -> Void
+            ) -> (shown: Bool, enabled: Bool, ack: Bool, pending: Bool) {
                 let cs = "tokenbar.selftest.cursorConfirm"
                 let d = UserDefaults(suiteName: cs)!
                 defer { d.removePersistentDomain(forName: cs) }
                 d.removePersistentDomain(forName: cs)
-                d.set(false, forKey: CursorSync.enabledKey)
+                if let start { d.set(start, forKey: CursorSync.enabledKey) }
                 let c = CursorSyncController()
-                let args = ["Syrtis", "--demo"]
-                let asks = c.switchChanged(to: true, defaults: d, arguments: args)
-                let afterAsk = (CursorSync.enabled(defaults: d), CursorSync.noticeAcknowledged(defaults: d))
-                c.setEnabled(true, defaults: d, arguments: args)
-                let afterConfirm = (CursorSync.enabled(defaults: d), CursorSync.noticeAcknowledged(defaults: d))
-                let asksOff = c.switchChanged(to: false, defaults: d, arguments: args)
-                expect(
-                    asks && afterAsk == (false, false) && afterConfirm == (true, true)
-                        && !asksOff && !CursorSync.enabled(defaults: d),
-                    "CONSENT-CONFIRM switching on only asks (nothing enabled or acknowledged, so cancel leaves it off); confirm enables and acknowledges; switching off applies without asking")
+                steps(c, d, ["Syrtis", "--demo"])
+                let en = CursorSync.enabled(defaults: d), ack = CursorSync.noticeAcknowledged(defaults: d)
+                return (CursorSync.toggleShowsOn(enabled: en, acknowledged: ack), en, ack, c.confirmPending)
             }
+            let consent: [(String, Bool)]? = { () -> [(String, Bool)] in
+                var ok: [(String, Bool)] = []
+                for start in [nil, false] as [Bool?] {
+                    let tag = start == nil ? "default" : "off"
+                    let asked = consentState(start) { c, d, a in c.switchChanged(to: true, defaults: d, arguments: a) }
+                    ok.append(("\(tag): on only asks", asked.pending && !asked.shown && !asked.ack
+                        && asked.enabled == (start == nil)))
+                    let cancelled = consentState(start) { c, d, a in
+                        c.switchChanged(to: true, defaults: d, arguments: a); c.cancelEnable()
+                    }
+                    ok.append(("\(tag): cancel enables nothing", !cancelled.pending && !cancelled.shown && !cancelled.ack))
+                    let confirmed = consentState(start) { c, d, a in
+                        c.switchChanged(to: true, defaults: d, arguments: a); c.confirmEnable(defaults: d, arguments: a)
+                    }
+                    ok.append(("\(tag): confirm enables and acknowledges", !confirmed.pending && confirmed.shown && confirmed.ack))
+                    let unasked = consentState(start) { c, d, a in c.confirmEnable(defaults: d, arguments: a) }
+                    ok.append(("\(tag): confirm without asking does nothing", !unasked.shown && !unasked.ack))
+                }
+                let off = consentState(true) { c, d, a in
+                    c.switchChanged(to: true, defaults: d, arguments: a); c.confirmEnable(defaults: d, arguments: a)
+                    c.switchChanged(to: false, defaults: d, arguments: a)
+                }
+                ok.append(("off applies without asking", !off.enabled && !off.pending))
+                return ok
+            }()
+            expect(
+                consent?.allSatisfy(\.1) == true,
+                "CONSENT-CONFIRM Settings switch gate: \(consent?.filter { !$0.1 }.map(\.0) ?? ["no result"])")
             let controller = CursorSyncController()
             // 1. Notice not acknowledged -> no sync.
             await controller.runSync(explicit: true, defaults: defaults, arguments: ["Syrtis"], sync: sync)
