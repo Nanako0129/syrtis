@@ -802,8 +802,10 @@ fn graph_cached(year: &str, max_age: Duration) -> Option<serde_json::Value> {
 fn graph_compute(year: &str) -> Result<serde_json::Value, String> {
     // Probe before parsing: a source write or topology change that lands
     // mid-compute changes the token, so the next aged-out read recomputes
-    // rather than serving a graph that missed it. Keep the same context for
-    // both paths so the probe and report scan observe identical source roots.
+    // rather than serving a graph that missed it. The probe and the scan each
+    // build their options, so each reads settings.json itself: an edit between
+    // them can leave a token older than the data, which only costs one extra
+    // recompute at the next probe (the token then differs).
     let generation = ROOT_GENERATION.load(Ordering::SeqCst);
     let context = LocalSourceContext::current();
     let token =
@@ -1020,10 +1022,10 @@ fn tail_tick_if_stale() {
 /// `{"ok":true,"messages":N,"opencodeDb":{...}}` or `{"ok":false,"err":...}`.
 /// `opencodeDb` = `{"settingsFile":"absent"|"ok"|"tooLarge"|"unreadable"|
 /// "invalidJson","handedToEngine":N,"issues":[{"source":"env"|"file",
-/// "index":i,"reason":"notAbsolute"|"badFileName"|"missing"}]}`: what the last
+/// "index":i,"reason":"notAbsolute"|"badFileName"|"missing"|"emptyEnv"}]}`: what the last
 /// read of the user's OpenCode DB settings found (see `user_scanner_settings`);
 /// `index` is the zero-based position in that source's list, `notAbsolute`
-/// paths are withheld from the engine, the other reasons are paths it will
+/// and `emptyEnv` are withheld from the engine, the other reasons are paths it will
 /// probably skip. No path crosses the ABI.
 #[no_mangle]
 pub extern "C" fn tb_probe() -> *mut c_char {

@@ -919,6 +919,25 @@ public enum TBCore {
         return out
     }
 
+    /// Pins the `opencodeDb` object of the legacy `tb_probe` payload. The literal
+    /// is the shape the Rust acceptance test `tb_probe_reports_rejected_paths`
+    /// asserts key by key, so a rename on either side fails one of the two.
+    public static func probeContractChecks() -> [(String, Bool)] {
+        let body = Data(
+            #"{"ok":true,"messages":3,"opencodeDb":{"settingsFile":"ok","handedToEngine":2,"issues":[{"source":"file","index":0,"reason":"badFileName"},{"source":"env","index":0,"reason":"missing"}]}}"#.utf8
+        )
+        guard let probe = try? JSONDecoder().decode(ProbeResult.self, from: body) else {
+            return [("probe opencodeDb diagnostics decode", false)]
+        }
+        let db = probe.opencodeDb
+        return [
+            ("probe opencodeDb diagnostics decode",
+             probe.messages == 3 && db?.settingsFile == "ok" && db?.handedToEngine == 2
+                && db?.issues.map { "\($0.source)/\($0.index)/\($0.reason)" }
+                    == ["file/0/badFileName", "env/0/missing"]),
+        ]
+    }
+
     /// Hermetic decoder and formatting checks for the source-aware filter
     /// parity payload. This keeps the Swift side independent of private local
     /// session data while pinning the lower-camel wire statuses and bounded

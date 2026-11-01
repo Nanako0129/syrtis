@@ -25,9 +25,9 @@ fn child_root() -> Option<PathBuf> {
     std::env::var_os(ROOT_VAR).map(PathBuf::from)
 }
 
-/// Re-run `test` in an env-cleared child. `with_env` passes the DB path to
-/// the child as `OPENCODE_DB` (the child creates the DB, so the parent only
-/// names where it will be).
+/// Re-run `test` in an env-cleared child, in a temp root prefixed `label`.
+/// `with_env` passes the DB path to the child as `OPENCODE_DB` (the child
+/// creates the DB, so the parent only names where it will be).
 fn run_in_child(test: &str, label: &str, with_env: bool) {
     let root = tempfile::Builder::new().prefix(label).tempdir().unwrap();
     let home = root.path().join("home");
@@ -238,7 +238,104 @@ fn tb_probe_reports_rejected_paths() {
     let report = &probe["opencodeDb"];
     assert_eq!(report["settingsFile"], "ok");
     assert_eq!(report["handedToEngine"], 2);
+    // Key names are the wire contract Swift's ProbeResult.OpenCodeDb decodes.
+    let keys = |v: &serde_json::Value| -> Vec<String> {
+        v.as_object().unwrap().keys().cloned().collect()
+    };
+    assert_eq!(keys(report), ["handedToEngine", "issues", "settingsFile"]);
+    assert_eq!(keys(&report["issues"][0]), ["index", "reason", "source"]);
+    assert_eq!(report["issues"][0]["source"], "file");
     assert_eq!(report["issues"][0]["reason"], "badFileName");
     assert_eq!(report["issues"][0]["index"], 0);
     assert!(!report.to_string().contains("mydb"), "a path must not cross the ABI");
+}
+
+/// The path users take: edit settings.json, no setter. Entries aged past the
+/// oneshot window are re-validated by the change token and recompute.
+#[test]
+fn an_aged_out_cache_entry_recomputes_after_a_settings_edit() {
+    let Some(root) = child_root() else {
+        return run_in_child("an_aged_out_cache_entry_recomputes_after_a_settings_edit", "oc-aged", false);
+    };
+    let db = write_external_db(&root);
+    assert_eq!(entries_seeing_the_db(), Vec::<&str>::new());
+    let zero = std::time::Duration::ZERO;
+    // Control: nothing changed, so the aged-out graph entry is re-stamped and served.
+    assert!(crate::graph_cached("", zero).is_some(), "unchanged source keeps the entry");
+    write_settings(&root, serde_json::json!([db]));
+    assert!(crate::graph_cached("", zero).is_none(), "the token sees the new DB path");
+    let graph = unsafe { take(crate::tb_refresh_graph(std::ptr::null())) };
+    assert!(has_int(&graph, OUTPUT), "{graph}");
+    // The window entry: age it past the oneshot window and ask again.
+    let aged = std::time::Instant::now()
+        .checked_sub(std::time::Duration::from_secs(crate::ONESHOT_MAX_AGE_SECS + 1));
+    let mut cache = crate::WINDOW_USAGE_CACHE.lock().unwrap();
+    assert!(!cache.is_empty());
+    for entry in cache.values_mut() {
+        entry.0 = aged.expect("monotonic clock is older than 31 s");
+    }
+    drop(cache);
+    let window = unsafe { take(crate::tb_window_usage(std::ptr::null(), WINDOW_FROM, WINDOW_UNTIL)) };
+    assert!(has_int(&window, OUTPUT), "{window}");
+}
+
+/// A pinned-corpus context ignores the user's DBs, like the per-client root
+/// variables; the live-process context takes them.
+#[test]
+fn a_corpus_context_ignores_the_users_opencode_dbs() {
+    let Some(root) = child_root() else {
+        return run_in_child("a_corpus_context_ignores_the_users_opencode_dbs", "oc-corpus", true);
+    };
+    let db = write_external_db(&root);
+    write_settings(&root, serde_json::json!([db]));
+    let home = root.join("home");
+    let live = crate::LocalSourceContext::for_home(home.clone());
+    assert!(!live.parse_options(None, None).scanner_settings.opencode_db_paths.is_empty());
+    let corpus = crate::LocalSourceContext::for_corpus(home);
+    assert!(corpus.parse_options(None, None).scanner_settings.opencode_db_paths.is_empty());
+}
+
+/// OPENCODE_DB as opencode reads it: a relative value lives under its data dir.
+#[test]
+fn a_relative_opencode_db_resolves_under_the_opencode_data_dir() {
+    let Some(root) = child_root() else {
+        return run_in_child("a_relative_opencode_db_resolves_under_the_opencode_data_dir", "oc-rel", false);
+    };
+    let db = write_external_db(&root);
+    let data = root.join("home/.local/share/opencode");
+    std::fs::create_dir_all(&data).unwrap();
+    std::fs::rename(&db, data.join("opencode-dev.db")).unwrap();
+    // Move it one level below the dir the engine lists, so only the env finds it.
+    let elsewhere = data.join("sub");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    std::fs::rename(data.join("opencode-dev.db"), elsewhere.join("opencode-dev.db")).unwrap();
+    assert_eq!(entries_seeing_the_db(), Vec::<&str>::new());
+    std::env::set_var("OPENCODE_DB", "sub/opencode-dev.db"); // verbatim, like opencode
+    // Drop the caches the first pass filled (a launch env would be set before).
+    let none = CString::new("{}").unwrap();
+    unsafe { take(crate::tb_set_extra_scan_paths(none.as_ptr())) };
+    assert_eq!(entries_seeing_the_db(), EVERY_ENTRY);
+}
+
+/// The data dir OPENCODE_DB is resolved against is the OpenCode root the
+/// engine scans: `$XDG_DATA_HOME/opencode` when set and non-empty, else
+/// `<home>/.local/share/opencode`.
+#[test]
+fn the_data_dir_follows_the_engines_xdg_data_root() {
+    let Some(root) = child_root() else {
+        return run_in_child("the_data_dir_follows_the_engines_xdg_data_root", "oc-xdg", false);
+    };
+    let home = root.join("home");
+    let data_dir = || crate::user_scanner_settings::opencode_data_dir(&home);
+    assert_eq!(data_dir(), home.join(".local/share/opencode"));
+    std::env::set_var("XDG_DATA_HOME", "");
+    assert_eq!(data_dir(), home.join(".local/share/opencode"), "empty counts as unset");
+    std::env::set_var("XDG_DATA_HOME", root.join("xdg"));
+    assert_eq!(data_dir(), root.join("xdg/opencode"));
+    // And it is the dir the engine really lists: a DB placed there is found
+    // with no OPENCODE_DB at all.
+    let db = write_external_db(&root);
+    std::fs::create_dir_all(data_dir()).unwrap();
+    std::fs::rename(&db, data_dir().join("opencode.db")).unwrap();
+    assert_eq!(entries_seeing_the_db(), EVERY_ENTRY);
 }
