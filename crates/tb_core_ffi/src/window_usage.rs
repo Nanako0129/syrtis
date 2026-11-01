@@ -148,9 +148,10 @@ fn nested_exclusions(dir: &str, own: &[PathBuf]) -> Vec<PathBuf> {
                 .cloned(),
         );
     }
-    // The engine canonicalises an exclusion before matching it, so one that is
-    // nested only as spelled (`D/.claude` a symlink back to `D` or above)
-    // would cover this account's own roots and empty its window. Such an
+    // The engine matches a file against an exclusion both as found (lexically
+    // normalised) and canonicalised, and canonicalises the exclusion too, so
+    // one that is nested only as spelled (`D/.claude` a symlink back to `D` or
+    // above) would cover this account's own roots and empty its window. Such an
     // entry is dropped: counted twice beats confidently zero.
     let canonical = |path: &Path| std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     let own: Vec<PathBuf> = own.iter().map(|root| canonical(root)).collect();
@@ -1035,8 +1036,9 @@ mod tests {
     }
 
     /// A configured `D/.claude` that is a symlink back to `D` is nested only as
-    /// spelled. The engine canonicalises exclusions, so listing it would cover
-    /// D's own roots and read D as zero; it is left out instead.
+    /// spelled. The engine also matches an exclusion by its canonical form, so
+    /// listing it would cover D's own roots and read D as zero; it is left out
+    /// instead.
     #[cfg(unix)]
     #[test]
     fn a_nested_path_that_resolves_to_the_account_itself_is_not_excluded() {
@@ -1054,6 +1056,36 @@ mod tests {
         let outer = scan(&context, &Some(d.display().to_string()));
 
         assert_eq!(output_tokens(&outer), D_OUTPUT, "D's own roots were excluded: {outer}");
+        reset_registries();
+    }
+
+    /// A primary transcript that is a symlink into an extra account's folder.
+    /// The engine judges each file both as found and by its canonical path, so
+    /// the link is the extra account's file and the primary's window leaves it
+    /// out. Before engine PR #76 (`15204f4`) only the scan root was compared, so
+    /// the primary counted the link's target a second time. The extra account's
+    /// own window still reads its target.
+    #[cfg(unix)]
+    #[test]
+    fn a_primary_transcript_symlinked_into_an_extra_account_is_not_the_primarys() {
+        let _guards = lock_registries();
+        reset_registries();
+        let fixture = account_fixture();
+        let target = fixture.d.join("projects/proj/d.jsonl");
+        assert!(target.is_file(), "the fixture has no target to link to");
+        let link = fixture.home.join(".claude/projects/proj/link.jsonl");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let context = crate::LocalSourceContext::for_home(fixture.home.clone());
+
+        let primary = scan(&context, &PRIMARY);
+        let extra = scan(&context, &Some(fixture.d.display().to_string()));
+
+        assert_eq!(
+            output_tokens(&primary),
+            PRIMARY_OUTPUT,
+            "the primary counted a transcript that lives in an extra account: {primary}"
+        );
+        assert_eq!(output_tokens(&extra), D_OUTPUT, "{extra}");
         reset_registries();
     }
 

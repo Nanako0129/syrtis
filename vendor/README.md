@@ -35,17 +35,8 @@ commit and run the TokenBar consumer gates.
 
 ## Cache consequences of the current pin
 
-Claude `parser_version` is 5 and a Claude shard is written in its own cache
-envelope (format 100). The first scan after an upgrade re-parses every Claude
-transcript once without losing cached history. A downgrade is lossy: an older
-engine reads these shards as stale and rewrites them from nothing, dropping
-turns that exist only in the cache. Before a first scan of the real cache on this
-pin, quit every Syrtis and tokscale process and copy
-`~/.config/tokscale/cache/source-message-cache-v2/claude/`. To roll back, in
-this order: quit every process that runs the newer engine, restore that
-directory, launch the older version, then check that the Claude shards still
-begin with format 4 and parser version 4. Details and measurements are in
-[`docs/knowledge/vendor-tokscale.md`](../docs/knowledge/vendor-tokscale.md).
+Claude cache compatibility, the co-running hazard and the ordered rollback live
+in [`docs/knowledge/vendor-tokscale.md`](../docs/knowledge/vendor-tokscale.md#claude-cache-co-running-and-rollback).
 
 ## Checkout
 
