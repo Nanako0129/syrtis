@@ -300,6 +300,7 @@ fn an_aged_out_cache_entry_recomputes_after_a_settings_edit() {
 
 /// A pinned-corpus context ignores the user's DBs, like the per-client root
 /// variables; the live-process context takes them.
+#[cfg(target_os = "macos")] // `for_corpus` exists only in macOS test builds.
 #[test]
 fn a_corpus_context_ignores_the_users_opencode_dbs() {
     let Some(root) = child_root() else {

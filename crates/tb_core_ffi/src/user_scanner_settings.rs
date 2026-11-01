@@ -379,6 +379,7 @@ mod tests {
     }
 
     /// A path that is not valid Unicode reaches the engine byte-for-byte.
+    #[cfg(unix)]
     #[test]
     fn a_non_unicode_env_path_is_passed_through_untouched() {
         use std::os::unix::ffi::OsStringExt;
