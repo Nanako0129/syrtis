@@ -1062,9 +1062,14 @@ mod tests {
     /// A primary transcript that is a symlink into an extra account's folder.
     /// The engine judges each file both as found and by its canonical path, so
     /// the link is the extra account's file and the primary's window leaves it
-    /// out. Before engine PR #76 (`15204f4`) only the scan root was compared, so
-    /// the primary counted the link's target a second time. The extra account's
-    /// own window still reads its target.
+    /// out. At the previous pin `15204f4`, before engine PR #76 (merged as
+    /// `76ee5d4`), only the scan root was compared, so the primary counted the
+    /// link's target a second time. The extra account's own window still reads
+    /// its target.
+    ///
+    /// The control at the end is what makes the first assertion mean something:
+    /// with no extra account registered and no `.cc-mirror` variant, nothing
+    /// excludes the link, and the primary reads it (1,000 + 7,000).
     #[cfg(unix)]
     #[test]
     fn a_primary_transcript_symlinked_into_an_extra_account_is_not_the_primarys() {
@@ -1086,6 +1091,20 @@ mod tests {
             "the primary counted a transcript that lives in an extra account: {primary}"
         );
         assert_eq!(output_tokens(&extra), D_OUTPUT, "{extra}");
+
+        // Control: drop the exclusion's inputs (both registries, and the
+        // variants that would reach `work-d` by another route, which would
+        // read the same message and hide the link behind a dedup). The link is
+        // then walked and counted, so the 1,000 above is the exclusion at work.
+        reset_registries();
+        std::fs::remove_dir_all(fixture.home.join(".cc-mirror")).unwrap();
+        let unexcluded = scan(&context, &PRIMARY);
+        assert_eq!(
+            output_tokens(&unexcluded),
+            PRIMARY_OUTPUT + D_OUTPUT,
+            "without the exclusion the symlinked transcript is not walked, so \
+             the assertion above proves nothing: {unexcluded}"
+        );
         reset_registries();
     }
 
