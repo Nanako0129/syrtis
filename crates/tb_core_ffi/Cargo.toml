@@ -46,3 +46,5 @@ security-framework = "3.7"
 
 [dev-dependencies]
 tempfile = "3"
+# Build DSH `session.v4.jsonl.zstd` fixtures; same line tokscale-core uses.
+zstd = "0.13"

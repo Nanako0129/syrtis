@@ -121,11 +121,15 @@ struct SettingsPanel: View {
     /// until the first probe lands, so a row shows no warning rather than a
     /// wrong one while the answer is still unknown.
     @State private var missingClaudeRoots: Set<String> = []
-    /// Additional Pi roots, same lifecycle as the Claude list above. The two
+    /// Additional Pi roots, same lifecycle as the Claude list above. The lists
     /// are applied together because `tb_set_extra_scan_paths` is full-replace.
     @State private var piExtraRoots: [String] = ExtraScanRoots.Pi.load()
     @State private var piExtraRootsResult: ExtraScanPathsResult?
     @State private var missingPiRoots: Set<String> = []
+    /// Additional DeepSeek Harness session folders, same lifecycle again.
+    @State private var dshExtraRoots: [String] = ExtraScanRoots.Dsh.load()
+    @State private var dshExtraRootsResult: ExtraScanPathsResult?
+    @State private var missingDshRoots: Set<String> = []
     /// The stored list itself, observed rather than copied: automatic capture
     /// changes it while this panel is open, and a copy held here would be
     /// written back over that change.
@@ -1072,6 +1076,8 @@ struct SettingsPanel: View {
 
         piExtraRootsSection()
 
+        dshExtraRootsSection()
+
         cursorSyncSection()
     }
 
@@ -1183,6 +1189,57 @@ struct SettingsPanel: View {
             }
         }
         .onAppear { refreshMissingPiRoots() }
+    }
+
+    /// Extra DeepSeek Harness homes. Each root is a `sessions` folder; its
+    /// usage merges into the single DSH total (the engine dedups a session
+    /// reachable under two roots).
+    @ViewBuilder
+    private func dshExtraRootsSection() -> some View {
+        infoSection(
+            AccountsCopy.dsh, summary: AccountsCopy.dshSummary,
+            details: { hint(AccountsCopy.dshDetails) }
+        ) {
+            ForEach(dshExtraRoots, id: \.self) { path in
+                row(path) {
+                    HStack(spacing: 6) {
+                        if missingDshRoots.contains(path) {
+                            Image(systemName: "exclamationmark.triangle.fill")
+                                .font(.caption2)
+                                .foregroundStyle(.orange)
+                                .help("Folder not found. Kept in case the drive is disconnected or the path needs fixing.".localized)
+                        }
+                        Button {
+                            dshExtraRoots.removeAll { $0 == path }
+                            commitDshExtraRoots()
+                        } label: {
+                            Image(systemName: "minus.circle")
+                                .foregroundStyle(.secondary)
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+            }
+            Button {
+                addDshExtraRoot()
+            } label: {
+                Label("Add folder…".localized, systemImage: "plus.circle")
+                    .font(.caption)
+            }
+            .buttonStyle(.plain)
+            .padding(.horizontal, 10)
+            let dshHint = ExtraScanRoots.clientHint(
+                dshExtraRootsResult, client: "dsh", requested: dshExtraRoots.count)
+            if let dshHint, dshHint.unreadable > 0 {
+                hint("%lld of %lld folders can't be read right now; Syrtis will retry on the next scan.".localized(
+                    dshHint.unreadable, dshHint.registered))
+            }
+            if let dshHint, dshHint.rejected > 0 {
+                hint("%lld path(s) can't be scanned and weren't added.".localized(
+                    dshHint.rejected))
+            }
+        }
+        .onAppear { refreshMissingDshRoots() }
     }
 
     /// Cursor usage synced from the Cursor desktop app. The privacy paragraph
@@ -1386,6 +1443,31 @@ struct SettingsPanel: View {
 
     private func refreshMissingPiRoots() {
         ExtraScanRoots.Pi.missingRoots(in: piExtraRoots) { missingPiRoots = $0 }
+    }
+
+    private func addDshExtraRoot() {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = false
+        panel.prompt = "Add".localized
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        let path = (url.path as NSString).standardizingPath
+        guard !ExtraScanRoots.Dsh.isRejectedRoot(path),
+            !dshExtraRoots.contains(path)
+        else { return }
+        dshExtraRoots.append(path)
+        commitDshExtraRoots()
+    }
+
+    private func commitDshExtraRoots() {
+        ExtraScanRoots.Dsh.save(dshExtraRoots)
+        ExtraScanRoots.apply { dshExtraRootsResult = $0 }
+        refreshMissingDshRoots()
+    }
+
+    private func refreshMissingDshRoots() {
+        ExtraScanRoots.Dsh.missingRoots(in: dshExtraRoots) { missingDshRoots = $0 }
     }
 
     @ViewBuilder
@@ -1664,6 +1746,10 @@ enum AccountsCopy {
         "Directories of Pi session-format JSONL files. Usage-only exports from headless runners are counted, and full Pi sessions also work.",
         "Only assistant usage contributes. Roots merge into the Pi total; there is no per-root breakdown.",
     ]
+    /// The registry's display name, so the header follows the product name.
+    static var dsh: String { ClientRegistry.style("dsh").displayName }
+    static let dshSummary = "Add another DSH home's sessions folder; its usage joins your totals."
+    static let dshDetails = "Add the sessions folder of another DeepSeek Harness home, such as <DSH_HOME>/sessions. Its usage joins your DSH totals; homes aren't shown separately, and a session found in two folders counts once."
     static let cursor = "Cursor"
     static let cursorSummary = "Sync usage from the Cursor app."
     static let antigravity = "Antigravity"
@@ -1687,8 +1773,8 @@ enum AccountsCopy {
     /// Every string that has a translation; the product names `claude` and
     /// `antigravity` are intentionally the same in every language.
     static let translated = [page, moreDetails, claudeSummary, claudeDetails,
-                             antigravitySummary, autoToggle, piSummary, cursorSummary]
-                             + piDetails + antigravityDetails
+                             dshSummary, dshDetails, antigravitySummary, autoToggle, piSummary,
+                             cursorSummary] + piDetails + antigravityDetails
 }
 
 /// ⓘ next to a section header; the popover holds the long explanation.
