@@ -39,7 +39,8 @@
 //! data dir itself, which holds no database): it is ignored and reported as
 //! `emptyEnv`. A relative value under a relative `XDG_DATA_HOME` is handed over
 //! relative, and the engine resolves it against the process cwd, as it does for
-//! its own discovery. `handedToEngine` counts distinct path strings, so paths
+//! its own discovery. `handedToEngine` counts distinct `PathBuf`s (which
+//! already ignores `.` components and repeated `/`, but not `..`), so paths
 //! differing only by `..` count twice; the engine dedups by canonical path, so
 //! totals stay right.
 //! `opencodeDbPaths` entries in settings.json are tokscale's field, not

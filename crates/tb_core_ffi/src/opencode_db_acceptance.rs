@@ -278,6 +278,13 @@ fn an_aged_out_cache_entry_recomputes_after_a_settings_edit() {
     let scans = crate::window_usage::scan_count();
     window();
     assert_eq!(crate::window_usage::scan_count(), scans, "unchanged source must not rescan");
+    // ...and the entry is young again (the re-stamp), not left aged.
+    for (at, _, _) in crate::WINDOW_USAGE_CACHE.lock().unwrap().values() {
+        assert!(
+            at.elapsed() < std::time::Duration::from_secs(crate::ONESHOT_MAX_AGE_SECS),
+            "an unchanged aged entry must be re-stamped"
+        );
+    }
     let zero = std::time::Duration::ZERO;
     // Control: nothing changed, so the aged-out graph entry is re-stamped and served.
     assert!(crate::graph_cached("", zero).is_some(), "unchanged source keeps the entry");
