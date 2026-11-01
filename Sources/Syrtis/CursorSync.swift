@@ -58,14 +58,21 @@ enum CursorSync {
 
     /// Added Cursor profiles (`--user-data-dir` roots), each `{"id","root"}`
     /// with a random uppercase UUID. Only the folder path and that id are
-    /// stored — never an account id, email or label. CMP-1 has no UI writing
-    /// it; the default profile is implicit and never listed.
+    /// stored — never an account id, email or label. Written by the Accounts
+    /// page (`CursorSyncController.addProfile` / `removeProfile`); the default
+    /// profile is implicit and never listed.
     static let profilesKey = "tokenbar.cursorSync.profiles"
 
     struct Profile: Equatable {
         let id: String
         let root: String
+        /// The stored and wire shape, `{"id","root"}`.
+        var stored: [String: String] { ["id": id, "root": root] }
     }
+
+    /// The core's limit (`cursor_sync::MAX_PROFILES`): a longer list is
+    /// rejected whole, the default profile included.
+    static let maxProfiles = 32
 
     static func profiles(defaults: UserDefaults = .standard) -> [Profile] {
         (defaults.array(forKey: profilesKey) as? [[String: String]] ?? []).compactMap { entry in
@@ -73,6 +80,54 @@ enum CursorSync {
             return Profile(id: id, root: root)
         }
     }
+
+    static func saveProfiles(_ profiles: [Profile], defaults: UserDefaults = .standard) {
+        defaults.set(profiles.map(\.stored), forKey: profilesKey)
+    }
+
+    /// The folder's file identity (a final symlink followed), so another
+    /// spelling of the same folder — a symlink, a firmlink such as
+    /// /System/Volumes/Data, a different case — compares equal on any volume.
+    /// nil for a folder that can't be read (gone, unmounted): never an
+    /// identity match. When the folder being added has no identity, `cantAdd`
+    /// compares standardized path strings instead; a stored or Cursor-own
+    /// folder without one only matches through that path comparison.
+    static func folderIdentity(_ path: String) -> NSObject? {
+        (try? URL(fileURLWithPath: path).resolvingSymlinksInPath()
+            .resourceValues(forKeys: [.fileResourceIdentifierKey]))?.fileResourceIdentifier as? NSObject
+    }
+
+    /// A folder that can't be added, checked before anything is saved. A 33rd
+    /// profile or a relative path or "/" would make the core reject the whole
+    /// config (`cursor_sync::parse_config`) and stop every profile's sync.
+    /// Cursor's own folder and a folder already listed are refused only to
+    /// avoid a duplicate row and a second read of the same login.
+    static func cantAdd(
+        root: String, existing: [Profile],
+        home: URL = FileManager.default.homeDirectoryForCurrentUser
+    ) -> Bool {
+        let standard = (root as NSString).standardizingPath
+        if existing.count >= maxProfiles || !standard.hasPrefix("/") || standard == "/" { return true }
+        let cursorOwn = home.appendingPathComponent("Library/Application Support/Cursor").path
+        let candidates = [cursorOwn] + existing.map(\.root)
+        guard let identity = folderIdentity(standard) else {
+            // Unreadable: the path string is all there is to compare.
+            return candidates.contains { ($0 as NSString).standardizingPath == standard }
+        }
+        return candidates.contains { folderIdentity($0)?.isEqual(identity) == true }
+    }
+
+    /// What the consent surfaces show: the privacy paragraph, plus the added
+    /// profiles' paragraph once any folder is stored (they are read too).
+    static func consentParagraphs(profiles: [Profile]) -> [String] {
+        profiles.isEmpty ? [Copy.privacy] : [Copy.privacy, Copy.profilesPrivacy]
+    }
+
+    typealias SetConfig = @Sendable (String) -> Bool?
+    typealias Sync = @Sendable (Bool) -> CursorSyncStatus?
+    /// The real core calls; tests inject spies in their place.
+    static let coreSetConfig: SetConfig = { (try? TBCore.setCursorSync(json: $0))?.cleanupFailed }
+    static let coreSync: Sync = { try? TBCore.cursorSync(explicit: $0) }
 
     /// `{"enabled","bundleId","profiles":[{"id","root"}],"cliTakeoverConfirmed"}`
     /// for `tb_set_cursor_sync`. The core derives every directory from the
@@ -85,7 +140,7 @@ enum CursorSync {
         let object: [String: Any] = [
             "enabled": shouldSync(defaults: defaults, arguments: arguments),
             "bundleId": bundleID,
-            "profiles": profiles(defaults: defaults).map { ["id": $0.id, "root": $0.root] },
+            "profiles": profiles(defaults: defaults).map(\.stored),
             "cliTakeoverConfirmed": takeoverConfirmed(defaults: defaults),
         ]
         let data = (try? JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])) ?? Data()
@@ -134,16 +189,58 @@ enum CursorSync {
         static let cleanupFailed = "Cursor sync is off, but some downloaded usage couldn't be deleted. Restart Syrtis to retry."
         /// The core refused the settings (`tb_set_cursor_sync` error): nothing syncs.
         static let configRejected = "Cursor sync couldn't be set up, so nothing is being synced."
+        /// Accounts page, profile list (CMP-520). The default profile's row.
+        static let defaultProfile = "Cursor app (default)"
+        static let addProfile = "Add Cursor profile folder…"
+        /// A row whose account an earlier profile already synced this round.
+        static let duplicate = "Same account as another profile; counted once."
+        /// Second paragraph, always shown under `privacy` (the ⓘ, and the
+        /// consent surfaces via `consentParagraphs`), so "above" is that
+        /// paragraph. Each sentence, checked against the code:
+        /// handled as above — an added profile goes through the same walk as
+        /// the default: `cursor_desktop::read_login_checked` on
+        /// `<root>/User/globalStorage/state.vscdb` each round,
+        /// `cursor_sync::walk` posting only to `USAGE_EVENTS_URL` (cursor.com,
+        /// https-only, no redirects; added profiles never feed Grok Bot),
+        /// `commit_file` writing only the parser fields into
+        /// `<appDir>/cursor-profiles/<id>`, and `CursorLogin` dropped after the
+        /// cookie (never stored or logged); one total, counted once —
+        /// `newest_per_account`; deletes the next time Syrtis can — the core's
+        /// orphan cleanup runs on the next accepted on push (`set_from_json`);
+        /// a failure there is not surfaced. Folder path in settings —
+        /// `profilesKey`.
+        static let profilesPrivacy = "Add a folder you start Cursor with using --user-data-dir to sync it too (Syrtis keeps the folder path in its settings); each profile's sign-in is handled as described above. All profiles add up to one Cursor total, and an account signed in to several profiles counts once. Removing a profile deletes its downloaded usage the next time Syrtis can."
+
+        /// Under the add button when `cantAdd` refuses a folder.
+        static let cantAdd = "That folder can't be added."
+        /// A row whose own reason is permanent (`permanentReasons`).
+        static let cantRead = "Syrtis can't read this folder's Cursor sign-in."
+        /// Accessibility label of a row's Remove button; `%@` is the folder name.
+        static let removeFolder = "Remove %@"
 
         static var all: [String] {
             [title, toggle, privacy, `continue`, cancel, turnOff, lastSynced, partial, expired, notSignedIn,
              offline, error, cliPresent, syncNow, syncing, cliQuestion, useSyrtis, keepCLI, cleanupFailed,
-             configRejected]
+             configRejected, defaultProfile, addProfile, duplicate, profilesPrivacy, cantAdd, cantRead,
+             removeFolder]
         }
     }
 
     /// Swift-side state: the last on push was refused by the core.
     static let configRejectedState = "configRejected"
+
+    /// Per-profile reasons a retry will not fix.
+    static let permanentReasons: Set<String> = [
+        "db_symlink", "db_not_file", "db_foreign_owner",
+    ]
+
+    /// A profile row's line: the duplicate note, the permanent-failure line,
+    /// or the status line for its state.
+    static func rowLine(_ status: CursorSyncStatus.Profile) -> String? {
+        if status.state == "duplicate" { return Copy.duplicate.localized }
+        if let reason = status.reason, permanentReasons.contains(reason) { return Copy.cantRead.localized }
+        return statusLine(state: status.state, lastSuccessMs: status.lastSuccessMs)
+    }
 
     /// Status line for a core state. nil where there is nothing to say
     /// (`disabled`, not yet synced, or `ok` with no recorded time).
@@ -185,6 +282,13 @@ final class CursorSyncController: ObservableObject {
     /// that switch only: `confirmEnable()` enables nothing unless this is set.
     /// The Overview notice answers through `answerNotice`, a separate path.
     @Published private(set) var confirmPending = false
+    /// The last sync's outcome per profile id (`default` or a UUID), so a row
+    /// shows its own error even when the headline says something else.
+    @Published private(set) var profileStates: [String: CursorSyncStatus.Profile] = [:]
+    /// The stored added profiles, published so every view that shows them or
+    /// their consent paragraph (the Overview notice card included) re-renders
+    /// after an add or a remove.
+    @Published private(set) var profiles: [CursorSync.Profile] = CursorSync.profiles()
 
     private var loop: Task<Void, Never>?
     /// The last config push. Each push waits for the one before it, so rapid
@@ -205,8 +309,8 @@ final class CursorSyncController: ObservableObject {
         refresh: Bool, defaults: UserDefaults = .standard,
         arguments: [String] = CommandLine.arguments,
         bundleID: String? = Bundle.main.bundleIdentifier,
-        setConfig: @escaping @Sendable (String) -> Bool? = { (try? TBCore.setCursorSync(json: $0))?.cleanupFailed },
-        sync: @escaping @Sendable (Bool) -> CursorSyncStatus? = { try? TBCore.cursorSync(explicit: $0) }
+        setConfig: @escaping CursorSync.SetConfig = CursorSync.coreSetConfig,
+        sync: @escaping CursorSync.Sync = CursorSync.coreSync
     ) {
         // Test modes make no core call at all: turning off deletes files, and
         // `--demo` runs with the real bundle id. No bundle id (bare `swift
@@ -217,17 +321,19 @@ final class CursorSyncController: ObservableObject {
         loop?.cancel()
         generation &+= 1
         // An off push retries the cleanup: hide the last failure until it reports.
-        if !run { state = nil; lastSuccessMs = nil; cleanupFailed = false }
+        if !run { state = nil; lastSuccessMs = nil; cleanupFailed = false; profileStates = [:] }
         let previous = configPush
         let push = Task { [weak self] in
             await previous?.value
             let failed = await Task.detached(priority: .utility) { setConfig(json) }.value
             // nil is a rejected push. A rejected on push is shown (the core
-            // kept its previous config, so sync would silently not run) and
-            // stops the schedule; the next accepted on push clears it.
+            // kept its previous config, so sync would silently not run),
+            // clears the rows' stale outcomes and stops the schedule; the next
+            // accepted on push clears it.
             if run, let self {
                 if failed == nil {
                     self.state = CursorSync.configRejectedState
+                    self.profileStates = [:]
                 } else if self.state == CursorSync.configRejectedState {
                     self.state = nil
                 }
@@ -255,7 +361,7 @@ final class CursorSyncController: ObservableObject {
     func runSync(
         explicit: Bool, defaults: UserDefaults = .standard,
         arguments: [String] = CommandLine.arguments,
-        sync: @escaping @Sendable (Bool) -> CursorSyncStatus? = { try? TBCore.cursorSync(explicit: $0) }
+        sync: @escaping CursorSync.Sync = CursorSync.coreSync
     ) async {
         guard CursorSync.shouldSync(defaults: defaults, arguments: arguments) else { return }
         if syncing { return }
@@ -278,9 +384,11 @@ final class CursorSyncController: ObservableObject {
             // its result describes a configuration that no longer applies.
             guard started == generation, CursorSync.shouldSync(defaults: defaults, arguments: arguments)
             else { rerunPending = true; continue }
-            guard let result else { state = "error"; continue }
+            guard let result else { state = "error"; profileStates = [:]; continue }
             state = result.state
             lastSuccessMs = result.lastSuccessMs
+            profileStates = Dictionary(
+                (result.profiles ?? []).map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
             // A round that wrote a file already invalidated the core's
             // caches; refresh the views on `changed`, not on the headline (one
             // profile can write while another fails) and not on the event
@@ -345,6 +453,54 @@ final class CursorSyncController: ObservableObject {
         defaults.set(true, forKey: CursorSync.noticeKey)
         if !continuing { defaults.set(false, forKey: CursorSync.enabledKey) }
         reconfigure(refresh: false, defaults: defaults)
+    }
+
+    /// Accounts page: add a `--user-data-dir` folder. Stores only a new
+    /// uppercase UUID and the path, unless `CursorSync.cantAdd` refuses it
+    /// (returns false; nothing is saved). Remove drops the entry. While sync
+    /// can't run (off, or the notice unanswered) neither reaches the core (no
+    /// config push, no sync, no database read); the stored list is pushed
+    /// when sync is turned on. While on, both reconfigure and sync at once;
+    /// on a remove the core's orphan cleanup deletes that profile's usage.
+    @discardableResult
+    func addProfile(
+        root: String, defaults: UserDefaults = .standard,
+        arguments: [String] = CommandLine.arguments,
+        bundleID: String? = Bundle.main.bundleIdentifier,
+        home: URL = FileManager.default.homeDirectoryForCurrentUser,
+        setConfig: @escaping CursorSync.SetConfig = CursorSync.coreSetConfig,
+        sync: @escaping CursorSync.Sync = CursorSync.coreSync
+    ) -> Bool {
+        var list = CursorSync.profiles(defaults: defaults)
+        if CursorSync.cantAdd(root: root, existing: list, home: home) { return false }
+        list.append(CursorSync.Profile(id: UUID().uuidString, root: (root as NSString).standardizingPath))
+        profilesChanged(list, defaults: defaults, arguments: arguments, bundleID: bundleID,
+                        setConfig: setConfig, sync: sync)
+        return true
+    }
+
+    func removeProfile(
+        id: String, defaults: UserDefaults = .standard,
+        arguments: [String] = CommandLine.arguments,
+        bundleID: String? = Bundle.main.bundleIdentifier,
+        setConfig: @escaping CursorSync.SetConfig = CursorSync.coreSetConfig,
+        sync: @escaping CursorSync.Sync = CursorSync.coreSync
+    ) {
+        profileStates[id] = nil
+        profilesChanged(CursorSync.profiles(defaults: defaults).filter { $0.id != id }, defaults: defaults,
+                        arguments: arguments, bundleID: bundleID, setConfig: setConfig, sync: sync)
+    }
+
+    /// Save, publish, and reconfigure only through the gate every sync passes.
+    private func profilesChanged(
+        _ list: [CursorSync.Profile], defaults: UserDefaults, arguments: [String], bundleID: String?,
+        setConfig: @escaping CursorSync.SetConfig, sync: @escaping CursorSync.Sync
+    ) {
+        CursorSync.saveProfiles(list, defaults: defaults)
+        profiles = list
+        guard CursorSync.shouldSync(defaults: defaults, arguments: arguments) else { return }
+        reconfigure(refresh: true, defaults: defaults, arguments: arguments, bundleID: bundleID,
+                    setConfig: setConfig, sync: sync)
     }
 
     /// D6: "Use Syrtis Sync" (true) or "Keep tokscale CLI Data" (false).

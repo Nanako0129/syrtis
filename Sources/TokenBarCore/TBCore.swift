@@ -216,6 +216,20 @@ public struct CursorSyncStatus: Decodable, Equatable, Sendable {
     public let reason: String?
     /// Some profile wrote its file this round, whatever `state` says.
     public let changed: Bool
+    /// Each profile's own outcome, the default (`id` `default`) first. Absent
+    /// from a status that predates CMP-520.
+    public let profiles: [Profile]?
+
+    public struct Profile: Decodable, Equatable, Sendable {
+        /// `default`, or the added profile's UUID.
+        public let id: String
+        /// As `state` above, plus `duplicate`.
+        public let state: String
+        public let lastSuccessMs: Int64?
+        public let reason: String?
+        /// For `duplicate`: the profile id that already synced this account.
+        public let duplicateOf: String?
+    }
 }
 
 /// Thin Swift facade over the tb_core_ffi staticlib. All calls are blocking;

@@ -673,6 +673,13 @@
 "Keep tokscale CLI Data" = "保留 tokscale CLI 的数据";
 "Cursor sync is off, but some downloaded usage couldn't be deleted. Restart Syrtis to retry." = "Cursor 同步已关闭，但有部分已下载的用量无法删除。重启 Syrtis 即可再试。";
 "Cursor sync couldn't be set up, so nothing is being synced." = "无法设置 Cursor 同步，目前不会同步任何用量。";
+"Cursor app (default)" = "Cursor 应用（默认）";
+"Add Cursor profile folder…" = "添加 Cursor 配置目录…";
+"Same account as another profile; counted once." = "和另一个配置是同一个账号，只算一次。";
+"That folder can't be added." = "无法添加这个目录。";
+"Syrtis can't read this folder's Cursor sign-in." = "Syrtis 无法读取这个目录的 Cursor 登录信息。";
+"Remove %@" = "移除 %@";
+"Add a folder you start Cursor with using --user-data-dir to sync it too (Syrtis keeps the folder path in its settings); each profile's sign-in is handled as described above. All profiles add up to one Cursor total, and an account signed in to several profiles counts once. Removing a profile deletes its downloaded usage the next time Syrtis can." = "添加用 --user-data-dir 启动 Cursor 的目录（目录路径会保存在 Syrtis 设置中），就能一起同步；每个配置的登录信息都按上一段的方式处理。所有配置合计成一个 Cursor 总量，同一个账号只算一次。移除配置后，Syrtis 会在下次能处理时删除它已下载的用量。";
 "Glass tint" = "玻璃深浅";
 "Makes the popover's glass less see-through, so its text stays readable over the windows behind it." = "让窗口的玻璃不那么透明，背后有其他窗口时文字也看得清楚。";
 "Text hard to read over the windows behind this one? Make the glass less see-through here. You can change it later in Quick settings at the top right." = "背后有其他窗口时，文字不好读吗？可以在这里把玻璃调得不那么透明，之后也能在右上角的快速设置调整。";
