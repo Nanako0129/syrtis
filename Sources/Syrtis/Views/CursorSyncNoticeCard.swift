@@ -10,6 +10,7 @@ import TokenBarCore
 struct CursorSyncNoticeCardView: View {
     @AppStorage(CursorSync.enabledKey) private var enabled = true
     @AppStorage(CursorSync.noticeKey) private var acknowledged = false
+    @ObservedObject private var cursorSync = CursorSyncController.shared
 
     var body: some View {
         let _ = (enabled, acknowledged)
@@ -18,7 +19,7 @@ struct CursorSyncNoticeCardView: View {
                 VStack(alignment: .leading, spacing: 8) {
                     // Added profile folders are read too: their paragraph
                     // joins the consent once any is stored.
-                    ForEach(CursorSync.consentParagraphs(), id: \.self) { paragraph in
+                    ForEach(CursorSync.consentParagraphs(profiles: cursorSync.profiles), id: \.self) { paragraph in
                         Text(paragraph.localized)
                             .font(.caption)
                             .foregroundStyle(.secondary)

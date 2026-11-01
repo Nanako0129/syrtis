@@ -677,7 +677,6 @@
 "Same account as another profile; counted once." = "和另一個設定檔是同一個帳號，只算一次。";
 "That folder can't be added." = "無法加入這個資料夾。";
 "Syrtis can't read this folder's Cursor sign-in." = "Syrtis 無法讀取這個資料夾的 Cursor 登入資訊。";
-"Some downloaded usage couldn't be deleted. Restart Syrtis to retry." = "有部分已下載的用量無法刪除。重新啟動 Syrtis 即可再試。";
 "Remove %@" = "移除 %@";
 "Add a folder you start Cursor with using --user-data-dir to sync it too; each profile's sign-in is handled as described above. All profiles add up to one Cursor total, and an account signed in to several profiles counts once. Removing a profile deletes its downloaded usage the next time Syrtis can." = "加入用 --user-data-dir 啟動 Cursor 的資料夾，就能一起同步；每個設定檔的登入資訊都照上一段的方式處理。所有設定檔合計成一個 Cursor 總量，同一個帳號只算一次。移除設定檔後，Syrtis 會在下次能處理時刪除它已下載的用量。";
 "Glass tint" = "玻璃深淺";

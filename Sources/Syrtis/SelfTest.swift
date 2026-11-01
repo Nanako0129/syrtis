@@ -18329,8 +18329,11 @@ enum SelfTest {
         // Cursor database). "No call" is observed through ordering: config
         // pushes are chained, so when the first on push lands, any push the
         // earlier steps queued would already be in the spy. Mutation: gate
-        // `profilesCanSync` on `CursorSync.enabled(defaults:)` instead of
+        // `profilesChanged` on `CursorSync.enabled(defaults:)` instead of
         // `shouldSync`, and the notice-unanswered add pushes a config first.
+        // Duplicate folders are found by file identity, on real temp folders:
+        // a symlink, and (when present) the /System/Volumes/Data firmlink
+        // spelling. Mutation: compare plain paths, and those adds succeed.
         let cursorProfiles: [String: Bool]? = awaitMainActorValue {
             let suite = "tokenbar.selftest.cursorProfiles"
             let defaults = UserDefaults(suiteName: suite)!
@@ -18338,48 +18341,71 @@ enum SelfTest {
             defaults.removePersistentDomain(forName: suite)
             defaults.set(true, forKey: CursorSync.noticeKey)
             defaults.set(false, forKey: CursorSync.enabledKey)
+            let fm = FileManager.default
+            let base = fm.temporaryDirectory.appendingPathComponent("syrtis-selftest-cursor-profiles-\(UUID().uuidString)")
+            defer { try? fm.removeItem(at: base) }
+            let home = base.appendingPathComponent("home", isDirectory: true)
+            let cursorOwn = home.appendingPathComponent("Library/Application Support/Cursor")
+            let rootURL = base.appendingPathComponent("cursor-b")
+            for dir in [cursorOwn, rootURL] { try? fm.createDirectory(at: dir, withIntermediateDirectories: true) }
+            let rootLink = base.appendingPathComponent("link-b").path
+            let ownLink = base.appendingPathComponent("link-own").path
+            try? fm.createSymbolicLink(atPath: rootLink, withDestinationPath: rootURL.path)
+            try? fm.createSymbolicLink(atPath: ownLink, withDestinationPath: cursorOwn.path)
+            // realpath, not resolvingSymlinksInPath (which drops "/private").
+            let firmlinked = "/System/Volumes/Data" + (realpath(rootURL.path, nil).map {
+                defer { free($0) }
+                return String(cString: $0)
+            } ?? rootURL.path)
             let pushes = UncheckedBox<[String]>([])
             let syncs = UncheckedBox<Int>(0)
             let setConfig: CursorSync.SetConfig = { pushes.value.append($0); return false }
             let sync: CursorSync.Sync = { _ in syncs.value += 1; return nil }
             let user = ["Syrtis"]
-            let home = URL(fileURLWithPath: "/Users/selftest-home", isDirectory: true)
             let controller = CursorSyncController()
-            @MainActor func add(_ root: String) -> String? {
+            @MainActor func add(_ root: String) -> Bool {
                 controller.addProfile(root: root, defaults: defaults, arguments: user, bundleID: "x.y",
                                       home: home, setConfig: setConfig, sync: sync)
             }
-            let root = "/Volumes/selftest/cursor-b"
+            @MainActor func remove(_ id: String) {
+                controller.removeProfile(id: id, defaults: defaults, arguments: user, bundleID: "x.y",
+                                         setConfig: setConfig, sync: sync)
+            }
+            let root = rootURL.path
             var ok: [String: Bool] = [:]
             // Off.
-            ok["off add accepted"] = add(root) == nil
-            ok["same folder, other spelling, refused"] = add("/Volumes/selftest/Cursor-B/") == CursorSync.Copy.cantAdd
+            ok["off add accepted"] = add(root)
+            ok["symlink to a listed folder refused"] = !add(rootLink)
+            // Present on APFS system volumes; recorded either way.
+            ok["firmlink spelling refused"] = !fm.fileExists(atPath: firmlinked) || !add(firmlinked)
+            ok["firmlink fixture present"] = fm.fileExists(atPath: firmlinked)
             let stored = CursorSync.profiles(defaults: defaults)
             let id = stored.first?.id ?? ""
             ok["uppercase UUID"] = id.count == 36 && id == id.uppercased() && UUID(uuidString: id) != nil
             let json = CursorSync.configJSON(bundleID: "x.y", defaults: defaults, arguments: user)
             let config = (try? JSONSerialization.jsonObject(with: Data(json.utf8))) as? [String: Any]
             ok["configJSON carries it"] = (config?["profiles"] as? [[String: String]]) == [["id": id, "root": root]]
-            ok["consent names added folders"] = CursorSync.consentParagraphs(defaults: defaults)
+            ok["consent follows the published list (add)"] = CursorSync.consentParagraphs(profiles: controller.profiles)
                 == [CursorSync.Copy.privacy, CursorSync.Copy.profilesPrivacy]
-            controller.removeProfile(id: id, defaults: defaults, arguments: user, bundleID: "x.y", setConfig: setConfig)
+            remove(id)
             ok["round trip"] = stored.count == 1 && stored.first?.root == root
                 && CursorSync.profiles(defaults: defaults).isEmpty
-            ok["consent without folders"] = CursorSync.consentParagraphs(defaults: defaults) == [CursorSync.Copy.privacy]
+            ok["consent follows the published list (remove)"] =
+                CursorSync.consentParagraphs(profiles: controller.profiles) == [CursorSync.Copy.privacy]
             // On by default, notice unanswered.
             defaults.removeObject(forKey: CursorSync.enabledKey)
             defaults.removeObject(forKey: CursorSync.noticeKey)
-            ok["unanswered add accepted"] = add(root) == nil
+            ok["unanswered add accepted"] = add(root)
             // Refused before anything is saved.
             let before = CursorSync.profiles(defaults: defaults)
-            ok["\"/\" refused"] = add("/") == CursorSync.Copy.cantAdd
-            ok["Cursor's own folder refused"] =
-                add(home.appendingPathComponent("Library/Application Support/Cursor").path) == CursorSync.Copy.cantAdd
+            ok["\"/\" refused"] = !add("/")
+            ok["Cursor's own folder refused"] = !add(cursorOwn.path)
+            ok["a symlink to Cursor's own folder refused"] = !add(ownLink)
             let full = before + (1..<CursorSync.maxProfiles).map {
                 CursorSync.Profile(id: UUID().uuidString, root: "/Volumes/selftest/p\($0)")
             }
             CursorSync.saveProfiles(full, defaults: defaults)
-            ok["33rd refused"] = add("/Volumes/selftest/extra") == CursorSync.Copy.cantAdd
+            ok["33rd refused"] = !add(base.path)
             ok["refusals save nothing"] = CursorSync.profiles(defaults: defaults) == full
             // Barrier: turn on, start empty, add; the on push must be the first.
             CursorSync.saveProfiles([], defaults: defaults)
@@ -18392,29 +18418,27 @@ enum SelfTest {
             let first = pushes.value.first ?? ""
             ok["no core call while it couldn't sync"] = pushes.value.count == 1 && first.contains(#""enabled":true"#)
             ok["control: on add pushes it and syncs"] = first.contains("cursor-b") && syncs.value == 1
-            // Removal while on: pushes a config without it, starts no sync.
-            let onID = CursorSync.profiles(defaults: defaults).first?.id ?? ""
-            controller.removeProfile(id: onID, defaults: defaults, arguments: user, bundleID: "x.y", setConfig: setConfig)
-            for _ in 0..<300 where pushes.value.count < 2 {
+            // Removal while on: reconfigures with a config without it.
+            remove(CursorSync.profiles(defaults: defaults).first?.id ?? "")
+            for _ in 0..<300 where pushes.value.count < 2 || syncs.value < 2 || controller.syncing {
                 try? await Task.sleep(nanoseconds: 10_000_000)
             }
-            // An immediate sync would follow the push at once; its absence
-            // can't be awaited, so give it this window.
-            try? await Task.sleep(nanoseconds: 100_000_000)
             ok["on removal pushes without it"] = pushes.value.count == 2
                 && pushes.value[1].contains(#""enabled":true"#) && !pushes.value[1].contains("cursor-b")
-            ok["on removal starts no sync"] = syncs.value == 1
             // Rows: a stub round, then a refused config clears them.
             let stub = try? JSONDecoder().decode(CursorSyncStatus.self, from: Data(#"""
                 {"state":"notSignedIn","events":0,"lastSuccessMs":null,"changed":false,"profiles":[
                 {"id":"default","state":"notSignedIn","lastSuccessMs":null},
                 {"id":"A","state":"error","reason":"db_symlink","lastSuccessMs":null},
-                {"id":"B","state":"duplicate","duplicateOf":"default","lastSuccessMs":null}]}
+                {"id":"B","state":"duplicate","duplicateOf":"default","lastSuccessMs":null},
+                {"id":"C","state":"error","reason":"login_unreadable","lastSuccessMs":null}]}
                 """#.utf8))
             await controller.runSync(explicit: true, defaults: defaults, arguments: user, sync: { _ in stub })
-            ok["rows filled"] = controller.profileStates.count == 3
+            ok["rows filled"] = controller.profileStates.count == 4
             ok["permanent reason line"] = controller.profileStates["A"].flatMap(CursorSync.rowLine)
                 == CursorSync.Copy.cantRead.localized
+            ok["transient reason keeps the retry line"] = controller.profileStates["C"].flatMap(CursorSync.rowLine)
+                == CursorSync.Copy.error.localized
             ok["duplicate line"] = controller.profileStates["B"].flatMap(CursorSync.rowLine)
                 == CursorSync.Copy.duplicate.localized
             controller.reconfigure(refresh: false, defaults: defaults, arguments: user, bundleID: "x.y",
@@ -18436,7 +18460,7 @@ enum SelfTest {
             let keys = [AccountsCopy.cursorSummary, CursorSync.Copy.toggle, CursorSync.Copy.privacy,
                         CursorSync.Copy.profilesPrivacy, CursorSync.Copy.defaultProfile,
                         CursorSync.Copy.addProfile, CursorSync.Copy.duplicate, CursorSync.Copy.cantAdd,
-                        CursorSync.Copy.cantRead, CursorSync.Copy.cleanupFailedOn, CursorSync.Copy.removeFolder,
+                        CursorSync.Copy.cantRead, CursorSync.Copy.removeFolder,
                         "Remove"]
             let missing = keys.filter {
                 let value = AppLanguage.localizedString($0, locale: locale)

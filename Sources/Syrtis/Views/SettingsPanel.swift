@@ -137,10 +137,8 @@ struct SettingsPanel: View {
     @AppStorage(CursorSync.enabledKey) private var cursorSyncOn = true
     @AppStorage(CursorSync.takeoverKey) private var cursorTakeover = false
     @AppStorage(CursorSync.noticeKey) private var cursorNoticeAck = false
-    /// Mirror of `CursorSync.profilesKey` for the rows; re-read after each edit.
-    @State private var cursorProfiles: [CursorSync.Profile] = []
-    /// `CursorSync.addRefusal`'s line after a refused add; cleared on the next edit.
-    @State private var cursorAddRefusal: String?
+    /// The last add was refused (`CursorSync.cantAdd`); cleared on the next edit.
+    @State private var cursorAddRefused = false
     /// 0 = auto (≈60% of the screen). The popover's drag handle writes the
     /// same key, so the two stay in sync.
     @AppStorage(PopoverChrome.heightKey) private var popoverHeight = 0.0
@@ -1220,7 +1218,7 @@ struct SettingsPanel: View {
                     VStack(alignment: .leading, spacing: 10) {
                         // Added profile folders are read too, so their
                         // paragraph joins the consent once any is stored.
-                        ForEach(CursorSync.consentParagraphs(), id: \.self) { hint($0) }
+                        ForEach(CursorSync.consentParagraphs(profiles: cursorSync.profiles), id: \.self) { hint($0) }
                         HStack {
                             Spacer()
                             Button(CursorSync.Copy.cancel.localized) { cursorSync.cancelEnable() }
@@ -1258,13 +1256,6 @@ struct SettingsPanel: View {
                     .controlSize(.small)
                     .padding(.horizontal, 10)
                 }
-                if cursorSync.cleanupFailed {
-                    // An on push could not delete a removed profile's files.
-                    Text(CursorSync.Copy.cleanupFailedOn.localized)
-                        .font(.caption2)
-                        .foregroundStyle(Color.orange)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
                 Button {
                     Task { await cursorSync.runSync(explicit: true) }
                 } label: {
@@ -1293,14 +1284,13 @@ struct SettingsPanel: View {
     private func cursorProfileRows() -> some View {
         let syncOn = CursorSync.toggleShowsOn(enabled: cursorSyncOn, acknowledged: cursorNoticeAck)
         cursorProfileRow(CursorSync.Copy.defaultProfile, id: "default", syncOn: syncOn) { EmptyView() }
-        ForEach(cursorProfiles, id: \.id) { profile in
+        ForEach(cursorSync.profiles, id: \.id) { profile in
             cursorProfileRow(
                 (profile.root as NSString).abbreviatingWithTildeInPath, id: profile.id, syncOn: syncOn
             ) {
                 Button {
                     cursorSync.removeProfile(id: profile.id)
-                    cursorProfiles = CursorSync.profiles()
-                    cursorAddRefusal = nil
+                    cursorAddRefused = false
                 } label: {
                     Image(systemName: "minus.circle")
                         .foregroundStyle(.secondary)
@@ -1319,9 +1309,8 @@ struct SettingsPanel: View {
         }
         .buttonStyle(.plain)
         .padding(.horizontal, 10)
-        .onAppear { cursorProfiles = CursorSync.profiles() }
-        if let cursorAddRefusal {
-            hint(cursorAddRefusal)
+        if cursorAddRefused {
+            hint(CursorSync.Copy.cantAdd)
         }
     }
 
@@ -1348,8 +1337,7 @@ struct SettingsPanel: View {
         panel.allowsMultipleSelection = false
         panel.prompt = "Add".localized
         guard panel.runModal() == .OK, let url = panel.url else { return }
-        cursorAddRefusal = cursorSync.addProfile(root: url.path)
-        cursorProfiles = CursorSync.profiles()
+        cursorAddRefused = !cursorSync.addProfile(root: url.path)
     }
 
     /// Extra Google accounts for Antigravity, each its own card. The copy says
