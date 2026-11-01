@@ -192,11 +192,12 @@ impl LocalSourceContext {
 
     /// The registry's extra roots, the user's OpenCode DB locations
     /// (`OPENCODE_DB`, settings.json; see `user_scanner_settings`) plus the
-    /// Cursor sync takeover (`cursor_sync::apply_takeover`), which adds the
-    /// sync dir and excludes the CLI's Cursor root only under the takeover
-    /// conditions. Every scan entry point builds its options through here.
-    /// A pinned-corpus context (`use_env_roots` false) ignores the user's DBs
-    /// like it ignores the per-client root variables.
+    /// Cursor sync takeover (`cursor_sync::apply_takeover`), which adds one
+    /// synced file per Cursor account (never a directory) and excludes the
+    /// CLI's Cursor root only under the takeover conditions. Every scan entry
+    /// point builds its options through here. A pinned-corpus context
+    /// (`use_env_roots` false) ignores the user's DBs like it ignores the
+    /// per-client root variables.
     fn scanner_settings(&self) -> tokscale_core::scanner::ScannerSettings {
         let mut settings = tokscale_core::scanner::ScannerSettings {
             extra_scan_paths: extra_scan_paths::snapshot(),
@@ -1617,16 +1618,30 @@ fn invalidate_scan_caches() {
 }
 
 /// Configure Cursor desktop sync (see the `cursor_sync` module doc). `json` is
-/// `{"enabled":bool,"dir":"<absolute dir>","cliTakeoverConfirmed":bool}`;
-/// `dir` is required while enabled and must be absolute, without `..`, and
-/// outside `~/.config/tokscale`. Full replace; in-memory, default off, so the
-/// caller re-applies it at launch. Turning sync off (or moving `dir`) deletes
-/// the Syrtis usage files from the dir no longer in use. Success data is
-/// `{"enabled","dir","cliTakeoverConfirmed","removedFiles":N,"cleanupFailed":bool}`
-/// (`cleanupFailed`: some of those files could not be deleted, or the dir
-/// could not be examined); invalid input
-/// is an error and leaves the registry unchanged. Invalidates the scan
-/// caches, since the takeover depends on every field.
+/// `{"enabled":bool,"bundleId":"<reverse DNS>","profiles":[{"id":"<UUID>","root":"/abs"}],
+/// "cliTakeoverConfirmed":bool}`. Rust derives `appDir` =
+/// `<HOME>/Library/Application Support/<bundleId>` (refused unless absent
+/// or, followed through a symlink, a directory owned by the current user;
+/// refused when it resolves under `~/.config/tokscale`); the
+/// implicit default profile syncs into `<appDir>/cursor-cache` and reads
+/// Cursor's fixed `state.vscdb`, each added profile into
+/// `<appDir>/cursor-profiles/<id>` and reads `<root>/User/globalStorage/state.vscdb`.
+/// Full replace; in-memory, default off, so the caller re-applies it at
+/// launch. Turning sync off deletes the Syrtis usage files from every profile
+/// dir; while on, dirs of profiles no longer listed are cleaned and removed.
+/// An off push (`"enabled":false`) is always accepted and turns the takeover
+/// off, whatever else it carries; an appDir failing the checks above is
+/// `null` and left untouched, and the appDir in use until then is re-checked
+/// before it is cleaned. Success data is
+/// `{"enabled","appDir":str|null,"profiles":[{"id","dir"}],
+/// "cliTakeoverConfirmed","removedFiles":N,"cleanupFailed":bool,
+/// "cleanupFailedProfiles":[id]}`, each id one of `default` / `<UUID>` (that
+/// profile's files could not all be deleted), `cursor-profiles` (the parent
+/// folder of the added profiles could not be read), or `appDir` (the appDir
+/// in use until this push now fails the checks, so files may be left there;
+/// a refused appDir never used before is not reported). Other invalid
+/// input is an error and leaves the registry unchanged. Invalidates the scan caches, since the
+/// takeover depends on every field.
 ///
 /// # Safety
 /// `json` must be NULL or a valid NUL-terminated UTF-8 string.
@@ -1651,16 +1666,28 @@ unsafe fn set_cursor_sync_from_c(json: *const c_char) -> Result<serde_json::Valu
     Ok(result)
 }
 
-/// Run one Cursor desktop sync now. Blocking (SQLite read + network, up to
-/// 10 min): never call on the main thread. `user_initiated` non-zero = the user's
-/// "Sync now" (10 min budget); zero = background (10 min until a complete
-/// file exists, then 60 s). Single-flight: a call made while one runs waits
-/// for it and returns its status. Success data is
+/// Run one Cursor desktop sync now: every configured profile, one at a
+/// time, within one time budget. Blocking (SQLite reads + network, up to
+/// 10 min): never call on the main thread. `user_initiated` non-zero = the
+/// user's "Sync now" (10 min budget); zero = background (10 min until every
+/// profile has a complete file, then 60 s). Single-flight: a call made while
+/// one runs waits for it and returns its status. Success data is
 /// `{"state":"ok|partial|expired|notSignedIn|offline|error|disabled|cliPresent",
-/// "events":N,"lastSuccessMs":ms|null,"reason"?:"<fixed code>"}`; `events` is
-/// the count written by this call (0 unless it completed), `lastSuccessMs` the
-/// complete file's mtime. `cliPresent` = the walk completed but CLI Cursor
-/// files exist and the user has not confirmed the takeover.
+/// "events":N,"lastSuccessMs":ms|null,"reason"?:"<fixed code>",
+/// "changed":bool,"profiles":[{"id","state","events","lastSuccessMs","reason"?,
+/// "duplicateOf"?}]}`. `changed`: some profile wrote its file this round
+/// (every successful walk rewrites it), so the scan caches were invalidated
+/// and views must refresh, whatever the headline state. `app_dir_rejected`: the appDir no longer
+/// passes the checks above; nothing is read, written or registered from it.
+/// The top-level `state` is `ok` when every profile is `ok` or `duplicate`
+/// (the account was already covered this round by the profile `duplicateOf`:
+/// synced, or failed in any way except one specific to its session or to
+/// this machine — expired (local expiry, 401, redirect, 403 JSON), disabled
+/// (removed mid-walk), client_unavailable, write_failed), else the
+/// first other profile state (a `notSignedIn` profile is skipped while
+/// another synced); `events` sums this call's writes, `lastSuccessMs` is the
+/// newest complete file's mtime. `cliPresent` = a walk completed but CLI Cursor files
+/// exist and the user has not confirmed the takeover; it carries no `reason`.
 #[no_mangle]
 pub extern "C" fn tb_cursor_sync(user_initiated: i32) -> *mut c_char {
     guarded("tb_cursor_sync", || {

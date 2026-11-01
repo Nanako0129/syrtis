@@ -183,10 +183,22 @@ public struct KeychainConsentResult: Decodable, Equatable, Sendable {
 
 /// Result of `tb_set_cursor_sync`.
 public struct CursorSyncConfigResult: Decodable, Equatable, Sendable {
+    public struct ProfileDir: Decodable, Equatable, Sendable {
+        /// `default`, or the added profile's UUID.
+        public let id: String
+        /// The sync dir the core derived for it.
+        public let dir: String
+    }
+
     public let enabled: Bool
-    public let dir: String?
+    /// `<HOME>/Library/Application Support/<bundle id>`, derived by the core;
+    /// nil when an off push's appDir failed the checks (left untouched).
+    public let appDir: String?
+    /// The default profile first, then each added one.
+    public let profiles: [ProfileDir]
     public let cliTakeoverConfirmed: Bool
-    /// Syrtis usage files deleted because sync was turned off or moved.
+    /// Syrtis usage files deleted because sync was turned off or a profile
+    /// was removed.
     public let removedFiles: Int
     /// Some of those files could not be deleted.
     public let cleanupFailed: Bool
@@ -202,6 +214,8 @@ public struct CursorSyncStatus: Decodable, Equatable, Sendable {
     public let lastSuccessMs: Int64?
     /// A fixed diagnostic code (e.g. `rate_limited`); never account data.
     public let reason: String?
+    /// Some profile wrote its file this round, whatever `state` says.
+    public let changed: Bool
 }
 
 /// Thin Swift facade over the tb_core_ffi staticlib. All calls are blocking;

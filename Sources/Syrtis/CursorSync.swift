@@ -54,27 +54,36 @@ enum CursorSync {
         isUserRuntime(arguments) && enabled(defaults: defaults) && noticeAcknowledged(defaults: defaults)
     }
 
-    /// `<Application Support>/<bundle id>/cursor-cache` — per bundle, so a test
-    /// bundle never shares the real app's data (S-5). nil without a bundle id
-    /// (bare `swift run`): no sync there.
-    static func syncDirectory(
-        bundleID: String? = Bundle.main.bundleIdentifier,
-        appSupport: URL? = FileManager.default.urls(
-            for: .applicationSupportDirectory, in: .userDomainMask).first
-    ) -> String? {
-        guard let bundleID, !bundleID.isEmpty, let appSupport else { return nil }
-        return appSupport.appendingPathComponent(bundleID, isDirectory: true)
-            .appendingPathComponent("cursor-cache", isDirectory: true).path
+    /// Added Cursor profiles (`--user-data-dir` roots), each `{"id","root"}`
+    /// with a random uppercase UUID. Only the folder path and that id are
+    /// stored — never an account id, email or label. CMP-1 has no UI writing
+    /// it; the default profile is implicit and never listed.
+    static let profilesKey = "tokenbar.cursorSync.profiles"
+
+    struct Profile: Equatable {
+        let id: String
+        let root: String
     }
 
-    /// `{"enabled","dir","cliTakeoverConfirmed"}` for `tb_set_cursor_sync`.
+    static func profiles(defaults: UserDefaults = .standard) -> [Profile] {
+        (defaults.array(forKey: profilesKey) as? [[String: String]] ?? []).compactMap { entry in
+            guard let id = entry["id"], let root = entry["root"] else { return nil }
+            return Profile(id: id, root: root)
+        }
+    }
+
+    /// `{"enabled","bundleId","profiles":[{"id","root"}],"cliTakeoverConfirmed"}`
+    /// for `tb_set_cursor_sync`. The core derives every directory from the
+    /// bundle id (per bundle, S-5) and every database path from a root; no
+    /// directory is passed (CMP-520 B2).
     static func configJSON(
-        dir: String, defaults: UserDefaults = .standard,
+        bundleID: String, defaults: UserDefaults = .standard,
         arguments: [String] = CommandLine.arguments
     ) -> String {
         let object: [String: Any] = [
             "enabled": shouldSync(defaults: defaults, arguments: arguments),
-            "dir": dir,
+            "bundleId": bundleID,
+            "profiles": profiles(defaults: defaults).map { ["id": $0.id, "root": $0.root] },
             "cliTakeoverConfirmed": takeoverConfirmed(defaults: defaults),
         ]
         let data = (try? JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])) ?? Data()
@@ -120,12 +129,18 @@ enum CursorSync {
         static let useSyrtis = "Use Syrtis Sync"
         static let keepCLI = "Keep tokscale CLI Data"
         static let cleanupFailed = "Cursor sync is off, but some downloaded usage couldn't be deleted. Restart Syrtis to retry."
+        /// The core refused the settings (`tb_set_cursor_sync` error): nothing syncs.
+        static let configRejected = "Cursor sync couldn't be set up, so nothing is being synced."
 
         static var all: [String] {
             [title, toggle, privacy, `continue`, turnOff, lastSynced, partial, expired, notSignedIn,
-             offline, error, cliPresent, syncNow, syncing, cliQuestion, useSyrtis, keepCLI, cleanupFailed]
+             offline, error, cliPresent, syncNow, syncing, cliQuestion, useSyrtis, keepCLI, cleanupFailed,
+             configRejected]
         }
     }
+
+    /// Swift-side state: the last on push was refused by the core.
+    static let configRejectedState = "configRejected"
 
     /// Status line for a core state. nil where there is nothing to say
     /// (`disabled`, not yet synced, or `ok` with no recorded time).
@@ -145,6 +160,7 @@ enum CursorSync {
         case "offline": return Copy.offline.localized
         case "error": return Copy.error.localized
         case "cliPresent": return Copy.cliPresent.localized
+        case configRejectedState: return Copy.configRejected.localized
         default: return nil
         }
     }
@@ -167,7 +183,6 @@ final class CursorSyncController: ObservableObject {
     /// The last config push. Each push waits for the one before it, so rapid
     /// toggles reach the core in the order they were made.
     private var configPush: Task<Void, Never>?
-    private var lastRefreshedEvents: Int?
     /// Bumped by every `reconfigure`; a sync result that comes back after a
     /// newer configuration is discarded, so a late result cannot undo an off.
     private var generation = 0
@@ -182,35 +197,43 @@ final class CursorSyncController: ObservableObject {
     func reconfigure(
         refresh: Bool, defaults: UserDefaults = .standard,
         arguments: [String] = CommandLine.arguments,
-        dir: String? = CursorSync.syncDirectory(),
+        bundleID: String? = Bundle.main.bundleIdentifier,
         setConfig: @escaping @Sendable (String) -> Bool? = { (try? TBCore.setCursorSync(json: $0))?.cleanupFailed },
         sync: @escaping @Sendable (Bool) -> CursorSyncStatus? = { try? TBCore.cursorSync(explicit: $0) }
     ) {
         // Test modes make no core call at all: turning off deletes files, and
-        // `--demo` runs with the real bundle id.
-        guard CursorSync.isUserRuntime(arguments), let dir else { return }
-        let json = CursorSync.configJSON(dir: dir, defaults: defaults, arguments: arguments)
+        // `--demo` runs with the real bundle id. No bundle id (bare `swift
+        // run`): no sync there.
+        guard CursorSync.isUserRuntime(arguments), let bundleID, !bundleID.isEmpty else { return }
+        let json = CursorSync.configJSON(bundleID: bundleID, defaults: defaults, arguments: arguments)
         let run = CursorSync.shouldSync(defaults: defaults, arguments: arguments)
         loop?.cancel()
         generation &+= 1
-        // Off deletes the synced files, so the next completed sync must
-        // refresh even when it writes the same event count again.
         // An off push retries the cleanup: hide the last failure until it reports.
-        if !run { state = nil; lastSuccessMs = nil; lastRefreshedEvents = nil; cleanupFailed = false }
+        if !run { state = nil; lastSuccessMs = nil; cleanupFailed = false }
         let previous = configPush
         let push = Task { [weak self] in
             await previous?.value
             let failed = await Task.detached(priority: .utility) { setConfig(json) }.value
-            // Only an off push's outcome sets it (the copy says sync is off; an
-            // on push deletes only when the dir moves, fixed per bundle here).
-            // nil is a rejected push.
+            // nil is a rejected push. A rejected on push is shown (the core
+            // kept its previous config, so sync would silently not run) and
+            // stops the schedule; the next accepted on push clears it.
+            if run, let self {
+                if failed == nil {
+                    self.state = CursorSync.configRejectedState
+                } else if self.state == CursorSync.configRejectedState {
+                    self.state = nil
+                }
+            }
+            // Only an off push's outcome sets it (the copy says sync is off;
+            // an on push deletes only orphaned profile dirs).
             if !run, let failed { self?.cleanupFailed = failed }
         }
         configPush = push
         loop = Task { [weak self] in
             await push.value
             if refresh { Self.refreshModel() }
-            guard run else { return }
+            guard run, self?.state != CursorSync.configRejectedState else { return }
             while !Task.isCancelled {
                 await self?.runSync(explicit: false, defaults: defaults, arguments: arguments, sync: sync)
                 try? await Task.sleep(for: .seconds(CursorSync.interval))
@@ -241,6 +264,8 @@ final class CursorSyncController: ObservableObject {
             // Turned off (or reconfigured) during that wait: send nothing.
             guard started == generation, CursorSync.shouldSync(defaults: defaults, arguments: arguments)
             else { rerunPending = true; continue }
+            // The core refused the newest settings: there is nothing to sync.
+            if state == CursorSync.configRejectedState { break }
             let result = await Task.detached(priority: .utility) { sync(explicit) }.value
             // A reconfigure (e.g. turning sync off) happened while this ran:
             // its result describes a configuration that no longer applies.
@@ -249,12 +274,13 @@ final class CursorSyncController: ObservableObject {
             guard let result else { state = "error"; continue }
             state = result.state
             lastSuccessMs = result.lastSuccessMs
-            // A completed walk already invalidated the core's caches; the Swift
-            // side only needs telling when the data changed.
-            if result.state == "ok", result.events != lastRefreshedEvents {
-                lastRefreshedEvents = result.events
-                Self.refreshModel()
-            }
+            // A round that wrote a file already invalidated the core's
+            // caches; refresh the views on `changed`, not on the headline (one
+            // profile can write while another fails) and not on the event
+            // count (another profile can write the same count). Every
+            // successful walk rewrites its file, so this reloads the views
+            // after each successful sync, at most every 30 minutes.
+            if result.changed { Self.refreshModel() }
         } while rerunPending && CursorSync.shouldSync(defaults: defaults, arguments: arguments)
     }
 

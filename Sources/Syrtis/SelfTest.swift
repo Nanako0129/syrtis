@@ -17761,27 +17761,27 @@ enum SelfTest {
             defaults.removePersistentDomain(forName: suite)
             let user = ["Syrtis"]
             func config(_ args: [String] = user) -> [String: Any] {
-                let json = CursorSync.configJSON(dir: "/x/cursor-cache", defaults: defaults, arguments: args)
+                let json = CursorSync.configJSON(bundleID: "x.y", defaults: defaults, arguments: args)
                 return (try? JSONSerialization.jsonObject(with: Data(json.utf8))) as? [String: Any] ?? [:]
             }
             func flags(_ c: [String: Any]) -> String {
-                "\(c["enabled"] as? Bool ?? false)/\(c["dir"] as? String ?? "-")/\(c["cliTakeoverConfirmed"] as? Bool ?? true)"
+                "\(c["enabled"] as? Bool ?? false)/\(c["bundleId"] as? String ?? "-")/\(c["cliTakeoverConfirmed"] as? Bool ?? true)"
             }
             expect(CursorSync.enabled(defaults: defaults), "CURSOR-SYNC the preference defaults to ON (D3)")
             expect(
-                flags(config()) == "false//x/cursor-cache/false",
+                flags(config()) == "false/x.y/false",
                 "CURSOR-SYNC before the notice is acknowledged the core is told enabled=false: \(flags(config()))")
             defaults.set(true, forKey: CursorSync.noticeKey)
             expect(
-                flags(config()) == "true//x/cursor-cache/false",
-                "CURSOR-SYNC acknowledged + default pref -> enabled=true, dir passed, takeover not confirmed")
+                flags(config()) == "true/x.y/false",
+                "CURSOR-SYNC acknowledged + default pref -> enabled=true, bundle id passed, takeover not confirmed")
             defaults.set(true, forKey: CursorSync.takeoverKey)
             expect(
-                flags(config()) == "true//x/cursor-cache/true",
+                flags(config()) == "true/x.y/true",
                 "CURSOR-SYNC the D6 confirmation is carried to the core")
             defaults.set(false, forKey: CursorSync.enabledKey)
             expect(
-                flags(config()) == "false//x/cursor-cache/true",
+                flags(config()) == "false/x.y/true",
                 "CURSOR-SYNC turning the toggle off sends enabled=false")
             defaults.set(true, forKey: CursorSync.enabledKey)
             for flag in ["--demo", "--smoke", "--selftest", "--icon-gallery"] {
@@ -17793,15 +17793,15 @@ enum SelfTest {
             expect(CursorSync.shouldSync(defaults: defaults, arguments: user),
                    "CURSOR-SYNC control: the same preferences enable in a user session")
 
-            // Per-bundle directory (S-5).
-            let support = URL(fileURLWithPath: "/tmp/AS", isDirectory: true)
-            expect(
-                CursorSync.syncDirectory(bundleID: "com.nyanako.tokenbar.livecheck", appSupport: support)
-                    == "/tmp/AS/com.nyanako.tokenbar.livecheck/cursor-cache"
-                    && CursorSync.syncDirectory(bundleID: "com.nyanako.tokenbar", appSupport: support)
-                        == "/tmp/AS/com.nyanako.tokenbar/cursor-cache"
-                    && CursorSync.syncDirectory(bundleID: nil, appSupport: support) == nil,
-                "CURSOR-SYNC the sync directory is per bundle id under Application Support; no bundle id -> none")
+            // CMP-520 B2: no directory crosses the FFI; the stored added
+            // profiles (id + root only) do, the default profile never.
+            expect(config()["dir"] == nil && (config()["profiles"] as? [Any])?.isEmpty == true,
+                   "CURSOR-SYNC the config carries no dir, and no profiles until one is added")
+            defaults.set([["id": "0A1B2C3D-0000-4000-8000-00000000000A", "root": "/Volumes/x/cursor-b"]],
+                         forKey: CursorSync.profilesKey)
+            expect((config()["profiles"] as? [[String: String]]) == [["id": "0A1B2C3D-0000-4000-8000-00000000000A", "root": "/Volumes/x/cursor-b"]],
+                   "CURSOR-SYNC stored added profiles reach the core as {id, root}")
+            defaults.removeObject(forKey: CursorSync.profilesKey)
 
             // Notice visibility: only with the Cursor app present, not yet answered, pref on.
             defaults.removeObject(forKey: CursorSync.noticeKey)
@@ -17866,7 +17866,7 @@ enum SelfTest {
             let syncCalls = UncheckedBox<Int>(0)
             let configCalls = UncheckedBox<[String]>([])
             let partial = try? JSONDecoder().decode(
-                CursorSyncStatus.self, from: Data(#"{"state":"partial","events":0,"lastSuccessMs":null}"#.utf8))
+                CursorSyncStatus.self, from: Data(#"{"state":"partial","events":0,"lastSuccessMs":null,"changed":false}"#.utf8))
             let sync: @Sendable (Bool) -> CursorSyncStatus? = { _ in syncCalls.value += 1; return partial }
             let controller = CursorSyncController()
             // 1. Notice not acknowledged -> no sync.
@@ -17880,14 +17880,14 @@ enum SelfTest {
             let testModes = syncCalls.value
             // 3. Test mode: reconfigure makes no core call at all.
             controller.reconfigure(
-                refresh: false, defaults: defaults, arguments: ["Syrtis", "--demo"], dir: "/x",
-                setConfig: { configCalls.value.append($0); return nil }, sync: sync)
+                refresh: false, defaults: defaults, arguments: ["Syrtis", "--demo"], bundleID: "x.y",
+                setConfig: { configCalls.value.append($0); return false }, sync: sync)
             try? await Task.sleep(nanoseconds: 100_000_000)
             let demoReconfigure = configCalls.value.count + syncCalls.value
             // 4. Control: a user session acknowledged -> config pushed and a sync runs.
             controller.reconfigure(
-                refresh: false, defaults: defaults, arguments: ["Syrtis"], dir: "/x",
-                setConfig: { configCalls.value.append($0); return nil }, sync: sync)
+                refresh: false, defaults: defaults, arguments: ["Syrtis"], bundleID: "x.y",
+                setConfig: { configCalls.value.append($0); return false }, sync: sync)
             for _ in 0..<200 where syncCalls.value == 0 {
                 try? await Task.sleep(nanoseconds: 10_000_000)
             }
@@ -17895,8 +17895,8 @@ enum SelfTest {
             // Stop the loop: turning the pref off cancels it and pushes enabled=false.
             defaults.set(false, forKey: CursorSync.enabledKey)
             controller.reconfigure(
-                refresh: false, defaults: defaults, arguments: ["Syrtis"], dir: "/x",
-                setConfig: { configCalls.value.append($0); return nil }, sync: sync)
+                refresh: false, defaults: defaults, arguments: ["Syrtis"], bundleID: "x.y",
+                setConfig: { configCalls.value.append($0); return false }, sync: sync)
             for _ in 0..<200 where configCalls.value.count < 2 {
                 try? await Task.sleep(nanoseconds: 10_000_000)
             }
@@ -17915,8 +17915,8 @@ enum SelfTest {
                "CURSOR-SYNC turning the preference off pushes enabled=false to the core")
 
         // Ordering and refresh. Mutations: the config push not chained on the
-        // previous one (on/off land out of order); `lastRefreshedEvents` not
-        // reset on off (an off->on resync of the same count never refreshes).
+        // previous one (on/off land out of order); a refresh gated on the event
+        // count (a second round that wrote the same count never refreshes).
         let cursorOrder: [String]? = awaitMainActorValue {
             let suite = "tokenbar.selftest.cursorSyncOrder"
             let defaults = UserDefaults(suiteName: suite)!
@@ -17927,14 +17927,14 @@ enum SelfTest {
             let slowOn: @Sendable (String) -> Bool? = { json in
                 if json.contains(#""enabled":true"#) { Thread.sleep(forTimeInterval: 0.3) }
                 pushes.value.append(json.contains(#""enabled":true"#) ? "on" : "off")
-                return nil
+                return false
             }
             let none: @Sendable (Bool) -> CursorSyncStatus? = { _ in nil }
             let controller = CursorSyncController()
-            controller.reconfigure(refresh: false, defaults: defaults, arguments: ["Syrtis"], dir: "/x",
+            controller.reconfigure(refresh: false, defaults: defaults, arguments: ["Syrtis"], bundleID: "x.y",
                                    setConfig: slowOn, sync: none)
             defaults.set(false, forKey: CursorSync.enabledKey)
-            controller.reconfigure(refresh: false, defaults: defaults, arguments: ["Syrtis"], dir: "/x",
+            controller.reconfigure(refresh: false, defaults: defaults, arguments: ["Syrtis"], bundleID: "x.y",
                                    setConfig: slowOn, sync: none)
             for _ in 0..<200 where pushes.value.count < 2 {
                 try? await Task.sleep(nanoseconds: 10_000_000)
@@ -17951,7 +17951,7 @@ enum SelfTest {
             defaults.removePersistentDomain(forName: suite)
             defaults.set(true, forKey: CursorSync.noticeKey)
             let ok = try? JSONDecoder().decode(
-                CursorSyncStatus.self, from: Data(#"{"state":"ok","events":7,"lastSuccessMs":1}"#.utf8))
+                CursorSyncStatus.self, from: Data(#"{"state":"ok","events":7,"lastSuccessMs":1,"changed":true}"#.utf8))
             let sync: @Sendable (Bool) -> CursorSyncStatus? = { _ in ok }
             let generation = { UserDefaults.standard.integer(forKey: ClaudeExtraRoots.generationKey) }
             let controller = CursorSyncController()
@@ -17962,8 +17962,8 @@ enum SelfTest {
             await controller.runSync(explicit: true, defaults: defaults, arguments: ["Syrtis"], sync: sync)
             let sameAgain = generation() != g1
             defaults.set(false, forKey: CursorSync.enabledKey)
-            controller.reconfigure(refresh: false, defaults: defaults, arguments: ["Syrtis"], dir: "/x",
-                                   setConfig: { _ in nil }, sync: sync)
+            controller.reconfigure(refresh: false, defaults: defaults, arguments: ["Syrtis"], bundleID: "x.y",
+                                   setConfig: { _ in false }, sync: sync)
             defaults.set(true, forKey: CursorSync.enabledKey)
             let g2 = generation()
             await controller.runSync(explicit: true, defaults: defaults, arguments: ["Syrtis"], sync: sync)
@@ -17979,7 +17979,7 @@ enum SelfTest {
             defaults.removePersistentDomain(forName: suite)
             defaults.set(true, forKey: CursorSync.noticeKey)
             let ok = try? JSONDecoder().decode(
-                CursorSyncStatus.self, from: Data(#"{"state":"ok","events":3,"lastSuccessMs":1}"#.utf8))
+                CursorSyncStatus.self, from: Data(#"{"state":"ok","events":3,"lastSuccessMs":1,"changed":true}"#.utf8))
             let slow: @Sendable (Bool) -> CursorSyncStatus? = { _ in Thread.sleep(forTimeInterval: 0.3); return ok }
             let controller = CursorSyncController()
             let running = Task { @MainActor in
@@ -17987,8 +17987,8 @@ enum SelfTest {
             }
             try? await Task.sleep(nanoseconds: 50_000_000)
             defaults.set(false, forKey: CursorSync.enabledKey)
-            controller.reconfigure(refresh: false, defaults: defaults, arguments: ["Syrtis"], dir: "/x",
-                                   setConfig: { _ in nil }, sync: slow)
+            controller.reconfigure(refresh: false, defaults: defaults, arguments: ["Syrtis"], bundleID: "x.y",
+                                   setConfig: { _ in false }, sync: slow)
             await running.value
             return controller.state
         }
@@ -18006,16 +18006,16 @@ enum SelfTest {
             defaults.set(true, forKey: CursorSync.noticeKey)
             let log = UncheckedBox<[String]>([])
             let ok = try? JSONDecoder().decode(
-                CursorSyncStatus.self, from: Data(#"{"state":"ok","events":2,"lastSuccessMs":1}"#.utf8))
+                CursorSyncStatus.self, from: Data(#"{"state":"ok","events":2,"lastSuccessMs":1,"changed":true}"#.utf8))
             let slowSync: @Sendable (Bool) -> CursorSyncStatus? = { _ in
                 log.value.append("sync"); Thread.sleep(forTimeInterval: 0.2); return ok
             }
             let slowPush: @Sendable (String) -> Bool? = { _ in
-                Thread.sleep(forTimeInterval: 0.2); log.value.append("push"); return nil
+                Thread.sleep(forTimeInterval: 0.2); log.value.append("push"); return false
             }
             let controller = CursorSyncController()
             // Sync Now right after a reconfigure: the push must land first.
-            controller.reconfigure(refresh: false, defaults: defaults, arguments: ["Syrtis"], dir: "/x",
+            controller.reconfigure(refresh: false, defaults: defaults, arguments: ["Syrtis"], bundleID: "x.y",
                                    setConfig: slowPush, sync: slowSync)
             await controller.runSync(explicit: true, defaults: defaults, arguments: ["Syrtis"], sync: slowSync)
             let firstTwo = Array(log.value.prefix(2))
@@ -18026,8 +18026,8 @@ enum SelfTest {
                 await controller.runSync(explicit: true, defaults: defaults, arguments: ["Syrtis"], sync: slowSync)
             }
             try? await Task.sleep(nanoseconds: 50_000_000)
-            controller.reconfigure(refresh: false, defaults: defaults, arguments: ["Syrtis"], dir: "/x",
-                                   setConfig: { _ in nil }, sync: slowSync)
+            controller.reconfigure(refresh: false, defaults: defaults, arguments: ["Syrtis"], bundleID: "x.y",
+                                   setConfig: { _ in false }, sync: slowSync)
             await running.value
             let syncs = log.value.filter { $0 == "sync" }.count
             return firstTwo + ["syncs=\(syncs >= 2)", "state=\(controller.state ?? "nil")"]
@@ -18051,11 +18051,11 @@ enum SelfTest {
             defaults.set(true, forKey: CursorSync.noticeKey)
             let log = UncheckedBox<[String]>([])
             let ok = try? JSONDecoder().decode(
-                CursorSyncStatus.self, from: Data(#"{"state":"ok","events":1,"lastSuccessMs":1}"#.utf8))
+                CursorSyncStatus.self, from: Data(#"{"state":"ok","events":1,"lastSuccessMs":1,"changed":true}"#.utf8))
             let sync: @Sendable (Bool) -> CursorSyncStatus? = { _ in log.value.append("sync"); return ok }
             let controller = CursorSyncController()
-            controller.reconfigure(refresh: false, defaults: defaults, arguments: ["Syrtis"], dir: "/x",
-                                   setConfig: { _ in Thread.sleep(forTimeInterval: 0.3); log.value.append("push1"); return nil },
+            controller.reconfigure(refresh: false, defaults: defaults, arguments: ["Syrtis"], bundleID: "x.y",
+                                   setConfig: { _ in Thread.sleep(forTimeInterval: 0.3); log.value.append("push1"); return false },
                                    sync: sync)
             let running = Task { @MainActor in
                 await controller.runSync(explicit: true, defaults: defaults, arguments: ["Syrtis"], sync: sync)
@@ -18067,15 +18067,15 @@ enum SelfTest {
             defaults.set(true, forKey: CursorSync.takeoverKey)
             // The new loop's own sync is dropped while `running` holds the
             // single flight, so one sync means the rerun sent it.
-            controller.reconfigure(refresh: false, defaults: defaults, arguments: ["Syrtis"], dir: "/x",
-                                   setConfig: { _ in Thread.sleep(forTimeInterval: 0.2); log.value.append("push2"); return nil },
+            controller.reconfigure(refresh: false, defaults: defaults, arguments: ["Syrtis"], bundleID: "x.y",
+                                   setConfig: { _ in Thread.sleep(forTimeInterval: 0.2); log.value.append("push2"); return false },
                                    sync: sync)
             await running.value
             let order = log.value
             // Stop the loop the second reconfigure started.
             defaults.set(false, forKey: CursorSync.enabledKey)
-            controller.reconfigure(refresh: false, defaults: defaults, arguments: ["Syrtis"], dir: "/x",
-                                   setConfig: { _ in nil }, sync: sync)
+            controller.reconfigure(refresh: false, defaults: defaults, arguments: ["Syrtis"], bundleID: "x.y",
+                                   setConfig: { _ in false }, sync: sync)
             return order
         }
         expect(cursorWait == ["push1", "push2", "sync"],
@@ -18091,8 +18091,8 @@ enum SelfTest {
             let syncs = UncheckedBox<Int>(0)
             let sync: @Sendable (Bool) -> CursorSyncStatus? = { _ in syncs.value += 1; return nil }
             let controller = CursorSyncController()
-            controller.reconfigure(refresh: false, defaults: defaults, arguments: ["Syrtis"], dir: "/x",
-                                   setConfig: { _ in Thread.sleep(forTimeInterval: 0.3); return nil }, sync: sync)
+            controller.reconfigure(refresh: false, defaults: defaults, arguments: ["Syrtis"], bundleID: "x.y",
+                                   setConfig: { _ in Thread.sleep(forTimeInterval: 0.3); return false }, sync: sync)
             let running = Task { @MainActor in
                 await controller.runSync(explicit: true, defaults: defaults, arguments: ["Syrtis"], sync: sync)
             }
@@ -18101,8 +18101,8 @@ enum SelfTest {
                 try? await Task.sleep(nanoseconds: 5_000_000)
             }
             defaults.set(false, forKey: CursorSync.enabledKey)
-            controller.reconfigure(refresh: false, defaults: defaults, arguments: ["Syrtis"], dir: "/x",
-                                   setConfig: { _ in nil }, sync: sync)
+            controller.reconfigure(refresh: false, defaults: defaults, arguments: ["Syrtis"], bundleID: "x.y",
+                                   setConfig: { _ in false }, sync: sync)
             await running.value
             try? await Task.sleep(nanoseconds: 100_000_000)
             return syncs.value
@@ -18128,7 +18128,7 @@ enum SelfTest {
             for (on, failed) in [(false, true), (true, false), (false, false)] {
                 defaults.set(on, forKey: CursorSync.enabledKey)
                 let before = pushes.value
-                controller.reconfigure(refresh: false, defaults: defaults, arguments: ["Syrtis"], dir: "/x",
+                controller.reconfigure(refresh: false, defaults: defaults, arguments: ["Syrtis"], bundleID: "x.y",
                                        setConfig: { _ in pushes.value += 1; return failed }, sync: none)
                 seen.append(controller.cleanupFailed)
                 for _ in 0..<200 where pushes.value == before {
@@ -18142,32 +18142,119 @@ enum SelfTest {
         expect(cursorCleanup == [false, true, true, true, false, false],
                "CURSOR-SYNC a failed off cleanup is reported until an off cleanup succeeds; got \(String(describing: cursorCleanup))")
         // The real FFI, so the Swift decode of `cleanupFailed` is exercised:
-        // a read-only dir refuses the delete. Ends with no dir registered; the
-        // file is not `usage.<64 hex>.json`, so the takeover never turns on
-        // and no scan reads this dir meanwhile.
+        // a read-only dir refuses the delete. Isolation (CMP-520 13b): a
+        // SelfTest-only bundle id under a temporary HOME, so an off push can
+        // never clean the real app's `cursor-cache` / `cursor-profiles`. Ends
+        // off; the file is a temp file (ours, never a complete file), so the
+        // takeover never turns on and no scan reads this dir meanwhile.
         do {
             let fm = FileManager.default
-            let dir = fm.temporaryDirectory.appendingPathComponent("syrtis-selftest-cursor-\(UUID().uuidString)")
+            let home = fm.temporaryDirectory.appendingPathComponent("syrtis-selftest-home-\(UUID().uuidString)")
+            let bundle = CursorSync.selfTestBundleID
+            let dir = home.appendingPathComponent("Library/Application Support/\(bundle)/cursor-cache")
             try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
-            let file = dir.appendingPathComponent("usage.selftest.json")
+            let file = dir.appendingPathComponent(".cursor-sync.tmp-selftest")
             fm.createFile(atPath: file.path, contents: Data("x".utf8))
             // The lock file exists already, so only the delete itself is refused.
             fm.createFile(atPath: dir.appendingPathComponent(".cursor-sync.lock").path, contents: Data())
-            let set = { (on: Bool) in try? TBCore.setCursorSync(json: #"{"enabled":\#(on),"dir":"\#(dir.path)"}"#) }
+            let set = { (on: Bool) in
+                withTemporaryHome(home) {
+                    try? TBCore.setCursorSync(json: #"{"enabled":\#(on),"bundleId":"\#(bundle)"}"#)
+                }
+            }
             let on = set(true)
             try? fm.setAttributes([.posixPermissions: 0o500], ofItemAtPath: dir.path)
             let stuck = set(false)
             try? fm.setAttributes([.posixPermissions: 0o700], ofItemAtPath: dir.path)
             _ = set(true)
             let retried = set(false)
-            _ = try? TBCore.setCursorSync(json: #"{"enabled":false}"#)
-            try? fm.removeItem(at: dir)
+            try? fm.removeItem(at: home)
             expect(on?.cleanupFailed == false && stuck?.cleanupFailed == true
                        && retried?.cleanupFailed == false && retried?.removedFiles == 1,
                    "CURSOR-SYNC tb_set_cursor_sync reports a refused delete as cleanupFailed and clears it on retry; got \(String(describing: [on?.cleanupFailed, stuck?.cleanupFailed, retried?.cleanupFailed]))")
         }
-        expect(cursorRefresh == [true, false, true],
-               "CURSOR-SYNC a changed count refreshes, the same count does not, and off->on refreshes again; got \(String(describing: cursorRefresh))")
+        // CMP-520 13b: the Swift↔Rust seam. Production `configJSON` output
+        // (real-format bundle id, the implicit default profile and one added
+        // profile) is accepted by the real core, which derives each profile's
+        // dir. Mutation: `configJSON` sending `dir` instead of
+        // `bundleId`/`profiles` is rejected here while every Rust test passes.
+        do {
+            let suite = "tokenbar.selftest.cursorSyncSeam"
+            let defaults = UserDefaults(suiteName: suite)!
+            defer { defaults.removePersistentDomain(forName: suite) }
+            defaults.removePersistentDomain(forName: suite)
+            defaults.set(true, forKey: CursorSync.noticeKey)
+            let id = UUID().uuidString
+            defaults.set([["id": id, "root": "/Volumes/selftest/cursor-b"]], forKey: CursorSync.profilesKey)
+            let fm = FileManager.default
+            let home = fm.temporaryDirectory.appendingPathComponent("syrtis-selftest-home-\(UUID().uuidString)")
+            try? fm.createDirectory(at: home, withIntermediateDirectories: true)
+            let bundle = CursorSync.selfTestBundleID
+            let json = CursorSync.configJSON(bundleID: bundle, defaults: defaults, arguments: ["Syrtis"])
+            let result = withTemporaryHome(home) { try? TBCore.setCursorSync(json: json) }
+            let off = withTemporaryHome(home) {
+                try? TBCore.setCursorSync(json: #"{"enabled":false,"bundleId":"\#(bundle)"}"#)
+            }
+            let appDir = home.appendingPathComponent("Library/Application Support/\(bundle)").path
+            try? fm.removeItem(at: home)
+            let expectedDirs: [[String]] = [
+                ["default", appDir + "/cursor-cache"],
+                [id, appDir + "/cursor-profiles/" + id],
+            ]
+            let accepted: Bool = result?.enabled == true && result?.appDir == appDir
+            let derived: Bool = result?.profiles.map { [$0.id, $0.dir] } == expectedDirs
+            expect(accepted && derived && off?.enabled == false,
+                   "CURSOR-SYNC the core accepts production configJSON and derives <appDir>/cursor-cache and <appDir>/cursor-profiles/<id>; got \(String(describing: result))")
+        }
+        // A config the core refuses is shown, not silently dropped, and
+        // nothing syncs. Mutation: drop the nil branch in `reconfigure`.
+        let cursorRejected: [String]? = awaitMainActorValue {
+            let suite = "tokenbar.selftest.cursorSyncRejected"
+            let defaults = UserDefaults(suiteName: suite)!
+            defer { defaults.removePersistentDomain(forName: suite) }
+            defaults.removePersistentDomain(forName: suite)
+            defaults.set(true, forKey: CursorSync.noticeKey)
+            let syncs = UncheckedBox<Int>(0)
+            let sync: @Sendable (Bool) -> CursorSyncStatus? = { _ in syncs.value += 1; return nil }
+            let controller = CursorSyncController()
+            controller.reconfigure(refresh: false, defaults: defaults, arguments: ["Syrtis"], bundleID: "x.y",
+                                   setConfig: { _ in nil }, sync: sync)
+            for _ in 0..<200 where controller.state == nil {
+                try? await Task.sleep(nanoseconds: 10_000_000)
+            }
+            await controller.runSync(explicit: true, defaults: defaults, arguments: ["Syrtis"], sync: sync)
+            let line = CursorSync.statusLine(state: controller.state, lastSuccessMs: nil) ?? "nil"
+            // Stop the loop.
+            defaults.set(false, forKey: CursorSync.enabledKey)
+            controller.reconfigure(refresh: false, defaults: defaults, arguments: ["Syrtis"], bundleID: "x.y",
+                                   setConfig: { _ in false }, sync: sync)
+            return [line, "syncs=\(syncs.value)"]
+        }
+        expect(cursorRejected == [CursorSync.Copy.configRejected.localized, "syncs=0"],
+               "CURSOR-SYNC a refused config shows the rejected line and syncs nothing; got \(String(describing: cursorRejected))")
+        expect(cursorRefresh == [true, true, true],
+               "CURSOR-SYNC every round that wrote refreshes, including two in a row with the same count, and after off->on; got \(String(describing: cursorRefresh))")
+        // CMP-520 FIX 1: one profile wrote while another failed — the
+        // headline is `error`, but the core changed the data, so the
+        // dashboard refreshes. Mutation: refresh only on `state == "ok"`.
+        let cursorPartialRefresh: Bool? = awaitMainActorValue {
+            let suite = "tokenbar.selftest.cursorSyncPartialRefresh"
+            let defaults = UserDefaults(suiteName: suite)!
+            defer { defaults.removePersistentDomain(forName: suite) }
+            defaults.removePersistentDomain(forName: suite)
+            defaults.set(true, forKey: CursorSync.noticeKey)
+            let mixed = try? JSONDecoder().decode(
+                CursorSyncStatus.self,
+                from: Data(#"{"state":"error","reason":"account_mismatch","events":4,"lastSuccessMs":1,"changed":true}"#.utf8))
+            let sync: @Sendable (Bool) -> CursorSyncStatus? = { _ in mixed }
+            let generation = { UserDefaults.standard.integer(forKey: ClaudeExtraRoots.generationKey) }
+            let controller = CursorSyncController()
+            let before = generation()
+            await controller.runSync(explicit: true, defaults: defaults, arguments: ["Syrtis"], sync: sync)
+            return mixed != nil && generation() != before && controller.state == "error"
+        }
+        expect(cursorPartialRefresh == true,
+               "CURSOR-SYNC a round where one profile wrote and another failed still refreshes the dashboard; got \(String(describing: cursorPartialRefresh))")
 
         // Status -> copy, every state; and every new key in both catalogs.
         do {
@@ -20880,4 +20967,28 @@ private final class AGAutoFake: @unchecked Sendable {
             remove: { key in self.write { $0.removedKeys.append(key) } },
             install: { _ in })
     }
+}
+
+extension CursorSync {
+    /// The bundle id SelfTests hand the real FFI: never the shipping one, so
+    /// an off push cannot clean the maintainer's real Cursor sync dirs
+    /// (CMP-520 13b). `--selftest` runs the shipping bundle in
+    /// `make selftest-bundled`, hence the suffix rather than a fixed id.
+    static var selfTestBundleID: String {
+        (Bundle.main.bundleIdentifier ?? "com.nyanako.tokenbar") + ".selftest"
+    }
+}
+
+/// Run `body` with `HOME` pointing at `home`, restored afterwards. The core
+/// derives Cursor sync dirs from `HOME` (`user_home_dir`), so a real-FFI
+/// SelfTest under a temporary HOME cannot reach the real Application
+/// Support. Only for the short synchronous FFI calls in `SelfTest.run`,
+/// where nothing else reads the environment concurrently.
+func withTemporaryHome<T>(_ home: URL, _ body: () -> T) -> T {
+    let saved = getenv("HOME").map { String(cString: $0) }
+    setenv("HOME", home.path, 1)
+    defer {
+        if let saved { setenv("HOME", saved, 1) } else { unsetenv("HOME") }
+    }
+    return body()
 }
