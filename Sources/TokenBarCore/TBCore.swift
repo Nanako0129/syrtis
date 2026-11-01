@@ -22,8 +22,22 @@ package enum AgentUsageBoundaryLogEvent: Equatable, Sendable {
 
 /// Result of the `tb_probe` smoke entry point.
 public struct ProbeResult: Decodable {
+    /// What the last read of the user's OpenCode DB settings found
+    /// (`OPENCODE_DB`, `scanner.opencodeDbPaths`); fixed codes, never a path.
+    public struct OpenCodeDb: Decodable {
+        public struct Issue: Decodable {
+            public let source: String
+            public let index: Int
+            public let reason: String
+        }
+        public let settingsFile: String
+        public let handedToEngine: Int
+        public let issues: [Issue]
+    }
+
     public let ok: Bool
     public let messages: Int?
+    public let opencodeDb: OpenCodeDb?
     public let err: String?
 }
 

@@ -55,7 +55,7 @@ flowchart LR
     QUOTA[Quota providers] --> FFI
 ```
 
-Rust owns the raw-session interpretation and all expensive aggregation. Swift calls the blocking FFI entry points away from the main actor, decodes the returned heap JSON, and frees the pointer through `tb_free`. Successful calls use `{"ok":true,"data":...}`; failures use `{"ok":false,"err":"..."}`. `tb_probe` keeps its legacy shape for the smoke path.
+Rust owns the raw-session interpretation and all expensive aggregation. Swift calls the blocking FFI entry points away from the main actor, decodes the returned heap JSON, and frees the pointer through `tb_free`. Successful calls use `{"ok":true,"data":...}`; failures use `{"ok":false,"err":"..."}`. `tb_probe` keeps its legacy top-level shape for the smoke path (`{"ok":true,"messages":N,"opencodeDb":{...}}`, where `opencodeDb` holds fixed-code diagnostics for the user's OpenCode DB settings; see `ctb.h`). `OPENCODE_DB` and `scanner.opencodeDbPaths` in the tokscale `settings.json` enter the scan in `LocalSourceContext::scanner_settings` (`user_scanner_settings.rs`), read at each options build; `OPENCODE_DB` is fixed at app launch.
 
 > **核心不變量：** Rust 產生的 payload 是跨語言契約。Swift 可以格式化、排序或選擇顯示視角，但不能假設自己能從已預聚合的數字反推出每個 client 的貢獻。
 

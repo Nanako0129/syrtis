@@ -46,7 +46,15 @@
 // not eligible for an implicit Linear fallback. ETA/risk remain optional inside
 // an available historical result. Other report payloads retain their existing
 // camelCase shapes from the Tauri contract.
-// tb_probe keeps its Phase 0 shape: {"ok":true,"messages":N} / {"ok":false,...}.
+// tb_probe keeps its Phase 0 top-level shape (no "data" wrapper):
+// {"ok":true,"messages":N,"opencodeDb":{...}} / {"ok":false,"err":...}.
+// opencodeDb = {"settingsFile":"absent"|"ok"|"tooLarge"|"unreadable"|
+// "invalidJson","handedToEngine":N,"issues":[{"source":"env"|"file","index":i,
+// "reason":"notAbsolute"|"badFileName"|"missing"}]} reports what the last read
+// of the user's OpenCode DB settings (OPENCODE_DB, tokscale settings.json
+// scanner.opencodeDbPaths) found. index is the zero-based position within that
+// source's list; "notAbsolute" paths are withheld from the engine, the other
+// reasons are paths it will probably skip. No path crosses the ABI.
 //
 // `year` parameters may be NULL or "" for the all-time view, otherwise a
 // 4-digit year string ("2026"). All calls are blocking; tb_agent_usage also
