@@ -240,28 +240,38 @@ char *tb_antigravity_auto_capture(const char *removed_keys_json);
 char *tb_set_keychain_consent(const char *json);
 
 // Configure Cursor desktop sync. `json` is
-// `{"enabled":bool,"dir":"<absolute dir>","cliTakeoverConfirmed":bool}`;
-// `dir` (the caller passes `<Application Support>/<bundle id>/cursor-cache`) is
-// required while enabled and must be absolute, without `..`, and outside
-// `~/.config/tokscale`. Full replace, in-memory, default off: the caller
-// re-applies the stored answer at launch. Turning sync off (or moving `dir`)
-// deletes the Syrtis usage files from the dir no longer in use. Success data
-// is `{"enabled","dir","cliTakeoverConfirmed","removedFiles":N,
-// "cleanupFailed":bool}` (some of those files could not be deleted, or the
-// dir could not be examined); invalid
-// input is an error and leaves the registry unchanged. While enabled with a
-// complete synced file, and the tokscale CLI's Cursor dir holds no usage files
-// (or `cliTakeoverConfirmed`), reports read Cursor from the sync dir only.
+// `{"enabled":bool,"bundleId":"<reverse DNS>","profiles":[{"id":"<UUID>",
+// "root":"/abs"}],"cliTakeoverConfirmed":bool}`. The caller passes its bundle
+// id and the added Cursor profiles (`--user-data-dir` roots, each with a
+// caller-made uppercase UUID), never a directory or a database path. The
+// core derives `appDir` = `<HOME>/Library/Application Support/<bundleId>`
+// (refused when a symlink, not a directory, or under `~/.config/tokscale`):
+// the implicit default profile syncs into `<appDir>/cursor-cache`, each added
+// one into `<appDir>/cursor-profiles/<id>` and reads
+// `<root>/User/globalStorage/state.vscdb`. Full replace, in-memory, default
+// off: the caller re-applies the stored answer at launch. Turning sync off
+// deletes the Syrtis usage files from every profile dir; while on, dirs of
+// profiles no longer listed are cleaned. Success data is `{"enabled","appDir",
+// "profiles":[{"id","dir"}],"cliTakeoverConfirmed","removedFiles":N,
+// "cleanupFailed":bool,"cleanupFailedProfiles":[id]}`; invalid input is an
+// error and leaves the registry unchanged. While enabled with a complete
+// synced file, and the tokscale CLI's Cursor dir holds no usage files (or
+// `cliTakeoverConfirmed`), reports read Cursor from the newest synced file of
+// each account only.
 char *tb_set_cursor_sync(const char *json);
 
-// Sync Cursor usage from the signed-in Cursor desktop app now. Blocking
-// (SQLite read + network, up to 10 min): never call on the main thread.
-// `user_initiated` non-zero = the user's "Sync now". Single-flight: a call
-// made while one runs waits for it and returns its status. Success data is
+// Sync Cursor usage from the signed-in Cursor desktop app now, every
+// configured profile in turn within one time budget. Blocking (SQLite reads +
+// network, up to 10 min): never call on the main thread. `user_initiated`
+// non-zero = the user's "Sync now". Single-flight: a call made while one runs
+// waits for it and returns its status. Success data is
 // `{"state":"ok|partial|expired|notSignedIn|offline|error|disabled|cliPresent",
-// "events":N,"lastSuccessMs":ms|null,"reason"?:"<fixed code>"}`. `cliPresent`
-// = the walk completed but tokscale CLI Cursor files exist and the takeover is
-// not confirmed. `reason` codes name no account and never carry the token.
+// "events":N,"lastSuccessMs":ms|null,"reason"?:"<fixed code>","profiles":[{"id",
+// "state","events","lastSuccessMs","reason"?,"duplicateOf"?}]}`. A profile
+// whose account an earlier profile already walked this round is `duplicate`
+// with `duplicateOf` = that profile's id. `cliPresent` = a walk completed but
+// tokscale CLI Cursor files exist and the takeover is not confirmed. `reason`
+// codes name no account and never carry the token.
 char *tb_cursor_sync(int32_t user_initiated);
 
 // Release a string returned by any tb_* entry point.

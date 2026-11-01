@@ -169,10 +169,21 @@ public struct KeychainConsentResult: Decodable, Equatable, Sendable {
 
 /// Result of `tb_set_cursor_sync`.
 public struct CursorSyncConfigResult: Decodable, Equatable, Sendable {
+    public struct ProfileDir: Decodable, Equatable, Sendable {
+        /// `default`, or the added profile's UUID.
+        public let id: String
+        /// The sync dir the core derived for it.
+        public let dir: String
+    }
+
     public let enabled: Bool
-    public let dir: String?
+    /// `<HOME>/Library/Application Support/<bundle id>`, derived by the core.
+    public let appDir: String
+    /// The default profile first, then each added one.
+    public let profiles: [ProfileDir]
     public let cliTakeoverConfirmed: Bool
-    /// Syrtis usage files deleted because sync was turned off or moved.
+    /// Syrtis usage files deleted because sync was turned off or a profile
+    /// was removed.
     public let removedFiles: Int
     /// Some of those files could not be deleted.
     public let cleanupFailed: Bool

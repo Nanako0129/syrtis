@@ -779,6 +779,67 @@ mod tests {
         assert_eq!(extract_user_id("no id here"), None);
     }
 
+    /// CMP-520 (11 ✱): Grok Bot's Cursor fallback reads only the default
+    /// profile's database (the fixed path or `TOKENBAR_CURSOR_STATE_VSCDB`);
+    /// an added Cursor sync profile never feeds it. The production entry
+    /// point runs with an added profile configured on this thread.
+    #[test]
+    fn added_cursor_profiles_never_feed_grok_bot() {
+        let _guard = crate::cursor_sync::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let default_user = "user_DEFAULTprofile0123456789";
+        let (default_dir, default_db) = temp_state_db(
+            "cmp_default",
+            &[
+                ("cursorAuth/accessToken", "DEFAULTPROFILETOKEN"),
+                ("glass.lastSignedInAuthId", default_user),
+            ],
+        );
+        let (added_dir, added_db) = temp_state_db(
+            "cmp_added",
+            &[
+                ("cursorAuth/accessToken", "ADDEDPROFILETOKEN"),
+                ("glass.lastSignedInAuthId", "user_ADDEDprofile01234567890"),
+            ],
+        );
+        let root = added_dir.join("root");
+        std::fs::create_dir_all(root.join("User/globalStorage")).unwrap();
+        std::fs::copy(&added_db, root.join("User/globalStorage/state.vscdb")).unwrap();
+        crate::cursor_sync::set_thread_config_for_test(Some(crate::cursor_sync::Config {
+            enabled: true,
+            app_dir: Some(added_dir.join("app")),
+            profiles: vec![crate::cursor_sync::Profile {
+                id: "0A1B2C3D-0000-4000-8000-00000000000A".to_string(),
+                root,
+            }],
+            cli_takeover_confirmed: false,
+        }));
+        let saved: Vec<_> = ["TOKENBAR_GROK_BOT_SECRETS", "TOKENBAR_CURSOR_STATE_VSCDB"]
+            .into_iter()
+            .map(|k| (k, std::env::var_os(k)))
+            .collect();
+        std::env::set_var("TOKENBAR_GROK_BOT_SECRETS", default_dir.join("absent.json"));
+        std::env::set_var("TOKENBAR_CURSOR_STATE_VSCDB", &default_db);
+        let loaded = load_credentials();
+        for (key, value) in saved {
+            match value {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
+        crate::cursor_sync::set_thread_config_for_test(None);
+        let _ = std::fs::remove_dir_all(&default_dir);
+        let _ = std::fs::remove_dir_all(&added_dir);
+        match loaded {
+            Ok(Some(GrokBotCredentials::Cursor(credentials))) => {
+                assert_eq!(credentials.access_token, "DEFAULTPROFILETOKEN");
+                assert_eq!(credentials.user_id, default_user);
+            }
+            _ => panic!("expected the default profile's Cursor credentials"),
+        }
+    }
+
     /// Write `rows` to a fresh temp `state.vscdb` and return (dir, path).
     fn temp_state_db(tag: &str, rows: &[(&str, &str)]) -> (PathBuf, PathBuf) {
         let dir = std::env::temp_dir().join(format!(

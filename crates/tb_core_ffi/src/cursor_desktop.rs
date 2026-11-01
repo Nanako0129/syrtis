@@ -5,8 +5,10 @@
 //! is opened read-only, never written, and the token is returned to the
 //! caller only; nothing here logs or persists it.
 //!
-//! `TOKENBAR_CURSOR_STATE_VSCDB` overrides the database path (tests,
-//! debugging). It selects which file is read, never where anything is sent.
+//! `TOKENBAR_CURSOR_STATE_VSCDB` overrides the default profile's database
+//! path (tests, debugging). It selects which file is read, never where
+//! anything is sent. Added Cursor profiles (`cursor_sync`) derive their own
+//! path from the profile root and never feed Grok Bot.
 
 use serde_json::Value;
 use std::path::{Path, PathBuf};
@@ -55,19 +57,77 @@ pub(crate) fn read_login(db_path: &Path) -> Result<Option<CursorLogin>, String> 
     let conn =
         rusqlite::Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
             .map_err(unreadable)?;
-    conn.busy_timeout(SQLITE_BUSY_TIMEOUT).map_err(unreadable)?;
+    query_login(&conn).map_err(unreadable)
+}
 
-    let mut stmt = conn
-        .prepare(
-            "SELECT key, value FROM ItemTable WHERE key IN \
-             ('cursorAuth/accessToken','glass.lastSignedInAuthId','cursorAuth/cachedScopedProfile')",
-        )
-        .map_err(unreadable)?;
+/// The Cursor usage sync's reader (plan CMP-520, per-sync DB checks): the
+/// last path component must be a regular file owned by the current user, not
+/// a symlink (intermediate symlinks are allowed); the open refuses a symlink
+/// (`SQLITE_OPEN_NOFOLLOW`) and runs with `trusted_schema=OFF` and
+/// `DEFENSIVE`. Every refusal is a fixed reason code; `Ok(None)` is an absent
+/// database or one without a token. Grok Bot keeps `read_login`.
+pub(crate) fn read_login_checked(db_path: &Path) -> Result<Option<CursorLogin>, &'static str> {
+    let meta = match std::fs::symlink_metadata(db_path) {
+        Ok(meta) => meta,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err("login_unreadable"),
+    };
+    if meta.file_type().is_symlink() {
+        return Err("db_symlink");
+    }
+    if !meta.file_type().is_file() {
+        return Err("db_not_file");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        if meta.uid() != current_uid() {
+            return Err("db_foreign_owner");
+        }
+    }
+    let conn = open_checked(db_path)?;
+    query_login(&conn).map_err(|_| "login_unreadable")
+}
+
+/// SQLite's NOFOLLOW refuses a symlink in *any* component (its full-pathname
+/// resolution reports every one), so the directory is resolved first and
+/// only the last component is opened with NOFOLLOW: intermediate symlinks
+/// (e.g. `/var` → `/private/var`) stay allowed, a symlinked file does not.
+fn open_checked(db_path: &Path) -> Result<rusqlite::Connection, &'static str> {
+    let (Some(parent), Some(name)) = (db_path.parent(), db_path.file_name()) else {
+        return Err("login_unreadable");
+    };
+    let path = std::fs::canonicalize(parent)
+        .map_err(|_| "login_unreadable")?
+        .join(name);
+    let flags =
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW;
+    let conn = rusqlite::Connection::open_with_flags(path, flags).map_err(|_| "login_unreadable")?;
+    conn.set_db_config(rusqlite::config::DbConfig::SQLITE_DBCONFIG_DEFENSIVE, true)
+        .map_err(|_| "login_unreadable")?;
+    conn.pragma_update(None, "trusted_schema", false)
+        .map_err(|_| "login_unreadable")?;
+    Ok(conn)
+}
+
+#[cfg(unix)]
+pub(crate) fn current_uid() -> u32 {
+    extern "C" {
+        fn getuid() -> u32;
+    }
+    // SAFETY: getuid(2) takes no arguments, cannot fail and touches no memory.
+    unsafe { getuid() }
+}
+
+fn query_login(conn: &rusqlite::Connection) -> rusqlite::Result<Option<CursorLogin>> {
+    conn.busy_timeout(SQLITE_BUSY_TIMEOUT)?;
+    let mut stmt = conn.prepare(
+        "SELECT key, value FROM ItemTable WHERE key IN \
+         ('cursorAuth/accessToken','glass.lastSignedInAuthId','cursorAuth/cachedScopedProfile')",
+    )?;
     let rows: Vec<(String, String)> = stmt
-        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
-        .map_err(unreadable)?
-        .collect::<Result<_, _>>()
-        .map_err(unreadable)?;
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<Result<_, _>>()?;
 
     let mut token: Option<String> = None;
     let mut identity: Option<String> = None;
@@ -136,5 +196,48 @@ mod extract_user_id_tests {
         );
         // Control: no qualifying occurrence at all.
         assert_eq!(extract_user_id(r#"{"user_id":"user_short"}"#), None);
+    }
+}
+
+#[cfg(test)]
+mod checked_open_tests {
+    use super::*;
+
+    fn db(dir: &Path) -> PathBuf {
+        let path = dir.join("state.vscdb");
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute_batch("CREATE TABLE ItemTable (key TEXT PRIMARY KEY, value TEXT)")
+            .unwrap();
+        path
+    }
+
+    #[test]
+    fn the_sync_reader_runs_untrusted_schema_and_defensive() {
+        let tmp = tempfile::tempdir().unwrap();
+        let conn = open_checked(&db(tmp.path())).unwrap();
+        let trusted: i64 = conn
+            .query_row("PRAGMA trusted_schema", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(trusted, 0);
+        assert!(conn
+            .db_config(rusqlite::config::DbConfig::SQLITE_DBCONFIG_DEFENSIVE)
+            .unwrap());
+    }
+
+    /// The open itself refuses a symlinked file (defence behind the
+    /// `symlink_metadata` check), while a symlinked directory is fine.
+    #[cfg(unix)]
+    #[test]
+    fn the_open_refuses_a_symlinked_file_but_not_a_symlinked_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = db(tmp.path());
+        let link = tmp.path().join("link.vscdb");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert!(open_checked(&link).is_err());
+        let dir_link = tmp.path().join("dir-link");
+        std::os::unix::fs::symlink(tmp.path(), &dir_link).unwrap();
+        assert!(open_checked(&dir_link.join("state.vscdb")).is_ok());
+        assert_eq!(read_login_checked(&link).err(), Some("db_symlink"));
     }
 }
