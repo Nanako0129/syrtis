@@ -61,7 +61,7 @@ struct SettingsWindowView: View {
 
     /// The user's hidden client set, parsed from the observed raw string.
     private var hiddenClients: Set<String> {
-        ClientRegistry.parseIdSet(tabsHiddenRaw)
+        ClientRegistry.hiddenTabClients(ClientRegistry.parseIdSet(tabsHiddenRaw))
     }
 
     /// Reconcile again for every generated payload, selection, or exclusion

@@ -352,7 +352,7 @@ struct SettingsPanel: View {
             payload: agentUsage,
             enabled: ClientTray.parseEnabledRaw(individualEnabledRaw),
             selections: ClientTray.parseSelectionsRaw(individualSelectionsRaw),
-            hidden: ClientRegistry.parseIdSet(tabsHiddenRaw),
+            hidden: ClientRegistry.hiddenTabClients(ClientRegistry.parseIdSet(tabsHiddenRaw)),
             orderRaw: tabsOrderRaw,
             officialClients: AgentIconView.availableOfficialClientIDs())
 
@@ -506,7 +506,7 @@ struct SettingsPanel: View {
                     // A tab hidden below always hides its quota card too — the
                     // toggle here reflects that (off + disabled) rather than
                     // offering a state the card can never actually reach.
-                    let tabHiddenSet = ClientRegistry.withGroupMembers(ClientRegistry.parseIdSet(tabsHiddenRaw))
+                    let tabHiddenSet = ClientRegistry.hiddenTabClients(ClientRegistry.parseIdSet(tabsHiddenRaw))
                     Divider()
                     VStack(spacing: 1) {
                         ForEach(limitOrdered, id: \.self) { id in
@@ -604,7 +604,7 @@ struct SettingsPanel: View {
         }
 
         section("Client tabs (top bar)") {
-            let hiddenSet = ClientRegistry.parseIdSet(tabsHiddenRaw)
+            let hiddenSet = ClientRegistry.hiddenTabClients(ClientRegistry.parseIdSet(tabsHiddenRaw))
 
             if tabsUniverse.isEmpty {
                 Text("No clients found yet.")
@@ -649,13 +649,10 @@ struct SettingsPanel: View {
                                     Toggle("", isOn: Binding(
                                         get: { isVisible },
                                         set: { show in
-                                            var hidden = hiddenSet
-                                            if show {
-                                                hidden.remove(id)
-                                            } else {
-                                                hidden.insert(id)
-                                            }
-                                            tabsHiddenRaw = hidden.sorted().joined(separator: ",")
+                                            tabsHiddenRaw = ClientRegistry.updatingTabVisibility(
+                                                ClientRegistry.parseIdSet(tabsHiddenRaw),
+                                                tab: id, visible: show
+                                            ).sorted().joined(separator: ",")
                                         }
                                     ))
                                     .disabled(DemoData.ignoresLocalVisibility)

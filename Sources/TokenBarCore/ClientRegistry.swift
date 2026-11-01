@@ -458,6 +458,31 @@ public enum ClientRegistry {
         hiddenTabClients(hiddenClients())
     }
 
+    /// The stored hidden set after a tab switch is flipped to `visible`.
+    ///
+    /// The switch reads through `hiddenTabClients`, so its write has to be the
+    /// inverse of that reading. Removing only `id` left a pre-grouping member id
+    /// in place: with `antigravity-cli` stored from before the IDE and CLI
+    /// shared one tab, turning the Antigravity switch back on removed
+    /// `antigravity`, and the fold immediately hid the group again. Clearing the
+    /// whole slice in both directions makes the write idempotent and converges
+    /// the stored form on the tab id the switch reads. Members are re-added as
+    /// the tab id when hiding, so `antigravity-cli` cannot sit in the set as a
+    /// second, stale spelling of the same hidden tab.
+    ///
+    /// `id` may name the tab or any member of its group; it is folded to the tab
+    /// first, so a caller holding a member id cannot write a second spelling of
+    /// the same tab.
+    public static func updatingTabVisibility(
+        _ hidden: Set<String>, tab id: String, visible: Bool
+    ) -> Set<String> {
+        let tab = memberToTabId[id] ?? id
+        var out = hidden
+        out.subtract(tabSlice(tab))
+        if !visible { out.insert(tab) }
+        return out
+    }
+
     /// Reactive overload of `displayClients`: takes the observed hidden/order
     /// raw strings so a SwiftUI view (e.g. the settings live preview) re-renders
     /// the instant the user toggles a tab or reorders, instead of waiting for

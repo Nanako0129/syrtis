@@ -6828,6 +6828,41 @@ enum SelfTest {
             ClientRegistry.displayClients(
                 present: ["antigravity"], hiddenRaw: "antigravity-cli", orderRaw: "").isEmpty,
             "a tab hidden under the pre-grouping id stays hidden after the upgrade")
+        // The write half of the same upgrade path. The Settings switch reads
+        // through `hiddenTabClients`, so turning the tab back on has to remove
+        // every id the fold saw — otherwise `antigravity-cli` survives the write
+        // and the next read hides the group again, which is exactly the state a
+        // user cannot escape from the UI.
+        let settingsShown = ClientRegistry.updatingTabVisibility(
+            ClientRegistry.parseIdSet("antigravity-cli,cline"),
+            tab: "antigravity", visible: true)
+        expect(
+            settingsShown == ["cline"],
+            "turning a grouped tab on clears its pre-grouping member id")
+        expect(
+            ClientRegistry.displayClients(
+                present: ["antigravity", "codex"],
+                hiddenRaw: settingsShown.sorted().joined(separator: ","), orderRaw: "")
+                == ["antigravity", "codex"],
+            "the first switch write after an upgrade actually brings the grouped tab back")
+        expect(
+            ClientRegistry.updatingTabVisibility([], tab: "antigravity", visible: false)
+                == ["antigravity"]
+                && ClientRegistry.updatingTabVisibility(
+                    ["grok-bot"], tab: "grok", visible: false) == ["grok"],
+            "hiding a grouped tab stores the group id, replacing a stored member id")
+        expect(
+            ClientRegistry.updatingTabVisibility(
+                ["antigravity", "codex"], tab: "antigravity-cli", visible: true)
+                == ["codex"],
+            "a member id target still clears the group it folds into")
+        // Control: an ungrouped tab toggles exactly itself.
+        expect(
+            ClientRegistry.updatingTabVisibility(["claude"], tab: "codex", visible: true)
+                == ["claude"]
+                && ClientRegistry.updatingTabVisibility([], tab: "codex", visible: false)
+                    == ["codex"],
+            "an ungrouped tab toggles only its own id")
         // The ordering half of the same upgrade path. A saved order naming
         // `antigravity-cli` supplied no position for the `antigravity` tab, so
         // the tab fell to the end and the user's arrangement rearranged itself.
