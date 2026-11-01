@@ -685,7 +685,7 @@ struct SettingsPanel: View {
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
-            hint("Drag to order tabs and quota cards. The switch hides a client's tab and its quota card. Rows marked (quota card only) have no tab of their own and are listed only for ordering their quota card.")
+            hint("Drag to order tabs and quota cards. The switch hides a client's tab and its quota card. Rows marked (quota card only) have no tab of their own; moving one also moves the tab it belongs to, because the first row of a group sets that group's tab position.")
         }
 
         section("Live trace") {

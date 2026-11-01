@@ -6866,7 +6866,7 @@ enum SelfTest {
         // The hint used to say quota-only Antigravity has no tab, which stopped
         // being true when #349 gave every configured quota source a tab. English
         // is the key, so both translations have to carry the rewritten sentence.
-        let clientTabsHint = "Drag to order tabs and quota cards. The switch hides a client's tab and its quota card. Rows marked (quota card only) have no tab of their own and are listed only for ordering their quota card."
+        let clientTabsHint = "Drag to order tabs and quota cards. The switch hides a client's tab and its quota card. Rows marked (quota card only) have no tab of their own; moving one also moves the tab it belongs to, because the first row of a group sets that group's tab position."
         let missingClientTabsHint = ["zh-Hant", "zh-Hans"].filter { locale in
             let value = AppLanguage.localizedString(
                 clientTabsHint, locale: locale, bundle: .tokenBarResources)

@@ -334,7 +334,7 @@
 "Hide one client's quota card and keep its tab. Grayed out when the tab is hidden, which already hides the card." = "隱藏單一用戶端的額度卡片，分頁保留。分頁已隱藏時會變灰，因為隱藏分頁就不會有卡片。";
 "Hide views you don't use from the tab row." = "把用不到的畫面從分頁列隱藏。";
 "Drag to order tabs and quota cards. The switch hides a client's tab and its quota card." = "拖曳調整分頁和額度卡片的順序。開關會隱藏用戶端的分頁和額度卡片。";
-"Drag to order tabs and quota cards. The switch hides a client's tab and its quota card. Rows marked (quota card only) have no tab of their own and are listed only for ordering their quota card." = "拖曳調整分頁和額度卡片的順序。開關會隱藏用戶端的分頁和額度卡片。標示「（僅額度卡片）」的列沒有自己的分頁，在這裡只能調整額度卡片的順序。";
+"Drag to order tabs and quota cards. The switch hides a client's tab and its quota card. Rows marked (quota card only) have no tab of their own; moving one also moves the tab it belongs to, because the first row of a group sets that group's tab position." = "拖曳調整分頁和額度卡片的順序。開關會隱藏用戶端的分頁和額度卡片。標示「（僅額度卡片）」的列沒有自己的分頁；移動這一列也會移動它所屬的分頁，因為群組中第一列的位置決定該群組分頁的位置。";
 "On: the live session card gives each agent and model its own row. Off: one row per app." = "開啟：即時工作階段卡片每個 agent 和模型各一列。關閉：每個 app 一列。";
 "You can also drag the bottom edge of the popover. Auto uses about 60% of your screen height." = "也可以直接拖曳彈出視窗底部。「自動」約為螢幕高度的 60%。";
 "How often Syrtis rereads all logs in full. In between, new activity still shows up within 5 minutes." = "Syrtis 多久完整重讀一次所有紀錄檔。兩次之間，新的用量仍會在 5 分鐘內出現。";
