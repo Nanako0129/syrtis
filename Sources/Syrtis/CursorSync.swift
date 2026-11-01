@@ -185,17 +185,21 @@ enum CursorSync {
         static let addProfile = "Add Cursor profile folder…"
         /// A row whose account an earlier profile already synced this round.
         static let duplicate = "Same account as another profile; counted once."
-        /// Second ⓘ paragraph. Each claim, checked against the code:
-        /// reads — `cursor_desktop::read_login_checked` on
-        /// `<root>/User/globalStorage/state.vscdb` in every round;
-        /// sends — `cursor_sync::walk` posts it only to `USAGE_EVENTS_URL`
-        /// (cursor.com, https-only, no redirects), and added profiles never
-        /// feed Grok Bot; stores — `commit_file` writes only the parser fields
-        /// into `<appDir>/cursor-profiles/<id>`; paths — `profilesKey`;
-        /// never stored or logged — `CursorLogin` is dropped after the cookie;
-        /// once — `newest_per_account`; deletes — orphan cleanup on the next
-        /// on push, everything on an off push (`set_from_json`).
-        static let profilesPrivacy = "To sync another Cursor profile (a folder you start Cursor with using --user-data-dir), add its folder. At each sync Syrtis reads that profile's login and sends it only to Cursor's usage service (cursor.com). Syrtis stores the date, model, token counts, cost and conversation ID of each request in its own folder, one per profile, and keeps the folder paths you add in its settings; the login itself is never saved or logged. All profiles add up to one Cursor total, and an account signed in to several profiles counts once. Removing a profile deletes its downloaded usage the next time Syrtis can; turning sync off deletes all of it."
+        /// Second paragraph, always shown under `privacy` (the ⓘ, and the
+        /// consent surfaces via `consentParagraphs`), so "above" is that
+        /// paragraph. Each sentence, checked against the code:
+        /// handled as above — an added profile goes through the same walk as
+        /// the default: `cursor_desktop::read_login_checked` on
+        /// `<root>/User/globalStorage/state.vscdb` each round,
+        /// `cursor_sync::walk` posting only to `USAGE_EVENTS_URL` (cursor.com,
+        /// https-only, no redirects; added profiles never feed Grok Bot),
+        /// `commit_file` writing only the parser fields into
+        /// `<appDir>/cursor-profiles/<id>`, and `CursorLogin` dropped after the
+        /// cookie (never stored or logged); one total, counted once —
+        /// `newest_per_account`; deletes the next time Syrtis can — orphan
+        /// cleanup on the next accepted on push (`set_from_json`), a failure
+        /// raising `cleanupFailed`.
+        static let profilesPrivacy = "Add a folder you start Cursor with using --user-data-dir to sync it too; each profile's sign-in is handled as described above. All profiles add up to one Cursor total, and an account signed in to several profiles counts once. Removing a profile deletes its downloaded usage the next time Syrtis can."
 
         /// Under the add button when `addRefusal` refuses a folder.
         static let cantAdd = "That folder can't be added."
