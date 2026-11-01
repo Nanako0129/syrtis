@@ -260,7 +260,6 @@ fn stop(state: State, reason: Option<&'static str>) -> Outcome {
         stop: Stop::new(state, reason),
         events: 0,
         duplicate_of: None,
-        wrote: false,
     }
 }
 
@@ -269,7 +268,6 @@ fn ok(events: usize) -> Outcome {
         stop: Stop::new(State::Ok, None),
         events,
         duplicate_of: None,
-        wrote: true,
     }
 }
 
@@ -2402,18 +2400,12 @@ fn cli_present_carries_no_other_reason() {
     let mismatched = login_db(&tmp.path().join("default"), &valid_token(), OTHER_USER);
     let root = profile_root(tmp.path(), "b", &other_token(), OTHER_USER);
     let registry = RwLock::new(multi(&home, true, vec![profile(PROFILE_A, &root)]));
-    let (url, _) = serve(vec![json_ok(&page(1, &["a"])), json_ok(&page(1, &["a"]))]);
+    let (url, _) = serve(vec![json_ok(&page(1, &["a"]))]);
     let status = sync_round_in(&mismatched, &url, &registry, limits(), Some(&home));
     assert_eq!(states(&status), ["error:account_mismatch", "ok"]);
     assert_eq!(
         (status["state"].as_str(), status.get("reason")),
         (Some("cliPresent"), None)
-    );
-    // An unchanged round still asks the D6 question.
-    let again = sync_round_in(&mismatched, &url, &registry, limits(), Some(&home));
-    assert_eq!(
-        (again["state"].as_str(), again["changed"].as_bool()),
-        (Some("cliPresent"), Some(false))
     );
 }
 
@@ -2598,32 +2590,4 @@ fn a_profile_removed_mid_walk_does_not_cover_its_account() {
     );
     assert!(covers_account(Stop::error("rate_limited")));
     assert!(!covers_account(Stop::new(State::Disabled, None)));
-}
-
-/// Round 3, item 5: a round that fetches the same history leaves the file
-/// as it is (same inode and mtime) and reports `changed: false`.
-#[cfg(unix)]
-#[test]
-fn an_identical_round_rewrites_nothing() {
-    use std::os::unix::fs::MetadataExt as _;
-    let _guard = lock();
-    let tmp = tempfile::tempdir().unwrap();
-    let home = tmp.path().join("home");
-    let default_db = login_db(&tmp.path().join("default"), &valid_token(), USER);
-    let registry = RwLock::new(multi(&home, true, vec![]));
-    let (url, _) = serve(vec![json_ok(&page(1, &["a"])), json_ok(&page(1, &["a"]))]);
-    let first = sync_round(&default_db, &url, &registry);
-    assert_eq!(first["changed"], true);
-    let file = expected_file(&default_sync_dir(&home));
-    let before = std::fs::metadata(&file).unwrap();
-    std::thread::sleep(Duration::from_millis(20));
-    let second = sync_round(&default_db, &url, &registry);
-    assert_eq!(states(&second), ["ok"]);
-    assert_eq!(second["changed"], false);
-    let after = std::fs::metadata(&file).unwrap();
-    assert_eq!(
-        (before.ino(), before.modified().unwrap()),
-        (after.ino(), after.modified().unwrap())
-    );
-    assert!(second["lastSuccessMs"].as_u64().unwrap() >= first["lastSuccessMs"].as_u64().unwrap());
 }

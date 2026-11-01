@@ -84,16 +84,19 @@ pub(crate) fn read_login_checked(db_path: &Path) -> Result<Option<CursorLogin>, 
 /// every release did, then opens the resolved file the checked way (regular
 /// file, NOFOLLOW, DEFENSIVE, trusted_schema=OFF) without an owner check
 /// (earlier releases had none; volumes with ignored ownership report uid
-/// 99). A path that cannot be resolved or is not a regular file is "not
-/// signed in", as `read_login` treats it. Grok Bot keeps `read_login`.
+/// 99). A path that does not exist or resolves to a directory is "not signed
+/// in", as `read_login` treats it; any other resolve or open failure is
+/// `login_unreadable`. Grok Bot keeps `read_login`.
 pub(crate) fn read_login_resolved(db_path: &Path) -> Result<Option<CursorLogin>, &'static str> {
-    let Ok(real) = std::fs::canonicalize(db_path) else {
-        return Ok(None);
+    let real = match std::fs::canonicalize(db_path) {
+        Ok(real) => real,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err("login_unreadable"),
     };
-    match read_checked(&real, None) {
-        Err("db_not_file") => Ok(None),
-        other => other,
+    if real.is_dir() {
+        return Ok(None);
     }
+    read_checked(&real, None)
 }
 
 /// `owner`: the uid the file must belong to; `None` skips that check.
@@ -276,8 +279,8 @@ mod checked_open_tests {
     }
 
     /// The default profile follows a symlinked database and opens the
-    /// target; a target that is not a regular file, an absent one, or one
-    /// below a non-directory is "not signed in", as `read_login` treats it.
+    /// target; an absent path or a directory is "not signed in", as
+    /// `read_login` treats it, and any other failure is an error.
     #[cfg(unix)]
     #[test]
     fn the_default_reader_follows_a_symlink_and_treats_non_files_as_signed_out() {
@@ -292,11 +295,22 @@ mod checked_open_tests {
             to_dir,
             tmp.path().to_path_buf(),
             tmp.path().join("absent.vscdb"),
-            path.join("below-a-file.vscdb"),
+            tmp.path().join("absent/state.vscdb"),
         ] {
             assert!(
                 matches!(read_login_resolved(&signed_out), Ok(None)),
                 "{signed_out:?}"
+            );
+        }
+        // Any other failure is an error, not "signed out": a path below a
+        // file (ENOTDIR) and a symlink loop (ELOOP).
+        let looped = tmp.path().join("loop.vscdb");
+        std::os::unix::fs::symlink(&looped, &looped).unwrap();
+        for broken in [path.join("below-a-file.vscdb"), looped] {
+            assert_eq!(
+                read_login_resolved(&broken).err(),
+                Some("login_unreadable"),
+                "{broken:?}"
             );
         }
     }

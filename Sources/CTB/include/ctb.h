@@ -277,16 +277,14 @@ char *tb_set_cursor_sync(const char *json);
 // `{"state":"ok|partial|expired|notSignedIn|offline|error|disabled|cliPresent",
 // "events":N,"lastSuccessMs":ms|null,"reason"?:"<fixed code>","changed":bool,
 // "profiles":[{"id","state","events","lastSuccessMs","reason"?,
-// "duplicateOf"?}]}`. `changed`: some profile's file bytes changed (scan
-// caches were invalidated; refresh views whatever the headline state); a
-// round that fetches the same history rewrites nothing and reports false.
-// A profile whose account an earlier profile already covered this round is
-// `duplicate` with `duplicateOf` = that profile's id. A walk covers its
-// account when it synced or failed for the whole account: rate_limited,
-// offline, server_error (5xx), partial (timeout, budget_exhausted). Any
-// other failure (expired/401/redirect/403 JSON, disabled, client_unavailable,
-// other refusals, a failed write) covers nothing, so the next profile on the
-// account tries its own session. `app_dir_rejected`: the appDir no longer
+// "duplicateOf"?}]}`. `changed`: some profile wrote its file (every
+// successful walk rewrites it; scan caches were invalidated, refresh views
+// whatever the headline state). A profile whose account an earlier profile
+// already covered this round is `duplicate` with `duplicateOf` = that
+// profile's id. Every walk failure covers its account except one specific to
+// that profile's session or to this machine: expired (local expiry, 401,
+// redirect, 403 JSON), disabled (removed mid-walk), client_unavailable and
+// write_failed; then the next profile on the account tries its own session. `app_dir_rejected`: the appDir no longer
 // passes the checks of `tb_set_cursor_sync`; nothing is read, written or
 // registered from it.
 // `cliPresent` = a walk completed but tokscale CLI Cursor files exist and the
