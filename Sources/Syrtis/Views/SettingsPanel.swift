@@ -1713,12 +1713,21 @@ private struct SettingsInfoButton<Details: View>: View {
     @State private var pending: Task<Void, Never>?
 
     var body: some View {
-        // Hover opens the popover; a click / Space / Return pins it open;
-        // Escape or a click elsewhere closes it.
+        // Hover opens the popover; Space / Return (or a click) pins it open and
+        // a second Space / Return closes it. With the mouse, a click on the icon
+        // while the popover is open dismisses it on mouse-down and the action
+        // then reopens it, so the mouse closes it by clicking elsewhere or with
+        // Escape. The Escape and click-elsewhere paths are being checked by hand
+        // in the preview; this code has not been run in a GUI.
         Button {
             pending?.cancel()
-            pinned = true
-            shown = true
+            if shown && pinned {
+                shown = false
+                pinned = false
+            } else {
+                pinned = true
+                shown = true
+            }
         } label: {
             Image(systemName: "info.circle")
                 .font(.caption2)

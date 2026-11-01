@@ -17907,12 +17907,15 @@ enum SelfTest {
             // SettingsPanel wiring (popover isPresented setter -> cancelEnable,
             // Continue -> confirmEnable, the row's onDisappear -> cancelEnable)
             // has no seam and is not observed here. Turning the switch on
-            // enables and acknowledges nothing until confirmEnable(); cancel
-            // leaves everything as it was. Run from the shipped default (keys
-            // absent: enabled reads true, notice false) and from an explicit off.
+            // enables and acknowledges nothing until confirmEnable(). Asserted
+            // for cancel: pending cleared, notice not acknowledged, and the
+            // stored enabled key unchanged (still absent from the default
+            // start, still false from an explicit off). Run from the shipped
+            // default (key absent: enabled reads true, notice false) and from
+            // an explicit off.
             @MainActor func consentState(
                 _ start: Bool?, _ steps: (CursorSyncController, UserDefaults, [String]) -> Void
-            ) -> (shown: Bool, enabled: Bool, ack: Bool, pending: Bool) {
+            ) -> (shown: Bool, enabled: Bool, raw: Bool?, ack: Bool, pending: Bool) {
                 let cs = "tokenbar.selftest.cursorConfirm"
                 let d = UserDefaults(suiteName: cs)!
                 defer { d.removePersistentDomain(forName: cs) }
@@ -17921,7 +17924,7 @@ enum SelfTest {
                 let c = CursorSyncController()
                 steps(c, d, ["Syrtis", "--demo"])
                 let en = CursorSync.enabled(defaults: d), ack = CursorSync.noticeAcknowledged(defaults: d)
-                return (CursorSync.toggleShowsOn(enabled: en, acknowledged: ack), en, ack, c.confirmPending)
+                return (CursorSync.toggleShowsOn(enabled: en, acknowledged: ack), en, d.object(forKey: CursorSync.enabledKey) as? Bool, ack, c.confirmPending)
             }
             let consent: [(String, Bool)] = { () -> [(String, Bool)] in
                 var ok: [(String, Bool)] = []
@@ -17929,18 +17932,18 @@ enum SelfTest {
                     let tag = start == nil ? "default" : "off"
                     let asked = consentState(start) { c, d, a in c.switchChanged(to: true, defaults: d, arguments: a) }
                     ok.append(("\(tag): on only asks", asked.pending && !asked.shown && !asked.ack
-                        && asked.enabled == (start == nil)))
+                        && asked.raw == start))
                     let cancelled = consentState(start) { c, d, a in
                         c.switchChanged(to: true, defaults: d, arguments: a); c.cancelEnable()
                     }
                     ok.append(("\(tag): cancel enables nothing", !cancelled.pending && !cancelled.shown && !cancelled.ack
-                        && cancelled.enabled == (start ?? true)))
+                        && cancelled.raw == start))
                     let confirmed = consentState(start) { c, d, a in
                         c.switchChanged(to: true, defaults: d, arguments: a); c.confirmEnable(defaults: d, arguments: a)
                     }
                     ok.append(("\(tag): confirm enables and acknowledges", !confirmed.pending && confirmed.shown && confirmed.ack))
                     let unasked = consentState(start) { c, d, a in c.confirmEnable(defaults: d, arguments: a) }
-                    ok.append(("\(tag): confirm without asking does nothing", !unasked.shown && !unasked.ack && unasked.enabled == (start ?? true)))
+                    ok.append(("\(tag): confirm without asking does nothing", !unasked.shown && !unasked.ack && unasked.raw == start))
                 }
                 let off = consentState(true) { c, d, a in
                     c.switchChanged(to: true, defaults: d, arguments: a); c.confirmEnable(defaults: d, arguments: a)
