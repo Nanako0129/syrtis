@@ -17112,60 +17112,6 @@ enum SelfTest {
         let piRootA = "/Users/x/pi-usage-a"
         let piRootB = "/Users/x/pi-usage-b"
 
-        // The upgrade case: with no Pi roots configured the payload must be
-        // exactly the Claude-only string the previous build stored in
-        // `appliedKey`. A new empty `pi` key would look like a root change and
-        // cost every user a cache-bypassing rescan on first launch.
-        expect(
-            ExtraScanRoots.payloadJSON(
-                claudeConfigDirs: ["/Users/x/.claude-work"], piRoots: [])
-                == #"{"claude":["\/Users\/x\/.claude-work\/projects","\/Users\/x\/.claude-work\/transcripts"]}"#,
-            "PI-ROOTS with no Pi roots the payload is byte-identical to the "
-                + "Claude-only payload, so an upgrade does not force an unnecessary "
-                + "cache drop (mutation: adding an empty \"pi\" key)")
-
-        let piOnly = ExtraScanRoots.payloadJSON(
-            claudeConfigDirs: ["/Users/x/.claude-work"], piRoots: [piRootA])
-        let piOnlyDecoded = try! JSONDecoder().decode(
-            [String: [String]].self, from: Data(piOnly.utf8))
-        expect(
-            piOnlyDecoded["claude"] == ClaudeExtraRoots.expand("/Users/x/.claude-work")
-                && piOnlyDecoded["pi"] == [piRootA],
-            "PI-ROOTS a Pi change carries Claude's expanded roots too, because a "
-                + "Pi-only payload would clear them (mutation: sending {\"pi\":[...]} alone)")
-
-        let claudeOnlyWithPi = ExtraScanRoots.payloadJSON(
-            claudeConfigDirs: ["/Users/x/.claude-other"], piRoots: [piRootA])
-        let claudeOnlyWithPiDecoded = try! JSONDecoder().decode(
-            [String: [String]].self, from: Data(claudeOnlyWithPi.utf8))
-        expect(
-            claudeOnlyWithPiDecoded["claude"]
-                == ClaudeExtraRoots.expand("/Users/x/.claude-other")
-                && claudeOnlyWithPiDecoded["pi"] == [piRootA],
-            "PI-ROOTS a Claude change still carries the configured Pi roots, so it "
-                + "does not clear them (mutation: building the payload from Claude's "
-                + "list alone)")
-
-        let piEmpty = ExtraScanRoots.payloadJSON(claudeConfigDirs: [], piRoots: [])
-        let piEmptyDecoded = try! JSONDecoder().decode(
-            [String: [String]].self, from: Data(piEmpty.utf8))
-        expect(
-            piEmpty == ClaudeExtraRoots.payloadJSON([])
-                && piEmptyDecoded["claude"] == []
-                && piEmptyDecoded["pi"] == nil,
-            "PI-ROOTS an empty registry is still the canonical Claude-only empty "
-                + "payload — the full-replace clear path — rather than a payload that "
-                + "leaves one client's old roots behind")
-
-        let piDup = ExtraScanRoots.payloadJSON(
-            claudeConfigDirs: [], piRoots: [piRootA, "\(piRootA)/", piRootA])
-        let piDupDecoded = try! JSONDecoder().decode(
-            [String: [String]].self, from: Data(piDup.utf8))
-        expect(
-            piDupDecoded["pi"] == [piRootA],
-            "PI-ROOTS repeated Pi roots are standardized and deduplicated before "
-                + "the wire, so one folder cannot enter the scan twice")
-
         let piHomeForDsh = FileManager.default.homeDirectoryForCurrentUser.path
         let dshRoot = "/Volumes/dsh-home/sessions"
         let dshWithPi = ExtraScanRoots.payloadJSON(
@@ -17183,9 +17129,12 @@ enum SelfTest {
                 && dshOnlyDecoded["pi"] == nil
                 && ExtraScanRoots.payloadJSON(claudeConfigDirs: [], piRoots: [], dshRoots: [])
                     == ClaudeExtraRoots.payloadJSON([])
-                && ExtraScanRoots.payloadJSON(claudeConfigDirs: [], piRoots: [piRootA])
-                    == ExtraScanRoots.payloadJSON(
-                        claudeConfigDirs: [], piRoots: [piRootA], dshRoots: []),
+                && ExtraScanRoots.payloadJSON(
+                    claudeConfigDirs: ["/Users/x/.claude-work"], piRoots: [piRootA], dshRoots: [])
+                    .hasSuffix("\"pi\":" + String(
+                        data: try! JSONEncoder().encode([piRootA]), encoding: .utf8)! + "}")
+                && !ExtraScanRoots.payloadJSON(
+                    claudeConfigDirs: [], piRoots: [piRootA], dshRoots: []).contains("dsh"),
             "DSH-ROOTS the payload carries a deduplicated \"dsh\" list next to Pi's, "
                 + "a DSH-only payload still carries Claude, and with no DSH roots the "
                 + "payload is byte-identical to the pre-DSH one (mutation: dropping the "
@@ -17195,6 +17144,76 @@ enum SelfTest {
                 && ExtraScanRoots.Dsh.isRejectedRoot(piHomeForDsh)
                 && !ExtraScanRoots.Dsh.isRejectedRoot("\(piHomeForDsh)/.dsh-copy/sessions"),
             "DSH-ROOTS DSH has its own storage key and refuses a home-wide root")
+
+        // The production path: what `apply` hands to the core. Persist through
+        // `Dsh.save` into a scratch suite and read the payload back from
+        // `currentPayload`, the function `apply` uses.
+        let dshSuite = "tokenbar.selftest.dsh.\(UUID().uuidString)"
+        if let d = UserDefaults(suiteName: dshSuite) {
+            defer { d.removePersistentDomain(forName: dshSuite) }
+            ExtraScanRoots.Dsh.save([dshRoot, "\(dshRoot)/"], defaults: d)
+            let applied = try! JSONDecoder().decode(
+                [String: [String]].self,
+                from: Data(ExtraScanRoots.currentPayload(dshDefaults: d).utf8))
+            expect(
+                applied["dsh"] == [dshRoot],
+                "DSH-ROOTS the saved DSH folders reach the payload apply() sends to the core "
+                    + "(mutation: apply building its payload with dshRoots: [])")
+        }
+
+        // The upgrade case: with no Pi roots configured the payload must be
+        // exactly the Claude-only string the previous build stored in
+        // `appliedKey`. A new empty `pi` key would look like a root change and
+        // cost every user a cache-bypassing rescan on first launch.
+        expect(
+            ExtraScanRoots.payloadJSON(
+                claudeConfigDirs: ["/Users/x/.claude-work"], piRoots: [], dshRoots: [])
+                == #"{"claude":["\/Users\/x\/.claude-work\/projects","\/Users\/x\/.claude-work\/transcripts"]}"#,
+            "PI-ROOTS with no Pi roots the payload is byte-identical to the "
+                + "Claude-only payload, so an upgrade does not force an unnecessary "
+                + "cache drop (mutation: adding an empty \"pi\" key)")
+
+        let piOnly = ExtraScanRoots.payloadJSON(
+            claudeConfigDirs: ["/Users/x/.claude-work"], piRoots: [piRootA], dshRoots: [])
+        let piOnlyDecoded = try! JSONDecoder().decode(
+            [String: [String]].self, from: Data(piOnly.utf8))
+        expect(
+            piOnlyDecoded["claude"] == ClaudeExtraRoots.expand("/Users/x/.claude-work")
+                && piOnlyDecoded["pi"] == [piRootA],
+            "PI-ROOTS a Pi change carries Claude's expanded roots too, because a "
+                + "Pi-only payload would clear them (mutation: sending {\"pi\":[...]} alone)")
+
+        let claudeOnlyWithPi = ExtraScanRoots.payloadJSON(
+            claudeConfigDirs: ["/Users/x/.claude-other"], piRoots: [piRootA], dshRoots: [])
+        let claudeOnlyWithPiDecoded = try! JSONDecoder().decode(
+            [String: [String]].self, from: Data(claudeOnlyWithPi.utf8))
+        expect(
+            claudeOnlyWithPiDecoded["claude"]
+                == ClaudeExtraRoots.expand("/Users/x/.claude-other")
+                && claudeOnlyWithPiDecoded["pi"] == [piRootA],
+            "PI-ROOTS a Claude change still carries the configured Pi roots, so it "
+                + "does not clear them (mutation: building the payload from Claude's "
+                + "list alone)")
+
+        let piEmpty = ExtraScanRoots.payloadJSON(claudeConfigDirs: [], piRoots: [], dshRoots: [])
+        let piEmptyDecoded = try! JSONDecoder().decode(
+            [String: [String]].self, from: Data(piEmpty.utf8))
+        expect(
+            piEmpty == ClaudeExtraRoots.payloadJSON([])
+                && piEmptyDecoded["claude"] == []
+                && piEmptyDecoded["pi"] == nil,
+            "PI-ROOTS an empty registry is still the canonical Claude-only empty "
+                + "payload — the full-replace clear path — rather than a payload that "
+                + "leaves one client's old roots behind")
+
+        let piDup = ExtraScanRoots.payloadJSON(
+            claudeConfigDirs: [], piRoots: [piRootA, "\(piRootA)/", piRootA], dshRoots: [])
+        let piDupDecoded = try! JSONDecoder().decode(
+            [String: [String]].self, from: Data(piDup.utf8))
+        expect(
+            piDupDecoded["pi"] == [piRootA],
+            "PI-ROOTS repeated Pi roots are standardized and deduplicated before "
+                + "the wire, so one folder cannot enter the scan twice")
 
         // Path shape: home, root and every ancestor of home are refused, because
         // a Pi root is walked recursively as-is; a missing path is kept (and
@@ -17233,7 +17252,7 @@ enum SelfTest {
             ExtraScanPathsResult.self, from: Data(piPartialJSON.utf8))
         let piRequested = ExtraScanRoots.payloadJSON(
             claudeConfigDirs: ["/Users/x/.claude-work"],
-            piRoots: [piRootA, piRootB, piMissing])
+            piRoots: [piRootA, piRootB, piMissing], dshRoots: [])
         let piRegistered = ClaudeExtraRoots.registeredJSON(
             piRequested, rejected: piPartial.rejected)
         let piRegisteredDecoded = try! JSONDecoder().decode(
@@ -17288,7 +17307,7 @@ enum SelfTest {
             ClaudeExtraRoots.resetApplyClaimForTesting()
             let payload = ExtraScanRoots.payloadJSON(
                 claudeConfigDirs: ["/tmp/tokenbar-pi-moved-claude"],
-                piRoots: ["/tmp/tokenbar-pi-moved-root"])
+                piRoots: ["/tmp/tokenbar-pi-moved-root"], dshRoots: [])
             let result = try? JSONDecoder().decode(
                 ExtraScanPathsResult.self,
                 from: Data(#"{"registeredCount":2,"unreadable":[],"rejected":[]}"#.utf8))

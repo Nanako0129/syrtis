@@ -79,7 +79,7 @@ enum ClaudeExtraRoots {
     /// list clears the registry (the Settings rollback path).
     ///
     /// Claude-only, and kept byte-compatible: `ExtraScanRoots.payloadJSON`
-    /// returns this exact string when no Pi roots are configured, so an
+    /// returns this exact string when no Pi or DSH roots are configured, so an
     /// upgrade does not look like a scan-root change.
     static func payloadJSON(_ configDirs: [String]) -> String {
         let object = ["claude": expandedPaths(configDirs)]

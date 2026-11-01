@@ -955,4 +955,49 @@ mod tests {
         assert_eq!(dsh_report(&context), (155, 2), "a distinct step in the extra root adds");
         reset();
     }
+
+    // A16: the same once-check through the lanes the app shows (a15 covers the
+    // parse count lane): `tb_graph`'s `simple_lane!` path and `tb_window_usage`.
+    // The step time is recent so neither report's date handling drops it.
+    #[test]
+    fn a16_dsh_duplicate_across_roots_counts_once_in_graph_and_window_lanes() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        reset();
+        const T: i64 = 1_791_661_487_168;
+        let home = tempfile::tempdir().unwrap();
+        let extra = tempfile::tempdir().unwrap();
+        write_dsh_session(&home.path().join(".dsh/sessions/proj"), "session-a", T, 100, 20);
+        let extra_root = extra.path().join("sessions");
+        write_dsh_session(&extra_root.join("proj"), "session-a", T, 100, 20);
+        let context = context_for(home.path());
+        let payload = serde_json::json!({ "dsh": [extra_root.display().to_string()] }).to_string();
+        set_from_json(&payload).unwrap();
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let graph_tokens = |ctx: &LocalSourceContext| -> i64 {
+            let options = ctx.report_options(None, Some(vec!["dsh".to_string()]));
+            rt.block_on(tokscale_core::generate_local_graph_report_local_only(options))
+                .unwrap()
+                .graph()
+                .summary
+                .total_tokens
+        };
+        let window_rows = |ctx: &LocalSourceContext| -> usize {
+            let options = ctx.report_options(None, Some(vec!["dsh".to_string()]));
+            rt.block_on(tokscale_core::get_window_usage(options, T - 1, T + 10_000_000))
+                .unwrap()
+                .messages
+                .len()
+        };
+        assert_eq!(
+            (graph_tokens(&context), window_rows(&context)),
+            (120, 1),
+            "(graph tokens, window rows): same step under two roots counts once"
+        );
+
+        // Control: a distinct step in the extra root adds in both lanes.
+        write_dsh_session(&extra_root.join("proj"), "session-b", T + 1000, 30, 5);
+        assert_eq!((graph_tokens(&context), window_rows(&context)), (155, 2));
+        reset();
+    }
 }

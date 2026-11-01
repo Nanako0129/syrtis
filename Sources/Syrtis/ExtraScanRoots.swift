@@ -77,21 +77,21 @@ enum ExtraScanRoots {
     enum Dsh {
         static let storageKey = "tokenbar.dsh.extraRoots"
 
-        static func load() -> [String] {
-            guard let raw = UserDefaults.standard.string(forKey: storageKey),
+        /// `defaults` is a parameter only so SelfTest can use a scratch suite
+        /// instead of the app's real preferences.
+        static func load(defaults: UserDefaults = .standard) -> [String] {
+            guard let raw = defaults.string(forKey: storageKey),
                 let data = raw.data(using: .utf8),
                 let paths = try? JSONDecoder().decode([String].self, from: data)
             else { return [] }
             return paths
         }
 
-        static func save(_ paths: [String]) {
+        static func save(_ paths: [String], defaults: UserDefaults = .standard) {
             let data = (try? JSONEncoder().encode(standardizedUnique(paths))) ?? Data("[]".utf8)
-            UserDefaults.standard.set(
-                String(data: data, encoding: .utf8) ?? "[]", forKey: storageKey)
+            defaults.set(String(data: data, encoding: .utf8) ?? "[]", forKey: storageKey)
         }
 
-        static func isMissing(_ path: String) -> Bool { Pi.isMissing(path) }
         static func isRejectedRoot(_ path: String) -> Bool { Pi.isRejectedRoot(path) }
         static func missingRoots(
             in paths: [String],
@@ -103,24 +103,22 @@ enum ExtraScanRoots {
 
     /// The complete payload for all clients.
     ///
-    /// With no Pi roots this returns `ClaudeExtraRoots.payloadJSON` unchanged
-    /// byte-for-byte. That is not cosmetic: `appliedKey` stores the last
+    /// With no Pi and no DSH roots this returns `ClaudeExtraRoots.payloadJSON`
+    /// unchanged byte-for-byte. That is not cosmetic: `appliedKey` stores the last
     /// accepted payload, and `install` drops the scan caches and advances the
     /// generation only when it moved. Re-encoding the same registry
     /// differently on the first launch after an upgrade would force a
     /// cache-bypassing rescan and reject the restart snapshot for a root set
     /// that never changed.
     ///
-    /// The two-key form is assembled from two separately encoded arrays rather
-    /// than a dictionary so its byte order is stable across launches. The
-    /// engine reads a full object, and both keys are always present together:
-    /// omitting one would clear that client's roots.
-    ///
-    /// `pi` and `dsh` appear only when non-empty: the setter is full-replace, so
-    /// an absent key already means "no roots for that client", and omitting
-    /// them keeps every pre-DSH payload byte-identical.
+    /// The multi-key form is assembled from separately encoded arrays rather
+    /// than a dictionary so its byte order is stable across launches (always
+    /// `claude`, then `pi`, then `dsh`). The engine reads a full object and the
+    /// setter is full-replace, so `claude` is always present, while `pi` and
+    /// `dsh` appear only when non-empty: an absent key already means "no roots
+    /// for that client". That also keeps every pre-DSH payload byte-identical.
     static func payloadJSON(
-        claudeConfigDirs: [String], piRoots: [String], dshRoots: [String] = []
+        claudeConfigDirs: [String], piRoots: [String], dshRoots: [String]
     ) -> String {
         let piPaths = standardizedUnique(piRoots)
         let dshPaths = standardizedUnique(dshRoots)
@@ -162,17 +160,20 @@ enum ExtraScanRoots {
     /// Apply the merged registry at launch and after every edit. The install
     /// machinery (quota registry, applied marker, generation, cache
     /// invalidation, and quota wake) stays in `ClaudeExtraRoots`, which is
-    /// where both clients' applies have always run.
+    /// where every client's apply has always run.
     static func apply(
         then completion: (@Sendable @MainActor (ExtraScanPathsResult?) -> Void)? = nil
     ) {
-        ClaudeExtraRoots.apply(
-            scanPayload: {
-                payloadJSON(
-                    claudeConfigDirs: ClaudeExtraRoots.load(),
-                    piRoots: Pi.load(), dshRoots: Dsh.load())
-            },
-            then: completion)
+        ClaudeExtraRoots.apply(scanPayload: { currentPayload() }, then: completion)
+    }
+
+    /// The payload `apply` hands to the core, built from the persisted lists.
+    /// A separate function so SelfTest observes the production path;
+    /// `dshDefaults` is only for a scratch suite.
+    static func currentPayload(dshDefaults: UserDefaults = .standard) -> String {
+        payloadJSON(
+            claudeConfigDirs: ClaudeExtraRoots.load(),
+            piRoots: Pi.load(), dshRoots: Dsh.load(defaults: dshDefaults))
     }
 
     private static func standardizedPath(_ path: String) -> String {
