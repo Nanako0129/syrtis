@@ -88,25 +88,31 @@ enum CursorSync {
     /// The folder's file identity (a final symlink followed), so another
     /// spelling of the same folder — a symlink, a firmlink such as
     /// /System/Volumes/Data, a different case — compares equal on any volume.
-    /// nil for a folder that can't be read (gone, unmounted): never a match.
+    /// nil for a folder that can't be read (gone, unmounted): never an
+    /// identity match (`cantAdd` then compares path strings).
     static func folderIdentity(_ path: String) -> NSObject? {
         (try? URL(fileURLWithPath: path).resolvingSymlinksInPath()
             .resourceValues(forKeys: [.fileResourceIdentifierKey]))?.fileResourceIdentifier as? NSObject
     }
 
-    /// A folder that can't be added, checked before anything is saved: one bad
-    /// entry would make the core reject the whole config and stop every
-    /// profile's sync. Refused: a 33rd profile, a relative path or "/",
-    /// Cursor's own folder, a folder already listed.
+    /// A folder that can't be added, checked before anything is saved. A 33rd
+    /// profile or a relative path or "/" would make the core reject the whole
+    /// config (`cursor_sync::parse_config`) and stop every profile's sync.
+    /// Cursor's own folder and a folder already listed are refused only to
+    /// avoid a duplicate row and a second read of the same login.
     static func cantAdd(
         root: String, existing: [Profile],
         home: URL = FileManager.default.homeDirectoryForCurrentUser
     ) -> Bool {
         let standard = (root as NSString).standardizingPath
         if existing.count >= maxProfiles || !standard.hasPrefix("/") || standard == "/" { return true }
-        guard let identity = folderIdentity(standard) else { return false }
         let cursorOwn = home.appendingPathComponent("Library/Application Support/Cursor").path
-        return ([cursorOwn] + existing.map(\.root)).contains { folderIdentity($0)?.isEqual(identity) == true }
+        let candidates = [cursorOwn] + existing.map(\.root)
+        guard let identity = folderIdentity(standard) else {
+            // Unreadable: the path string is all there is to compare.
+            return candidates.contains { ($0 as NSString).standardizingPath == standard }
+        }
+        return candidates.contains { folderIdentity($0)?.isEqual(identity) == true }
     }
 
     /// What the consent surfaces show: the privacy paragraph, plus the added
@@ -197,10 +203,11 @@ enum CursorSync {
         /// `commit_file` writing only the parser fields into
         /// `<appDir>/cursor-profiles/<id>`, and `CursorLogin` dropped after the
         /// cookie (never stored or logged); one total, counted once —
-        /// `newest_per_account`; deletes the next time Syrtis can — orphan
-        /// cleanup on the next accepted on push (`set_from_json`), a failure
-        /// raising `cleanupFailed`.
-        static let profilesPrivacy = "Add a folder you start Cursor with using --user-data-dir to sync it too; each profile's sign-in is handled as described above. All profiles add up to one Cursor total, and an account signed in to several profiles counts once. Removing a profile deletes its downloaded usage the next time Syrtis can."
+        /// `newest_per_account`; deletes the next time Syrtis can — the core's
+        /// orphan cleanup runs on the next accepted on push (`set_from_json`);
+        /// a failure there is not surfaced. Folder path in settings —
+        /// `profilesKey`.
+        static let profilesPrivacy = "Add a folder you start Cursor with using --user-data-dir to sync it too (Syrtis keeps the folder path in its settings); each profile's sign-in is handled as described above. All profiles add up to one Cursor total, and an account signed in to several profiles counts once. Removing a profile deletes its downloaded usage the next time Syrtis can."
 
         /// Under the add button when `cantAdd` refuses a folder.
         static let cantAdd = "That folder can't be added."

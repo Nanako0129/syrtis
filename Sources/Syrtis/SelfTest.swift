@@ -18389,6 +18389,7 @@ enum SelfTest {
         // Duplicate folders are found by file identity, on real temp folders:
         // a symlink, and (when present) the /System/Volumes/Data firmlink
         // spelling. Mutation: compare plain paths, and those adds succeed.
+        let cursorFirmlinkSkipped = UncheckedBox<Bool>(false)
         let cursorProfiles: [String: Bool]? = awaitMainActorValue {
             let suite = "tokenbar.selftest.cursorProfiles"
             let defaults = UserDefaults(suiteName: suite)!
@@ -18408,10 +18409,13 @@ enum SelfTest {
             try? fm.createSymbolicLink(atPath: rootLink, withDestinationPath: rootURL.path)
             try? fm.createSymbolicLink(atPath: ownLink, withDestinationPath: cursorOwn.path)
             // realpath, not resolvingSymlinksInPath (which drops "/private").
-            let firmlinked = "/System/Volumes/Data" + (realpath(rootURL.path, nil).map {
-                defer { free($0) }
-                return String(cString: $0)
-            } ?? rootURL.path)
+            // nil when realpath fails or the temp dir has no such spelling
+            // (another volume): that check is then skipped, not passed.
+            let firmlinked = realpath(rootURL.path, nil).map { resolved -> String in
+                defer { free(resolved) }
+                return "/System/Volumes/Data" + String(cString: resolved)
+            }.flatMap { fm.fileExists(atPath: $0) ? $0 : nil }
+            cursorFirmlinkSkipped.value = firmlinked == nil
             let pushes = UncheckedBox<[String]>([])
             let syncs = UncheckedBox<Int>(0)
             let setConfig: CursorSync.SetConfig = { pushes.value.append($0); return false }
@@ -18432,8 +18436,9 @@ enum SelfTest {
             ok["off add accepted"] = add(root)
             ok["symlink to a listed folder refused"] = !add(rootLink)
             // Present on APFS system volumes; recorded either way.
-            ok["firmlink spelling refused"] = !fm.fileExists(atPath: firmlinked) || !add(firmlinked)
-            ok["firmlink fixture present"] = fm.fileExists(atPath: firmlinked)
+            if let firmlinked {
+                ok["firmlink spelling refused"] = !add(firmlinked)
+            }
             let stored = CursorSync.profiles(defaults: defaults)
             let id = stored.first?.id ?? ""
             ok["uppercase UUID"] = id.count == 36 && id == id.uppercased() && UUID(uuidString: id) != nil
@@ -18451,12 +18456,15 @@ enum SelfTest {
             defaults.removeObject(forKey: CursorSync.enabledKey)
             defaults.removeObject(forKey: CursorSync.noticeKey)
             ok["unanswered add accepted"] = add(root)
+            // A folder whose identity can't be read falls back to the path.
+            let gone = base.appendingPathComponent("gone-folder").path
+            ok["unreadable folder added once"] = add(gone) && !add(gone)
             // Refused before anything is saved.
             let before = CursorSync.profiles(defaults: defaults)
             ok["\"/\" refused"] = !add("/")
             ok["Cursor's own folder refused"] = !add(cursorOwn.path)
             ok["a symlink to Cursor's own folder refused"] = !add(ownLink)
-            let full = before + (1..<CursorSync.maxProfiles).map {
+            let full = before + (before.count..<CursorSync.maxProfiles).map {
                 CursorSync.Profile(id: UUID().uuidString, root: "/Volumes/selftest/p\($0)")
             }
             CursorSync.saveProfiles(full, defaults: defaults)
@@ -18511,6 +18519,9 @@ enum SelfTest {
         }
         expect(cursorProfiles?.values.allSatisfy { $0 } == true,
                "CURSOR-PROFILES gate, validation, round trip, configJSON, removal and rows; failed: \(cursorProfiles?.filter { !$0.value }.map(\.key).sorted() ?? ["nil"])")
+        if cursorFirmlinkSkipped.value {
+            print("skip CURSOR-PROFILES firmlink spelling: the temp dir has no /System/Volumes/Data path here (other volume, or realpath failed)")
+        }
         for locale in ["zh-Hant", "zh-Hans"] {
             let keys = [AccountsCopy.cursorSummary, CursorSync.Copy.toggle, CursorSync.Copy.privacy,
                         CursorSync.Copy.profilesPrivacy, CursorSync.Copy.defaultProfile,
