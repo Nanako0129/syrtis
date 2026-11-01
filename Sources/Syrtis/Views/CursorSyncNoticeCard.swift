@@ -16,10 +16,14 @@ struct CursorSyncNoticeCardView: View {
         OnboardingCardContainer(visible: CursorSync.noticeVisible()) {
             DashCard(CursorSync.Copy.title.localized) {
                 VStack(alignment: .leading, spacing: 8) {
-                    Text(CursorSync.Copy.privacy.localized)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
+                    // Added profile folders are read too: their paragraph
+                    // joins the consent once any is stored.
+                    ForEach(CursorSync.consentParagraphs(), id: \.self) { paragraph in
+                        Text(paragraph.localized)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
                     HStack(spacing: 10) {
                         Spacer()
                         Button(CursorSync.Copy.turnOff.localized) {

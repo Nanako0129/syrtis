@@ -18323,11 +18323,14 @@ enum SelfTest {
         expect(cursorRejected == [CursorSync.Copy.configRejected.localized, "syncs=0"],
                "CURSOR-SYNC a refused config shows the rejected line and syncs nothing; got \(String(describing: cursorRejected))")
         // CMP-520 acceptance 14: the Accounts page profile list, through the
-        // controller methods the rows call. Off: adding or removing reaches no
-        // core call at all (no config push; no sync, the only path that reads
-        // a Cursor database). Control: the same add while on pushes a config
-        // carrying it. Mutation: drop the `shouldSync` gate in
-        // `profilesChanged`, and the off add pushes a config.
+        // controller methods the rows call. While sync can't run (off, or on
+        // by default with the notice unanswered) adding or removing reaches
+        // no core call (no config push; no sync, the only path that reads a
+        // Cursor database). "No call" is observed through ordering: config
+        // pushes are chained, so when the first on push lands, any push the
+        // earlier steps queued would already be in the spy. Mutation: gate
+        // `profilesCanSync` on `CursorSync.enabled(defaults:)` instead of
+        // `shouldSync`, and the notice-unanswered add pushes a config first.
         let cursorProfiles: [String: Bool]? = awaitMainActorValue {
             let suite = "tokenbar.selftest.cursorProfiles"
             let defaults = UserDefaults(suiteName: suite)!
@@ -18337,52 +18340,104 @@ enum SelfTest {
             defaults.set(false, forKey: CursorSync.enabledKey)
             let pushes = UncheckedBox<[String]>([])
             let syncs = UncheckedBox<Int>(0)
-            let setConfig: @Sendable (String) -> Bool? = { pushes.value.append($0); return false }
-            let sync: @Sendable (Bool) -> CursorSyncStatus? = { _ in syncs.value += 1; return nil }
+            let setConfig: CursorSync.SetConfig = { pushes.value.append($0); return false }
+            let sync: CursorSync.Sync = { _ in syncs.value += 1; return nil }
             let user = ["Syrtis"]
+            let home = URL(fileURLWithPath: "/Users/selftest-home", isDirectory: true)
             let controller = CursorSyncController()
+            @MainActor func add(_ root: String) -> String? {
+                controller.addProfile(root: root, defaults: defaults, arguments: user, bundleID: "x.y",
+                                      home: home, setConfig: setConfig, sync: sync)
+            }
             let root = "/Volumes/selftest/cursor-b"
-            let added = controller.addProfile(
-                root: root, defaults: defaults, arguments: user, bundleID: "x.y", setConfig: setConfig, sync: sync)
-            let again = controller.addProfile(
-                root: root + "/", defaults: defaults, arguments: user, bundleID: "x.y", setConfig: setConfig, sync: sync)
-            try? await Task.sleep(nanoseconds: 100_000_000)
+            var ok: [String: Bool] = [:]
+            // Off.
+            ok["off add accepted"] = add(root) == nil
+            ok["same folder, other spelling, refused"] = add("/Volumes/selftest/Cursor-B/") == CursorSync.Copy.cantAdd
             let stored = CursorSync.profiles(defaults: defaults)
             let id = stored.first?.id ?? ""
-            let uuidShape = id.count == 36 && id == id.uppercased() && UUID(uuidString: id) != nil
+            ok["uppercase UUID"] = id.count == 36 && id == id.uppercased() && UUID(uuidString: id) != nil
             let json = CursorSync.configJSON(bundleID: "x.y", defaults: defaults, arguments: user)
             let config = (try? JSONSerialization.jsonObject(with: Data(json.utf8))) as? [String: Any]
-            let carried = (config?["profiles"] as? [[String: String]]) == [["id": id, "root": root]]
-            let offAdd = pushes.value.isEmpty && syncs.value == 0
-            controller.removeProfile(
-                id: id, defaults: defaults, arguments: user, bundleID: "x.y", setConfig: setConfig, sync: sync)
-            try? await Task.sleep(nanoseconds: 100_000_000)
-            let roundTrip = stored.count == 1 && stored.first?.root == root
+            ok["configJSON carries it"] = (config?["profiles"] as? [[String: String]]) == [["id": id, "root": root]]
+            ok["consent names added folders"] = CursorSync.consentParagraphs(defaults: defaults)
+                == [CursorSync.Copy.privacy, CursorSync.Copy.profilesPrivacy]
+            controller.removeProfile(id: id, defaults: defaults, arguments: user, bundleID: "x.y", setConfig: setConfig)
+            ok["round trip"] = stored.count == 1 && stored.first?.root == root
                 && CursorSync.profiles(defaults: defaults).isEmpty
-            let offRemove = pushes.value.isEmpty && syncs.value == 0
-            // Control: on, the add reaches the core with the new profile.
+            ok["consent without folders"] = CursorSync.consentParagraphs(defaults: defaults) == [CursorSync.Copy.privacy]
+            // On by default, notice unanswered.
+            defaults.removeObject(forKey: CursorSync.enabledKey)
+            defaults.removeObject(forKey: CursorSync.noticeKey)
+            ok["unanswered add accepted"] = add(root) == nil
+            // Refused before anything is saved.
+            let before = CursorSync.profiles(defaults: defaults)
+            ok["\"/\" refused"] = add("/") == CursorSync.Copy.cantAdd
+            ok["Cursor's own folder refused"] =
+                add(home.appendingPathComponent("Library/Application Support/Cursor").path) == CursorSync.Copy.cantAdd
+            let full = before + (1..<CursorSync.maxProfiles).map {
+                CursorSync.Profile(id: UUID().uuidString, root: "/Volumes/selftest/p\($0)")
+            }
+            CursorSync.saveProfiles(full, defaults: defaults)
+            ok["33rd refused"] = add("/Volumes/selftest/extra") == CursorSync.Copy.cantAdd
+            ok["refusals save nothing"] = CursorSync.profiles(defaults: defaults) == full
+            // Barrier: turn on, start empty, add; the on push must be the first.
+            CursorSync.saveProfiles([], defaults: defaults)
+            defaults.set(true, forKey: CursorSync.noticeKey)
             defaults.set(true, forKey: CursorSync.enabledKey)
-            controller.addProfile(
-                root: root, defaults: defaults, arguments: user, bundleID: "x.y", setConfig: setConfig, sync: sync)
-            for _ in 0..<200 where pushes.value.isEmpty {
+            _ = add(root)
+            for _ in 0..<300 where pushes.value.isEmpty || syncs.value == 0 || controller.syncing {
                 try? await Task.sleep(nanoseconds: 10_000_000)
             }
-            let onPushed = pushes.value.first?.contains(#""root":"\/Volumes\/selftest\/cursor-b""#) == true
-                || pushes.value.first?.contains(#""root":"/Volumes/selftest/cursor-b""#) == true
-            // Stop the loop the on add started.
+            let first = pushes.value.first ?? ""
+            ok["no core call while it couldn't sync"] = pushes.value.count == 1 && first.contains(#""enabled":true"#)
+            ok["control: on add pushes it and syncs"] = first.contains("cursor-b") && syncs.value == 1
+            // Removal while on: pushes a config without it, starts no sync.
+            let onID = CursorSync.profiles(defaults: defaults).first?.id ?? ""
+            controller.removeProfile(id: onID, defaults: defaults, arguments: user, bundleID: "x.y", setConfig: setConfig)
+            for _ in 0..<300 where pushes.value.count < 2 {
+                try? await Task.sleep(nanoseconds: 10_000_000)
+            }
+            // An immediate sync would follow the push at once; its absence
+            // can't be awaited, so give it this window.
+            try? await Task.sleep(nanoseconds: 100_000_000)
+            ok["on removal pushes without it"] = pushes.value.count == 2
+                && pushes.value[1].contains(#""enabled":true"#) && !pushes.value[1].contains("cursor-b")
+            ok["on removal starts no sync"] = syncs.value == 1
+            // Rows: a stub round, then a refused config clears them.
+            let stub = try? JSONDecoder().decode(CursorSyncStatus.self, from: Data(#"""
+                {"state":"notSignedIn","events":0,"lastSuccessMs":null,"changed":false,"profiles":[
+                {"id":"default","state":"notSignedIn","lastSuccessMs":null},
+                {"id":"A","state":"error","reason":"db_symlink","lastSuccessMs":null},
+                {"id":"B","state":"duplicate","duplicateOf":"default","lastSuccessMs":null}]}
+                """#.utf8))
+            await controller.runSync(explicit: true, defaults: defaults, arguments: user, sync: { _ in stub })
+            ok["rows filled"] = controller.profileStates.count == 3
+            ok["permanent reason line"] = controller.profileStates["A"].flatMap(CursorSync.rowLine)
+                == CursorSync.Copy.cantRead.localized
+            ok["duplicate line"] = controller.profileStates["B"].flatMap(CursorSync.rowLine)
+                == CursorSync.Copy.duplicate.localized
+            controller.reconfigure(refresh: false, defaults: defaults, arguments: user, bundleID: "x.y",
+                                   setConfig: { _ in nil }, sync: sync)
+            for _ in 0..<300 where controller.state != CursorSync.configRejectedState {
+                try? await Task.sleep(nanoseconds: 10_000_000)
+            }
+            ok["configRejected clears rows"] = controller.state == CursorSync.configRejectedState
+                && controller.profileStates.isEmpty
+            // Stop the loop.
             defaults.set(false, forKey: CursorSync.enabledKey)
             controller.reconfigure(refresh: false, defaults: defaults, arguments: user, bundleID: "x.y",
                                    setConfig: { _ in false }, sync: sync)
-            return ["added once": added && !again, "uppercase UUID": uuidShape, "configJSON carries it": carried,
-                    "off add: no core call": offAdd, "round trip": roundTrip,
-                    "off remove: no core call": offRemove, "control: on add pushes it": onPushed]
+            return ok
         }
         expect(cursorProfiles?.values.allSatisfy { $0 } == true,
-               "CURSOR-PROFILES add/remove while off reach no core call, round-trip the stored list, and configJSON carries the new uppercase UUID and root; failed: \(cursorProfiles?.filter { !$0.value }.map(\.key).sorted() ?? ["nil"])")
+               "CURSOR-PROFILES gate, validation, round trip, configJSON, removal and rows; failed: \(cursorProfiles?.filter { !$0.value }.map(\.key).sorted() ?? ["nil"])")
         for locale in ["zh-Hant", "zh-Hans"] {
             let keys = [AccountsCopy.cursorSummary, CursorSync.Copy.toggle, CursorSync.Copy.privacy,
                         CursorSync.Copy.profilesPrivacy, CursorSync.Copy.defaultProfile,
-                        CursorSync.Copy.addProfile, CursorSync.Copy.duplicate, "Remove"]
+                        CursorSync.Copy.addProfile, CursorSync.Copy.duplicate, CursorSync.Copy.cantAdd,
+                        CursorSync.Copy.cantRead, CursorSync.Copy.cleanupFailedOn, CursorSync.Copy.removeFolder,
+                        "Remove"]
             let missing = keys.filter {
                 let value = AppLanguage.localizedString($0, locale: locale)
                 return value == nil || value == $0

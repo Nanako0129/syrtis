@@ -139,6 +139,8 @@ struct SettingsPanel: View {
     @AppStorage(CursorSync.noticeKey) private var cursorNoticeAck = false
     /// Mirror of `CursorSync.profilesKey` for the rows; re-read after each edit.
     @State private var cursorProfiles: [CursorSync.Profile] = []
+    /// `CursorSync.addRefusal`'s line after a refused add; cleared on the next edit.
+    @State private var cursorAddRefusal: String?
     /// 0 = auto (≈60% of the screen). The popover's drag handle writes the
     /// same key, so the two stay in sync.
     @AppStorage(PopoverChrome.heightKey) private var popoverHeight = 0.0
@@ -1216,7 +1218,9 @@ struct SettingsPanel: View {
                     arrowEdge: .bottom
                 ) {
                     VStack(alignment: .leading, spacing: 10) {
-                        hint(CursorSync.Copy.privacy)
+                        // Added profile folders are read too, so their
+                        // paragraph joins the consent once any is stored.
+                        ForEach(CursorSync.consentParagraphs(), id: \.self) { hint($0) }
                         HStack {
                             Spacer()
                             Button(CursorSync.Copy.cancel.localized) { cursorSync.cancelEnable() }
@@ -1254,6 +1258,13 @@ struct SettingsPanel: View {
                     .controlSize(.small)
                     .padding(.horizontal, 10)
                 }
+                if cursorSync.cleanupFailed {
+                    // An on push could not delete a removed profile's files.
+                    Text(CursorSync.Copy.cleanupFailedOn.localized)
+                        .font(.caption2)
+                        .foregroundStyle(Color.orange)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
                 Button {
                     Task { await cursorSync.runSync(explicit: true) }
                 } label: {
@@ -1289,12 +1300,15 @@ struct SettingsPanel: View {
                 Button {
                     cursorSync.removeProfile(id: profile.id)
                     cursorProfiles = CursorSync.profiles()
+                    cursorAddRefusal = nil
                 } label: {
                     Image(systemName: "minus.circle")
                         .foregroundStyle(.secondary)
                 }
                 .buttonStyle(.plain)
                 .help("Remove".localized)
+                .accessibilityLabel(CursorSync.Copy.removeFolder.localized(
+                    (profile.root as NSString).lastPathComponent))
             }
         }
         Button {
@@ -1306,6 +1320,9 @@ struct SettingsPanel: View {
         .buttonStyle(.plain)
         .padding(.horizontal, 10)
         .onAppear { cursorProfiles = CursorSync.profiles() }
+        if let cursorAddRefusal {
+            hint(cursorAddRefusal)
+        }
     }
 
     @ViewBuilder
@@ -1314,10 +1331,7 @@ struct SettingsPanel: View {
     ) -> some View {
         row(label, trailing: trailing)
         if syncOn, let status = cursorSync.profileStates[id] {
-            let line = status.state == "duplicate"
-                ? CursorSync.Copy.duplicate.localized
-                : CursorSync.statusLine(state: status.state, lastSuccessMs: status.lastSuccessMs)
-            if let line {
+            if let line = CursorSync.rowLine(status) {
                 Text(line)
                     .font(.caption2)
                     .foregroundStyle(["ok", "duplicate"].contains(status.state) ? Color.secondary : Color.orange)
@@ -1334,7 +1348,7 @@ struct SettingsPanel: View {
         panel.allowsMultipleSelection = false
         panel.prompt = "Add".localized
         guard panel.runModal() == .OK, let url = panel.url else { return }
-        cursorSync.addProfile(root: url.path)
+        cursorAddRefusal = cursorSync.addProfile(root: url.path)
         cursorProfiles = CursorSync.profiles()
     }
 
