@@ -1196,7 +1196,9 @@ struct SettingsPanel: View {
             // Consent: turning the switch on opens a confirmation carrying the
             // privacy paragraph; nothing is enabled until Continue. Cancel,
             // Escape, clicking away or leaving the page leaves the switch off.
-            // All state lives in the controller (`confirmPending`).
+            // All state lives in the controller (`confirmPending`). Checked by
+            // hand in a preview build of 394ada5a (2026-11-01): Return does not
+            // consent, and leaving the page does not bring the prompt back.
             toggleRow(
                 CursorSync.Copy.toggle,
                 isOn: Binding(
@@ -1706,19 +1708,18 @@ private struct SettingsInfoButton<Details: View>: View {
     let details: Details
     @State private var shown = false
     /// Opened by click or keyboard: stays open regardless of the pointer until
-    /// Escape or a click elsewhere closes it.
+    /// Escape, a click elsewhere, or another click on the icon closes it.
     @State private var pinned = false
     @State private var overIcon = false
     @State private var overContent = false
     @State private var pending: Task<Void, Never>?
 
     var body: some View {
-        // Hover opens the popover; Space / Return (or a click) pins it open and
-        // a second Space / Return closes it. With the mouse, a click on the icon
-        // while the popover is open dismisses it on mouse-down and the action
-        // then reopens it, so the mouse closes it by clicking elsewhere or with
-        // Escape. The Escape and click-elsewhere paths are being checked by hand
-        // in the preview; this code has not been run in a GUI.
+        // Hover opens the popover; a click, Space or Return pins it open, and
+        // the same again closes it. Checked by hand in a preview build of
+        // 394ada5a on macOS 27 (2026-11-01): a click pins a hover-opened
+        // popover, a second click on the icon closes it, and Escape or a click
+        // elsewhere closes it. Space / Return were not checked by hand.
         Button {
             pending?.cancel()
             if shown && pinned {
