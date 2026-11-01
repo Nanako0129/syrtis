@@ -1678,24 +1678,75 @@ private struct SettingsInfoButton<Details: View>: View {
     /// height at this width has not been measured.
     private static var popoverWidth: CGFloat { 280 }
 
+    /// Pause before a hover opens the popover, so sweeping the pointer across
+    /// the page does not flash popovers. About the system tooltip delay.
+    private static var hoverDelay: Duration { .milliseconds(400) }
+    /// Grace after the pointer leaves the icon or the popover, so crossing the
+    /// gap between them does not close it.
+    private static var leaveGrace: Duration { .milliseconds(200) }
+
     let section: String
 
     let details: Details
     @State private var shown = false
+    /// Opened by click or keyboard: stays until dismissed (click again, Escape,
+    /// or click outside), regardless of the pointer.
+    @State private var pinned = false
+    @State private var overIcon = false
+    @State private var overContent = false
+    @State private var pending: Task<Void, Never>?
 
     var body: some View {
-        Button { shown.toggle() } label: {
+        // Mechanism: a popover driven by `.onHover`, not `.help()`, because a
+        // system tooltip does not lay out multi-paragraph text with a bold
+        // caption. Click / Space / Return pin it open; Escape closes it.
+        Button {
+            pending?.cancel()
+            if shown && pinned {
+                shown = false
+            } else {
+                pinned = true
+                shown = true
+            }
+        } label: {
             Image(systemName: "info.circle")
                 .font(.caption2)
                 .foregroundStyle(.tertiary)
         }
         .buttonStyle(.plain)
-        .help(AccountsCopy.moreDetails.localized)
         .accessibilityLabel("\(AccountsCopy.moreDetails.localized): \(section)")
+        .onHover { inside in
+            overIcon = inside
+            pending?.cancel()
+            if inside {
+                guard !shown else { return }
+                pending = Task {
+                    try? await Task.sleep(for: Self.hoverDelay)
+                    if !Task.isCancelled, overIcon { shown = true }
+                }
+            } else {
+                scheduleClose()
+            }
+        }
+        .onChange(of: shown) { _, now in
+            if !now { pinned = false; overContent = false }
+        }
         .popover(isPresented: $shown, arrowEdge: .bottom) {
             VStack(alignment: .leading, spacing: 8) { details }
                 .frame(width: Self.popoverWidth, alignment: .leading)
                 .padding(12)
+                .onHover { inside in
+                    overContent = inside
+                    pending?.cancel()
+                    if !inside { scheduleClose() }
+                }
+        }
+    }
+
+    private func scheduleClose() {
+        pending = Task {
+            try? await Task.sleep(for: Self.leaveGrace)
+            if !Task.isCancelled, !pinned, !overIcon, !overContent { shown = false }
         }
     }
 }
