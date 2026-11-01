@@ -315,7 +315,8 @@
 
 "Add config dir…" = "添加配置目录…";
 "Add folder…" = "添加目录…";
-"Additional Pi roots" = "额外的 Pi 根目录";
+"Add another Pi sessions folder; its usage joins your totals." = "添加另一个 Pi 会话目录，它的用量会并入总计。";
+"Sync usage from the Cursor app." = "同步 Cursor 应用的用量。";
 "Add" = "添加";
 "Folder not found. Kept in case the drive is disconnected or the path needs fixing." = "找不到这个目录。先保留，以防磁盘没有连接或路径需要修正。";
 

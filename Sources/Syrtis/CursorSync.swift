@@ -270,8 +270,9 @@ final class CursorSyncController: ObservableObject {
 
     // MARK: - Actions behind the controls
 
-    /// Settings toggle. Turning it on shows the privacy paragraph beside it,
-    /// so it also answers the notice.
+    /// Settings toggle. Turning it on also answers the notice because the
+    /// privacy paragraph is shown beside the switch whenever it shows off
+    /// (`SettingsPanel.cursorSyncSection`); keep the two together.
     func setEnabled(_ on: Bool, defaults: UserDefaults = .standard) {
         defaults.set(on, forKey: CursorSync.enabledKey)
         if on { defaults.set(true, forKey: CursorSync.noticeKey) }

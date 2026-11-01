@@ -17295,7 +17295,6 @@ enum SelfTest {
                 + "nothing, so the launch apply costs no rescan")
 
         let piCopyKeys = [
-            "Additional Pi roots",
             "Add folder…",
             "Directories of Pi session-format JSONL files. Usage-only exports from headless runners are counted, and full Pi sessions also work.",
             "Only assistant usage contributes. Roots merge into the Pi total; there is no per-root breakdown.",
@@ -17345,6 +17344,9 @@ enum SelfTest {
                 .allSatisfy(agyDetails.contains)
                 && AccountsCopy.claudeDetails.contains("CLAUDE_CONFIG_DIR")
                 && AccountsCopy.antigravityDetails.count == 5
+                && ["reads the login of the Cursor app", "sends it only to Cursor's usage service (cursor.com)",
+                    "date, model, token counts, cost and conversation ID", "the login itself is never saved or logged",
+                    "Turning this off deletes the downloaded usage"].allSatisfy(CursorSync.Copy.privacy.contains)
                 && AccountsCopy.antigravityGeneral.last == AccountsCopy.remove
                 && AccountsCopy.autoToggleGroup(autoCaptureOn: true) == [AccountsCopy.autoOn]
                 && AccountsCopy.autoToggleGroup(autoCaptureOn: false) == [AccountsCopy.autoOn, AccountsCopy.autoOff]

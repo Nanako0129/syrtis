@@ -1045,10 +1045,6 @@ struct SettingsPanel: View {
         }
         .id(SettingsWindowController.Destination.discordAnchor)
 
-        piExtraRootsSection()
-
-        cursorSyncSection()
-
         section("Language") {
             radioGroup(
                 selection: Binding(
@@ -1073,6 +1069,10 @@ struct SettingsPanel: View {
         claudeExtraRootsSection()
 
         antigravityAccountsSection()
+
+        piExtraRootsSection()
+
+        cursorSyncSection()
     }
 
     /// A second (or further) Claude account isolated with `CLAUDE_CONFIG_DIR`
@@ -1137,7 +1137,10 @@ struct SettingsPanel: View {
     /// distinction. No default root and no discovery: the list starts empty.
     @ViewBuilder
     private func piExtraRootsSection() -> some View {
-        section("Additional Pi roots") {
+        infoSection(
+            AccountsCopy.pi, summary: AccountsCopy.piSummary,
+            details: { ForEach(AccountsCopy.piDetails, id: \.self) { hint($0) } }
+        ) {
             ForEach(piExtraRoots, id: \.self) { path in
                 row(path) {
                     HStack(spacing: 6) {
@@ -1178,23 +1181,31 @@ struct SettingsPanel: View {
                 hint("%lld path(s) can't be scanned and weren't added.".localized(
                     piHint.rejected))
             }
-            hint("Directories of Pi session-format JSONL files. Usage-only exports from headless runners are counted, and full Pi sessions also work.")
-            hint("Only assistant usage contributes. Roots merge into the Pi total; there is no per-root breakdown.")
         }
         .onAppear { refreshMissingPiRoots() }
     }
 
-    /// Cursor usage synced from the Cursor desktop app. The hint is the same
-    /// privacy paragraph the one-time notice shows (`CursorSync.Copy.privacy`).
+    /// Cursor usage synced from the Cursor desktop app. The privacy paragraph
+    /// is the one the one-time notice shows (`CursorSync.Copy.privacy`).
     @ViewBuilder
     private func cursorSyncSection() -> some View {
-        section(CursorSync.Copy.title) {
+        infoSection(
+            AccountsCopy.cursor, summary: AccountsCopy.cursorSummary,
+            details: { hint(CursorSync.Copy.privacy) }
+        ) {
             toggleRow(
                 CursorSync.Copy.toggle,
                 isOn: Binding(
                     get: { CursorSync.toggleShowsOn(enabled: cursorSyncOn, acknowledged: cursorNoticeAck) },
                     set: { cursorSync.setEnabled($0) }))
-            hint(CursorSync.Copy.privacy)
+            // Consent: turning the switch on acknowledges the notice
+            // (`CursorSyncController.setEnabled`) on the strength of this
+            // paragraph being beside it. So it stays inline whenever the switch
+            // shows off, i.e. before it can be turned on; once on, it lives in
+            // the ⓘ like the other sections' explanations.
+            if !CursorSync.toggleShowsOn(enabled: cursorSyncOn, acknowledged: cursorNoticeAck) {
+                hint(CursorSync.Copy.privacy)
+            }
             if CursorSync.toggleShowsOn(enabled: cursorSyncOn, acknowledged: cursorNoticeAck) {
                 if let line = CursorSync.statusLine(
                     state: cursorSync.state, lastSuccessMs: cursorSync.lastSuccessMs)
@@ -1628,6 +1639,14 @@ enum AccountsCopy {
     static let claude = "Claude"
     static let claudeSummary = "Extra accounts join your totals."
     static let claudeDetails = "For another Claude account, run Claude Code with CLAUDE_CONFIG_DIR set to its own folder and add that folder here. Its usage joins your totals; accounts aren't shown separately."
+    static let pi = "Pi"
+    static let piSummary = "Add another Pi sessions folder; its usage joins your totals."
+    static let piDetails = [
+        "Directories of Pi session-format JSONL files. Usage-only exports from headless runners are counted, and full Pi sessions also work.",
+        "Only assistant usage contributes. Roots merge into the Pi total; there is no per-root breakdown.",
+    ]
+    static let cursor = "Cursor"
+    static let cursorSummary = "Sync usage from the Cursor app."
     static let antigravity = "Antigravity"
     static let antigravitySummary = "Capture a Google account agy signs into."
     static let autoToggle = "Capture accounts agy signs into automatically"
@@ -1649,7 +1668,8 @@ enum AccountsCopy {
     /// Every string that has a translation; the product names `claude` and
     /// `antigravity` are intentionally the same in every language.
     static let translated = [page, moreDetails, claudeSummary, claudeDetails,
-                             antigravitySummary, autoToggle] + antigravityDetails
+                             antigravitySummary, autoToggle, piSummary, cursorSummary]
+                             + piDetails + antigravityDetails
 }
 
 /// ⓘ next to a section header; the popover holds the long explanation.
