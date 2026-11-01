@@ -18435,7 +18435,8 @@ enum SelfTest {
             // Off.
             ok["off add accepted"] = add(root)
             ok["symlink to a listed folder refused"] = !add(rootLink)
-            // Present on APFS system volumes; recorded either way.
+            // Present on APFS system volumes; when absent the check is left out and a
+            // `skip` line says so (no failure, no vacuous pass).
             if let firmlinked {
                 ok["firmlink spelling refused"] = !add(firmlinked)
             }

@@ -89,7 +89,9 @@ enum CursorSync {
     /// spelling of the same folder — a symlink, a firmlink such as
     /// /System/Volumes/Data, a different case — compares equal on any volume.
     /// nil for a folder that can't be read (gone, unmounted): never an
-    /// identity match (`cantAdd` then compares path strings).
+    /// identity match. When the folder being added has no identity, `cantAdd`
+    /// compares standardized path strings instead; a stored or Cursor-own
+    /// folder without one only matches through that path comparison.
     static func folderIdentity(_ path: String) -> NSObject? {
         (try? URL(fileURLWithPath: path).resolvingSymlinksInPath()
             .resourceValues(forKeys: [.fileResourceIdentifierKey]))?.fileResourceIdentifier as? NSObject
