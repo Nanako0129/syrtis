@@ -249,7 +249,6 @@
 "Could not save this classification: existing attribution data is invalid or foreign." = "无法保存此分类：现有归属数据无效或来自其他格式。";
 "Could not save this classification: the attribution entry limit was reached." = "无法保存此分类：已达到归属条目上限。";
 "Could not save this classification: the new value is too large or unsupported." = "无法保存此分类：新值过大或不受支持。";
-"Claude accounts" = "Claude 账户";
 
 /* ===== 设置：选项 ===== */
 "Launch at login" = "登录时启动";
@@ -316,7 +315,8 @@
 
 "Add config dir…" = "添加配置目录…";
 "Add folder…" = "添加目录…";
-"Additional Pi roots" = "额外的 Pi 根目录";
+"Add another Pi sessions folder; its usage joins your totals." = "添加另一个 Pi 会话目录，它的用量会并入总计。";
+"Sync usage from the Cursor app." = "同步 Cursor 应用的用量。";
 "Add" = "添加";
 "Folder not found. Kept in case the drive is disconnected or the path needs fixing." = "找不到这个目录。先保留，以防磁盘没有连接或路径需要修正。";
 
@@ -622,7 +622,10 @@
 "macOS did not add Syrtis to your login items. Check System Settings → General → Login Items." = "macOS 没有把 Syrtis 添加到登录项。请前往“系统设置 → 通用 → 登录项”查看。";
 
 /* ===== 设置：Antigravity 账户 ===== */
-"Antigravity accounts" = "Antigravity 账户";
+"Accounts" = "账户";
+"Extra accounts join your totals." = "额外的账户会并入你的总计。";
+"Capture a Google account agy signs into." = "捕获 agy 登录的 Google 账户。";
+"More details" = "详细说明";
 "Antigravity account" = "Antigravity 账户";
 "Capture current agy login" = "捕获当前 agy 登录";
 "Capturing…" = "捕获中…";
@@ -651,6 +654,7 @@
 "Cursor usage sync" = "Cursor 用量同步";
 "Sync Cursor usage from the Cursor app" = "从 Cursor 应用同步用量";
 "To show your Cursor usage, Syrtis reads the login of the Cursor app on this Mac and sends it only to Cursor's usage service (cursor.com) to download your usage. Syrtis stores the date, model, token counts, cost and conversation ID of each request on this Mac; the login itself is never saved or logged. Turning this off deletes the downloaded usage." = "要显示 Cursor 用量，Syrtis 会读取这台 Mac 上 Cursor 应用的登录信息，只发送到 Cursor 的用量服务（cursor.com）下载你的用量。Syrtis 会在这台 Mac 上存下每次请求的日期、模型、token 数、费用和对话 ID；登录信息本身不会存储或记录。关闭这个选项会删除已下载的用量。";
+"Cancel" = "取消";
 "Continue" = "继续";
 "Turn Off" = "关闭";
 "Last synced %@" = "上次同步：%@";

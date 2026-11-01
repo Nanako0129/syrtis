@@ -10,6 +10,7 @@ struct SettingsPanel: View {
         case menuBar = "Menu bar"
         case dashboard = "Dashboard"
         case usageAttribution = "Usage attribution"
+        case accounts = "Accounts"
         case general = "General"
         case about = "About"
 
@@ -22,6 +23,7 @@ struct SettingsPanel: View {
             case .menuBar: "menubar.rectangle"
             case .dashboard: "chart.bar.xaxis"
             case .usageAttribution: "arrow.triangle.branch"
+            case .accounts: "person.2"
             case .general: "gearshape"
             case .about: "info.circle"
             }
@@ -227,6 +229,8 @@ struct SettingsPanel: View {
                     tabsUniverse: tabsUniverse)
             case .usageAttribution:
                 usageAttributionPage()
+            case .accounts:
+                accountsPage()
             case .general:
                 generalPage()
             case .about:
@@ -1041,14 +1045,6 @@ struct SettingsPanel: View {
         }
         .id(SettingsWindowController.Destination.discordAnchor)
 
-        claudeExtraRootsSection()
-
-        piExtraRootsSection()
-
-        antigravityAccountsSection()
-
-        cursorSyncSection()
-
         section("Language") {
             radioGroup(
                 selection: Binding(
@@ -1066,6 +1062,19 @@ struct SettingsPanel: View {
         }
     }
 
+    /// Multi-account management. Each section keeps one line of description;
+    /// the rest lives behind its ⓘ (see `infoSection`).
+    @ViewBuilder
+    private func accountsPage() -> some View {
+        claudeExtraRootsSection()
+
+        antigravityAccountsSection()
+
+        piExtraRootsSection()
+
+        cursorSyncSection()
+    }
+
     /// A second (or further) Claude account isolated with `CLAUDE_CONFIG_DIR`
     /// is otherwise invisible to Syrtis's scan (see `docs/knowledge/
     /// architecture.md`'s extra-scan-paths section). Each config dir here
@@ -1073,7 +1082,10 @@ struct SettingsPanel: View {
     /// single reported total — there is no per-account breakdown.
     @ViewBuilder
     private func claudeExtraRootsSection() -> some View {
-        section("Claude accounts") {
+        infoSection(
+            AccountsCopy.claude, summary: AccountsCopy.claudeSummary,
+            details: { hint(AccountsCopy.claudeDetails) }
+        ) {
             ForEach(claudeExtraRoots, id: \.self) { path in
                 row(path) {
                     HStack(spacing: 6) {
@@ -1115,7 +1127,6 @@ struct SettingsPanel: View {
                 hint("%lld path(s) can't be scanned and weren't added.".localized(
                     claudeHint.rejected))
             }
-            hint("For another Claude account, run Claude Code with CLAUDE_CONFIG_DIR set to its own folder and add that folder here. Its usage joins your totals; accounts aren't shown separately.")
         }
         .onAppear { refreshMissingClaudeRoots() }
     }
@@ -1126,7 +1137,10 @@ struct SettingsPanel: View {
     /// distinction. No default root and no discovery: the list starts empty.
     @ViewBuilder
     private func piExtraRootsSection() -> some View {
-        section("Additional Pi roots") {
+        infoSection(
+            AccountsCopy.pi, summary: AccountsCopy.piSummary,
+            details: { ForEach(AccountsCopy.piDetails, id: \.self) { hint($0) } }
+        ) {
             ForEach(piExtraRoots, id: \.self) { path in
                 row(path) {
                     HStack(spacing: 6) {
@@ -1167,23 +1181,50 @@ struct SettingsPanel: View {
                 hint("%lld path(s) can't be scanned and weren't added.".localized(
                     piHint.rejected))
             }
-            hint("Directories of Pi session-format JSONL files. Usage-only exports from headless runners are counted, and full Pi sessions also work.")
-            hint("Only assistant usage contributes. Roots merge into the Pi total; there is no per-root breakdown.")
         }
         .onAppear { refreshMissingPiRoots() }
     }
 
-    /// Cursor usage synced from the Cursor desktop app. The hint is the same
-    /// privacy paragraph the one-time notice shows (`CursorSync.Copy.privacy`).
+    /// Cursor usage synced from the Cursor desktop app. The privacy paragraph
+    /// is the one the one-time notice shows (`CursorSync.Copy.privacy`).
     @ViewBuilder
     private func cursorSyncSection() -> some View {
-        section(CursorSync.Copy.title) {
+        infoSection(
+            AccountsCopy.cursor, summary: AccountsCopy.cursorSummary,
+            details: { hint(CursorSync.Copy.privacy) }
+        ) {
+            // Consent: turning the switch on opens a confirmation carrying the
+            // privacy paragraph; nothing is enabled until Continue. Cancel,
+            // Escape, clicking away or leaving the page leaves the switch off.
+            // All state lives in the controller (`confirmPending`). Checked by
+            // hand in a preview build of 394ada5a (2026-11-01): Return does not
+            // consent, and leaving the page does not bring the prompt back.
             toggleRow(
                 CursorSync.Copy.toggle,
                 isOn: Binding(
                     get: { CursorSync.toggleShowsOn(enabled: cursorSyncOn, acknowledged: cursorNoticeAck) },
-                    set: { cursorSync.setEnabled($0) }))
-            hint(CursorSync.Copy.privacy)
+                    set: { cursorSync.switchChanged(to: $0) }))
+                .popover(
+                    isPresented: Binding(
+                        get: { cursorSync.confirmPending },
+                        set: { if !$0 { cursorSync.cancelEnable() } }),
+                    arrowEdge: .bottom
+                ) {
+                    VStack(alignment: .leading, spacing: 10) {
+                        hint(CursorSync.Copy.privacy)
+                        HStack {
+                            Spacer()
+                            Button(CursorSync.Copy.cancel.localized) { cursorSync.cancelEnable() }
+                                .keyboardShortcut(.cancelAction)
+                            // No default-action shortcut: Return must not consent.
+                            Button(CursorSync.Copy.continue.localized) { cursorSync.confirmEnable() }
+                        }
+                        .controlSize(.small)
+                    }
+                    .frame(width: 280, alignment: .leading)
+                    .padding(12)
+                }
+                .onDisappear { cursorSync.cancelEnable() }
             if CursorSync.toggleShowsOn(enabled: cursorSyncOn, acknowledged: cursorNoticeAck) {
                 if let line = CursorSync.statusLine(
                     state: cursorSync.state, lastSuccessMs: cursorSync.lastSuccessMs)
@@ -1235,7 +1276,21 @@ struct SettingsPanel: View {
     private func antigravityAccountsSection() -> some View {
         let accounts = AntigravityAccounts.decode(antigravityAccountsRaw)
         let busy = antigravityAutoCapture.busy
-        section("Antigravity accounts") {
+        infoSection(
+            AccountsCopy.antigravity, summary: AccountsCopy.antigravitySummary,
+            details: {
+                ForEach(AccountsCopy.antigravityGeneral, id: \.self) { hint($0) }
+                // Last, so the paragraphs under the caption read as that
+                // switch's. `autoOff` is shown only while the switch is off:
+                // without it a manual Capture's merge lasts only until agy
+                // rewrites its login item when it refreshes its sign-in
+                // (measured: about hourly), because the marker moves and
+                // Syrtis may not re-read agy's login to confirm the account.
+                Text(AccountsCopy.autoToggle.localized)
+                    .font(.caption2.weight(.semibold))
+                ForEach(AccountsCopy.autoToggleGroup(autoCaptureOn: antigravityAutoCaptureOn), id: \.self) { hint($0) }
+            }
+        ) {
             ForEach(accounts, id: \.key) { account in
                 row(account.label) {
                     Button {
@@ -1267,7 +1322,7 @@ struct SettingsPanel: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
             toggleRow(
-                "Capture accounts agy signs into automatically",
+                AccountsCopy.autoToggle,
                 isOn: Binding(
                     get: { antigravityAutoCaptureOn },
                     set: { on in Task { await antigravityAutoCapture.setEnabled(on) } }))
@@ -1282,17 +1337,6 @@ struct SettingsPanel: View {
                     .foregroundStyle(.orange)
                     .fixedSize(horizontal: false, vertical: true)
             }
-            if !antigravityAutoCaptureOn {
-                // Without it a manual Capture's merge lasts only until agy
-                // rewrites its login item when it refreshes its sign-in
-                // (measured: about hourly), because the marker moves and
-                // Syrtis may not re-read agy's login to confirm the account.
-                hint("Turn this on to keep reading agy's current account through its captured sign-in, shown as one OAUTH card, so Syrtis rarely needs to run agy. With it off, a Capture lasts only until agy next refreshes its sign-in (usually within an hour); after that the main card runs agy again.")
-            }
-            hint("When on, Syrtis copies the sign-in of each account agy signs into to this Mac's login keychain: once when you turn this on, then whenever agy's sign-in changes. Turning it off keeps the copies. An account you remove stays removed until you press Capture.")
-            hint("To add another Google account:\n1. Sign agy in to that account.\n2. Press Capture current agy login.\n3. Sign agy back in to your main account.")
-            hint("Capture reads agy's saved Google login once when you press the button, and once each time agy's sign-in changes while automatic capture is on. The copy is kept in this Mac's login keychain. Syrtis uses it only with Google's token service and Cloud Code quota service, and its requests identify as Antigravity.")
-            hint("Remove deletes only the copy on this Mac. Google still accepts it until you revoke access in Google Account → third-party access, which also signs Antigravity out of that account.")
         }
     }
 
@@ -1494,6 +1538,25 @@ struct SettingsPanel: View {
         }
     }
 
+    /// `section` with a one-line description under the header and the long
+    /// explanation behind an ⓘ popover. State notices stay in `content`.
+    private func infoSection(
+        _ label: String, summary: String,
+        @ViewBuilder details: () -> some View,
+        @ViewBuilder content: () -> some View
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 4) {
+                Text(label.localized.uppercased())
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(.tertiary)
+                SettingsInfoButton(section: label.localized, details: details())
+            }
+            hint(summary)
+            content()
+        }
+    }
+
     private func row(_ label: String, @ViewBuilder trailing: () -> some View) -> some View {
         HStack {
             Text(label.localized)
@@ -1582,6 +1645,139 @@ struct SettingsPanel: View {
             .font(.caption2)
             .foregroundStyle(.tertiary)
             .fixedSize(horizontal: false, vertical: true)
+    }
+}
+
+/// Accounts-page copy, shared by the view and SelfTest so the test reads what
+/// the view shows. English is the catalog key. The Antigravity paragraphs
+/// state privacy facts (keychain copy, Google services, revoke), checked
+/// against `agent_antigravity.rs`'s captured-account section.
+enum AccountsCopy {
+    static let page = "Accounts"
+    static let moreDetails = "More details"
+    static let claude = "Claude"
+    static let claudeSummary = "Extra accounts join your totals."
+    static let claudeDetails = "For another Claude account, run Claude Code with CLAUDE_CONFIG_DIR set to its own folder and add that folder here. Its usage joins your totals; accounts aren't shown separately."
+    static let pi = "Pi"
+    static let piSummary = "Add another Pi sessions folder; its usage joins your totals."
+    static let piDetails = [
+        "Directories of Pi session-format JSONL files. Usage-only exports from headless runners are counted, and full Pi sessions also work.",
+        "Only assistant usage contributes. Roots merge into the Pi total; there is no per-root breakdown.",
+    ]
+    static let cursor = "Cursor"
+    static let cursorSummary = "Sync usage from the Cursor app."
+    static let antigravity = "Antigravity"
+    static let antigravitySummary = "Capture a Google account agy signs into."
+    static let autoToggle = "Capture accounts agy signs into automatically"
+    static let recipe = "To add another Google account:\n1. Sign agy in to that account.\n2. Press Capture current agy login.\n3. Sign agy back in to your main account."
+    static let captureReads = "Capture reads agy's saved Google login once when you press the button, and once each time agy's sign-in changes while automatic capture is on. The copy is kept in this Mac's login keychain. Syrtis uses it only with Google's token service and Cloud Code quota service, and its requests identify as Antigravity."
+    static let autoOn = "When on, Syrtis copies the sign-in of each account agy signs into to this Mac's login keychain: once when you turn this on, then whenever agy's sign-in changes. Turning it off keeps the copies. An account you remove stays removed until you press Capture."
+    static let autoOff = "Turn this on to keep reading agy's current account through its captured sign-in, shown as one OAUTH card, so Syrtis rarely needs to run agy. With it off, a Capture lasts only until agy next refreshes its sign-in (usually within an hour); after that the main card runs agy again."
+    static let remove = "Remove deletes only the copy on this Mac. Google still accepts it until you revoke access in Google Account → third-party access, which also signs Antigravity out of that account."
+
+    /// Popover order: general paragraphs first, then the toggle group last so
+    /// "When on" / "this" follow the caption naming the switch.
+    static let antigravityGeneral = [recipe, captureReads, remove]
+    /// Paragraphs under the toggle caption; `autoOff` only while it is off.
+    static func autoToggleGroup(autoCaptureOn: Bool) -> [String] {
+        autoCaptureOn ? [autoOn] : [autoOn, autoOff]
+    }
+    /// Every Antigravity paragraph, for presence checks.
+    static let antigravityDetails = antigravityGeneral + [autoOn, autoOff]
+    /// Every string that has a translation; the product names `claude` and
+    /// `antigravity` are intentionally the same in every language.
+    static let translated = [page, moreDetails, claudeSummary, claudeDetails,
+                             antigravitySummary, autoToggle, piSummary, cursorSummary]
+                             + piDetails + antigravityDetails
+}
+
+/// ⓘ next to a section header; the popover holds the long explanation.
+private struct SettingsInfoButton<Details: View>: View {
+    /// Popover content width. Chosen for readable paragraphs; the wrapped
+    /// height at this width has not been measured.
+    private static var popoverWidth: CGFloat { 280 }
+
+    /// Pause before a hover opens the popover, so sweeping the pointer across
+    /// the page does not flash popovers. About the system tooltip delay.
+    private static var hoverDelay: Duration { .milliseconds(400) }
+    /// Grace after the pointer leaves the icon or the popover, so crossing the
+    /// gap between them does not close it.
+    private static var leaveGrace: Duration { .milliseconds(200) }
+    let section: String
+
+    let details: Details
+    @State private var shown = false
+    /// Opened by click or keyboard: stays open regardless of the pointer until
+    /// Escape, a click elsewhere, or another click on the icon closes it.
+    @State private var pinned = false
+    @State private var overIcon = false
+    @State private var overContent = false
+    @State private var pending: Task<Void, Never>?
+
+    var body: some View {
+        // Hover opens the popover; a click, Space or Return pins it open, and
+        // the same again closes it. Checked by hand in a preview build of
+        // 394ada5a on macOS 27 (2026-11-01): a click pins a hover-opened
+        // popover, a second click on the icon closes it, and Escape or a click
+        // elsewhere closes it. Space / Return were not checked by hand.
+        Button {
+            pending?.cancel()
+            if shown && pinned {
+                shown = false
+                pinned = false
+            } else {
+                pinned = true
+                shown = true
+            }
+        } label: {
+            Image(systemName: "info.circle")
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("\(AccountsCopy.moreDetails.localized): \(section)")
+        .onHover { inside in
+            overIcon = inside
+            pending?.cancel()
+            if inside {
+                guard !shown else { return }
+                pending = Task {
+                    try? await Task.sleep(for: Self.hoverDelay)
+                    if !Task.isCancelled, overIcon { shown = true }
+                }
+            } else {
+                scheduleClose()
+            }
+        }
+        .onChange(of: shown) { _, now in
+            if !now {
+                pinned = false
+                overContent = false
+            }
+        }
+        .onDisappear {
+            pending?.cancel()
+            overIcon = false
+            overContent = false
+            shown = false
+        }
+        .popover(isPresented: $shown, arrowEdge: .bottom) {
+            VStack(alignment: .leading, spacing: 8) { details }
+                .frame(width: Self.popoverWidth, alignment: .leading)
+                .padding(12)
+                .onHover { inside in
+                    overContent = inside
+                    pending?.cancel()
+                    if !inside { scheduleClose() }
+                }
+        }
+    }
+
+    private func scheduleClose() {
+        pending = Task {
+            try? await Task.sleep(for: Self.leaveGrace)
+            if !Task.isCancelled, !pinned, !overIcon, !overContent { shown = false }
+        }
     }
 }
 

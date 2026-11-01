@@ -17298,7 +17298,6 @@ enum SelfTest {
                 + "nothing, so the launch apply costs no rescan")
 
         let piCopyKeys = [
-            "Additional Pi roots",
             "Add folder…",
             "Directories of Pi session-format JSONL files. Usage-only exports from headless runners are counted, and full Pi sessions also work.",
             "Only assistant usage contributes. Roots merge into the Pi total; there is no per-root breakdown.",
@@ -17319,6 +17318,45 @@ enum SelfTest {
             piCopyMissing.isEmpty,
             "PI-ROOTS every new Settings copy key exists in zh-Hant and zh-Hans "
                 + "(English is the key): \(piCopyMissing)")
+
+        // ACCOUNTS-PAGE: the sidebar carries the Accounts page between Usage
+        // attribution and General, and every new or moved-into-popover copy key
+        // is translated (English is the key). Claude, Antigravity, Pi and Cursor
+        // moved out of General; their behavior is unchanged. Which sections each
+        // page builder includes is not asserted: the builders are private view
+        // functions with no seam, and a source-text scan would not be a guard.
+        expect(
+            SettingsPanel.Page.allCases.map(\.rawValue)
+                == ["Menu bar", "Dashboard", "Usage attribution", "Accounts", "General", "About"],
+            "ACCOUNTS-PAGE sidebar order: Accounts sits between Usage attribution and General")
+        let accountsCopyKeys = AccountsCopy.translated
+        var accountsCopyMissing: [String] = []
+        for key in accountsCopyKeys {
+            for locale in ["zh-Hant", "zh-Hans"] {
+                let value = AppLanguage.localizedString(
+                    key, locale: locale, bundle: .tokenBarResources)
+                if value == nil || value == key {
+                    accountsCopyMissing.append("\(locale): \(key.prefix(24))")
+                }
+            }
+        }
+        expect(
+            accountsCopyMissing.isEmpty,
+            "ACCOUNTS-PAGE every Accounts copy key exists in zh-Hant and zh-Hans: \(accountsCopyMissing)")
+        let agyDetails = AccountsCopy.antigravityDetails.joined(separator: "\n")
+        expect(
+            ["login keychain", "token service and Cloud Code quota service", "revoke access in Google Account"]
+                .allSatisfy(agyDetails.contains)
+                && AccountsCopy.claudeDetails.contains("CLAUDE_CONFIG_DIR")
+                && AccountsCopy.antigravityDetails.count == 5
+                && ["reads the login of the Cursor app", "sends it only to Cursor's usage service (cursor.com)",
+                    "date, model, token counts, cost and conversation ID", "the login itself is never saved or logged",
+                    "Turning this off deletes the downloaded usage"].allSatisfy(CursorSync.Copy.privacy.contains)
+                && AccountsCopy.antigravityGeneral.last == AccountsCopy.remove
+                && AccountsCopy.autoToggleGroup(autoCaptureOn: true) == [AccountsCopy.autoOn]
+                && AccountsCopy.autoToggleGroup(autoCaptureOn: false) == [AccountsCopy.autoOn, AccountsCopy.autoOff]
+                && AccountsCopy.page == SettingsPanel.Page.accounts.rawValue,
+            "ACCOUNTS-PAGE Antigravity details keep the keychain / token-service / revoke facts and Claude details keep the CLAUDE_CONFIG_DIR instructions")
 
         // MARK: - M3: a Claude card is addressed by (clientId, accountKey)
 
@@ -17868,6 +17906,58 @@ enum SelfTest {
             let partial = try? JSONDecoder().decode(
                 CursorSyncStatus.self, from: Data(#"{"state":"partial","events":0,"lastSuccessMs":null,"changed":false}"#.utf8))
             let sync: @Sendable (Bool) -> CursorSyncStatus? = { _ in syncCalls.value += 1; return partial }
+            // CONSENT-CONFIRM: drives the controller methods only. The
+            // SettingsPanel wiring (popover isPresented setter -> cancelEnable,
+            // Continue -> confirmEnable, the row's onDisappear -> cancelEnable)
+            // has no seam and is not observed here. Turning the switch on
+            // enables and acknowledges nothing until confirmEnable(). Asserted
+            // for cancel: pending cleared, notice not acknowledged, and the
+            // stored enabled key unchanged (still absent from the default
+            // start, still false from an explicit off). Run from the shipped
+            // default (key absent: enabled reads true, notice false) and from
+            // an explicit off.
+            @MainActor func consentState(
+                _ start: Bool?, _ steps: (CursorSyncController, UserDefaults, [String]) -> Void
+            ) -> (shown: Bool, enabled: Bool, raw: Bool?, ack: Bool, pending: Bool) {
+                let cs = "tokenbar.selftest.cursorConfirm"
+                let d = UserDefaults(suiteName: cs)!
+                defer { d.removePersistentDomain(forName: cs) }
+                d.removePersistentDomain(forName: cs)
+                if let start { d.set(start, forKey: CursorSync.enabledKey) }
+                let c = CursorSyncController()
+                steps(c, d, ["Syrtis", "--demo"])
+                let en = CursorSync.enabled(defaults: d), ack = CursorSync.noticeAcknowledged(defaults: d)
+                return (CursorSync.toggleShowsOn(enabled: en, acknowledged: ack), en, d.object(forKey: CursorSync.enabledKey) as? Bool, ack, c.confirmPending)
+            }
+            let consent: [(String, Bool)] = { () -> [(String, Bool)] in
+                var ok: [(String, Bool)] = []
+                for start in [nil, false] as [Bool?] {
+                    let tag = start == nil ? "default" : "off"
+                    let asked = consentState(start) { c, d, a in c.switchChanged(to: true, defaults: d, arguments: a) }
+                    ok.append(("\(tag): on only asks", asked.pending && !asked.shown && !asked.ack
+                        && asked.raw == start))
+                    let cancelled = consentState(start) { c, d, a in
+                        c.switchChanged(to: true, defaults: d, arguments: a); c.cancelEnable()
+                    }
+                    ok.append(("\(tag): cancel enables nothing", !cancelled.pending && !cancelled.shown && !cancelled.ack
+                        && cancelled.raw == start))
+                    let confirmed = consentState(start) { c, d, a in
+                        c.switchChanged(to: true, defaults: d, arguments: a); c.confirmEnable(defaults: d, arguments: a)
+                    }
+                    ok.append(("\(tag): confirm enables and acknowledges", !confirmed.pending && confirmed.shown && confirmed.ack))
+                    let unasked = consentState(start) { c, d, a in c.confirmEnable(defaults: d, arguments: a) }
+                    ok.append(("\(tag): confirm without asking does nothing", !unasked.shown && !unasked.ack && unasked.raw == start))
+                }
+                let off = consentState(true) { c, d, a in
+                    c.switchChanged(to: true, defaults: d, arguments: a); c.confirmEnable(defaults: d, arguments: a)
+                    c.switchChanged(to: false, defaults: d, arguments: a)
+                }
+                ok.append(("off applies without asking", !off.enabled && !off.pending))
+                return ok
+            }()
+            expect(
+                consent.allSatisfy(\.1),
+                "CONSENT-CONFIRM Settings switch gate: \(consent.filter { !$0.1 }.map(\.0))")
             let controller = CursorSyncController()
             // 1. Notice not acknowledged -> no sync.
             await controller.runSync(explicit: true, defaults: defaults, arguments: ["Syrtis"], sync: sync)
