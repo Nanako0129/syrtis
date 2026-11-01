@@ -9418,6 +9418,9 @@ enum SelfTest {
         for (label, passed) in TBCore.filterParityContractChecks() {
             expect(passed, "filter parity: \(label)")
         }
+        for (label, passed) in TBCore.probeContractChecks() {
+            expect(passed, "probe: \(label)")
+        }
 
         // Native scroll routing and pinch zoom; no window or system input needed.
         do {

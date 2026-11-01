@@ -4,7 +4,8 @@
 //! string; the caller must release it with `tb_free`. Entry points are
 //! synchronous — Swift calls them from a background thread.
 //!
-//! Envelope: every entry point (except the legacy `tb_probe`) wraps its
+//! Envelope: every entry point (except the legacy `tb_probe`, whose shape is
+//! `{"ok":true,"messages":N,"opencodeDb":{...}}`, documented at `tb_probe`) wraps its
 //! payload as `{"ok":true,"data":<payload>}` on success and
 //! `{"ok":false,"err":"..."}` on failure. The `data` shapes mirror the Tauri
 //! frontend contract (`src/lib/types.ts` / `src/lib/agentUsage.ts` in the
@@ -37,9 +38,12 @@ mod kiro_integrations;
 mod macos_safe_storage;
 mod window_usage;
 mod model_report;
+#[cfg(test)]
+mod opencode_db_acceptance;
 mod opencode_integrations;
 mod usage_graph;
 mod usage_tail;
+mod user_scanner_settings;
 
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::{c_char, CStr, CString};
@@ -186,13 +190,22 @@ impl LocalSourceContext {
         }
     }
 
-    /// The registry's extra roots plus the Cursor sync takeover
-    /// (`cursor_sync::apply_takeover`), which adds one synced file per
-    /// Cursor account (never a directory) and excludes
-    /// the CLI's Cursor root only under the takeover conditions.
+    /// The registry's extra roots, the user's OpenCode DB locations
+    /// (`OPENCODE_DB`, settings.json; see `user_scanner_settings`) plus the
+    /// Cursor sync takeover (`cursor_sync::apply_takeover`), which adds one
+    /// synced file per Cursor account (never a directory) and excludes the
+    /// CLI's Cursor root only under the takeover conditions. Every scan entry
+    /// point builds its options through here. A pinned-corpus context
+    /// (`use_env_roots` false) ignores the user's DBs like it ignores the
+    /// per-client root variables.
     fn scanner_settings(&self) -> tokscale_core::scanner::ScannerSettings {
         let mut settings = tokscale_core::scanner::ScannerSettings {
             extra_scan_paths: extra_scan_paths::snapshot(),
+            opencode_db_paths: if self.use_env_roots {
+                user_scanner_settings::opencode_db_paths(self.home_dir.as_deref())
+            } else {
+                Vec::new()
+            },
             ..Default::default()
         };
         cursor_sync::apply_takeover(
@@ -790,8 +803,10 @@ fn graph_cached(year: &str, max_age: Duration) -> Option<serde_json::Value> {
 fn graph_compute(year: &str) -> Result<serde_json::Value, String> {
     // Probe before parsing: a source write or topology change that lands
     // mid-compute changes the token, so the next aged-out read recomputes
-    // rather than serving a graph that missed it. Keep the same context for
-    // both paths so the probe and report scan observe identical source roots.
+    // rather than serving a graph that missed it. The probe and the scan each
+    // build their options, so each reads settings.json itself: an edit between
+    // them can leave a token older than the data, which only costs one extra
+    // recompute at the next probe (the token then differs).
     let generation = ROOT_GENERATION.load(Ordering::SeqCst);
     let context = LocalSourceContext::current();
     let token =
@@ -1004,13 +1019,26 @@ fn tail_tick_if_stale() {
 
 /// Smoke probe: parse all local clients and report the message count.
 /// Proves the staticlib links and tokscale-core can read this machine.
-/// (Legacy Phase 0 shape: `{"ok":true,"messages":N}`, no `data` wrapper.)
+/// Legacy Phase 0 shape, no `data` wrapper:
+/// `{"ok":true,"messages":N,"opencodeDb":{...}}` or `{"ok":false,"err":...}`.
+/// `opencodeDb` = `{"settingsFile":"absent"|"ok"|"tooLarge"|"unreadable"|
+/// "invalidJson","handedToEngine":N,"issues":[{"source":"env"|"file",
+/// "index":i,"reason":"notAbsolute"|"badFileName"|"missing"|"emptyEnv"}]}`: what the last
+/// read of the user's OpenCode DB settings found (see `user_scanner_settings`);
+/// `index` is the zero-based position in that source's list, `notAbsolute`
+/// and `emptyEnv` are withheld from the engine, the other reasons are paths it will
+/// probably skip. No path crosses the ABI.
 #[no_mangle]
 pub extern "C" fn tb_probe() -> *mut c_char {
     guarded("tb_probe", || {
         let context = LocalSourceContext::current();
         let json = match tokscale_core::parse_local_clients(context.parse_options(None, None)) {
-            Ok(pm) => format!(r#"{{"ok":true,"messages":{}}}"#, pm.messages.len()),
+            Ok(pm) => serde_json::json!({
+                "ok": true,
+                "messages": pm.messages.len(),
+                "opencodeDb": user_scanner_settings::diagnostics(),
+            })
+            .to_string(),
             Err(e) => serde_json::json!({"ok": false, "err": e}).to_string(),
         };
         into_raw_json(json)
