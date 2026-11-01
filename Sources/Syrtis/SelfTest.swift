@@ -6863,6 +6863,19 @@ enum SelfTest {
                 && ClientRegistry.updatingTabVisibility([], tab: "codex", visible: false)
                     == ["codex"],
             "an ungrouped tab toggles only its own id")
+        // The hint used to say quota-only Antigravity has no tab, which stopped
+        // being true when #349 gave every configured quota source a tab. English
+        // is the key, so both translations have to carry the rewritten sentence.
+        let clientTabsHint = "Drag to order tabs and quota cards. The switch hides a client's tab and its quota card. Rows marked (quota card only) have no tab of their own and are listed only for ordering their quota card."
+        let missingClientTabsHint = ["zh-Hant", "zh-Hans"].filter { locale in
+            let value = AppLanguage.localizedString(
+                clientTabsHint, locale: locale, bundle: .tokenBarResources)
+            return value == nil || value == clientTabsHint
+        }
+        expect(
+            missingClientTabsHint.isEmpty,
+            "the rewritten Client-tabs hint is translated in zh-Hant and zh-Hans: "
+                + "\(missingClientTabsHint)")
         // The ordering half of the same upgrade path. A saved order naming
         // `antigravity-cli` supplied no position for the `antigravity` tab, so
         // the tab fell to the end and the user's arrangement rearranged itself.

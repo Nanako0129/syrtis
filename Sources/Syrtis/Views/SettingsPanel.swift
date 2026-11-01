@@ -619,11 +619,10 @@ struct SettingsPanel: View {
                     VStack(spacing: 1) {
                         ForEach(tabsUniverse, id: \.self) { id in
                             let isVisible = !hiddenSet.contains(id)
-                            // Only present clients can be top tabs, so only
-                            // they get the show/hide switch. Quota-only ids
-                            // (e.g. Antigravity — OAuth quota, no local
-                            // sessions) appear solely to order their quota
-                            // card, so they show a caption instead.
+                            // Rows that are not tab ids — a grouped member
+                            // that owns its own quota card, for example — have
+                            // no tab of their own, so they show a caption
+                            // instead of the switch.
                             let canTab = presentSet.contains(id)
                             HStack(spacing: 8) {
                                 // Drag handle - always shown for every provider
@@ -686,7 +685,7 @@ struct SettingsPanel: View {
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
-            hint("Drag to order tabs and quota cards. The switch hides a client's tab and its quota card. Clients that only report quota, such as Antigravity, have no tab and are listed only for ordering.")
+            hint("Drag to order tabs and quota cards. The switch hides a client's tab and its quota card. Rows marked (quota card only) have no tab of their own and are listed only for ordering their quota card.")
         }
 
         section("Live trace") {
