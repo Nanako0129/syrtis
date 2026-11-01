@@ -240,7 +240,9 @@ fn tb_probe_reports_rejected_paths() {
     assert_eq!(report["handedToEngine"], 2);
     // Key names are the wire contract Swift's ProbeResult.OpenCodeDb decodes.
     let keys = |v: &serde_json::Value| -> Vec<String> {
-        v.as_object().unwrap().keys().cloned().collect()
+        let mut keys: Vec<String> = v.as_object().unwrap().keys().cloned().collect();
+        keys.sort();
+        keys
     };
     assert_eq!(keys(report), ["handedToEngine", "issues", "settingsFile"]);
     assert_eq!(keys(&report["issues"][0]), ["index", "reason", "source"]);
@@ -259,6 +261,23 @@ fn an_aged_out_cache_entry_recomputes_after_a_settings_edit() {
     };
     let db = write_external_db(&root);
     assert_eq!(entries_seeing_the_db(), Vec::<&str>::new());
+    let age_window_entries = || {
+        let aged = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_secs(crate::ONESHOT_MAX_AGE_SECS + 1))
+            .expect("monotonic clock is older than 31 s");
+        let mut cache = crate::WINDOW_USAGE_CACHE.lock().unwrap();
+        assert!(!cache.is_empty());
+        for entry in cache.values_mut() {
+            entry.0 = aged;
+        }
+    };
+    let window = || unsafe { take(crate::tb_window_usage(std::ptr::null(), WINDOW_FROM, WINDOW_UNTIL)) };
+    // Control: an aged window entry whose source did not change is re-stamped,
+    // not rescanned.
+    age_window_entries();
+    let scans = crate::window_usage::scan_count();
+    window();
+    assert_eq!(crate::window_usage::scan_count(), scans, "unchanged source must not rescan");
     let zero = std::time::Duration::ZERO;
     // Control: nothing changed, so the aged-out graph entry is re-stamped and served.
     assert!(crate::graph_cached("", zero).is_some(), "unchanged source keeps the entry");
@@ -267,15 +286,8 @@ fn an_aged_out_cache_entry_recomputes_after_a_settings_edit() {
     let graph = unsafe { take(crate::tb_refresh_graph(std::ptr::null())) };
     assert!(has_int(&graph, OUTPUT), "{graph}");
     // The window entry: age it past the oneshot window and ask again.
-    let aged = std::time::Instant::now()
-        .checked_sub(std::time::Duration::from_secs(crate::ONESHOT_MAX_AGE_SECS + 1));
-    let mut cache = crate::WINDOW_USAGE_CACHE.lock().unwrap();
-    assert!(!cache.is_empty());
-    for entry in cache.values_mut() {
-        entry.0 = aged.expect("monotonic clock is older than 31 s");
-    }
-    drop(cache);
-    let window = unsafe { take(crate::tb_window_usage(std::ptr::null(), WINDOW_FROM, WINDOW_UNTIL)) };
+    age_window_entries();
+    let window = window();
     assert!(has_int(&window, OUTPUT), "{window}");
 }
 

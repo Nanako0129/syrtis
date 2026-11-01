@@ -921,7 +921,8 @@ public enum TBCore {
 
     /// Pins the `opencodeDb` object of the legacy `tb_probe` payload. The literal
     /// is the shape the Rust acceptance test `tb_probe_reports_rejected_paths`
-    /// asserts key by key, so a rename on either side fails one of the two.
+    /// asserts key by key. A rename on one side only is caught; a coordinated rename
+    /// on both sides is not.
     public static func probeContractChecks() -> [(String, Bool)] {
         let body = Data(
             #"{"ok":true,"messages":3,"opencodeDb":{"settingsFile":"ok","handedToEngine":2,"issues":[{"source":"file","index":0,"reason":"badFileName"},{"source":"env","index":0,"reason":"missing"}]}}"#.utf8

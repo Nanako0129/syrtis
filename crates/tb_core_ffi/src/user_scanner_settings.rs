@@ -16,9 +16,10 @@
 //! by the next scan that is not served from a cache. The graph and window
 //! caches serve an entry younger than `ONESHOT_MAX_AGE_SECS` without looking;
 //! an older one is re-validated by the engine's change token (which covers the
-//! DB paths), so an edit shows up within that window plus the duration of a
-//! compute that was running when the file changed. Editing the file does not
-//! bump `ROOT_GENERATION`; only a root setter clears the caches at once.
+//! DB paths), so an edit shows up after that window, plus a compute that was
+//! in flight when the file changed, plus one full recompute (and, in the app,
+//! the Swift poll interval). Editing the file does not bump `ROOT_GENERATION`;
+//! only a root setter clears the caches at once.
 //! `OPENCODE_DB` is read from the live environment too, but a GUI app's
 //! environment is fixed at launch, so a changed value needs an app restart.
 //! There is no process-context lock on macOS to keep this read out of.
@@ -36,7 +37,11 @@
 //! resolution, then `opencode`), so an absolute value is taken as is. An
 //! exactly empty value is our choice, not opencode's (it would resolve to the
 //! data dir itself, which holds no database): it is ignored and reported as
-//! `emptyEnv`.
+//! `emptyEnv`. A relative value under a relative `XDG_DATA_HOME` is handed over
+//! relative, and the engine resolves it against the process cwd, as it does for
+//! its own discovery. `handedToEngine` counts distinct path strings, so paths
+//! differing only by `..` count twice; the engine dedups by canonical path, so
+//! totals stay right.
 //! `opencodeDbPaths` entries in settings.json are tokscale's field, not
 //! opencode's, and must be absolute: nothing documents a base for relative
 //! ones. Their syntax: surrounding whitespace and one pair of quotes are
@@ -166,26 +171,20 @@ fn is_opencode_db_filename(name: &str) -> bool {
         })
 }
 
-/// An absolute path to hand to the engine, plus the diagnostic (if any) that
-/// the engine will probably skip it. Only `notAbsolute` withholds a path.
-fn normalize_os(
-    raw: &std::ffi::OsStr,
-    home: Option<&Path>,
-) -> Result<(PathBuf, Option<&'static str>), &'static str> {
+/// An absolute settings.json path to hand to the engine; only a non-absolute
+/// one is withheld (`notAbsolute`).
+fn normalize_os(raw: &std::ffi::OsStr, home: Option<&Path>) -> Result<PathBuf, &'static str> {
     // Only valid Unicode is trimmed/unquoted/expanded; anything else is
     // passed through untouched.
     let path = match raw.to_str() {
         Some(text) => normalize(text, home),
         None => PathBuf::from(raw),
     };
-    if !path.is_absolute() {
-        return Err("notAbsolute");
+    if path.is_absolute() {
+        Ok(path)
+    } else {
+        Err("notAbsolute")
     }
-    let name_ok = path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .is_some_and(is_opencode_db_filename);
-    Ok((path, (!name_ok).then_some("badFileName")))
 }
 
 fn normalize(raw: &str, home: Option<&Path>) -> PathBuf {
@@ -233,10 +232,13 @@ fn keep(
     source: &'static str,
     index: usize,
     path: PathBuf,
-    name_issue: Option<&'static str>,
 ) {
-    if let Some(reason) = name_issue {
-        issues.push(Issue { source, index, reason });
+    let name_ok = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(is_opencode_db_filename);
+    if !name_ok {
+        issues.push(Issue { source, index, reason: "badFileName" });
     }
     if !path.is_file() {
         issues.push(Issue { source, index, reason: "missing" });
@@ -258,9 +260,7 @@ fn resolve(
     let mut seen = HashSet::new();
     for (index, raw) in from_file.iter().enumerate() {
         match normalize_os(raw.as_ref(), home) {
-            Ok((path, name_issue)) => {
-                keep(&mut paths, &mut issues, &mut seen, "file", index, path, name_issue)
-            }
+            Ok(path) => keep(&mut paths, &mut issues, &mut seen, "file", index, path),
             Err(reason) => issues.push(Issue { source: "file", index, reason }),
         }
     }
@@ -270,11 +270,13 @@ fn resolve(
         if raw.is_empty() {
             issues.push(Issue { source: "env", index: 0, reason: "emptyEnv" });
         } else if raw != ":memory:" {
-            match data_dir.map(|d| d.join(&raw)).or_else(|| Some(PathBuf::from(&raw)).filter(|p| p.is_absolute())) {
-                Some(path) => {
-                    let name_ok = path.file_name().and_then(|n| n.to_str()).is_some_and(is_opencode_db_filename);
-                    keep(&mut paths, &mut issues, &mut seen, "env", 0, path, (!name_ok).then_some("badFileName"))
-                }
+            let path = match data_dir {
+                Some(dir) => Some(dir.join(&raw)),
+                None if Path::new(&raw).is_absolute() => Some(PathBuf::from(&raw)),
+                None => None,
+            };
+            match path {
+                Some(path) => keep(&mut paths, &mut issues, &mut seen, "env", 0, path),
                 None => issues.push(Issue { source: "env", index: 0, reason: "notAbsolute" }),
             }
         }
