@@ -1647,17 +1647,21 @@ unsafe fn set_cursor_sync_from_c(json: *const c_char) -> Result<serde_json::Valu
 /// `{"state":"ok|partial|expired|notSignedIn|offline|error|disabled|cliPresent",
 /// "events":N,"lastSuccessMs":ms|null,"reason"?:"<fixed code>",
 /// "changed":bool,"profiles":[{"id","state","events","lastSuccessMs","reason"?,
-/// "duplicateOf"?}]}`. `changed`: some profile wrote its file this round, so
-/// the scan caches were invalidated and views must refresh, whatever the
-/// headline state.
+/// "duplicateOf"?}]}`. `changed`: some profile's file bytes changed this
+/// round, so the scan caches were invalidated and views must refresh,
+/// whatever the headline state; a round fetching the same history rewrites
+/// nothing and reports false. `app_dir_rejected`: the appDir no longer
+/// passes the checks above; nothing is read, written or registered from it.
 /// The top-level `state` is `ok` when every profile is `ok` or `duplicate`
 /// (the account was already covered this round by the profile `duplicateOf`:
 /// synced, or failed for the whole account — rate_limited, offline,
-/// partial, other server errors; an expired session or a failed write
-/// covers nothing), else the
+/// server_error (5xx), partial (timeout, budget_exhausted); any other
+/// failure — expired/401/redirect/403 JSON, disabled, client_unavailable,
+/// other refusals, a failed write — covers nothing), else the
 /// first other profile state (a `notSignedIn` profile is skipped while
-/// another synced); `events` sums this call's writes, `lastSuccessMs` is the
-/// newest complete file. `cliPresent` = a walk completed but CLI Cursor files
+/// another synced); `events` sums this call's fetched events,
+/// `lastSuccessMs` is now for a profile synced this round, else its complete
+/// file's mtime (newest across profiles at the top level). `cliPresent` = a walk completed but CLI Cursor files
 /// exist and the user has not confirmed the takeover; it carries no `reason`.
 #[no_mangle]
 pub extern "C" fn tb_cursor_sync(user_initiated: i32) -> *mut c_char {

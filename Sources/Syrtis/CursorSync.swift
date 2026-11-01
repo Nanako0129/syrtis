@@ -277,8 +277,8 @@ final class CursorSyncController: ObservableObject {
             // A round that wrote a file already invalidated the core's
             // caches; refresh the views on `changed`, not on the headline (one
             // profile can write while another fails) and not on the event
-            // count (another profile can write the same count). The cost is a
-            // view reload after every sync that wrote, at most every 30 min.
+            // count (another profile can write the same count). The core
+            // reports `changed` only when a file's bytes changed.
             if result.changed { Self.refreshModel() }
         } while rerunPending && CursorSync.shouldSync(defaults: defaults, arguments: arguments)
     }

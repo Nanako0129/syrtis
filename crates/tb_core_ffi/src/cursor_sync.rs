@@ -2,8 +2,8 @@
 //!
 //! Data flow, per Cursor profile (the default one plus each added
 //! `--user-data-dir` root, walked one at a time): its `state.vscdb`
-//! (read-only; `cursor_desktop::read_login_checked`, after resolving a
-//! symlink for the default profile only) → access token + its
+//! (read-only; `cursor_desktop::read_login_checked` for an added profile,
+//! `read_login_resolved` for the default) → access token + its
 //! own JWT `sub` → POST `get-filtered-usage-events` on cursor.com, full
 //! history, paginated → a trimmed JSON file `usage.<hmac>.json` in that
 //! profile's Syrtis-owned dir (`<appDir>/cursor-cache` for the default,
@@ -25,15 +25,20 @@
 //!   (cursor.com sends an expired session to WorkOS) means `expired`.
 //! - The switch is in Rust, default off, and is re-read before every page (S-3).
 //! - Only the engine parser's fields are deserialised and written (S-6).
-//! - Only a complete walk replaces the file; partial or failed walks leave it.
+//! - Only a complete walk replaces the file; partial or failed walks leave it,
+//!   and a complete walk with the same bytes leaves it untouched.
+//! - Every round re-checks the appDir first; one that no longer passes
+//!   (`check_app_dir`) gets no read, lock, write or takeover file
+//!   (`app_dir_rejected`).
 //! - Swift passes a bundle id and `(uuid, root)` pairs, never a directory or a
 //!   database path; Rust derives both (CMP-520 B2). `sub` never crosses the
 //!   FFI: a profile whose account an earlier profile already covered this
 //!   round reports only that profile's id (`duplicateOf`). A walk covers its
 //!   account when it synced, or failed in a way a second session would only
-//!   repeat (rate_limited, offline, partial, any other server error); it does
-//!   not when the failure belongs to that session or that profile
-//!   (`expired`, a failed write) — then the next profile tries its own.
+//!   repeat (`covers_account`: rate_limited, offline, server_error (5xx),
+//!   partial: timeout or budget_exhausted). Any other failure (expired/401/
+//!   redirect/403 JSON, disabled, client_unavailable, other refusals, a
+//!   failed write) leaves the account to the next profile on it.
 
 use crate::cursor_desktop::{self, CursorLogin};
 use fs2::FileExt as _;
@@ -468,6 +473,14 @@ pub(crate) fn takeover(config: &Config, home: Option<&Path>) -> Takeover {
     let (true, Some(home)) = (config.enabled, home) else {
         return Takeover::Off;
     };
+    // Never register files from an appDir that no longer passes the checks.
+    if config
+        .app_dir
+        .as_deref()
+        .is_some_and(|app_dir| check_app_dir(app_dir, home).is_err())
+    {
+        return Takeover::Off;
+    }
     let files = newest_per_account(config);
     if files.is_empty() {
         return Takeover::Off;
@@ -680,7 +693,7 @@ fn commit_file(
     stem: &str,
     events: &[Event],
     still_wanted: &dyn Fn() -> bool,
-) -> Result<(), Stop> {
+) -> Result<bool, Stop> {
     let failed = || Stop::error("write_failed");
     // An added profile's dir sits in `cursor-profiles`: that must be a real
     // directory too, or `create_dir_all` would follow a symlink there.
@@ -701,6 +714,12 @@ fn commit_file(
     })
     .map_err(|_| failed())?;
     let final_name = format!("usage.{stem}.json");
+    // Same bytes as the file already there: leave it (and its mtime) alone,
+    // so the engine's source cache and the scan caches stay valid.
+    if std::fs::read(dir.join(&final_name)).is_ok_and(|old| old == payload) {
+        let (removed, _) = remove_usage_files(dir, Some(&final_name));
+        return Ok(removed > 0);
+    }
     let temp_path = dir.join(temp_file_name());
     let written = (|| {
         let mut options = std::fs::OpenOptions::new();
@@ -723,7 +742,7 @@ fn commit_file(
     // The rename is the commit point; a failed dir fsync cannot undo it.
     let _ = crate::agent_quota_history::sync_directory(dir);
     let _ = remove_usage_files(dir, Some(&final_name));
-    Ok(())
+    Ok(true)
 }
 
 // ---------------------------------------------------------------------------
@@ -848,6 +867,9 @@ struct Outcome {
     /// For `Duplicate`: the index (in this round's slots) of the profile that
     /// already covered the same account. Never the account itself.
     duplicate_of: Option<usize>,
+    /// The usage file's bytes changed this round (a no-op rewrite does not
+    /// count, so scan caches stay valid).
+    wrote: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -1032,6 +1054,9 @@ async fn walk(
             // A maintainer stop condition (plan C2 stops), distinct on purpose.
             return Err(Stop::error("rate_limited"));
         }
+        if status.is_server_error() {
+            return Err(Stop::error("server_error"));
+        }
         if !status.is_success() {
             return Err(Stop::error("http_status"));
         }
@@ -1059,6 +1084,16 @@ async fn walk(
     Err(Stop::error("too_many_pages"))
 }
 
+/// A walk failure a second session on the same account would only repeat
+/// (429 amplification): rate_limited, offline, a 5xx, partial (timeout,
+/// budget_exhausted). Anything else (expired/401/redirect/403 JSON,
+/// disabled, client_unavailable, other refusals) leaves the account to the
+/// next profile on it; so does a failed write, which never reaches here.
+fn covers_account(stop: Stop) -> bool {
+    matches!(stop.state, State::Partial | State::Offline)
+        || matches!(stop.reason, Some("rate_limited" | "server_error"))
+}
+
 /// One profile's sync, start to finish. `enabled` is the live switch (and,
 /// in production, "this profile is still configured as when the round
 /// started"). `claim(stem, false)` returns the index of an earlier profile
@@ -1067,7 +1102,8 @@ async fn walk(
 /// that is not this session's own (see the module doc). `checked`: an added
 /// profile, read with `read_login_checked` (a symlinked database refused);
 /// the default profile follows a symlinked `state.vscdb`, as every release
-/// did, and checks the resolved file (`read_login_resolved`).
+/// did, and opens the resolved file the checked way without an owner check
+/// (`read_login_resolved`).
 async fn run(
     target: &Target<'_>,
     db_path: &Path,
@@ -1081,6 +1117,7 @@ async fn run(
         stop,
         events: 0,
         duplicate_of: None,
+        wrote: false,
     };
     if !enabled() {
         return stopped(Stop::new(State::Disabled, None));
@@ -1115,6 +1152,7 @@ async fn run(
             stop: Stop::new(State::Duplicate, None),
             events: 0,
             duplicate_of: Some(first),
+            wrote: false,
         };
     }
     let Ok(mut cookie) = reqwest::header::HeaderValue::from_str(&format!(
@@ -1128,10 +1166,7 @@ async fn run(
     let events = match walk(target, &cookie, limits, enabled).await {
         Ok(events) => events,
         Err(stop) => {
-            // Only this session's refusal leaves the account to the next
-            // profile on it; a rate limit, outage or other server error would
-            // only be repeated by a second session (429 amplification).
-            if stop.state != State::Expired {
+            if covers_account(stop) {
                 claim(&stem, true);
             }
             return stopped(stop);
@@ -1139,12 +1174,13 @@ async fn run(
     };
     drop(cookie);
     match commit_file(dir, &stem, &events, enabled) {
-        Ok(()) => {
+        Ok(wrote) => {
             claim(&stem, true);
             Outcome {
                 stop: Stop::new(State::Ok, None),
                 events: events.len(),
                 duplicate_of: None,
+                wrote,
             }
         }
         Err(stop) => stopped(stop),
@@ -1211,6 +1247,12 @@ fn sync_with(
     let start = config();
     // Off is decided per profile, before its login is read (`run`).
     let profiles = slots(&start, target.db_path);
+    // The appDir may have changed since it was accepted (e.g. replaced by a
+    // symlink into the tokscale tree): re-check before any lock or write.
+    let app_dir_rejected = matches!(
+        (start.app_dir.as_deref(), home),
+        (Some(app_dir), Some(home)) if check_app_dir(app_dir, home).is_err()
+    );
     let budget = if explicit || profiles.iter().any(|p| complete_file(&p.dir).is_none()) {
         FULL_BUDGET
     } else {
@@ -1225,11 +1267,19 @@ fn sync_with(
     let mut outcomes: Vec<Outcome> = Vec::with_capacity(profiles.len());
     for (index, profile) in profiles.iter().enumerate() {
         let remaining = deadline.saturating_duration_since(Instant::now());
-        let outcome = if remaining.is_zero() {
+        let outcome = if app_dir_rejected {
+            Outcome {
+                stop: Stop::error("app_dir_rejected"),
+                events: 0,
+                duplicate_of: None,
+                wrote: false,
+            }
+        } else if remaining.is_zero() {
             Outcome {
                 stop: Stop::new(State::Partial, Some("budget_exhausted")),
                 events: 0,
                 duplicate_of: None,
+                wrote: false,
             }
         } else {
             let still_wanted = || profile.still_in(&start, &config());
@@ -1258,20 +1308,31 @@ fn sync_with(
         };
         outcomes.push(outcome);
     }
-    let changed = outcomes.iter().any(|o| o.stop.state == State::Ok);
+    let changed = outcomes.iter().any(|o| o.wrote);
     let head = if profiles.is_empty() {
         Stop::new(State::Disabled, None)
     } else {
         headline(&outcomes)
     };
-    let cli_present = changed && takeover(&config(), home) == Takeover::Blocked;
+    // A completed walk, written or unchanged, still asks the D6 question.
+    let completed = outcomes.iter().any(|o| o.stop.state == State::Ok);
+    let cli_present = completed && takeover(&config(), home) == Takeover::Blocked;
     let state = if cli_present {
         State::CliPresent
     } else {
         head.state
     };
-    let last_success_ms = |dir: &Path| {
-        complete_file(dir)
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .ok();
+    // A profile synced this round succeeded now, even when its file was left
+    // untouched (same bytes); otherwise its complete file's mtime.
+    let last_success = |profile: &Slot, outcome: &Outcome| {
+        if outcome.stop.state == State::Ok {
+            return now_ms;
+        }
+        complete_file(&profile.dir)
             .and_then(|(_, modified)| modified.duration_since(UNIX_EPOCH).ok())
             .map(|d| d.as_millis() as u64)
     };
@@ -1283,7 +1344,7 @@ fn sync_with(
                 "id": profile.id,
                 "state": outcome.stop.state,
                 "events": outcome.events,
-                "lastSuccessMs": last_success_ms(&profile.dir),
+                "lastSuccessMs": last_success(profile, outcome),
             });
             if let Some(reason) = outcome.stop.reason {
                 entry["reason"] = reason.into();
@@ -1297,7 +1358,11 @@ fn sync_with(
     let mut status = serde_json::json!({
         "state": state,
         "events": outcomes.iter().map(|o| o.events).sum::<usize>(),
-        "lastSuccessMs": profiles.iter().filter_map(|p| last_success_ms(&p.dir)).max(),
+        "lastSuccessMs": profiles
+            .iter()
+            .zip(&outcomes)
+            .filter_map(|(profile, outcome)| last_success(profile, outcome))
+            .max(),
         "changed": changed,
         "profiles": per_profile,
     });

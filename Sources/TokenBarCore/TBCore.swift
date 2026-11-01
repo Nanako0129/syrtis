@@ -200,7 +200,7 @@ public struct CursorSyncStatus: Decodable, Equatable, Sendable {
     public let lastSuccessMs: Int64?
     /// A fixed diagnostic code (e.g. `rate_limited`); never account data.
     public let reason: String?
-    /// Some profile wrote its file this round, whatever `state` says.
+    /// Some profile's file bytes changed this round, whatever `state` says.
     public let changed: Bool
 }
 

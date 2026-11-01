@@ -10,8 +10,8 @@
 //! anything is sent. Added Cursor profiles (`cursor_sync`) derive their own
 //! path from the profile root, are read with `read_login_checked` (a
 //! symlinked database is refused), and never feed Grok Bot. The default
-//! profile's sync read follows a symlink and checks the target
-//! (`read_login_resolved`).
+//! profile's sync read follows a symlink and opens the target the checked
+//! way, without an owner check (`read_login_resolved`).
 
 use serde_json::Value;
 use std::path::{Path, PathBuf};
@@ -69,20 +69,35 @@ pub(crate) fn read_login(db_path: &Path) -> Result<Option<CursorLogin>, String> 
 /// the open refuses a symlink (`SQLITE_OPEN_NOFOLLOW`) and runs with
 /// `trusted_schema=OFF` and `DEFENSIVE`. Every refusal is a fixed reason
 /// code; `Ok(None)` is an absent database or one without a token. The
-/// default profile's sync read goes through `read_login_resolved` (symlink
-/// followed, target checked here); Grok Bot keeps `read_login`.
+/// default profile's sync read is `read_login_resolved`; Grok Bot keeps
+/// `read_login`.
 pub(crate) fn read_login_checked(db_path: &Path) -> Result<Option<CursorLogin>, &'static str> {
     #[cfg(unix)]
-    let uid = current_uid();
+    let owner = Some(current_uid());
     #[cfg(not(unix))]
-    let uid = 0;
-    read_login_checked_for(db_path, uid)
+    let owner = None;
+    read_checked(db_path, owner)
 }
 
-fn read_login_checked_for(
-    db_path: &Path,
-    #[cfg_attr(not(unix), allow(unused_variables))] uid: u32,
-) -> Result<Option<CursorLogin>, &'static str> {
+/// The default profile's reader for the sync: follows a symlinked
+/// `state.vscdb` (including one named by `TOKENBAR_CURSOR_STATE_VSCDB`), as
+/// every release did, then opens the resolved file the checked way (regular
+/// file, NOFOLLOW, DEFENSIVE, trusted_schema=OFF) without an owner check
+/// (earlier releases had none; volumes with ignored ownership report uid
+/// 99). A path that cannot be resolved or is not a regular file is "not
+/// signed in", as `read_login` treats it. Grok Bot keeps `read_login`.
+pub(crate) fn read_login_resolved(db_path: &Path) -> Result<Option<CursorLogin>, &'static str> {
+    let Ok(real) = std::fs::canonicalize(db_path) else {
+        return Ok(None);
+    };
+    match read_checked(&real, None) {
+        Err("db_not_file") => Ok(None),
+        other => other,
+    }
+}
+
+/// `owner`: the uid the file must belong to; `None` skips that check.
+fn read_checked(db_path: &Path, owner: Option<u32>) -> Result<Option<CursorLogin>, &'static str> {
     let meta = match std::fs::symlink_metadata(db_path) {
         Ok(meta) => meta,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -97,10 +112,12 @@ fn read_login_checked_for(
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt as _;
-        if meta.uid() != uid {
+        if owner.is_some_and(|uid| meta.uid() != uid) {
             return Err("db_foreign_owner");
         }
     }
+    #[cfg(not(unix))]
+    let _ = owner;
     let conn = open_checked(db_path)?;
     query_login(&conn).map_err(|_| "login_unreadable")
 }
@@ -125,26 +142,6 @@ fn open_checked(db_path: &Path) -> Result<rusqlite::Connection, &'static str> {
     conn.pragma_update(None, "trusted_schema", false)
         .map_err(|_| "login_unreadable")?;
     Ok(conn)
-}
-
-/// The default profile's reader for the sync: follows a symlinked
-/// `state.vscdb` (including one named by `TOKENBAR_CURSOR_STATE_VSCDB`), as
-/// every release did, then applies `read_login_checked` to the resolved
-/// file. Grok Bot keeps `read_login`.
-pub(crate) fn read_login_resolved(db_path: &Path) -> Result<Option<CursorLogin>, &'static str> {
-    #[cfg(unix)]
-    let uid = current_uid();
-    #[cfg(not(unix))]
-    let uid = 0;
-    read_login_resolved_for(db_path, uid)
-}
-
-fn read_login_resolved_for(db_path: &Path, uid: u32) -> Result<Option<CursorLogin>, &'static str> {
-    match std::fs::canonicalize(db_path) {
-        Ok(real) => read_login_checked_for(&real, uid),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(_) => Err("login_unreadable"),
-    }
 }
 
 #[cfg(unix)]
@@ -278,45 +275,52 @@ mod checked_open_tests {
         assert_eq!(read_login_checked(&link).err(), Some("db_symlink"));
     }
 
-    /// The default profile follows a symlinked database and checks what it
-    /// resolves to: a foreign owner or a non-file is still refused.
+    /// The default profile follows a symlinked database and opens the
+    /// target; a target that is not a regular file, an absent one, or one
+    /// below a non-directory is "not signed in", as `read_login` treats it.
     #[cfg(unix)]
     #[test]
-    fn the_default_reader_follows_a_symlink_and_checks_the_target() {
+    fn the_default_reader_follows_a_symlink_and_treats_non_files_as_signed_out() {
         let tmp = tempfile::tempdir().unwrap();
         let path = db(tmp.path());
         let link = tmp.path().join("link.vscdb");
         std::os::unix::fs::symlink(&path, &link).unwrap();
-        let me = current_uid();
-        assert!(matches!(read_login_resolved_for(&link, me), Ok(None)));
-        assert_eq!(
-            read_login_resolved_for(&link, me.wrapping_add(1)).err(),
-            Some("db_foreign_owner")
-        );
+        assert!(matches!(read_login_resolved(&link), Ok(None)));
         let to_dir = tmp.path().join("dir-link.vscdb");
         std::os::unix::fs::symlink(tmp.path(), &to_dir).unwrap();
-        assert_eq!(
-            read_login_resolved_for(&to_dir, me).err(),
-            Some("db_not_file")
-        );
-        assert!(matches!(
-            read_login_resolved_for(&tmp.path().join("absent.vscdb"), me),
-            Ok(None)
-        ));
+        for signed_out in [
+            to_dir,
+            tmp.path().to_path_buf(),
+            tmp.path().join("absent.vscdb"),
+            path.join("below-a-file.vscdb"),
+        ] {
+            assert!(
+                matches!(read_login_resolved(&signed_out), Ok(None)),
+                "{signed_out:?}"
+            );
+        }
     }
 
-    /// 7: a database owned by another user is refused before it is opened.
+    /// Owner check: added profiles refuse another user's database; the
+    /// default profile does not check the owner (earlier releases had no such
+    /// check, and volumes with ignored ownership report uid 99). A root-owned
+    /// regular file that is not a database shows which check ran.
     #[cfg(unix)]
     #[test]
-    fn a_foreign_owned_database_is_refused() {
+    fn only_added_profiles_check_the_owner() {
         let tmp = tempfile::tempdir().unwrap();
         let path = db(tmp.path());
         let me = current_uid();
         assert_eq!(
-            read_login_checked_for(&path, me.wrapping_add(1)).err(),
+            read_checked(&path, Some(me.wrapping_add(1))).err(),
             Some("db_foreign_owner")
         );
         // Control: the owner's own file opens (no token: `None`).
-        assert!(matches!(read_login_checked_for(&path, me), Ok(None)));
+        assert!(matches!(read_checked(&path, Some(me)), Ok(None)));
+        let foreign = Path::new("/etc/hosts");
+        if me != 0 && foreign.is_file() {
+            assert_eq!(read_login_checked(foreign).err(), Some("db_foreign_owner"));
+            assert_eq!(read_login_resolved(foreign).err(), Some("login_unreadable"));
+        }
     }
 }

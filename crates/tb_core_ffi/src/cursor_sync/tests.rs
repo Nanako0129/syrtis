@@ -260,6 +260,7 @@ fn stop(state: State, reason: Option<&'static str>) -> Outcome {
         stop: Stop::new(state, reason),
         events: 0,
         duplicate_of: None,
+        wrote: false,
     }
 }
 
@@ -268,6 +269,7 @@ fn ok(events: usize) -> Outcome {
         stop: Stop::new(State::Ok, None),
         events,
         duplicate_of: None,
+        wrote: true,
     }
 }
 
@@ -454,7 +456,7 @@ fn http_statuses_map_to_states() {
         ),
         (
             http("500 Internal Server Error", "text/plain", "x"),
-            stop(State::Error, Some("http_status")),
+            stop(State::Error, Some("server_error")),
         ),
         (
             json_ok(r#"{"totalUsageEventsCount":1}"#),
@@ -2378,13 +2380,12 @@ fn a_symlinked_default_database_still_syncs() {
     let status = sync_round(&link, &url, &registry);
     assert_eq!(states(&status), ["ok", "error:db_symlink"]);
     assert_eq!(seen.lock().unwrap().len(), 1);
-    // The default's symlink target is checked: one to a directory is
-    // refused with the fixed reason (a foreign owner:
-    // `cursor_desktop::checked_open_tests`).
+    // A default symlink to a directory is "not signed in", as `read_login`
+    // treated it (owner: `cursor_desktop::checked_open_tests`).
     let to_dir = tmp.path().join("dir-link.vscdb");
     std::os::unix::fs::symlink(tmp.path(), &to_dir).unwrap();
     let status = sync_round(&to_dir, &url, &registry);
-    assert_eq!(states(&status)[0], "error:db_not_file");
+    assert_eq!(states(&status)[0], "notSignedIn");
     assert_eq!(seen.lock().unwrap().len(), 1);
 }
 
@@ -2401,12 +2402,18 @@ fn cli_present_carries_no_other_reason() {
     let mismatched = login_db(&tmp.path().join("default"), &valid_token(), OTHER_USER);
     let root = profile_root(tmp.path(), "b", &other_token(), OTHER_USER);
     let registry = RwLock::new(multi(&home, true, vec![profile(PROFILE_A, &root)]));
-    let (url, _) = serve(vec![json_ok(&page(1, &["a"]))]);
+    let (url, _) = serve(vec![json_ok(&page(1, &["a"])), json_ok(&page(1, &["a"]))]);
     let status = sync_round_in(&mismatched, &url, &registry, limits(), Some(&home));
     assert_eq!(states(&status), ["error:account_mismatch", "ok"]);
     assert_eq!(
         (status["state"].as_str(), status.get("reason")),
         (Some("cliPresent"), None)
+    );
+    // An unchanged round still asks the D6 question.
+    let again = sync_round_in(&mismatched, &url, &registry, limits(), Some(&home));
+    assert_eq!(
+        (again["state"].as_str(), again["changed"].as_bool()),
+        (Some("cliPresent"), Some(false))
     );
 }
 
@@ -2505,4 +2512,118 @@ fn a_rate_limited_account_is_not_retried_from_another_profile() {
     let status = sync_round(&default_db, &url, &registry);
     assert_eq!(states(&status), ["error:rate_limited", "duplicate"]);
     assert_eq!(seen.lock().unwrap().len(), 1, "the 429 was repeated from B");
+}
+
+/// Round 3, item 1: the appDir is re-checked at the start of every round.
+/// Accepted, then replaced by a symlink into a tokscale-like folder: the
+/// round writes nothing there, creates no lock, registers no takeover file,
+/// and reports `app_dir_rejected`.
+#[cfg(unix)]
+#[test]
+fn a_round_writes_nothing_into_an_app_dir_that_now_fails_the_checks() {
+    let _guard = lock();
+    set_for_test(Config::default());
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let app = app_dir_in(&home);
+    std::fs::create_dir_all(&app).unwrap();
+    set_in(
+        &home,
+        serde_json::json!({"enabled": true, "bundleId": BUNDLE}),
+    )
+    .unwrap();
+    let registry = RwLock::new(config());
+    set_for_test(Config::default());
+    let outside = home.join(".config/tokscale/scratch");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::remove_dir(&app).unwrap();
+    std::os::unix::fs::symlink(&outside, &app).unwrap();
+    let default_db = login_db(&tmp.path().join("default"), &valid_token(), USER);
+    let (url, seen) = serve(vec![json_ok(&page(1, &["a"]))]);
+    let status = sync_round_in(&default_db, &url, &registry, limits(), Some(&home));
+    assert_eq!(states(&status), ["error:app_dir_rejected"]);
+    assert_eq!(status["reason"], "app_dir_rejected");
+    assert_eq!(status["changed"], false);
+    assert!(seen.lock().unwrap().is_empty());
+    assert!(
+        names_in(&outside).is_empty(),
+        "something was created outside"
+    );
+    assert!(!outside.join(LOCK_FILE_NAME).exists());
+    // A complete file placed there is never registered either.
+    write_complete_file(&outside.join("cursor-cache"));
+    assert_eq!(
+        takeover(&registry.read().unwrap(), Some(&home)),
+        Takeover::Off
+    );
+}
+
+/// Round 3, item 3: a profile removed mid-walk (`disabled`) does not cover
+/// its account, so the next profile on it still walks.
+#[test]
+fn a_profile_removed_mid_walk_does_not_cover_its_account() {
+    let _guard = lock();
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let a = profile_root(tmp.path(), "a", &valid_token(), USER);
+    let b = profile_root(tmp.path(), "b", &valid_token(), USER);
+    let registry = RwLock::new(multi(
+        &home,
+        true,
+        vec![profile(PROFILE_A, &a), profile(PROFILE_B, &b)],
+    ));
+    let first_page = match json_ok(&page(4, &["a", "b"])) {
+        Reply::Raw(bytes) => bytes,
+        _ => unreachable!(),
+    };
+    let (url, seen) = serve(vec![
+        Reply::Delayed(Duration::from_millis(300), first_page),
+        json_ok(&page(1, &["c"])),
+    ]);
+    let status = std::thread::scope(|scope| {
+        let walk = scope.spawn(|| sync_round(&tmp.path().join("absent.vscdb"), &url, &registry));
+        let started = Instant::now();
+        while seen.lock().unwrap().is_empty() {
+            assert!(started.elapsed() < Duration::from_secs(5));
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        registry.write().unwrap().profiles.remove(0);
+        walk.join().unwrap()
+    });
+    assert_eq!(states(&status), ["notSignedIn", "disabled", "ok"]);
+    assert_eq!(
+        seen.lock().unwrap().len(),
+        2,
+        "B was skipped as a duplicate"
+    );
+    assert!(covers_account(Stop::error("rate_limited")));
+    assert!(!covers_account(Stop::new(State::Disabled, None)));
+}
+
+/// Round 3, item 5: a round that fetches the same history leaves the file
+/// as it is (same inode and mtime) and reports `changed: false`.
+#[cfg(unix)]
+#[test]
+fn an_identical_round_rewrites_nothing() {
+    use std::os::unix::fs::MetadataExt as _;
+    let _guard = lock();
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let default_db = login_db(&tmp.path().join("default"), &valid_token(), USER);
+    let registry = RwLock::new(multi(&home, true, vec![]));
+    let (url, _) = serve(vec![json_ok(&page(1, &["a"])), json_ok(&page(1, &["a"]))]);
+    let first = sync_round(&default_db, &url, &registry);
+    assert_eq!(first["changed"], true);
+    let file = expected_file(&default_sync_dir(&home));
+    let before = std::fs::metadata(&file).unwrap();
+    std::thread::sleep(Duration::from_millis(20));
+    let second = sync_round(&default_db, &url, &registry);
+    assert_eq!(states(&second), ["ok"]);
+    assert_eq!(second["changed"], false);
+    let after = std::fs::metadata(&file).unwrap();
+    assert_eq!(
+        (before.ino(), before.modified().unwrap()),
+        (after.ino(), after.modified().unwrap())
+    );
+    assert!(second["lastSuccessMs"].as_u64().unwrap() >= first["lastSuccessMs"].as_u64().unwrap());
 }
