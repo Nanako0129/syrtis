@@ -270,13 +270,29 @@ final class CursorSyncController: ObservableObject {
 
     // MARK: - Actions behind the controls
 
-    /// Settings toggle. Turning it on also answers the notice because the
-    /// privacy paragraph is shown beside the switch whenever it shows off
+    /// Settings switch. Off applies at once. On does not enable anything: it
+    /// returns true so the caller shows the privacy paragraph in a
+    /// confirmation, and only `setEnabled(true)` (the confirm button) enables.
+    /// Cancelling or dismissing the confirmation simply never calls it.
+    func switchChanged(
+        to on: Bool, defaults: UserDefaults = .standard,
+        arguments: [String] = CommandLine.arguments
+    ) -> Bool {
+        if on { return true }
+        setEnabled(false, defaults: defaults, arguments: arguments)
+        return false
+    }
+
+    /// Enables (or disables) and, when enabling, answers the notice: the
+    /// privacy paragraph was shown in the confirmation that led here
     /// (`SettingsPanel.cursorSyncSection`); keep the two together.
-    func setEnabled(_ on: Bool, defaults: UserDefaults = .standard) {
+    func setEnabled(
+        _ on: Bool, defaults: UserDefaults = .standard,
+        arguments: [String] = CommandLine.arguments
+    ) {
         defaults.set(on, forKey: CursorSync.enabledKey)
         if on { defaults.set(true, forKey: CursorSync.noticeKey) }
-        reconfigure(refresh: true, defaults: defaults)
+        reconfigure(refresh: true, defaults: defaults, arguments: arguments)
     }
 
     /// Notice: Continue (`enable`) or Turn Off.

@@ -17901,6 +17901,25 @@ enum SelfTest {
             let partial = try? JSONDecoder().decode(
                 CursorSyncStatus.self, from: Data(#"{"state":"partial","events":0,"lastSuccessMs":null}"#.utf8))
             let sync: @Sendable (Bool) -> CursorSyncStatus? = { _ in syncCalls.value += 1; return partial }
+            // CONSENT-CONFIRM: turning the switch on enables nothing until confirmed.
+            do {
+                let cs = "tokenbar.selftest.cursorConfirm"
+                let d = UserDefaults(suiteName: cs)!
+                defer { d.removePersistentDomain(forName: cs) }
+                d.removePersistentDomain(forName: cs)
+                d.set(false, forKey: CursorSync.enabledKey)
+                let c = CursorSyncController()
+                let args = ["Syrtis", "--demo"]
+                let asks = c.switchChanged(to: true, defaults: d, arguments: args)
+                let afterAsk = (CursorSync.enabled(defaults: d), CursorSync.noticeAcknowledged(defaults: d))
+                c.setEnabled(true, defaults: d, arguments: args)
+                let afterConfirm = (CursorSync.enabled(defaults: d), CursorSync.noticeAcknowledged(defaults: d))
+                let asksOff = c.switchChanged(to: false, defaults: d, arguments: args)
+                expect(
+                    asks && afterAsk == (false, false) && afterConfirm == (true, true)
+                        && !asksOff && !CursorSync.enabled(defaults: d),
+                    "CONSENT-CONFIRM switching on only asks (nothing enabled or acknowledged, so cancel leaves it off); confirm enables and acknowledges; switching off applies without asking")
+            }
             let controller = CursorSyncController()
             // 1. Notice not acknowledged -> no sync.
             await controller.runSync(explicit: true, defaults: defaults, arguments: ["Syrtis"], sync: sync)

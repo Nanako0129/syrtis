@@ -137,6 +137,7 @@ struct SettingsPanel: View {
     @AppStorage(CursorSync.enabledKey) private var cursorSyncOn = true
     @AppStorage(CursorSync.takeoverKey) private var cursorTakeover = false
     @AppStorage(CursorSync.noticeKey) private var cursorNoticeAck = false
+    @State private var cursorConfirmShown = false
     /// 0 = auto (≈60% of the screen). The popover's drag handle writes the
     /// same key, so the two stay in sync.
     @AppStorage(PopoverChrome.heightKey) private var popoverHeight = 0.0
@@ -1193,19 +1194,32 @@ struct SettingsPanel: View {
             AccountsCopy.cursor, summary: AccountsCopy.cursorSummary,
             details: { hint(CursorSync.Copy.privacy) }
         ) {
+            // Consent: turning the switch on opens a confirmation carrying the
+            // privacy paragraph; nothing is enabled until Continue. Cancel,
+            // Escape or clicking away leaves the switch off.
             toggleRow(
                 CursorSync.Copy.toggle,
                 isOn: Binding(
                     get: { CursorSync.toggleShowsOn(enabled: cursorSyncOn, acknowledged: cursorNoticeAck) },
-                    set: { cursorSync.setEnabled($0) }))
-            // Consent: turning the switch on acknowledges the notice
-            // (`CursorSyncController.setEnabled`) on the strength of this
-            // paragraph being beside it. So it stays inline whenever the switch
-            // shows off, i.e. before it can be turned on; once on, it lives in
-            // the ⓘ like the other sections' explanations.
-            if !CursorSync.toggleShowsOn(enabled: cursorSyncOn, acknowledged: cursorNoticeAck) {
-                hint(CursorSync.Copy.privacy)
-            }
+                    set: { if cursorSync.switchChanged(to: $0) { cursorConfirmShown = true } }))
+                .popover(isPresented: $cursorConfirmShown, arrowEdge: .bottom) {
+                    VStack(alignment: .leading, spacing: 10) {
+                        hint(CursorSync.Copy.privacy)
+                        HStack {
+                            Spacer()
+                            Button("Cancel".localized) { cursorConfirmShown = false }
+                                .keyboardShortcut(.cancelAction)
+                            Button(CursorSync.Copy.continue.localized) {
+                                cursorConfirmShown = false
+                                cursorSync.setEnabled(true)
+                            }
+                            .keyboardShortcut(.defaultAction)
+                        }
+                        .controlSize(.small)
+                    }
+                    .frame(width: 280, alignment: .leading)
+                    .padding(12)
+                }
             if CursorSync.toggleShowsOn(enabled: cursorSyncOn, acknowledged: cursorNoticeAck) {
                 if let line = CursorSync.statusLine(
                     state: cursorSync.state, lastSuccessMs: cursorSync.lastSuccessMs)
