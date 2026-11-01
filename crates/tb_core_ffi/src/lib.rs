@@ -1600,10 +1600,17 @@ fn invalidate_scan_caches() {
 /// Full replace; in-memory, default off, so the caller re-applies it at
 /// launch. Turning sync off deletes the Syrtis usage files from every profile
 /// dir; while on, dirs of profiles no longer listed are cleaned and removed.
-/// Success data is `{"enabled","appDir","profiles":[{"id","dir"}],
+/// An off push (`"enabled":false`) is always accepted and turns the takeover
+/// off, whatever else it carries; it cleans only an appDir that passes the
+/// checks above (`appDir` is then null). An own-uid symlinked appDir whose
+/// target is a real directory is accepted. Success data is
+/// `{"enabled","appDir":str|null,"profiles":[{"id","dir"}],
 /// "cliTakeoverConfirmed","removedFiles":N,"cleanupFailed":bool,
-/// "cleanupFailedProfiles":["default"|"<UUID>"]}`; invalid input is an error
-/// and leaves the registry unchanged. Invalidates the scan caches, since the
+/// "cleanupFailedProfiles":[id]}`, each id one of `default` / `<UUID>` (that
+/// profile's files could not all be deleted), `cursor-profiles` (the parent
+/// folder of the added profiles could not be read), or `appDir` (an off
+/// push's appDir was refused, so nothing in it was cleaned). Other invalid
+/// input is an error and leaves the registry unchanged. Invalidates the scan caches, since the
 /// takeover depends on every field.
 ///
 /// # Safety
@@ -1637,13 +1644,17 @@ unsafe fn set_cursor_sync_from_c(json: *const c_char) -> Result<serde_json::Valu
 /// one runs waits for it and returns its status. Success data is
 /// `{"state":"ok|partial|expired|notSignedIn|offline|error|disabled|cliPresent",
 /// "events":N,"lastSuccessMs":ms|null,"reason"?:"<fixed code>",
-/// "profiles":[{"id","state","events","lastSuccessMs","reason"?,"duplicateOf"?}]}`.
+/// "changed":bool,"profiles":[{"id","state","events","lastSuccessMs","reason"?,
+/// "duplicateOf"?}]}`. `changed`: some profile wrote its file this round, so
+/// the scan caches were invalidated and views must refresh, whatever the
+/// headline state.
 /// The top-level `state` is `ok` when every profile is `ok` or `duplicate`
-/// (the account was already walked from the profile `duplicateOf`), else the
+/// (the account was already synced this round by the profile `duplicateOf`;
+/// a failed walk covers nothing), else the
 /// first other profile state (a `notSignedIn` profile is skipped while
 /// another synced); `events` sums this call's writes, `lastSuccessMs` is the
 /// newest complete file. `cliPresent` = a walk completed but CLI Cursor files
-/// exist and the user has not confirmed the takeover.
+/// exist and the user has not confirmed the takeover; it carries no `reason`.
 #[no_mangle]
 pub extern "C" fn tb_cursor_sync(user_initiated: i32) -> *mut c_char {
     guarded("tb_cursor_sync", || {

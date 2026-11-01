@@ -278,8 +278,9 @@ final class CursorSyncController: ObservableObject {
             state = result.state
             lastSuccessMs = result.lastSuccessMs
             // A completed walk already invalidated the core's caches; the Swift
-            // side only needs telling when the data changed.
-            if result.state == "ok", result.events != lastRefreshedEvents {
+            // side only needs telling when the data changed. `changed`, not
+            // the headline: one profile can write while another fails.
+            if result.changed, result.events != lastRefreshedEvents {
                 lastRefreshedEvents = result.events
                 Self.refreshModel()
             }

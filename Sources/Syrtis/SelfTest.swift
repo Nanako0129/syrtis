@@ -17863,7 +17863,7 @@ enum SelfTest {
             let syncCalls = UncheckedBox<Int>(0)
             let configCalls = UncheckedBox<[String]>([])
             let partial = try? JSONDecoder().decode(
-                CursorSyncStatus.self, from: Data(#"{"state":"partial","events":0,"lastSuccessMs":null}"#.utf8))
+                CursorSyncStatus.self, from: Data(#"{"state":"partial","events":0,"lastSuccessMs":null,"changed":false}"#.utf8))
             let sync: @Sendable (Bool) -> CursorSyncStatus? = { _ in syncCalls.value += 1; return partial }
             let controller = CursorSyncController()
             // 1. Notice not acknowledged -> no sync.
@@ -17948,7 +17948,7 @@ enum SelfTest {
             defaults.removePersistentDomain(forName: suite)
             defaults.set(true, forKey: CursorSync.noticeKey)
             let ok = try? JSONDecoder().decode(
-                CursorSyncStatus.self, from: Data(#"{"state":"ok","events":7,"lastSuccessMs":1}"#.utf8))
+                CursorSyncStatus.self, from: Data(#"{"state":"ok","events":7,"lastSuccessMs":1,"changed":true}"#.utf8))
             let sync: @Sendable (Bool) -> CursorSyncStatus? = { _ in ok }
             let generation = { UserDefaults.standard.integer(forKey: ClaudeExtraRoots.generationKey) }
             let controller = CursorSyncController()
@@ -17976,7 +17976,7 @@ enum SelfTest {
             defaults.removePersistentDomain(forName: suite)
             defaults.set(true, forKey: CursorSync.noticeKey)
             let ok = try? JSONDecoder().decode(
-                CursorSyncStatus.self, from: Data(#"{"state":"ok","events":3,"lastSuccessMs":1}"#.utf8))
+                CursorSyncStatus.self, from: Data(#"{"state":"ok","events":3,"lastSuccessMs":1,"changed":true}"#.utf8))
             let slow: @Sendable (Bool) -> CursorSyncStatus? = { _ in Thread.sleep(forTimeInterval: 0.3); return ok }
             let controller = CursorSyncController()
             let running = Task { @MainActor in
@@ -18003,7 +18003,7 @@ enum SelfTest {
             defaults.set(true, forKey: CursorSync.noticeKey)
             let log = UncheckedBox<[String]>([])
             let ok = try? JSONDecoder().decode(
-                CursorSyncStatus.self, from: Data(#"{"state":"ok","events":2,"lastSuccessMs":1}"#.utf8))
+                CursorSyncStatus.self, from: Data(#"{"state":"ok","events":2,"lastSuccessMs":1,"changed":true}"#.utf8))
             let slowSync: @Sendable (Bool) -> CursorSyncStatus? = { _ in
                 log.value.append("sync"); Thread.sleep(forTimeInterval: 0.2); return ok
             }
@@ -18048,7 +18048,7 @@ enum SelfTest {
             defaults.set(true, forKey: CursorSync.noticeKey)
             let log = UncheckedBox<[String]>([])
             let ok = try? JSONDecoder().decode(
-                CursorSyncStatus.self, from: Data(#"{"state":"ok","events":1,"lastSuccessMs":1}"#.utf8))
+                CursorSyncStatus.self, from: Data(#"{"state":"ok","events":1,"lastSuccessMs":1,"changed":true}"#.utf8))
             let sync: @Sendable (Bool) -> CursorSyncStatus? = { _ in log.value.append("sync"); return ok }
             let controller = CursorSyncController()
             controller.reconfigure(refresh: false, defaults: defaults, arguments: ["Syrtis"], bundleID: "x.y",
@@ -18231,6 +18231,27 @@ enum SelfTest {
                "CURSOR-SYNC a refused config shows the rejected line and syncs nothing; got \(String(describing: cursorRejected))")
         expect(cursorRefresh == [true, false, true],
                "CURSOR-SYNC a changed count refreshes, the same count does not, and off->on refreshes again; got \(String(describing: cursorRefresh))")
+        // CMP-520 FIX 1: one profile wrote while another failed — the
+        // headline is `error`, but the core changed the data, so the
+        // dashboard refreshes. Mutation: refresh only on `state == "ok"`.
+        let cursorPartialRefresh: Bool? = awaitMainActorValue {
+            let suite = "tokenbar.selftest.cursorSyncPartialRefresh"
+            let defaults = UserDefaults(suiteName: suite)!
+            defer { defaults.removePersistentDomain(forName: suite) }
+            defaults.removePersistentDomain(forName: suite)
+            defaults.set(true, forKey: CursorSync.noticeKey)
+            let mixed = try? JSONDecoder().decode(
+                CursorSyncStatus.self,
+                from: Data(#"{"state":"error","reason":"account_mismatch","events":4,"lastSuccessMs":1,"changed":true}"#.utf8))
+            let sync: @Sendable (Bool) -> CursorSyncStatus? = { _ in mixed }
+            let generation = { UserDefaults.standard.integer(forKey: ClaudeExtraRoots.generationKey) }
+            let controller = CursorSyncController()
+            let before = generation()
+            await controller.runSync(explicit: true, defaults: defaults, arguments: ["Syrtis"], sync: sync)
+            return mixed != nil && generation() != before && controller.state == "error"
+        }
+        expect(cursorPartialRefresh == true,
+               "CURSOR-SYNC a round where one profile wrote and another failed still refreshes the dashboard; got \(String(describing: cursorPartialRefresh))")
 
         // Status -> copy, every state; and every new key in both catalogs.
         do {

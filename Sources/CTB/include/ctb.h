@@ -251,10 +251,16 @@ char *tb_set_keychain_consent(const char *json);
 // `<root>/User/globalStorage/state.vscdb`. Full replace, in-memory, default
 // off: the caller re-applies the stored answer at launch. Turning sync off
 // deletes the Syrtis usage files from every profile dir; while on, dirs of
-// profiles no longer listed are cleaned. Success data is `{"enabled","appDir",
+// profiles no longer listed are cleaned. An off push is always accepted and
+// turns the takeover off; it cleans only an appDir passing the checks above
+// (else `appDir` is null). An own-uid symlinked appDir whose target is a real
+// directory is accepted. Success data is `{"enabled","appDir":str|null,
 // "profiles":[{"id","dir"}],"cliTakeoverConfirmed","removedFiles":N,
-// "cleanupFailed":bool,"cleanupFailedProfiles":[id]}`; invalid input is an
-// error and leaves the registry unchanged. While enabled with a complete
+// "cleanupFailed":bool,"cleanupFailedProfiles":[id]}`; each id is `default`
+// or `<UUID>` (that profile's files could not all be deleted),
+// `cursor-profiles` (the parent folder of the added profiles could not be
+// read), or `appDir` (an off push's appDir was refused, nothing cleaned).
+// Other invalid input is an error and leaves the registry unchanged. While enabled with a complete
 // synced file, and the tokscale CLI's Cursor dir holds no usage files (or
 // `cliTakeoverConfirmed`), reports read Cursor from the newest synced file of
 // each account only.
@@ -266,12 +272,15 @@ char *tb_set_cursor_sync(const char *json);
 // non-zero = the user's "Sync now". Single-flight: a call made while one runs
 // waits for it and returns its status. Success data is
 // `{"state":"ok|partial|expired|notSignedIn|offline|error|disabled|cliPresent",
-// "events":N,"lastSuccessMs":ms|null,"reason"?:"<fixed code>","profiles":[{"id",
-// "state","events","lastSuccessMs","reason"?,"duplicateOf"?}]}`. A profile
-// whose account an earlier profile already walked this round is `duplicate`
-// with `duplicateOf` = that profile's id. `cliPresent` = a walk completed but
-// tokscale CLI Cursor files exist and the takeover is not confirmed. `reason`
-// codes name no account and never carry the token.
+// "events":N,"lastSuccessMs":ms|null,"reason"?:"<fixed code>","changed":bool,
+// "profiles":[{"id","state","events","lastSuccessMs","reason"?,
+// "duplicateOf"?}]}`. `changed`: some profile wrote its file (scan caches
+// were invalidated; refresh views whatever the headline state). A profile
+// whose account an earlier profile already synced this round is `duplicate`
+// with `duplicateOf` = that profile's id; a failed walk covers nothing.
+// `cliPresent` = a walk completed but tokscale CLI Cursor files exist and the
+// takeover is not confirmed; it carries no `reason`. `reason` codes name no
+// account and never carry the token.
 char *tb_cursor_sync(int32_t user_initiated);
 
 // Release a string returned by any tb_* entry point.

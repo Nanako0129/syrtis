@@ -221,7 +221,15 @@ fn run_with(
         https_only: false,
         file_stem: &stem,
     };
-    crate::RUNTIME.block_on(run(&target, db, dir, limits, enabled, &mut |_| None))
+    crate::RUNTIME.block_on(run(
+        &target,
+        db,
+        dir,
+        limits,
+        enabled,
+        &mut |_, _| None,
+        false,
+    ))
 }
 
 struct Fixture {
@@ -999,7 +1007,11 @@ fn base_validation_rejects_bad_bundle_ids_and_app_dirs() {
         serde_json::json!({"enabled": true, "bundleId": BUNDLE, "extra": 1}),
     ] {
         assert!(set(bad.clone()).is_err(), "{bad}");
-        assert_eq!(config(), Config::default(), "rejected {bad} changed the registry");
+        assert_eq!(
+            config(),
+            Config::default(),
+            "rejected {bad} changed the registry"
+        );
     }
     assert!(set_from_json(
         &serde_json::json!({"enabled": true, "bundleId": BUNDLE}).to_string(),
@@ -1007,17 +1019,44 @@ fn base_validation_rejects_bad_bundle_ids_and_app_dirs() {
     )
     .is_err());
 
-    // A symlinked appDir, and a file in its place.
+    // A file in the appDir's place, a symlink to a file, and (unless root)
+    // a symlink to a directory owned by someone else are refused for an on
+    // push.
     let support = home.path().join("Library/Application Support");
     std::fs::create_dir_all(&support).unwrap();
-    let elsewhere = home.path().join("elsewhere");
-    std::fs::create_dir_all(&elsewhere).unwrap();
-    #[cfg(unix)]
-    std::os::unix::fs::symlink(&elsewhere, support.join("com.example.linked")).unwrap();
     std::fs::write(support.join("com.example.file"), "x").unwrap();
-    for bundle in ["com.example.linked", "com.example.file"] {
-        assert!(set(serde_json::json!({"enabled": true, "bundleId": bundle})).is_err(), "{bundle}");
+    let mut refused = vec!["com.example.file"];
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(
+            support.join("com.example.file"),
+            support.join("com.example.tofile"),
+        )
+        .unwrap();
+        refused.push("com.example.tofile");
+        if crate::cursor_desktop::current_uid() != 0 {
+            std::os::unix::fs::symlink("/usr", support.join("com.example.foreign")).unwrap();
+            refused.push("com.example.foreign");
+        }
+    }
+    for bundle in refused {
+        assert!(
+            set(serde_json::json!({"enabled": true, "bundleId": bundle})).is_err(),
+            "{bundle}"
+        );
         assert_eq!(config(), Config::default());
+    }
+    // An own-uid symlinked appDir is accepted, as earlier releases did.
+    #[cfg(unix)]
+    {
+        let elsewhere = home.path().join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, support.join("com.example.linked")).unwrap();
+        let on =
+            set(serde_json::json!({"enabled": true, "bundleId": "com.example.linked"})).unwrap();
+        assert_eq!(on["enabled"], true);
+        assert_eq!(config().app_dir, Some(support.join("com.example.linked")));
+        set_for_test(Config::default());
     }
 
     // An appDir that resolves under ~/.config/tokscale through a symlinked
@@ -1027,20 +1066,103 @@ fn base_validation_rejects_bad_bundle_ids_and_app_dirs() {
     std::fs::create_dir_all(&inside).unwrap();
     #[cfg(unix)]
     std::os::unix::fs::symlink(&inside, tricky.path().join("Library")).unwrap();
-    assert!(set_in(tricky.path(), serde_json::json!({"enabled": true, "bundleId": BUNDLE})).is_err());
+    assert!(set_in(
+        tricky.path(),
+        serde_json::json!({"enabled": true, "bundleId": BUNDLE})
+    )
+    .is_err());
     assert_eq!(config(), Config::default());
 
     // Controls: valid ids are accepted, and two ids never share a dir.
     let one = set(serde_json::json!({"enabled": false, "bundleId": "com.example.one"})).unwrap();
-    let two = set(serde_json::json!({"enabled": false, "bundleId": "com.example.one.selftest"})).unwrap();
+    let two =
+        set(serde_json::json!({"enabled": false, "bundleId": "com.example.one.selftest"})).unwrap();
     let (one, two) = (
         PathBuf::from(one["appDir"].as_str().unwrap()),
         PathBuf::from(two["appDir"].as_str().unwrap()),
     );
     assert_eq!(one, support.join("com.example.one"));
-    assert!(!one.starts_with(&two) && !two.starts_with(&one), "{one:?} {two:?}");
-    let ok = set_in(tricky.path(), serde_json::json!({"enabled": false, "bundleId": "com.example.x"}));
-    assert!(ok.is_err(), "the tokscale-resolving home stays refused for every id");
+    assert!(
+        !one.starts_with(&two) && !two.starts_with(&one),
+        "{one:?} {two:?}"
+    );
+    // An off push there is accepted but cleans nothing, and says so.
+    let off = set_in(
+        tricky.path(),
+        serde_json::json!({"enabled": false, "bundleId": "com.example.x"}),
+    )
+    .unwrap();
+    assert_eq!(off["enabled"], false);
+    assert_eq!(off["appDir"], serde_json::Value::Null);
+    assert_eq!(off["cleanupFailedProfiles"], serde_json::json!(["appDir"]));
+    set_for_test(Config::default());
+}
+
+/// FIX 3: an off push is always accepted and turns the takeover off,
+/// whatever its bundle id, profiles or appDir; it cleans only an appDir that
+/// passes the on-push checks and reports the rest.
+#[test]
+fn an_off_push_is_always_accepted() {
+    let _guard = lock();
+    let home = tempfile::tempdir().unwrap();
+    let app = app_dir_in(home.path());
+    let support = app.parent().unwrap().to_path_buf();
+    std::fs::create_dir_all(&support).unwrap();
+    let on = || {
+        set_for_test(Config {
+            enabled: true,
+            app_dir: Some(app.clone()),
+            ..Config::default()
+        })
+    };
+    for off in [
+        serde_json::json!({"enabled": false, "bundleId": BUNDLE,
+            "profiles": [{"id": "/", "root": "relative"}]}),
+        serde_json::json!({"enabled": false, "bundleId": ".."}),
+        serde_json::json!({"enabled": false}),
+        serde_json::json!({"enabled": false, "dir": "/x/cursor-cache"}),
+    ] {
+        on();
+        let result = set_in(home.path(), off.clone()).unwrap_or_else(|e| panic!("{off}: {e}"));
+        assert_eq!(result["enabled"], false, "{off}");
+        assert!(!config().enabled, "{off}");
+        assert_eq!(takeover(&config(), Some(home.path())), Takeover::Off);
+    }
+    // The invalid-profile push still cleaned its (valid) appDir.
+    on();
+    let default = app.join("cursor-cache");
+    std::fs::create_dir_all(&default).unwrap();
+    let temp = default.join(format!("{TEMP_FILE_PREFIX}1-1"));
+    std::fs::write(&temp, "x").unwrap();
+    let result = set_in(
+        home.path(),
+        serde_json::json!({"enabled": false, "bundleId": BUNDLE,
+            "profiles": [{"id": "/", "root": "relative"}]}),
+    )
+    .unwrap();
+    assert_eq!(result["removedFiles"], 1);
+    assert!(!temp.exists());
+
+    // A symlinked appDir pointing at a file: accepted, nothing cleaned there.
+    #[cfg(unix)]
+    {
+        let target = home.path().join("plain-file");
+        std::fs::write(&target, "x").unwrap();
+        std::os::unix::fs::symlink(&target, support.join("com.example.bad")).unwrap();
+        on();
+        let result = set_in(
+            home.path(),
+            serde_json::json!({"enabled": false, "bundleId": "com.example.bad"}),
+        )
+        .unwrap();
+        assert!(!config().enabled);
+        assert_eq!(result["cleanupFailed"], true);
+        assert_eq!(
+            result["cleanupFailedProfiles"],
+            serde_json::json!(["appDir"])
+        );
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "x");
+    }
     set_for_test(Config::default());
 }
 
@@ -1186,9 +1308,20 @@ fn removed_and_orphaned_profiles_are_cleaned_and_nothing_else() {
     assert_eq!(result["removedFiles"], 2);
     assert_eq!(result["cleanupFailed"], false);
     assert_eq!(names_in(&a), [temp.clone(), "foreign.txt".to_string()]);
-    assert_eq!(names_in(&b), ["usage.foreign.json".to_string()], "B: only ours went");
-    assert_eq!(names_in(&outside), [hex_name('c')], "the symlink was followed");
-    assert!(std::fs::symlink_metadata(profiles.join(PROFILE_C)).unwrap().file_type().is_symlink());
+    assert_eq!(
+        names_in(&b),
+        ["usage.foreign.json".to_string()],
+        "B: only ours went"
+    );
+    assert_eq!(
+        names_in(&outside),
+        [hex_name('c')],
+        "the symlink was followed"
+    );
+    assert!(std::fs::symlink_metadata(profiles.join(PROFILE_C))
+        .unwrap()
+        .file_type()
+        .is_symlink());
     for name in ["not-a-uuid", "0a1b2c3d-0000-4000-8000-00000000000d"] {
         assert_eq!(names_in(&profiles.join(name)), [hex_name('d')], "{name}");
     }
@@ -1212,7 +1345,11 @@ fn removed_and_orphaned_profiles_are_cleaned_and_nothing_else() {
     std::fs::write(target.join(PROFILE_B).join(hex_name('e')), "x").unwrap();
     #[cfg(unix)]
     std::os::unix::fs::symlink(&target, other_app.join("cursor-profiles")).unwrap();
-    set_in(other.path(), serde_json::json!({"enabled": false, "bundleId": BUNDLE})).unwrap();
+    set_in(
+        other.path(),
+        serde_json::json!({"enabled": false, "bundleId": BUNDLE}),
+    )
+    .unwrap();
     assert_eq!(names_in(&target.join(PROFILE_B)), [hex_name('e')]);
     set_for_test(Config::default());
 }
@@ -1227,7 +1364,11 @@ fn disable_reports_a_cleanup_it_could_not_finish() {
     let dir = app_dir_in(home.path()).join("cursor-cache");
     std::fs::create_dir_all(&dir).unwrap();
     let set = |enabled: bool| {
-        set_in(home.path(), serde_json::json!({"enabled": enabled, "bundleId": BUNDLE})).unwrap()
+        set_in(
+            home.path(),
+            serde_json::json!({"enabled": enabled, "bundleId": BUNDLE}),
+        )
+        .unwrap()
     };
     set(true);
     // A temp file is ours but never complete, so the global takeover stays off.
@@ -1301,7 +1442,11 @@ fn write_complete_file(dir: &Path) -> PathBuf {
 fn write_named_file(dir: &Path, c: char) -> PathBuf {
     std::fs::create_dir_all(dir).unwrap();
     let path = dir.join(hex_name(c));
-    std::fs::write(&path, r#"{"totalUsageEventsCount":0,"usageEventsDisplay":[]}"#).unwrap();
+    std::fs::write(
+        &path,
+        r#"{"totalUsageEventsCount":0,"usageEventsDisplay":[]}"#,
+    )
+    .unwrap();
     std::fs::canonicalize(path).unwrap()
 }
 
@@ -1333,7 +1478,10 @@ fn takeover_matrix() {
             files.push(write_named_file(&app.join("cursor-cache"), 'a'));
         }
         if in_added {
-            files.push(write_named_file(&app.join("cursor-profiles").join(PROFILE_A), 'b'));
+            files.push(write_named_file(
+                &app.join("cursor-profiles").join(PROFILE_A),
+                'b',
+            ));
         }
         if cli_files {
             std::fs::write(cli.join("usage.csv"), "x").unwrap();
@@ -1522,10 +1670,13 @@ fn cursor_report_with(
     set_thread_config_for_test(None);
     if let Some(dir) = legacy_dir {
         let settings = &mut options.scanner_settings;
-        settings.extra_scan_paths.insert("cursor".to_string(), vec![dir.to_path_buf()]);
         settings
-            .excluded_scan_paths
-            .insert("cursor".to_string(), vec![home.join(".config/tokscale/cursor-cache")]);
+            .extra_scan_paths
+            .insert("cursor".to_string(), vec![dir.to_path_buf()]);
+        settings.excluded_scan_paths.insert(
+            "cursor".to_string(),
+            vec![home.join(".config/tokscale/cursor-cache")],
+        );
     }
     let report = crate::RUNTIME
         .block_on(tokscale_core::get_model_report(options))
@@ -1634,7 +1785,8 @@ fn synced_file_reaches_the_report_once() {
 fn usage_file(dir: &Path, account: char, events: &[serde_json::Value], age_secs: u64) -> PathBuf {
     std::fs::create_dir_all(dir).unwrap();
     let path = dir.join(hex_name(account));
-    let body = serde_json::json!({"totalUsageEventsCount": events.len(), "usageEventsDisplay": events});
+    let body =
+        serde_json::json!({"totalUsageEventsCount": events.len(), "usageEventsDisplay": events});
     std::fs::write(&path, body.to_string()).unwrap();
     std::fs::File::options()
         .write(true)
@@ -1695,7 +1847,11 @@ fn same_account_in_two_profiles_counts_once() {
     let _guard = lock();
     let tmp = tempfile::tempdir().unwrap();
     let (_env, home) = engine_home(tmp.path());
-    let config = multi(&home, true, vec![profile(PROFILE_A, Path::new("/Users/x/a"))]);
+    let config = multi(
+        &home,
+        true,
+        vec![profile(PROFILE_A, Path::new("/Users/x/a"))],
+    );
     usage_file(&default_sync_dir(&home), 'a', &[x_event()], 10);
     let copy = usage_file(&profile_dir(&home, PROFILE_A), 'a', &[x_event()], 0);
 
@@ -1755,10 +1911,19 @@ fn upgrade_keeps_the_existing_file_and_registers_no_directory() {
     usage_file(&default_sync_dir(&home), 'a', &[x_event(), y_event()], 0);
     for config in [
         multi(&home, true, vec![]),
-        multi(&home, true, vec![profile(PROFILE_A, Path::new("/Users/x/a"))]),
+        multi(
+            &home,
+            true,
+            vec![profile(PROFILE_A, Path::new("/Users/x/a"))],
+        ),
     ] {
         if !config.profiles.is_empty() {
-            usage_file(&profile_dir(&home, PROFILE_A), 'a', &[x_event(), y_event()], 5);
+            usage_file(
+                &profile_dir(&home, PROFILE_A),
+                'a',
+                &[x_event(), y_event()],
+                5,
+            );
         }
         let (input, _, _, _, sessions) = cursor_report(&home, Some(config.clone()));
         assert_eq!(input, 300, "{config:?}");
@@ -1767,7 +1932,10 @@ fn upgrade_keeps_the_existing_file_and_registers_no_directory() {
         apply_takeover(&mut settings, &config, Some(&home));
         let cursor = &settings.extra_scan_paths["cursor"];
         assert!(!cursor.is_empty());
-        assert!(cursor.iter().all(|p| p.is_file()), "a directory was registered: {cursor:?}");
+        assert!(
+            cursor.iter().all(|p| p.is_file()),
+            "a directory was registered: {cursor:?}"
+        );
     }
 }
 
@@ -1782,8 +1950,11 @@ fn rollback_scan_of_cursor_cache_counts_the_account_once() {
     usage_file(&default_sync_dir(&home), 'a', &[x_event()], 0);
     usage_file(&profile_dir(&home, PROFILE_A), 'a', &[x_event()], 0);
     usage_file(&profile_dir(&home, PROFILE_B), 'b', &[y_event()], 0);
-    let (input, _, _, _, sessions) =
-        cursor_report_with(&home, Some(Config::default()), Some(&default_sync_dir(&home)));
+    let (input, _, _, _, sessions) = cursor_report_with(
+        &home,
+        Some(Config::default()),
+        Some(&default_sync_dir(&home)),
+    );
     assert_eq!(input, 100);
     assert_eq!(sessions, ["conv-x"]);
 }
@@ -1822,6 +1993,16 @@ fn sync_round_with(
     registry: &RwLock<Config>,
     limits: Limits,
 ) -> serde_json::Value {
+    sync_round_in(default_db, url, registry, limits, None)
+}
+
+fn sync_round_in(
+    default_db: &Path,
+    url: &str,
+    registry: &RwLock<Config>,
+    limits: Limits,
+    home: Option<&Path>,
+) -> serde_json::Value {
     let target = Target {
         db_path: default_db,
         url,
@@ -1829,7 +2010,7 @@ fn sync_round_with(
         file_stem: &stem,
     };
     let source = || registry.read().unwrap().clone();
-    sync_with(true, None, &target, &source, Some(limits)).0
+    sync_with(true, home, &target, &source, Some(limits)).0
 }
 
 fn states(status: &serde_json::Value) -> Vec<String> {
@@ -1838,7 +2019,10 @@ fn states(status: &serde_json::Value) -> Vec<String> {
         .unwrap()
         .iter()
         .map(|p| {
-            let reason = p["reason"].as_str().map(|r| format!(":{r}")).unwrap_or_default();
+            let reason = p["reason"]
+                .as_str()
+                .map(|r| format!(":{r}"))
+                .unwrap_or_default();
             format!("{}{reason}", p["state"].as_str().unwrap())
         })
         .collect()
@@ -1857,7 +2041,11 @@ fn a_second_profile_on_the_same_account_is_not_walked_again() {
     let registry = RwLock::new(multi(&home, true, vec![profile(PROFILE_A, &root)]));
     let (url, seen) = serve(vec![json_ok(&page(1, &["a"])), json_ok(&page(1, &["a"]))]);
     let status = sync_round(&default_db, &url, &registry);
-    assert_eq!(seen.lock().unwrap().len(), 1, "the account was walked twice");
+    assert_eq!(
+        seen.lock().unwrap().len(),
+        1,
+        "the account was walked twice"
+    );
     assert_eq!(states(&status), ["ok", "duplicate"]);
     assert_eq!(status["profiles"][1]["duplicateOf"], "default");
     assert_eq!(status["state"], "ok");
@@ -1887,7 +2075,10 @@ fn account_switch_in_a_profile_leaves_only_the_new_file() {
     let (url, _) = serve(vec![json_ok(&body.to_string())]);
     let status = sync_round(&tmp.path().join("absent.vscdb"), &url, &registry);
     assert_eq!(states(&status), ["notSignedIn", "ok"]);
-    assert_eq!(status["state"], "ok", "no default login is not a problem here");
+    assert_eq!(
+        status["state"], "ok",
+        "no default login is not a problem here"
+    );
     assert!(!old.exists());
     assert_eq!(
         names_in(&profile_dir(&home, PROFILE_A)),
@@ -1916,24 +2107,22 @@ fn unsafe_profile_databases_send_nothing() {
     .unwrap();
     let directory = tmp.path().join("directory");
     std::fs::create_dir_all(directory.join("User/globalStorage/state.vscdb")).unwrap();
-    // A regular file owned by root (the test does not run as root).
-    let foreign = Path::new("/etc/hosts");
-    let foreign_owned = crate::cursor_desktop::current_uid() != 0;
+    // (A foreign owner: `cursor_desktop::checked_open_tests`.)
     let registry = RwLock::new(multi(
         &home,
         true,
         vec![profile(PROFILE_A, &linked), profile(PROFILE_B, &directory)],
     ));
     let (url, seen) = serve(vec![json_ok(&page(1, &["a"]))]);
-    let status = sync_round(foreign, &url, &registry);
-    assert!(seen.lock().unwrap().is_empty(), "an unsafe database was sent");
-    let mut expected = vec!["error:db_symlink", "error:db_not_file"];
-    if foreign_owned {
-        expected.insert(0, "error:db_foreign_owner");
-        assert_eq!(states(&status), expected);
-    } else {
-        assert_eq!(states(&status)[1..], expected);
-    }
+    let status = sync_round(&tmp.path().join("absent.vscdb"), &url, &registry);
+    assert!(
+        seen.lock().unwrap().is_empty(),
+        "an unsafe database was sent"
+    );
+    assert_eq!(
+        states(&status),
+        ["notSignedIn", "error:db_symlink", "error:db_not_file"]
+    );
     // Control: the real file behind the symlink is sent.
     *registry.write().unwrap() = multi(&home, true, vec![profile(PROFILE_A, &real)]);
     let status = sync_round(&tmp.path().join("absent.vscdb"), &url, &registry);
@@ -1963,8 +2152,15 @@ fn each_profile_token_reaches_only_its_own_requests() {
     assert_eq!(seen.len(), 3);
     for (i, request) in seen.iter().enumerate() {
         let cookie = header(&request.head, "cookie").unwrap();
-        let (own, other) = if i < 2 { (&token_a, &token_b) } else { (&token_b, &token_a) };
-        assert!(cookie.contains(own.as_str()), "request {i} lacks its own token");
+        let (own, other) = if i < 2 {
+            (&token_a, &token_b)
+        } else {
+            (&token_b, &token_a)
+        };
+        assert!(
+            cookie.contains(own.as_str()),
+            "request {i} lacks its own token"
+        );
         assert!(!request.head.contains(other.as_str()) && !request.body.contains(other.as_str()));
     }
     let mut outputs = vec![status.to_string()];
@@ -1976,7 +2172,13 @@ fn each_profile_token_reaches_only_its_own_requests() {
     }
     let all = outputs.join("\n");
     assert!(all.contains("usage.") && all.contains("conversationId") && all.contains("\"ok\""));
-    for canary in [token_a.as_str(), token_b.as_str(), SIGNATURE, USER, OTHER_USER] {
+    for canary in [
+        token_a.as_str(),
+        token_b.as_str(),
+        SIGNATURE,
+        USER,
+        OTHER_USER,
+    ] {
         assert!(!all.contains(canary), "canary leaked");
     }
 }
@@ -2044,7 +2246,11 @@ fn switch_off_sends_nothing_for_every_profile() {
     });
     assert_eq!(states(&status), ["disabled", "disabled"]);
     std::thread::sleep(Duration::from_millis(100));
-    assert_eq!(seen.lock().unwrap().len(), 1, "the next profile sent after off");
+    assert_eq!(
+        seen.lock().unwrap().len(),
+        1,
+        "the next profile sent after off"
+    );
     assert!(!expected_file(&default_sync_dir(&home)).exists());
 }
 
@@ -2061,10 +2267,14 @@ fn account_mismatch_refuses_only_its_own_profile() {
     let status = sync_round(&mismatched, &url, &registry);
     assert_eq!(states(&status), ["error:account_mismatch", "ok"]);
     assert_eq!(status["state"], "error");
+    // FIX 1: a file was written although the headline is an error.
+    assert_eq!(status["changed"], true);
     assert_eq!(status["reason"], "account_mismatch");
     let seen = seen.lock().unwrap().clone();
     assert_eq!(seen.len(), 1);
-    assert!(header(&seen[0].head, "cookie").unwrap().contains(OTHER_USER));
+    assert!(header(&seen[0].head, "cookie")
+        .unwrap()
+        .contains(OTHER_USER));
 }
 
 /// One budget for the whole round: a spent one starts no profile.
@@ -2091,4 +2301,81 @@ fn one_budget_covers_every_profile() {
         ["partial:budget_exhausted", "partial:budget_exhausted"]
     );
     assert!(seen.lock().unwrap().is_empty());
+}
+
+/// FIX 2 ✱: an account is covered only by a walk that synced. The default
+/// profile's session for X is refused (401); profile B on the same account
+/// then tries its own session, and X still counts once.
+#[test]
+fn a_failed_walk_does_not_cover_the_account_for_later_profiles() {
+    let _guard = lock();
+    let tmp = tempfile::tempdir().unwrap();
+    let (_env, home) = engine_home(tmp.path());
+    let default_db = login_db(&tmp.path().join("default"), &valid_token(), USER);
+    let root = profile_root(tmp.path(), "b", &valid_token(), USER);
+    let registry = RwLock::new(multi(&home, true, vec![profile(PROFILE_A, &root)]));
+    let body = serde_json::json!({"totalUsageEventsCount": 1, "usageEventsDisplay": [x_event()]});
+    let (url, seen) = serve(vec![
+        http("401 Unauthorized", "application/json", "{}"),
+        json_ok(&body.to_string()),
+    ]);
+    let status = sync_round(&default_db, &url, &registry);
+    assert_eq!(states(&status), ["expired", "ok"]);
+    assert_eq!(
+        seen.lock().unwrap().len(),
+        2,
+        "B never tried its own session"
+    );
+    assert!(expected_file(&profile_dir(&home, PROFILE_A)).exists());
+    let (input, _, _, _, sessions) = cursor_report(&home, Some(registry.read().unwrap().clone()));
+    assert_eq!(input, 100);
+    assert_eq!(sessions, ["conv-x"]);
+}
+
+/// FIX 6 ✱: the default profile follows a symlinked `state.vscdb` (as every
+/// release did, including through `TOKENBAR_CURSOR_STATE_VSCDB`); an added
+/// profile's symlinked database is still refused.
+#[cfg(unix)]
+#[test]
+fn a_symlinked_default_database_still_syncs() {
+    let _guard = lock();
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let real = login_db(&tmp.path().join("real"), &valid_token(), USER);
+    let link = tmp.path().join("link.vscdb");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    let added = tmp.path().join("added");
+    std::fs::create_dir_all(added.join("User/globalStorage")).unwrap();
+    std::os::unix::fs::symlink(
+        login_db(&tmp.path().join("other"), &other_token(), OTHER_USER),
+        added.join("User/globalStorage/state.vscdb"),
+    )
+    .unwrap();
+    let registry = RwLock::new(multi(&home, true, vec![profile(PROFILE_A, &added)]));
+    let (url, seen) = serve(vec![json_ok(&page(1, &["a"])), json_ok(&page(1, &["b"]))]);
+    let status = sync_round(&link, &url, &registry);
+    assert_eq!(states(&status), ["ok", "error:db_symlink"]);
+    assert_eq!(seen.lock().unwrap().len(), 1);
+}
+
+/// FIX 5: when the round becomes `cliPresent`, no other profile's reason
+/// rides along.
+#[test]
+fn cli_present_carries_no_other_reason() {
+    let _guard = lock();
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let cli = home.join(".config/tokscale/cursor-cache");
+    std::fs::create_dir_all(&cli).unwrap();
+    std::fs::write(cli.join("usage.csv"), "x").unwrap();
+    let mismatched = login_db(&tmp.path().join("default"), &valid_token(), OTHER_USER);
+    let root = profile_root(tmp.path(), "b", &other_token(), OTHER_USER);
+    let registry = RwLock::new(multi(&home, true, vec![profile(PROFILE_A, &root)]));
+    let (url, _) = serve(vec![json_ok(&page(1, &["a"]))]);
+    let status = sync_round_in(&mismatched, &url, &registry, limits(), Some(&home));
+    assert_eq!(states(&status), ["error:account_mismatch", "ok"]);
+    assert_eq!(
+        (status["state"].as_str(), status.get("reason")),
+        (Some("cliPresent"), None)
+    );
 }

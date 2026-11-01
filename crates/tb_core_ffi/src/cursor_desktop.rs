@@ -8,7 +8,8 @@
 //! `TOKENBAR_CURSOR_STATE_VSCDB` overrides the default profile's database
 //! path (tests, debugging). It selects which file is read, never where
 //! anything is sent. Added Cursor profiles (`cursor_sync`) derive their own
-//! path from the profile root and never feed Grok Bot.
+//! path from the profile root, are read with `read_login_checked`, and never
+//! feed Grok Bot.
 
 use serde_json::Value;
 use std::path::{Path, PathBuf};
@@ -60,13 +61,26 @@ pub(crate) fn read_login(db_path: &Path) -> Result<Option<CursorLogin>, String> 
     query_login(&conn).map_err(unreadable)
 }
 
-/// The Cursor usage sync's reader (plan CMP-520, per-sync DB checks): the
-/// last path component must be a regular file owned by the current user, not
-/// a symlink (intermediate symlinks are allowed); the open refuses a symlink
-/// (`SQLITE_OPEN_NOFOLLOW`) and runs with `trusted_schema=OFF` and
-/// `DEFENSIVE`. Every refusal is a fixed reason code; `Ok(None)` is an absent
-/// database or one without a token. Grok Bot keeps `read_login`.
+/// The Cursor usage sync's reader for an *added* profile (plan CMP-520,
+/// per-sync DB checks): the last path component must be a regular file owned
+/// by the current user, not a symlink (intermediate symlinks are allowed);
+/// the open refuses a symlink (`SQLITE_OPEN_NOFOLLOW`) and runs with
+/// `trusted_schema=OFF` and `DEFENSIVE`. Every refusal is a fixed reason
+/// code; `Ok(None)` is an absent database or one without a token. The
+/// default profile (sync and Grok Bot) keeps `read_login`, which follows a
+/// symlinked `state.vscdb` as every earlier release did.
 pub(crate) fn read_login_checked(db_path: &Path) -> Result<Option<CursorLogin>, &'static str> {
+    #[cfg(unix)]
+    let uid = current_uid();
+    #[cfg(not(unix))]
+    let uid = 0;
+    read_login_checked_for(db_path, uid)
+}
+
+fn read_login_checked_for(
+    db_path: &Path,
+    #[cfg_attr(not(unix), allow(unused_variables))] uid: u32,
+) -> Result<Option<CursorLogin>, &'static str> {
     let meta = match std::fs::symlink_metadata(db_path) {
         Ok(meta) => meta,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -81,7 +95,7 @@ pub(crate) fn read_login_checked(db_path: &Path) -> Result<Option<CursorLogin>, 
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt as _;
-        if meta.uid() != current_uid() {
+        if meta.uid() != uid {
             return Err("db_foreign_owner");
         }
     }
@@ -102,7 +116,8 @@ fn open_checked(db_path: &Path) -> Result<rusqlite::Connection, &'static str> {
         .join(name);
     let flags =
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW;
-    let conn = rusqlite::Connection::open_with_flags(path, flags).map_err(|_| "login_unreadable")?;
+    let conn =
+        rusqlite::Connection::open_with_flags(path, flags).map_err(|_| "login_unreadable")?;
     conn.set_db_config(rusqlite::config::DbConfig::SQLITE_DBCONFIG_DEFENSIVE, true)
         .map_err(|_| "login_unreadable")?;
     conn.pragma_update(None, "trusted_schema", false)
@@ -239,5 +254,20 @@ mod checked_open_tests {
         std::os::unix::fs::symlink(tmp.path(), &dir_link).unwrap();
         assert!(open_checked(&dir_link.join("state.vscdb")).is_ok());
         assert_eq!(read_login_checked(&link).err(), Some("db_symlink"));
+    }
+
+    /// 7: a database owned by another user is refused before it is opened.
+    #[cfg(unix)]
+    #[test]
+    fn a_foreign_owned_database_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = db(tmp.path());
+        let me = current_uid();
+        assert_eq!(
+            read_login_checked_for(&path, me.wrapping_add(1)).err(),
+            Some("db_foreign_owner")
+        );
+        // Control: the owner's own file opens (no token: `None`).
+        assert!(matches!(read_login_checked_for(&path, me), Ok(None)));
     }
 }
