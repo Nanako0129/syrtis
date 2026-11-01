@@ -58,8 +58,9 @@ enum CursorSync {
 
     /// Added Cursor profiles (`--user-data-dir` roots), each `{"id","root"}`
     /// with a random uppercase UUID. Only the folder path and that id are
-    /// stored — never an account id, email or label. CMP-1 has no UI writing
-    /// it; the default profile is implicit and never listed.
+    /// stored — never an account id, email or label. Written by the Accounts
+    /// page (`CursorSyncController.addProfile` / `removeProfile`); the default
+    /// profile is implicit and never listed.
     static let profilesKey = "tokenbar.cursorSync.profiles"
 
     struct Profile: Equatable {
@@ -72,6 +73,10 @@ enum CursorSync {
             guard let id = entry["id"], let root = entry["root"] else { return nil }
             return Profile(id: id, root: root)
         }
+    }
+
+    static func saveProfiles(_ profiles: [Profile], defaults: UserDefaults = .standard) {
+        defaults.set(profiles.map { ["id": $0.id, "root": $0.root] }, forKey: profilesKey)
     }
 
     /// `{"enabled","bundleId","profiles":[{"id","root"}],"cliTakeoverConfirmed"}`
@@ -134,11 +139,27 @@ enum CursorSync {
         static let cleanupFailed = "Cursor sync is off, but some downloaded usage couldn't be deleted. Restart Syrtis to retry."
         /// The core refused the settings (`tb_set_cursor_sync` error): nothing syncs.
         static let configRejected = "Cursor sync couldn't be set up, so nothing is being synced."
+        /// Accounts page, profile list (CMP-520). The default profile's row.
+        static let defaultProfile = "Cursor app (default)"
+        static let addProfile = "Add Cursor profile folder…"
+        /// A row whose account an earlier profile already synced this round.
+        static let duplicate = "Same account as another profile; counted once."
+        /// Second ⓘ paragraph. Each claim, checked against the code:
+        /// reads — `cursor_desktop::read_login_checked` on
+        /// `<root>/User/globalStorage/state.vscdb` in every round;
+        /// sends — `cursor_sync::walk` posts it only to `USAGE_EVENTS_URL`
+        /// (cursor.com, https-only, no redirects), and added profiles never
+        /// feed Grok Bot; stores — `commit_file` writes only the parser fields
+        /// into `<appDir>/cursor-profiles/<id>`; paths — `profilesKey`;
+        /// never stored or logged — `CursorLogin` is dropped after the cookie;
+        /// once — `newest_per_account`; deletes — orphan cleanup on the next
+        /// on push, everything on an off push (`set_from_json`).
+        static let profilesPrivacy = "To sync another Cursor profile (a folder you start Cursor with using --user-data-dir), add its folder. At each sync Syrtis reads that profile's login and sends it only to Cursor's usage service (cursor.com). Syrtis stores the date, model, token counts, cost and conversation ID of each request in its own folder, one per profile, and keeps the folder paths you add in its settings; the login itself is never saved or logged. All profiles add up to one Cursor total, and an account signed in to several profiles counts once. Removing a profile deletes its downloaded usage; turning sync off deletes all of it."
 
         static var all: [String] {
             [title, toggle, privacy, `continue`, cancel, turnOff, lastSynced, partial, expired, notSignedIn,
              offline, error, cliPresent, syncNow, syncing, cliQuestion, useSyrtis, keepCLI, cleanupFailed,
-             configRejected]
+             configRejected, defaultProfile, addProfile, duplicate, profilesPrivacy]
         }
     }
 
@@ -185,6 +206,9 @@ final class CursorSyncController: ObservableObject {
     /// that switch only: `confirmEnable()` enables nothing unless this is set.
     /// The Overview notice answers through `answerNotice`, a separate path.
     @Published private(set) var confirmPending = false
+    /// The last sync's outcome per profile id (`default` or a UUID), so a row
+    /// shows its own error even when the headline says something else.
+    @Published private(set) var profileStates: [String: CursorSyncStatus.Profile] = [:]
 
     private var loop: Task<Void, Never>?
     /// The last config push. Each push waits for the one before it, so rapid
@@ -217,7 +241,7 @@ final class CursorSyncController: ObservableObject {
         loop?.cancel()
         generation &+= 1
         // An off push retries the cleanup: hide the last failure until it reports.
-        if !run { state = nil; lastSuccessMs = nil; cleanupFailed = false }
+        if !run { state = nil; lastSuccessMs = nil; cleanupFailed = false; profileStates = [:] }
         let previous = configPush
         let push = Task { [weak self] in
             await previous?.value
@@ -281,6 +305,8 @@ final class CursorSyncController: ObservableObject {
             guard let result else { state = "error"; continue }
             state = result.state
             lastSuccessMs = result.lastSuccessMs
+            profileStates = Dictionary(
+                (result.profiles ?? []).map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
             // A round that wrote a file already invalidated the core's
             // caches; refresh the views on `changed`, not on the headline (one
             // profile can write while another fails) and not on the event
@@ -345,6 +371,52 @@ final class CursorSyncController: ObservableObject {
         defaults.set(true, forKey: CursorSync.noticeKey)
         if !continuing { defaults.set(false, forKey: CursorSync.enabledKey) }
         reconfigure(refresh: false, defaults: defaults)
+    }
+
+    /// Accounts page: add a `--user-data-dir` folder. Stores only a new
+    /// uppercase UUID and the path. While sync is off nothing reaches the core
+    /// (no config push, no sync, no database read); the stored list is pushed
+    /// when sync is turned on. Returns false for a folder already listed.
+    @discardableResult
+    func addProfile(
+        root: String, defaults: UserDefaults = .standard,
+        arguments: [String] = CommandLine.arguments,
+        bundleID: String? = Bundle.main.bundleIdentifier,
+        setConfig: @escaping @Sendable (String) -> Bool? = { (try? TBCore.setCursorSync(json: $0))?.cleanupFailed },
+        sync: @escaping @Sendable (Bool) -> CursorSyncStatus? = { try? TBCore.cursorSync(explicit: $0) }
+    ) -> Bool {
+        let root = (root as NSString).standardizingPath
+        var list = CursorSync.profiles(defaults: defaults)
+        guard !list.contains(where: { $0.root == root }) else { return false }
+        list.append(CursorSync.Profile(id: UUID().uuidString, root: root))
+        CursorSync.saveProfiles(list, defaults: defaults)
+        profilesChanged(defaults: defaults, arguments: arguments, bundleID: bundleID, setConfig: setConfig, sync: sync)
+        return true
+    }
+
+    /// Accounts page Remove. While sync is on, the reconfigure lets the core
+    /// delete that profile's downloaded usage (orphan cleanup); while off it
+    /// was already deleted when sync was turned off.
+    func removeProfile(
+        id: String, defaults: UserDefaults = .standard,
+        arguments: [String] = CommandLine.arguments,
+        bundleID: String? = Bundle.main.bundleIdentifier,
+        setConfig: @escaping @Sendable (String) -> Bool? = { (try? TBCore.setCursorSync(json: $0))?.cleanupFailed },
+        sync: @escaping @Sendable (Bool) -> CursorSyncStatus? = { try? TBCore.cursorSync(explicit: $0) }
+    ) {
+        CursorSync.saveProfiles(CursorSync.profiles(defaults: defaults).filter { $0.id != id }, defaults: defaults)
+        profileStates[id] = nil
+        profilesChanged(defaults: defaults, arguments: arguments, bundleID: bundleID, setConfig: setConfig, sync: sync)
+    }
+
+    private func profilesChanged(
+        defaults: UserDefaults, arguments: [String], bundleID: String?,
+        setConfig: @escaping @Sendable (String) -> Bool?,
+        sync: @escaping @Sendable (Bool) -> CursorSyncStatus?
+    ) {
+        guard CursorSync.shouldSync(defaults: defaults, arguments: arguments) else { return }
+        reconfigure(refresh: true, defaults: defaults, arguments: arguments, bundleID: bundleID,
+                    setConfig: setConfig, sync: sync)
     }
 
     /// D6: "Use Syrtis Sync" (true) or "Keep tokscale CLI Data" (false).

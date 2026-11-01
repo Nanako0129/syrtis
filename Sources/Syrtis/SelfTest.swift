@@ -18322,6 +18322,73 @@ enum SelfTest {
         }
         expect(cursorRejected == [CursorSync.Copy.configRejected.localized, "syncs=0"],
                "CURSOR-SYNC a refused config shows the rejected line and syncs nothing; got \(String(describing: cursorRejected))")
+        // CMP-520 acceptance 14: the Accounts page profile list, through the
+        // controller methods the rows call. Off: adding or removing reaches no
+        // core call at all (no config push; no sync, the only path that reads
+        // a Cursor database). Control: the same add while on pushes a config
+        // carrying it. Mutation: drop the `shouldSync` gate in
+        // `profilesChanged`, and the off add pushes a config.
+        let cursorProfiles: [String: Bool]? = awaitMainActorValue {
+            let suite = "tokenbar.selftest.cursorProfiles"
+            let defaults = UserDefaults(suiteName: suite)!
+            defer { defaults.removePersistentDomain(forName: suite) }
+            defaults.removePersistentDomain(forName: suite)
+            defaults.set(true, forKey: CursorSync.noticeKey)
+            defaults.set(false, forKey: CursorSync.enabledKey)
+            let pushes = UncheckedBox<[String]>([])
+            let syncs = UncheckedBox<Int>(0)
+            let setConfig: @Sendable (String) -> Bool? = { pushes.value.append($0); return false }
+            let sync: @Sendable (Bool) -> CursorSyncStatus? = { _ in syncs.value += 1; return nil }
+            let user = ["Syrtis"]
+            let controller = CursorSyncController()
+            let root = "/Volumes/selftest/cursor-b"
+            let added = controller.addProfile(
+                root: root, defaults: defaults, arguments: user, bundleID: "x.y", setConfig: setConfig, sync: sync)
+            let again = controller.addProfile(
+                root: root + "/", defaults: defaults, arguments: user, bundleID: "x.y", setConfig: setConfig, sync: sync)
+            try? await Task.sleep(nanoseconds: 100_000_000)
+            let stored = CursorSync.profiles(defaults: defaults)
+            let id = stored.first?.id ?? ""
+            let uuidShape = id.count == 36 && id == id.uppercased() && UUID(uuidString: id) != nil
+            let json = CursorSync.configJSON(bundleID: "x.y", defaults: defaults, arguments: user)
+            let config = (try? JSONSerialization.jsonObject(with: Data(json.utf8))) as? [String: Any]
+            let carried = (config?["profiles"] as? [[String: String]]) == [["id": id, "root": root]]
+            let offAdd = pushes.value.isEmpty && syncs.value == 0
+            controller.removeProfile(
+                id: id, defaults: defaults, arguments: user, bundleID: "x.y", setConfig: setConfig, sync: sync)
+            try? await Task.sleep(nanoseconds: 100_000_000)
+            let roundTrip = stored.count == 1 && stored.first?.root == root
+                && CursorSync.profiles(defaults: defaults).isEmpty
+            let offRemove = pushes.value.isEmpty && syncs.value == 0
+            // Control: on, the add reaches the core with the new profile.
+            defaults.set(true, forKey: CursorSync.enabledKey)
+            controller.addProfile(
+                root: root, defaults: defaults, arguments: user, bundleID: "x.y", setConfig: setConfig, sync: sync)
+            for _ in 0..<200 where pushes.value.isEmpty {
+                try? await Task.sleep(nanoseconds: 10_000_000)
+            }
+            let onPushed = pushes.value.first?.contains(#""root":"\/Volumes\/selftest\/cursor-b""#) == true
+                || pushes.value.first?.contains(#""root":"/Volumes/selftest/cursor-b""#) == true
+            // Stop the loop the on add started.
+            defaults.set(false, forKey: CursorSync.enabledKey)
+            controller.reconfigure(refresh: false, defaults: defaults, arguments: user, bundleID: "x.y",
+                                   setConfig: { _ in false }, sync: sync)
+            return ["added once": added && !again, "uppercase UUID": uuidShape, "configJSON carries it": carried,
+                    "off add: no core call": offAdd, "round trip": roundTrip,
+                    "off remove: no core call": offRemove, "control: on add pushes it": onPushed]
+        }
+        expect(cursorProfiles?.values.allSatisfy { $0 } == true,
+               "CURSOR-PROFILES add/remove while off reach no core call, round-trip the stored list, and configJSON carries the new uppercase UUID and root; failed: \(cursorProfiles?.filter { !$0.value }.map(\.key).sorted() ?? ["nil"])")
+        for locale in ["zh-Hant", "zh-Hans"] {
+            let keys = [AccountsCopy.cursorSummary, CursorSync.Copy.toggle, CursorSync.Copy.privacy,
+                        CursorSync.Copy.profilesPrivacy, CursorSync.Copy.defaultProfile,
+                        CursorSync.Copy.addProfile, CursorSync.Copy.duplicate, "Remove"]
+            let missing = keys.filter {
+                let value = AppLanguage.localizedString($0, locale: locale)
+                return value == nil || value == $0
+            }
+            expect(missing.isEmpty, "CURSOR-PROFILES Accounts page Cursor section copy resolves in \(locale): missing \(missing)")
+        }
         expect(cursorRefresh == [true, true, true],
                "CURSOR-SYNC every round that wrote refreshes, including two in a row with the same count, and after off->on; got \(String(describing: cursorRefresh))")
         // CMP-520 FIX 1: one profile wrote while another failed — the

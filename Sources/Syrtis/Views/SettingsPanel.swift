@@ -137,6 +137,8 @@ struct SettingsPanel: View {
     @AppStorage(CursorSync.enabledKey) private var cursorSyncOn = true
     @AppStorage(CursorSync.takeoverKey) private var cursorTakeover = false
     @AppStorage(CursorSync.noticeKey) private var cursorNoticeAck = false
+    /// Mirror of `CursorSync.profilesKey` for the rows; re-read after each edit.
+    @State private var cursorProfiles: [CursorSync.Profile] = []
     /// 0 = auto (≈60% of the screen). The popover's drag handle writes the
     /// same key, so the two stay in sync.
     @AppStorage(PopoverChrome.heightKey) private var popoverHeight = 0.0
@@ -1191,7 +1193,10 @@ struct SettingsPanel: View {
     private func cursorSyncSection() -> some View {
         infoSection(
             AccountsCopy.cursor, summary: AccountsCopy.cursorSummary,
-            details: { hint(CursorSync.Copy.privacy) }
+            details: {
+                hint(CursorSync.Copy.privacy)
+                hint(CursorSync.Copy.profilesPrivacy)
+            }
         ) {
             // Consent: turning the switch on opens a confirmation carrying the
             // privacy paragraph; nothing is enabled until Continue. Cancel,
@@ -1265,7 +1270,72 @@ struct SettingsPanel: View {
                     .foregroundStyle(Color.orange)
                     .fixedSize(horizontal: false, vertical: true)
             }
+            cursorProfileRows()
         }
+    }
+
+    /// The default profile plus each added `--user-data-dir` folder. A row
+    /// shows its own last outcome while sync is on, so an added profile's
+    /// error is visible even when the headline above says something else.
+    /// Editable while off; adding or removing then reaches no core call.
+    @ViewBuilder
+    private func cursorProfileRows() -> some View {
+        let syncOn = CursorSync.toggleShowsOn(enabled: cursorSyncOn, acknowledged: cursorNoticeAck)
+        cursorProfileRow(CursorSync.Copy.defaultProfile, id: "default", syncOn: syncOn) { EmptyView() }
+        ForEach(cursorProfiles, id: \.id) { profile in
+            cursorProfileRow(
+                (profile.root as NSString).abbreviatingWithTildeInPath, id: profile.id, syncOn: syncOn
+            ) {
+                Button {
+                    cursorSync.removeProfile(id: profile.id)
+                    cursorProfiles = CursorSync.profiles()
+                } label: {
+                    Image(systemName: "minus.circle")
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+                .help("Remove".localized)
+            }
+        }
+        Button {
+            addCursorProfile()
+        } label: {
+            Label(CursorSync.Copy.addProfile.localized, systemImage: "plus.circle")
+                .font(.caption)
+        }
+        .buttonStyle(.plain)
+        .padding(.horizontal, 10)
+        .onAppear { cursorProfiles = CursorSync.profiles() }
+    }
+
+    @ViewBuilder
+    private func cursorProfileRow(
+        _ label: String, id: String, syncOn: Bool, @ViewBuilder trailing: () -> some View
+    ) -> some View {
+        row(label, trailing: trailing)
+        if syncOn, let status = cursorSync.profileStates[id] {
+            let line = status.state == "duplicate"
+                ? CursorSync.Copy.duplicate.localized
+                : CursorSync.statusLine(state: status.state, lastSuccessMs: status.lastSuccessMs)
+            if let line {
+                Text(line)
+                    .font(.caption2)
+                    .foregroundStyle(["ok", "duplicate"].contains(status.state) ? Color.secondary : Color.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(.horizontal, 10)
+            }
+        }
+    }
+
+    private func addCursorProfile() {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = false
+        panel.prompt = "Add".localized
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        cursorSync.addProfile(root: url.path)
+        cursorProfiles = CursorSync.profiles()
     }
 
     /// Extra Google accounts for Antigravity, each its own card. The copy says
