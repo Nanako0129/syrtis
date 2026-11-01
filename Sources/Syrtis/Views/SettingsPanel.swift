@@ -362,7 +362,7 @@ struct SettingsPanel: View {
             payload: agentUsage,
             enabled: ClientTray.parseEnabledRaw(individualEnabledRaw),
             selections: ClientTray.parseSelectionsRaw(individualSelectionsRaw),
-            hidden: ClientRegistry.parseIdSet(tabsHiddenRaw),
+            hidden: ClientRegistry.hiddenTabClients(ClientRegistry.parseIdSet(tabsHiddenRaw)),
             orderRaw: tabsOrderRaw,
             officialClients: AgentIconView.availableOfficialClientIDs())
 
@@ -516,7 +516,7 @@ struct SettingsPanel: View {
                     // A tab hidden below always hides its quota card too — the
                     // toggle here reflects that (off + disabled) rather than
                     // offering a state the card can never actually reach.
-                    let tabHiddenSet = ClientRegistry.withGroupMembers(ClientRegistry.parseIdSet(tabsHiddenRaw))
+                    let tabHiddenSet = ClientRegistry.hiddenTabClients(ClientRegistry.parseIdSet(tabsHiddenRaw))
                     Divider()
                     VStack(spacing: 1) {
                         ForEach(limitOrdered, id: \.self) { id in
@@ -614,7 +614,7 @@ struct SettingsPanel: View {
         }
 
         section("Client tabs (top bar)") {
-            let hiddenSet = ClientRegistry.parseIdSet(tabsHiddenRaw)
+            let hiddenSet = ClientRegistry.hiddenTabClients(ClientRegistry.parseIdSet(tabsHiddenRaw))
 
             if tabsUniverse.isEmpty {
                 Text("No clients found yet.")
@@ -629,11 +629,10 @@ struct SettingsPanel: View {
                     VStack(spacing: 1) {
                         ForEach(tabsUniverse, id: \.self) { id in
                             let isVisible = !hiddenSet.contains(id)
-                            // Only present clients can be top tabs, so only
-                            // they get the show/hide switch. Quota-only ids
-                            // (e.g. Antigravity — OAuth quota, no local
-                            // sessions) appear solely to order their quota
-                            // card, so they show a caption instead.
+                            // Rows that are not tab ids — a grouped member
+                            // that owns its own quota card, for example — have
+                            // no tab of their own, so they show a caption
+                            // instead of the switch.
                             let canTab = presentSet.contains(id)
                             HStack(spacing: 8) {
                                 // Drag handle - always shown for every provider
@@ -659,13 +658,10 @@ struct SettingsPanel: View {
                                     Toggle("", isOn: Binding(
                                         get: { isVisible },
                                         set: { show in
-                                            var hidden = hiddenSet
-                                            if show {
-                                                hidden.remove(id)
-                                            } else {
-                                                hidden.insert(id)
-                                            }
-                                            tabsHiddenRaw = hidden.sorted().joined(separator: ",")
+                                            tabsHiddenRaw = ClientRegistry.updatingTabVisibility(
+                                                ClientRegistry.parseIdSet(tabsHiddenRaw),
+                                                tab: id, visible: show
+                                            ).sorted().joined(separator: ",")
                                         }
                                     ))
                                     .disabled(DemoData.ignoresLocalVisibility)
@@ -699,7 +695,7 @@ struct SettingsPanel: View {
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
-            hint("Drag to order tabs and quota cards. The switch hides a client's tab and its quota card. Clients that only report quota, such as Antigravity, have no tab and are listed only for ordering.")
+            hint("Drag to order tabs and quota cards. The switch hides a client's tab and its quota card. Rows marked (quota card only) have no tab of their own; moving one also moves the tab it belongs to, because the first row of a group sets that group's tab position.")
         }
 
         section("Live trace") {
