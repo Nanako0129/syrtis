@@ -36,10 +36,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // lastHiddenRaw: didChangeNotification fires for every unrelated write,
     // so only re-push to the FFI registry when one of these specific keys
     // actually changed (e.g. Settings added/removed a Claude config dir or an
-    // additional Pi root). Both values are tracked because the setter is
-    // full-replace and one merged payload carries both clients.
+    // additional Pi or DSH root). All values are tracked because the setter is
+    // full-replace and one merged payload carries every client.
     private var lastExtraRootsRaw = UserDefaults.standard.string(forKey: ClaudeExtraRoots.storageKey) ?? ""
     private var lastPiExtraRootsRaw = UserDefaults.standard.string(forKey: ExtraScanRoots.Pi.storageKey) ?? ""
+    private var lastDshExtraRootsRaw = UserDefaults.standard.string(forKey: ExtraScanRoots.Dsh.storageKey) ?? ""
     // The Discord presence client, or nil whenever this process may not connect
     // (switched off, or a demo/test run). Only makeDiscordClient creates it.
     private var discord: DiscordIPCClient?
@@ -81,7 +82,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // under, before the title-refresh loop below starts warming it.
         AttributedSeriesModel.captureLaunchTimeZone()
         // Push any configured extra scan roots (Claude config dirs and
-        // additional Pi roots) as ONE merged payload. The FFI registry starts
+        // additional Pi and DSH roots) as ONE merged payload. The FFI registry starts
         // empty every process launch (it's an in-memory RwLock, not persisted
         // core-side; UserDefaults is the source of truth Swift owns), and the
         // setter is full-replace, so sending one client alone would clear the
@@ -401,18 +402,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
 
             // Settings added/removed/edited a Claude config dir or an
-            // additional Pi root — push the merged list to the FFI registry
-            // immediately (D1: no restart). Either key can move; the payload
-            // always carries both clients.
+            // additional Pi or DSH root — push the merged list to the FFI registry
+            // immediately (D1: no restart). Any key can move; the payload
+            // always carries every client's roots.
             let extraRootsRaw = UserDefaults.standard.string(
                 forKey: ClaudeExtraRoots.storageKey) ?? ""
             let piExtraRootsRaw = UserDefaults.standard.string(
                 forKey: ExtraScanRoots.Pi.storageKey) ?? ""
+            let dshExtraRootsRaw = UserDefaults.standard.string(
+                forKey: ExtraScanRoots.Dsh.storageKey) ?? ""
             if extraRootsRaw != self.lastExtraRootsRaw
                 || piExtraRootsRaw != self.lastPiExtraRootsRaw
+                || dshExtraRootsRaw != self.lastDshExtraRootsRaw
             {
                 self.lastExtraRootsRaw = extraRootsRaw
                 self.lastPiExtraRootsRaw = piExtraRootsRaw
+                self.lastDshExtraRootsRaw = dshExtraRootsRaw
                 ExtraScanRoots.apply()
             }
 

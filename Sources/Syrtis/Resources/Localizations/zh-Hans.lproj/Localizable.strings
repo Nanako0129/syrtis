@@ -624,6 +624,8 @@
 /* ===== 设置：Antigravity 账户 ===== */
 "Accounts" = "账户";
 "Extra accounts join your totals." = "额外的账户会并入你的总计。";
+"Add another DSH home's sessions folder; its usage joins your totals." = "添加另一个 DSH home 的 sessions 文件夹；其用量会并入你的总计。";
+"Add the sessions folder of another DeepSeek Harness home, such as <DSH_HOME>/sessions. Its usage joins your DSH totals; homes aren't shown separately, and a session found in two folders counts once." = "添加另一个 DeepSeek Harness home 的 sessions 文件夹，例如 <DSH_HOME>/sessions。其用量会并入你的 DSH 总计，不会分开显示；同一个会话出现在两个文件夹时只计一次。";
 "Capture a Google account agy signs into." = "捕获 agy 登录的 Google 账户。";
 "More details" = "详细说明";
 "Antigravity account" = "Antigravity 账户";

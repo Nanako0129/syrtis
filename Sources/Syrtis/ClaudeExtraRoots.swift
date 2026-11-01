@@ -79,7 +79,7 @@ enum ClaudeExtraRoots {
     /// list clears the registry (the Settings rollback path).
     ///
     /// Claude-only, and kept byte-compatible: `ExtraScanRoots.payloadJSON`
-    /// returns this exact string when no Pi roots are configured, so an
+    /// returns this exact string when no Pi or DSH roots are configured, so an
     /// upgrade does not look like a scan-root change.
     static func payloadJSON(_ configDirs: [String]) -> String {
         let object = ["claude": expandedPaths(configDirs)]
@@ -441,7 +441,7 @@ enum ClaudeExtraRoots {
     /// client's roots. `ExtraScanRoots.apply` is the coordinator that builds
     /// the complete payload; this type owns the install machinery (the quota
     /// registry, applied-payload marker, generation, cache invalidation, and
-    /// quota wake) that both clients share.
+    /// quota wake) that every client's apply shares.
     ///
     /// **Never runs the setter on the calling actor.** The core probes every
     /// configured path with `read_dir`, and an unmounted external volume or a

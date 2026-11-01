@@ -17112,20 +17112,72 @@ enum SelfTest {
         let piRootA = "/Users/x/pi-usage-a"
         let piRootB = "/Users/x/pi-usage-b"
 
+        let piHomeForDsh = FileManager.default.homeDirectoryForCurrentUser.path
+        let dshRoot = "/Volumes/dsh-home/sessions"
+        let dshWithPi = ExtraScanRoots.payloadJSON(
+            claudeConfigDirs: [], piRoots: [piRootA], dshRoots: [dshRoot, "\(dshRoot)/"])
+        let dshWithPiDecoded = try! JSONDecoder().decode(
+            [String: [String]].self, from: Data(dshWithPi.utf8))
+        let dshOnlyDecoded = try! JSONDecoder().decode(
+            [String: [String]].self,
+            from: Data(
+                ExtraScanRoots.payloadJSON(
+                    claudeConfigDirs: [], piRoots: [], dshRoots: [dshRoot]).utf8))
+        expect(
+            dshWithPiDecoded["dsh"] == [dshRoot] && dshWithPiDecoded["pi"] == [piRootA]
+                && dshOnlyDecoded["dsh"] == [dshRoot] && dshOnlyDecoded["claude"] == []
+                && dshOnlyDecoded["pi"] == nil
+                && ExtraScanRoots.payloadJSON(claudeConfigDirs: [], piRoots: [], dshRoots: [])
+                    == ClaudeExtraRoots.payloadJSON([])
+                && ExtraScanRoots.payloadJSON(
+                    claudeConfigDirs: ["/Users/x/.claude-work"], piRoots: [piRootA], dshRoots: [])
+                    .hasSuffix("\"pi\":" + String(
+                        data: try! JSONEncoder().encode([piRootA]), encoding: .utf8)! + "}")
+                && !ExtraScanRoots.payloadJSON(
+                    claudeConfigDirs: [], piRoots: [piRootA], dshRoots: []).contains("dsh"),
+            "DSH-ROOTS the payload carries a deduplicated \"dsh\" list next to Pi's, "
+                + "a DSH-only payload still carries Claude, and with no DSH roots the "
+                + "payload is byte-identical to the pre-DSH one (mutation: dropping the "
+                + "\"dsh\" key, which the setter would then read as a clear)")
+        expect(
+            ExtraScanRoots.Dsh.storageKey != ExtraScanRoots.Pi.storageKey
+                && ExtraScanRoots.Dsh.isRejectedRoot(piHomeForDsh)
+                && !ExtraScanRoots.Dsh.isRejectedRoot("\(piHomeForDsh)/.dsh-copy/sessions"),
+            "DSH-ROOTS DSH has its own storage key and refuses a home-wide root")
+
+        // The production path: what `apply` hands to the core. Persist through
+        // `Dsh.save` into a scratch suite and read the payload back from
+        // `currentPayload`, the function `apply` uses.
+        let dshSuite = "tokenbar.selftest.dsh.\(UUID().uuidString)"
+        if let d = UserDefaults(suiteName: dshSuite) {
+            defer { d.removePersistentDomain(forName: dshSuite) }
+            ExtraScanRoots.Dsh.save([dshRoot, "\(dshRoot)/"], defaults: d)
+            let applied = try! JSONDecoder().decode(
+                [String: [String]].self,
+                from: Data(ExtraScanRoots.currentPayload(dshDefaults: d).utf8))
+            expect(
+                applied["dsh"] == [dshRoot],
+                "DSH-ROOTS the saved DSH folders reach ExtraScanRoots.currentPayload, the only "
+                    + "payload provider apply() passes to the core (mutation: currentPayload "
+                    + "building with dshRoots: [])")
+        } else {
+            expect(false, "DSH-ROOTS could not create the scratch UserDefaults suite, so the apply-path check did not run")
+        }
+
         // The upgrade case: with no Pi roots configured the payload must be
         // exactly the Claude-only string the previous build stored in
         // `appliedKey`. A new empty `pi` key would look like a root change and
         // cost every user a cache-bypassing rescan on first launch.
         expect(
             ExtraScanRoots.payloadJSON(
-                claudeConfigDirs: ["/Users/x/.claude-work"], piRoots: [])
+                claudeConfigDirs: ["/Users/x/.claude-work"], piRoots: [], dshRoots: [])
                 == #"{"claude":["\/Users\/x\/.claude-work\/projects","\/Users\/x\/.claude-work\/transcripts"]}"#,
             "PI-ROOTS with no Pi roots the payload is byte-identical to the "
                 + "Claude-only payload, so an upgrade does not force an unnecessary "
                 + "cache drop (mutation: adding an empty \"pi\" key)")
 
         let piOnly = ExtraScanRoots.payloadJSON(
-            claudeConfigDirs: ["/Users/x/.claude-work"], piRoots: [piRootA])
+            claudeConfigDirs: ["/Users/x/.claude-work"], piRoots: [piRootA], dshRoots: [])
         let piOnlyDecoded = try! JSONDecoder().decode(
             [String: [String]].self, from: Data(piOnly.utf8))
         expect(
@@ -17135,7 +17187,7 @@ enum SelfTest {
                 + "Pi-only payload would clear them (mutation: sending {\"pi\":[...]} alone)")
 
         let claudeOnlyWithPi = ExtraScanRoots.payloadJSON(
-            claudeConfigDirs: ["/Users/x/.claude-other"], piRoots: [piRootA])
+            claudeConfigDirs: ["/Users/x/.claude-other"], piRoots: [piRootA], dshRoots: [])
         let claudeOnlyWithPiDecoded = try! JSONDecoder().decode(
             [String: [String]].self, from: Data(claudeOnlyWithPi.utf8))
         expect(
@@ -17146,7 +17198,7 @@ enum SelfTest {
                 + "does not clear them (mutation: building the payload from Claude's "
                 + "list alone)")
 
-        let piEmpty = ExtraScanRoots.payloadJSON(claudeConfigDirs: [], piRoots: [])
+        let piEmpty = ExtraScanRoots.payloadJSON(claudeConfigDirs: [], piRoots: [], dshRoots: [])
         let piEmptyDecoded = try! JSONDecoder().decode(
             [String: [String]].self, from: Data(piEmpty.utf8))
         expect(
@@ -17158,7 +17210,7 @@ enum SelfTest {
                 + "leaves one client's old roots behind")
 
         let piDup = ExtraScanRoots.payloadJSON(
-            claudeConfigDirs: [], piRoots: [piRootA, "\(piRootA)/", piRootA])
+            claudeConfigDirs: [], piRoots: [piRootA, "\(piRootA)/", piRootA], dshRoots: [])
         let piDupDecoded = try! JSONDecoder().decode(
             [String: [String]].self, from: Data(piDup.utf8))
         expect(
@@ -17203,7 +17255,7 @@ enum SelfTest {
             ExtraScanPathsResult.self, from: Data(piPartialJSON.utf8))
         let piRequested = ExtraScanRoots.payloadJSON(
             claudeConfigDirs: ["/Users/x/.claude-work"],
-            piRoots: [piRootA, piRootB, piMissing])
+            piRoots: [piRootA, piRootB, piMissing], dshRoots: [])
         let piRegistered = ClaudeExtraRoots.registeredJSON(
             piRequested, rejected: piPartial.rejected)
         let piRegisteredDecoded = try! JSONDecoder().decode(
@@ -17258,7 +17310,7 @@ enum SelfTest {
             ClaudeExtraRoots.resetApplyClaimForTesting()
             let payload = ExtraScanRoots.payloadJSON(
                 claudeConfigDirs: ["/tmp/tokenbar-pi-moved-claude"],
-                piRoots: ["/tmp/tokenbar-pi-moved-root"])
+                piRoots: ["/tmp/tokenbar-pi-moved-root"], dshRoots: [])
             let result = try? JSONDecoder().decode(
                 ExtraScanPathsResult.self,
                 from: Data(#"{"registeredCount":2,"unreadable":[],"rejected":[]}"#.utf8))
@@ -17348,6 +17400,9 @@ enum SelfTest {
             ["login keychain", "token service and Cloud Code quota service", "revoke access in Google Account"]
                 .allSatisfy(agyDetails.contains)
                 && AccountsCopy.claudeDetails.contains("CLAUDE_CONFIG_DIR")
+                && AccountsCopy.dsh == "DeepSeek Harness"
+                && AccountsCopy.dshDetails.contains("<DSH_HOME>/sessions")
+                && AccountsCopy.translated.contains(AccountsCopy.dshSummary)
                 && AccountsCopy.antigravityDetails.count == 5
                 && ["reads the login of the Cursor app", "sends it only to Cursor's usage service (cursor.com)",
                     "date, model, token counts, cost and conversation ID", "the login itself is never saved or logged",

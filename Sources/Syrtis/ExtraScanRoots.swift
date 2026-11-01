@@ -4,8 +4,8 @@ import TokenBarCore
 /// The single coordinator that builds one `tb_set_extra_scan_paths` payload
 /// from every client's configured roots. The setter is full-replace, so a
 /// payload for one client alone would silently clear the others; Claude's
-/// expanded roots and the additional Pi roots therefore always travel
-/// together.
+/// expanded roots and the additional Pi and DSH roots therefore always
+/// travel together.
 ///
 /// The engine's `pi` lane scans `*.jsonl` under each root with the same parser
 /// it uses for `~/.pi/agent/sessions`. A usage-only export (session header plus
@@ -68,27 +68,67 @@ enum ExtraScanRoots {
         }
     }
 
-    /// The complete payload for both clients.
+    /// Additional DeepSeek Harness session folders (`<DSH_HOME>/sessions`),
+    /// persisted exactly as configured. The engine's `dsh` lane walks each root
+    /// for `session*.jsonl.zstd` like `~/.dsh/sessions`, and its cross-file
+    /// dedup key carries no session id or root, so one session reachable under
+    /// two roots counts once. Same path rules as Pi: recursive walk, so the
+    /// same too-broad roots are refused.
+    enum Dsh {
+        static let storageKey = "tokenbar.dsh.extraRoots"
+
+        /// `defaults` is a parameter only so SelfTest can use a scratch suite
+        /// instead of the app's real preferences.
+        static func load(defaults: UserDefaults = .standard) -> [String] {
+            guard let raw = defaults.string(forKey: storageKey),
+                let data = raw.data(using: .utf8),
+                let paths = try? JSONDecoder().decode([String].self, from: data)
+            else { return [] }
+            return paths
+        }
+
+        static func save(_ paths: [String], defaults: UserDefaults = .standard) {
+            let data = (try? JSONEncoder().encode(standardizedUnique(paths))) ?? Data("[]".utf8)
+            defaults.set(String(data: data, encoding: .utf8) ?? "[]", forKey: storageKey)
+        }
+
+        static func isRejectedRoot(_ path: String) -> Bool { Pi.isRejectedRoot(path) }
+        static func missingRoots(
+            in paths: [String],
+            then completion: @escaping @Sendable @MainActor (Set<String>) -> Void
+        ) {
+            Pi.missingRoots(in: paths, then: completion)
+        }
+    }
+
+    /// The complete payload for all clients.
     ///
-    /// With no Pi roots this returns `ClaudeExtraRoots.payloadJSON` unchanged
-    /// byte-for-byte. That is not cosmetic: `appliedKey` stores the last
+    /// With no Pi and no DSH roots this returns `ClaudeExtraRoots.payloadJSON`
+    /// unchanged byte-for-byte. That is not cosmetic: `appliedKey` stores the last
     /// accepted payload, and `install` drops the scan caches and advances the
     /// generation only when it moved. Re-encoding the same registry
     /// differently on the first launch after an upgrade would force a
     /// cache-bypassing rescan and reject the restart snapshot for a root set
     /// that never changed.
     ///
-    /// The two-key form is assembled from two separately encoded arrays rather
-    /// than a dictionary so its byte order is stable across launches. The
-    /// engine reads a full object, and both keys are always present together:
-    /// omitting one would clear that client's roots.
-    static func payloadJSON(claudeConfigDirs: [String], piRoots: [String]) -> String {
+    /// The multi-key form is assembled from separately encoded arrays rather
+    /// than a dictionary so its byte order is stable across launches (always
+    /// `claude`, then `pi`, then `dsh`). The engine reads a full object and the
+    /// setter is full-replace, so `claude` is always present, while `pi` and
+    /// `dsh` appear only when non-empty: an absent key already means "no roots
+    /// for that client". That also keeps every pre-DSH payload byte-identical.
+    static func payloadJSON(
+        claudeConfigDirs: [String], piRoots: [String], dshRoots: [String]
+    ) -> String {
         let piPaths = standardizedUnique(piRoots)
-        guard !piPaths.isEmpty else {
+        let dshPaths = standardizedUnique(dshRoots)
+        guard !piPaths.isEmpty || !dshPaths.isEmpty else {
             return ClaudeExtraRoots.payloadJSON(claudeConfigDirs)
         }
-        let claudePaths = ClaudeExtraRoots.expandedPaths(claudeConfigDirs)
-        return "{\"claude\":\(encode(claudePaths)),\"pi\":\(encode(piPaths))}"
+        var json = "{\"claude\":\(encode(ClaudeExtraRoots.expandedPaths(claudeConfigDirs)))"
+        if !piPaths.isEmpty { json += ",\"pi\":\(encode(piPaths))" }
+        if !dshPaths.isEmpty { json += ",\"dsh\":\(encode(dshPaths))" }
+        return json + "}"
     }
 
     /// One client's share of a merged apply result, for the per-section hints
@@ -120,17 +160,20 @@ enum ExtraScanRoots {
     /// Apply the merged registry at launch and after every edit. The install
     /// machinery (quota registry, applied marker, generation, cache
     /// invalidation, and quota wake) stays in `ClaudeExtraRoots`, which is
-    /// where both clients' applies have always run.
+    /// where every client's apply has always run.
     static func apply(
         then completion: (@Sendable @MainActor (ExtraScanPathsResult?) -> Void)? = nil
     ) {
-        ClaudeExtraRoots.apply(
-            scanPayload: {
-                payloadJSON(
-                    claudeConfigDirs: ClaudeExtraRoots.load(),
-                    piRoots: Pi.load())
-            },
-            then: completion)
+        ClaudeExtraRoots.apply(scanPayload: { currentPayload() }, then: completion)
+    }
+
+    /// The payload `apply` hands to the core, built from the persisted lists.
+    /// A separate function so SelfTest observes the production path;
+    /// `dshDefaults` is only for a scratch suite.
+    static func currentPayload(dshDefaults: UserDefaults = .standard) -> String {
+        payloadJSON(
+            claudeConfigDirs: ClaudeExtraRoots.load(),
+            piRoots: Pi.load(), dshRoots: Dsh.load(defaults: dshDefaults))
     }
 
     private static func standardizedPath(_ path: String) -> String {

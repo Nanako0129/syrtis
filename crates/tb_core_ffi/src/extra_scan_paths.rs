@@ -41,8 +41,9 @@ pub(crate) fn snapshot() -> BTreeMap<String, Vec<PathBuf>> {
 /// client. `pi` is the second entry: its lane scans `*.jsonl` under each root
 /// with the same parser that reads the default `~/.pi/agent/sessions` tree, so
 /// a usage-only export and a full session are both accepted without a separate
-/// parser.
-const SUPPORTED_CLIENTS: &[&str] = &["claude", "pi"];
+/// parser. `dsh` is the third: each root is a DeepSeek Harness `sessions`
+/// folder, walked for `session*.jsonl.zstd` like `~/.dsh/sessions`.
+const SUPPORTED_CLIENTS: &[&str] = &["claude", "pi", "dsh"];
 
 /// Clear the registry. Test seam: the statics are process-wide, so a test that
 /// leaves one populated changes the next test's answer.
@@ -888,6 +889,118 @@ mod tests {
             [30, 5, 0, 0],
         );
         assert_eq!(pi_report(&context), (155, 2));
+        reset();
+    }
+
+    /// Write a DSH session log (`<root>/<session>/session.v4.jsonl.zstd`) with
+    /// one `assistant/message` step.
+    fn write_dsh_session(root: &Path, session: &str, time: i64, input: i64, output: i64) {
+        let dir = root.join(session);
+        fs::create_dir_all(&dir).unwrap();
+        let jsonl = format!(
+            "{}\n{}\n",
+            serde_json::json!({"type":"session","version":4,"id":session,"createdAt":1791661487168i64,
+                "cwd":"/tmp/dsh-project","isSeeded":false,"delegationDepth":0}),
+            serde_json::json!({"type":"assistant/message","seq":1,"time":time,"data":{
+                "turn":1,"step":1,
+                "message":{"role":"assistant","content":[{"type":"text","text":"ok"}],
+                    "source":{"kind":"model","provider":"deepseek","model":"deepseek-v4-pro"}},
+                "usage":{"inputTokens":input,"cacheReadTokens":0,"outputTokens":output}}})
+        );
+        fs::write(
+            dir.join("session.v4.jsonl.zstd"),
+            zstd::encode_all(jsonl.as_bytes(), 3).unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn dsh_report(context: &LocalSourceContext) -> (i64, i32) {
+        let options = context.parse_options(None, Some(vec!["dsh".to_string()]));
+        let parsed = tokscale_core::parse_local_clients(options).unwrap();
+        let tokens = parsed
+            .messages
+            .iter()
+            .map(|m| m.input + m.output + m.cache_read + m.cache_write + m.reasoning)
+            .sum();
+        (tokens, parsed.counts.get(tokscale_core::ClientId::Dsh))
+    }
+
+    // A15: `dsh` is accepted and an extra DSH sessions folder reaches the
+    // engine scan; the same session seen under two roots counts once (the DSH
+    // lane's cross-file dedup key has no session id or root), a distinct one adds.
+    #[test]
+    fn a15_dsh_extra_root_is_accepted_scanned_and_dedups_across_roots() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        reset();
+        let home = tempfile::tempdir().unwrap();
+        let extra = tempfile::tempdir().unwrap();
+        write_dsh_session(&home.path().join(".dsh/sessions/proj"), "session-a", 1000, 100, 20);
+        let extra_root = extra.path().join("sessions");
+        write_dsh_session(&extra_root.join("proj"), "session-a", 1000, 100, 20);
+
+        let context = context_for(home.path());
+        assert_eq!(dsh_report(&context), (120, 1), "control: default root alone");
+
+        let payload = serde_json::json!({ "dsh": [extra_root.display().to_string()] }).to_string();
+        let result = set_from_json(&payload).unwrap();
+        assert_eq!(result["registeredCount"], 1);
+        assert_eq!(result["rejected"].as_array().unwrap().len(), 0);
+        assert_eq!(
+            dsh_report(&context),
+            (120, 1),
+            "same session under two roots counts once"
+        );
+
+        write_dsh_session(&extra_root.join("proj"), "session-b", 2000, 30, 5);
+        assert_eq!(dsh_report(&context), (155, 2), "a distinct step in the extra root adds");
+        reset();
+    }
+
+    // A16: the same once-check through the lanes the app shows (a15 covers the
+    // parse count lane): the graph's `simple_lane!` path and `tb_window_usage`.
+    // The graph is driven through `generate_local_graph_report_local_only`
+    // because the entry `tb_graph` calls (`generate_local_graph_report`) loads
+    // pricing, which can touch the network; both reach the same
+    // `generate_graph_with_loaded_pricing`, so the lane and its dedup are shared.
+    #[test]
+    fn a16_dsh_duplicate_across_roots_counts_once_in_graph_and_window_lanes() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        reset();
+        const T: i64 = 1_791_661_487_168;
+        let home = tempfile::tempdir().unwrap();
+        let extra = tempfile::tempdir().unwrap();
+        write_dsh_session(&home.path().join(".dsh/sessions/proj"), "session-a", T, 100, 20);
+        let extra_root = extra.path().join("sessions");
+        write_dsh_session(&extra_root.join("proj"), "session-a", T, 100, 20);
+        let context = context_for(home.path());
+        let payload = serde_json::json!({ "dsh": [extra_root.display().to_string()] }).to_string();
+        set_from_json(&payload).unwrap();
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let graph_tokens = |ctx: &LocalSourceContext| -> i64 {
+            let options = ctx.report_options(None, Some(vec!["dsh".to_string()]));
+            rt.block_on(tokscale_core::generate_local_graph_report_local_only(options))
+                .unwrap()
+                .graph()
+                .summary
+                .total_tokens
+        };
+        let window_rows = |ctx: &LocalSourceContext| -> usize {
+            let options = ctx.report_options(None, Some(vec!["dsh".to_string()]));
+            rt.block_on(tokscale_core::get_window_usage(options, T - 1, T + 10_000_000))
+                .unwrap()
+                .messages
+                .len()
+        };
+        assert_eq!(
+            (graph_tokens(&context), window_rows(&context)),
+            (120, 1),
+            "(graph tokens, window rows): same step under two roots counts once"
+        );
+
+        // Control: a distinct step in the extra root adds in both lanes.
+        write_dsh_session(&extra_root.join("proj"), "session-b", T + 1000, 30, 5);
+        assert_eq!((graph_tokens(&context), window_rows(&context)), (155, 2));
         reset();
     }
 }

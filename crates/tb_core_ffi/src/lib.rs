@@ -1273,7 +1273,7 @@ pub unsafe extern "C" fn tb_quota_curve(
 /// `extra_scan_paths` module doc). `json` is an object of
 /// `{"<public-client-id>": ["<absolute-dir-path>", ...]}`, e.g.
 /// `{"claude":["/Users/x/.claude-work/projects","/Users/x/.claude-work/transcripts"]}`.
-/// The allowlisted clients are `claude` and `pi`. Full-replace: passing `{}`
+/// The allowlisted clients are `claude`, `pi` and `dsh`. Full-replace: passing `{}`
 /// (or every client's list empty) clears the registry — a payload for one
 /// client therefore clears every other client's roots, so callers must always
 /// send the complete set. Every subsequent report/parse call picks up the new
