@@ -1080,7 +1080,12 @@ mod tests {
         assert!(target.is_file(), "the fixture has no target to link to");
         let link = fixture.home.join(".claude/projects/proj/link.jsonl");
         std::os::unix::fs::symlink(&target, &link).unwrap();
-        let context = crate::LocalSourceContext::for_home(fixture.home.clone());
+        // Fixture sources only: a CLAUDE_CONFIG_DIR or TOKSCALE_EXTRA_DIRS in the
+        // test process's environment must not add roots to either scan.
+        let context = crate::LocalSourceContext {
+            home_dir: Some(fixture.home.clone()),
+            use_env_roots: false,
+        };
 
         let primary = scan(&context, &PRIMARY);
         let extra = scan(&context, &Some(fixture.d.display().to_string()));

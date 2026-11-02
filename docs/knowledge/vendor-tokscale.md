@@ -104,7 +104,7 @@ Native 現在 pin reviewed engine commit `8535394b092c64dbd98e12d81f47d6eca81427
 
 升級本身無損，降級有損。Claude 的 pv 5 shard 與 format 100 envelope 都不會被舊 engine 讀懂：pv 4 的 engine 把 pv 5 shard 當 Stale，從空 map 重寫，**連只存在於快取、已被 compact 抹去的 Claude turn 一起丟**（engine 測試 `test_a_claude_pv5_shard_read_with_a_pv4_identity_is_stale` 釘住）；沒有 format 100 envelope 的 engine 讀到它是同樣的結果。可行的退路只有還原備份。誰會觸發這個損失見上方「共存風險」。
 
-備份與還原：在第一次用這個 pin（或之後任何 pin）掃描真實快取之前，先**結束所有 Syrtis 與 tokscale 行程**，複製 `~/.config/tokscale/cache/source-message-cache-v2/claude/` 整個目錄。要降級時依序：
+備份與還原：在第一次用這個 pin（或之後任何 pin）掃描真實快取之前，先**結束所有 Syrtis 與 tokscale 行程**，複製該行程實際使用的設定根目錄底下的 `cache/source-message-cache-v2/claude/` 整個目錄：設定根目錄是 `TOKSCALE_CONFIG_DIR`（非空時；直接啟動的行程會把只有空白的值當成相對路徑），未設定或為空時是 `~/.config/tokscale`；`make run` 的開發版用 `.build/tokscale-dev`（見上）。備份與還原要對同一個根目錄。要降級時依序：
 
 1. 結束所有跑 pv 5 程式碼的行程：新 pin 的 Syrtis、測試 bundle、任何寫快取的東西。快取鎖是 advisory、只有 engine 存檔才取，跑著的 pv 5 行程會把還原的 pv 4 項目重新 parse 並以 pv 5 存回。
 2. 還原 `claude/` 目錄。
