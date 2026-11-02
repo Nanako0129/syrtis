@@ -86,7 +86,7 @@ make selftest          # = swift run Syrtis --selftest -AppleLanguages "(en)"
 swift run Syrtis --smoke
 ```
 
-> `make selftest`, `make selftest-bundled` and `make run` export `TOKSCALE_CONFIG_DIR=.build/tokscale-dev` unless it is already set, so they leave the real `~/.config/tokscale` alone; the bare `swift run Syrtis --smoke` is not covered and needs its own scratch `TOKSCALE_CONFIG_DIR`. Why, and until when: [`vendor-tokscale.md`](vendor-tokscale.md#claude-cache-co-running-and-rollback).
+> Only `make run` is guarded: with `TOKSCALE_CONFIG_DIR` unset or empty (whitespace counts as a value) it points it at `.build/tokscale-dev`, which also redirects the Config-rooted sources, `settings.json` and the pricing cache, not just the Claude cache. `make selftest`, `make selftest-bundled` and a directly invoked `swift run Syrtis ...` (including `--smoke`) are not guarded; SelfTest left the engine cache untouched in the two runs measured. Why, and until when: [`vendor-tokscale.md`](vendor-tokscale.md#claude-cache-co-running-and-rollback).
 
 每一項都跑 debug configuration 的 bare executable，`Bundle.main.bundleIdentifier` 因此是 nil。凡是以那個差異為條件的值，在 suite 看得到的地方是一種樣子、在出貨的地方是另一種樣子，而任何 source scan 都關不掉這個缺口（#146 寫過三道、三道都被繞過，缺口不在原始碼文字裡）。CI 因此在 push 到 main 時多跑一次 `make selftest-bundled`：release build、裝進 `.app`、從 bundled binary 執行同一套 suite。
 

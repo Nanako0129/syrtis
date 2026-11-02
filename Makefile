@@ -5,23 +5,25 @@
 
 all: build
 
-# Dev and test runs read and WRITE the engine's cache under TOKSCALE_CONFIG_DIR
-# (default ~/.config/tokscale). This tree's engine writes Claude shards at
-# parser version 5 / envelope 100, which an older engine (the installed app,
-# any pre-pin build) reads as stale and rewrites from nothing, dropping the
-# Claude turns only the cache still holds. So unless the caller sets
-# TOKSCALE_CONFIG_DIR (an explicit value always wins), these targets use an
-# empty directory in the ignored build output; the first scan is cold.
+# `make run` starts the dev app against the engine's cache directory, by default
+# ~/.config/tokscale, which an installed app shares. This tree's engine writes
+# Claude shards at parser version 5 / envelope 100; an older engine (the
+# installed app, any pre-pin build) reads those as stale and rewrites them from
+# nothing, dropping the Claude turns only the cache still holds. So unless
+# TOKSCALE_CONFIG_DIR is set to a non-empty value (the engine reads an empty one
+# as unset; whitespace counts as a value), `make run` points it at an
+# ignored directory in the build output. TOKSCALE_CONFIG_DIR also roots the
+# Config-rooted sources (Antigravity cache, Trae, Warp), settings.json and the
+# pricing cache, so the dev app sees those from that directory too.
+# Not guarded, on purpose: `make selftest` / `make selftest-bundled` (the
+# release gate runs the latter, and an override changes what it exercises;
+# SelfTest left the engine cache untouched in the two runs measured) and a
+# `swift run` invoked directly.
 # docs/knowledge/vendor-tokscale.md#claude-cache-co-running-and-rollback
-# ponytail: delete this block once a release ships parser version 5. A direct
-# `swift run Syrtis --smoke` or `--selftest` (not via make) is not covered.
-ifeq ($(strip $(TOKSCALE_CONFIG_DIR)),)
+# ponytail: delete this block once a release ships parser version 5.
+ifeq ($(TOKSCALE_CONFIG_DIR),)
 DEV_CONFIG_DIR := $(CURDIR)/.build/tokscale-dev
-run selftest selftest-bundled: export TOKSCALE_CONFIG_DIR := $(DEV_CONFIG_DIR)
 endif
-define make_dev_config_dir
-$(if $(DEV_CONFIG_DIR),mkdir -p "$(DEV_CONFIG_DIR)")
-endef
 
 check-docs:
 	python3 scripts/check_knowledge.py --self-test
@@ -40,14 +42,12 @@ build: rust
 # .build/debug, which only SwiftPM creates. Running it before a build fails on a
 # fresh or freshly cleaned checkout.
 run: build
-	@$(call make_dev_config_dir)
-	@$(if $(DEV_CONFIG_DIR),echo "make run: TOKSCALE_CONFIG_DIR=$(DEV_CONFIG_DIR) (empty cache, the first scan is cold); set TOKSCALE_CONFIG_DIR to use another")
-	swift run Syrtis
+	@$(if $(DEV_CONFIG_DIR),echo "make run: TOKSCALE_CONFIG_DIR=$(DEV_CONFIG_DIR); the Claude cache, the Config-rooted sources (Antigravity cache, Trae, Warp), settings.json and the pricing cache come from there, not ~/.config/tokscale, and the first run starts empty")
+	$(if $(DEV_CONFIG_DIR),TOKSCALE_CONFIG_DIR="$(DEV_CONFIG_DIR)" )swift run Syrtis
 
 # Several assertions compare against English UI copy, so the language is
 # pinned here rather than inherited from the developer's Mac.
 selftest: build
-	@$(call make_dev_config_dir)
 	swift run Syrtis --selftest -AppleLanguages "(en)"
 
 # The same suite from the configuration that ships: release, inside a .app.
@@ -106,7 +106,6 @@ selftest-bundled: rust
 # declarations the library no longer has — the exact failure the debug target
 # already guards.
 	@$(call rebuild_if_header_stale,release)
-	@$(call make_dev_config_dir)
 	BUNDLE_ID=$(SELFTEST_BUNDLE_ID) OUT_DIR=dist/selftest scripts/bundle.sh
 	dist/selftest/Syrtis.app/Contents/MacOS/Syrtis --selftest -AppleLanguages "(en)"
 
