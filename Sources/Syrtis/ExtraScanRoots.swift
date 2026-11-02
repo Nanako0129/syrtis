@@ -52,9 +52,9 @@ enum ExtraScanRoots {
         /// missing path is kept and reported as missing for a later scan.
         static func isRejectedRoot(_ path: String) -> Bool {
             let standardized = standardizedPath(path)
-            if ClaudeExtraRoots.isRejectedRoot(standardized) { return true }
             let home = FileManager.default.homeDirectoryForCurrentUser.path
-            return home.hasPrefix(standardized + "/")
+            return standardized.isEmpty || standardized == "/" || standardized == home
+                || home.hasPrefix(standardized + "/")
         }
 
         /// Probe paths off the main actor on the setter's serial queue. A probe

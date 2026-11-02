@@ -91,11 +91,12 @@ public struct ExtraScanPathsResult: Decodable, Equatable, Sendable {
     public let rejected: [ScanPathNote]
 }
 
-/// One directory `tb_set_claude_config_dirs` refused, and why. Unlike an
-/// unreadable scan root, nothing here fixes itself by waiting: the path is
-/// empty, relative, the filesystem root, or a repeat of one already listed.
+/// One directory `tb_set_claude_config_dirs` (or the pre-check
+/// `tb_claude_config_dir_refusals`) refused: its position in the input and a
+/// fixed code (`primary_scan_root`, `overlap`, `limit_reached`, ...). The path
+/// is never echoed back. Nothing here fixes itself by waiting.
 public struct RejectedConfigDir: Decodable, Equatable, Sendable {
-    public let path: String
+    public let index: Int
     public let reason: String
 }
 
@@ -103,6 +104,11 @@ public struct RejectedConfigDir: Decodable, Equatable, Sendable {
 public struct ClaudeConfigDirsResult: Decodable, Equatable, Sendable {
     /// Directories now fetched as their own Claude quota card.
     public let registeredCount: Int
+    public let rejected: [RejectedConfigDir]
+}
+
+/// Result of `tb_claude_config_dir_refusals`.
+public struct ClaudeConfigDirRefusals: Decodable, Equatable, Sendable {
     public let rejected: [RejectedConfigDir]
 }
 
@@ -521,6 +527,17 @@ public enum TBCore {
     /// user configured — not the scan subset the core accepted.
     public static func setClaudeConfigDirs(json: String) throws -> ClaudeConfigDirsResult {
         try unwrap(json.withCString { tb_set_claude_config_dirs($0) })
+    }
+
+    /// Which entries of a JSON array of Claude config directories the core
+    /// refuses, by index and fixed code, without registering anything. The
+    /// one rule behind `setClaudeConfigDirs` and the primary window's guard;
+    /// Swift runs it before building either registry's payload. Pure: no file
+    /// is read, so it is safe on the main actor.
+    public static func claudeConfigDirRefusals(json: String) throws -> [RejectedConfigDir] {
+        let result: ClaudeConfigDirRefusals = try unwrap(
+            json.withCString { tb_claude_config_dir_refusals($0) })
+        return result.rejected
     }
 
     /// Replace the process-wide registry of captured Antigravity accounts.

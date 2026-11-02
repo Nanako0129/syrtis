@@ -319,6 +319,7 @@
 "Sync usage from the Cursor app." = "同步 Cursor 应用的用量。";
 "Add" = "添加";
 "Folder not found. Kept in case the drive is disconnected or the path needs fixing." = "找不到这个目录。先保留，以防磁盘没有连接或路径需要修正。";
+"Syrtis doesn't use this folder." = "Syrtis 不会使用这个目录。";
 
 /* ===== 设置：说明文字 ===== */
 "Spins faster as the live token rate climbs (idle 2 fps, 1M tokens/min tops out at 40 fps)." = "实时 token 速率越高，转得越快（空闲时 2 fps；达到每分钟 100 万 token 时，上限为 40 fps）。";

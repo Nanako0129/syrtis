@@ -153,8 +153,10 @@ char *tb_set_extra_scan_paths(const char *json);
 // `CLAUDE_CONFIG_DIR`-isolated accounts that each get their own quota card.
 // `json` is an array of absolute directory paths, e.g.
 // `["/Users/x/.claude-work"]`, full-replace semantics ([] clears it). Success
-// data is `{"registeredCount":N,"rejected":[{"path","reason"}]}`; a path is
-// rejected when it is empty, relative, the filesystem root, or a repeat.
+// data is `{"registeredCount":N,"rejected":[{"index":i,"reason":"<code>"}]}`,
+// with the rule and codes of tb_claude_config_dir_refusals; the path is never
+// echoed. Invalidates the scan caches and drops removed accounts' last-good
+// cards.
 // Existence is NOT probed: whether a directory is readable right now says
 // nothing about which account its credential belongs to.
 //
@@ -164,6 +166,17 @@ char *tb_set_extra_scan_paths(const char *json);
 // themselves and decides whose credential each quota card is fetched with.
 // Passing one where the other is expected fails silently in both directions.
 char *tb_set_claude_config_dirs(const char *json);
+// Which entries of a JSON array of Claude config directories
+// tb_set_claude_config_dirs would refuse, without registering anything.
+// Success data is `{"rejected":[{"index":i,"reason":"<code>"}]}`; codes:
+// empty_path, not_absolute, filesystem_root, home_unknown, home_directory,
+// primary_scan_root (equals, contains or sits inside ~/.claude, its projects
+// or transcripts, or ~/Library/Application Support/Claude/
+// local-agent-mode-sessions; compared without case), duplicate, overlap
+// (contains or sits inside an earlier accepted entry), limit_reached (more
+// than 8). Earlier entries win. Malformed input is the error
+// invalid_config_dirs_json.
+char *tb_claude_config_dir_refusals(const char *json);
 // Replace the process-wide registry of captured Antigravity accounts. `json`
 // is `[{"key":"<64 lowercase hex>","label":"<display label>"}]`, full-replace
 // semantics ([] clears it). Each entry becomes its own Antigravity quota card

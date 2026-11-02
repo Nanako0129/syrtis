@@ -17130,15 +17130,60 @@ enum SelfTest {
                    + "the gate is a comparison rather than a one-shot latch")
         ClaudeExtraRoots.resetAppliedConfigDirsForTesting()
 
-        // isRejectedRoot: home and root are refused; an ordinary subfolder is not.
-        let ceHome = FileManager.default.homeDirectoryForCurrentUser.path
+        // CE-P1 (audit 2026-11-03). A stored `~/.claude` (or any primary scan
+        // root) reaches NEITHER registry: not the config-dir payload and not
+        // the scan payload, which a separate setter with no such rule
+        // installs. Built through the production builders `apply` uses, with
+        // the core's rule judged against a temporary HOME. A sibling folder is
+        // the control. Then the FFI seam (MA-48): the Swift-built config JSON
+        // fed to the real setter registers exactly the control, and the
+        // unfiltered list is refused there by index and fixed code.
+        let ceHomeURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("syrtis-selftest-ce-p1-home")
+        let ceHome = ceHomeURL.path
+        let ceStored = [
+            "\(ceHome)/.claude", "\(ceHome)/.CLAUDE/", "\(ceHome)/.claude/projects",
+            "\(ceHome)/Library/Application Support/Claude", ceHome, "/",
+            "\(ceHome)/.claude-work",
+        ]
+        let ceP1 = withTemporaryHome(ceHomeURL) { () -> (String, String, String, [Int: String], String?, ClaudeConfigDirsResult?, ClaudeConfigDirsResult?) in
+            let configJSON = ClaudeExtraRoots.configDirsPayloadJSON(ceStored)
+            let scanJSON = ClaudeExtraRoots.payloadJSON(ceStored)
+            let mergedJSON = ExtraScanRoots.payloadJSON(
+                claudeConfigDirs: ceStored, piRoots: ["/tmp/syrtis-selftest-pi"], dshRoots: [])
+            let refused = ClaudeExtraRoots.refusals(ceStored)
+            let addRefusal = ClaudeExtraRoots.refusal(adding: "\(ceHome)/.claude", to: [])
+            let seam = try? TBCore.setClaudeConfigDirs(json: configJSON)
+            let raw = try? TBCore.setClaudeConfigDirs(json: String(
+                decoding: try! JSONEncoder().encode(ceStored), as: UTF8.self))
+            _ = try? TBCore.setClaudeConfigDirs(json: "[]")
+            return (configJSON, scanJSON, mergedJSON, refused, addRefusal, seam, raw)
+        }
+        let ceScan = try? JSONDecoder().decode([String: [String]].self, from: Data(ceP1.1.utf8))
+        let ceMerged = try? JSONDecoder().decode([String: [String]].self, from: Data(ceP1.2.utf8))
+        let ceWork = "\(ceHome)/.claude-work"
         expect(
-            ClaudeExtraRoots.isRejectedRoot(ceHome) && ClaudeExtraRoots.isRejectedRoot("/")
-                && !ClaudeExtraRoots.isRejectedRoot("\(ceHome)/.claude-work"),
-            "isRejectedRoot refuses the home directory and filesystem root but not an "
-                + "ordinary subfolder (mutation: refusing everything would make Settings' "
-                + "add button always a no-op; refusing nothing would let a scan-everything "
-                + "root through unwarned)")
+            ceP1.0 == String(decoding: try! JSONEncoder().encode([ceWork]), as: UTF8.self),
+            "CE-P1 a stored primary scan root yields no config-dir entry; the sibling "
+                + "control does (got \(ceP1.0))")
+        expect(
+            ceScan?["claude"] == ["\(ceWork)/projects", "\(ceWork)/transcripts"]
+                && ceMerged?["claude"] == ["\(ceWork)/projects", "\(ceWork)/transcripts"],
+            "CE-P1 a stored primary scan root yields no scan root, in the Claude-only and "
+                + "the merged payload (mutation: leave the refused dir in the scan payload)")
+        expect(
+            ceP1.3.keys.sorted() == [0, 1, 2, 3, 4, 5]
+                && ceP1.3[0] == "primary_scan_root" && ceP1.3[4] == "home_directory"
+                && ceP1.3[5] == "filesystem_root" && ceP1.4 == "primary_scan_root",
+            "CE-P1 the core's rule refuses every primary root by index with a fixed code, "
+                + "and the Settings add pre-check asks the same rule (got \(ceP1.3))")
+        expect(
+            ceP1.5?.registeredCount == 1 && ceP1.5?.rejected.isEmpty == true
+                && ceP1.6?.registeredCount == 1
+                && ceP1.6?.rejected.map(\.index) == [0, 1, 2, 3, 4, 5]
+                && ceP1.6?.rejected.first?.reason == "primary_scan_root",
+            "CE-P1 FFI seam: the Swift-built config JSON registers only the control in the "
+                + "real setter, and the setter itself refuses the unfiltered list by index")
 
         // isMissing: a real directory is present; a path that doesn't exist is missing.
         let ceTempDir = FileManager.default.temporaryDirectory.path

@@ -1302,10 +1302,12 @@ pub unsafe extern "C" fn tb_set_extra_scan_paths(json: *const c_char) -> *mut c_
 /// directory paths, e.g. `["/Users/x/.claude-work"]`; full-replace semantics
 /// (`[]` clears it). Each one is fetched as its own Claude quota card, using
 /// the Keychain item that directory selects. Success data is
-/// `{"registeredCount":N,"rejected":[{"path","reason"}]}`; a path is rejected
-/// when it is empty, relative, the filesystem root, or a repeat of one already
-/// in the list. Existence is not probed — whether the directory is readable
-/// right now says nothing about which account its credential belongs to.
+/// `{"registeredCount":N,"rejected":[{"index":i,"reason":"<code>"}]}`, the
+/// rule and codes of `tb_claude_config_dir_refusals`; the path is never echoed.
+/// Existence is not probed — whether the directory is readable right now says
+/// nothing about which account its credential belongs to. Invalidates the scan
+/// caches (the primary window's exclusions come from this list) and drops the
+/// last-good card of every account the replace removed.
 ///
 /// This is NOT `tb_set_extra_scan_paths`. That one takes the expanded
 /// `<dir>/projects` and `<dir>/transcripts` sub-roots and decides what the
@@ -1318,6 +1320,28 @@ pub unsafe extern "C" fn tb_set_extra_scan_paths(json: *const c_char) -> *mut c_
 pub unsafe extern "C" fn tb_set_claude_config_dirs(json: *const c_char) -> *mut c_char {
     guarded("tb_set_claude_config_dirs", || {
         envelope(unsafe { set_claude_config_dirs_from_c(json) })
+    })
+}
+
+/// Which entries of a JSON array of Claude config directories
+/// `tb_set_claude_config_dirs` would refuse, without registering anything.
+/// Success data is `{"rejected":[{"index":i,"reason":"<code>"}]}`. The codes:
+/// `empty_path`, `not_absolute`, `filesystem_root`, `home_unknown`,
+/// `home_directory`, `primary_scan_root` (equals, contains or sits inside
+/// `~/.claude`, its `projects` / `transcripts`, or Claude Desktop's
+/// `~/Library/Application Support/Claude/local-agent-mode-sessions`, compared
+/// without case), `duplicate`, `overlap` (contains or sits inside an earlier
+/// accepted entry) and `limit_reached` (more than 8). Earlier entries win.
+/// Swift runs this before building either registry's payload, so a refused
+/// directory reaches neither. Malformed input is the error
+/// `invalid_config_dirs_json`.
+///
+/// # Safety
+/// `json` must be NULL or a valid NUL-terminated UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn tb_claude_config_dir_refusals(json: *const c_char) -> *mut c_char {
+    guarded("tb_claude_config_dir_refusals", || {
+        envelope(unsafe { claude_config_dir_refusals_from_c(json) })
     })
 }
 
@@ -1550,7 +1574,40 @@ unsafe fn set_claude_config_dirs_from_c(json: *const c_char) -> Result<serde_jso
     let raw = unsafe { CStr::from_ptr(json) }
         .to_str()
         .map_err(|_| "Claude config dirs payload is not valid UTF-8".to_string())?;
-    claude_config_dirs::set_from_json(raw)
+    apply_claude_config_dirs(raw)
+}
+
+/// Replace the account registry, then drop what was derived from the old one
+/// (MA-35). The primary window's exclusions are built from this registry, so
+/// the scan caches are invalidated (bumping `ROOT_GENERATION`, which a window
+/// scan started under the old list checks before publishing), and each removed
+/// account's last-good card is purged so a re-added folder starts clean.
+/// Swift's `applyQueue` serialises calls, so the before/after diff is not raced.
+fn apply_claude_config_dirs(raw: &str) -> Result<serde_json::Value, String> {
+    let before = claude_config_dirs::snapshot();
+    let result = claude_config_dirs::set_from_json(raw)?;
+    let after = claude_config_dirs::snapshot();
+    invalidate_scan_caches();
+    let removed: Vec<String> = before
+        .into_iter()
+        .filter(|dir| !after.contains(dir))
+        .collect();
+    agent_usage::purge_claude_accounts(&removed);
+    Ok(result)
+}
+
+/// # Safety
+/// `json` must be NULL or a valid NUL-terminated UTF-8 string.
+unsafe fn claude_config_dir_refusals_from_c(
+    json: *const c_char,
+) -> Result<serde_json::Value, String> {
+    if json.is_null() {
+        return Err("invalid_config_dirs_json".to_string());
+    }
+    let raw = unsafe { CStr::from_ptr(json) }
+        .to_str()
+        .map_err(|_| "invalid_config_dirs_json".to_string())?;
+    claude_config_dirs::refusals_from_json(raw)
 }
 
 /// # Safety
@@ -1780,6 +1837,46 @@ mod tests {
         assert!(reply.contains("\"ok\":false"), "{reply}");
 
         keychain_consent::reset_for_test();
+    }
+
+    /// MA-35: the account registry feeds the primary window's exclusions, so a
+    /// replace must move the root generation (a window scanned under the old
+    /// list then refuses to publish) and drop the removed account's last-good
+    /// card. Driven through the real `extern "C"` setter.
+    #[test]
+    fn claude_config_dir_setter_bumps_the_generation_and_purges_removed_accounts() {
+        let _g = claude_config_dirs::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        claude_config_dirs::reset_for_test();
+        let set = |json: &str| {
+            let payload = CString::new(json).unwrap();
+            let raw = unsafe { tb_set_claude_config_dirs(payload.as_ptr()) };
+            let reply = unsafe { CStr::from_ptr(raw) }.to_str().unwrap().to_string();
+            unsafe { tb_free(raw) };
+            assert!(reply.contains("\"ok\":true"), "{reply}");
+        };
+        set(r#"["/w/kept","/w/gone"]"#);
+        agent_usage::seed_claude_last_good_for_test("/w/kept");
+        agent_usage::seed_claude_last_good_for_test("/w/gone");
+        let before = root_generation();
+
+        set(r#"["/w/kept"]"#);
+
+        assert!(
+            root_generation() > before,
+            "the config-dir replace did not move the generation"
+        );
+        assert!(
+            !agent_usage::has_claude_last_good_for_test("/w/gone"),
+            "the removed account's last-good card survived the replace"
+        );
+        assert!(
+            agent_usage::has_claude_last_good_for_test("/w/kept"),
+            "control: an account still listed keeps its last-good card"
+        );
+        agent_usage::purge_claude_accounts(&["/w/kept".to_string()]);
+        claude_config_dirs::reset_for_test();
     }
 
     /// Clearing the caches loses to a scan that was already running: it

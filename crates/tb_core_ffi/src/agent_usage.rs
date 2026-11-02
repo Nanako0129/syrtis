@@ -620,6 +620,48 @@ impl ProviderLastGoodCache {
 static PROVIDER_LAST_GOOD: LazyLock<Mutex<ProviderLastGoodCache>> =
     LazyLock::new(|| Mutex::new(ProviderLastGoodCache::default()));
 
+/// Drop the last-good card of each extra Claude account `config_dirs` names,
+/// so a folder removed and added back does not show the old account's data
+/// as its last good reading (MA-35). The per-account rate-limit gate
+/// (`CLAUDE_USAGE_GATES`) is kept on purpose: removing and re-adding a folder
+/// must not skip a cooldown Anthropic asked for.
+pub(crate) fn purge_claude_accounts(config_dirs: &[String]) {
+    purge_claude_accounts_in(&PROVIDER_LAST_GOOD, config_dirs);
+}
+
+fn purge_claude_accounts_in(cache: &Mutex<ProviderLastGoodCache>, config_dirs: &[String]) {
+    let mut cache = lock_last_good(cache);
+    for dir in config_dirs {
+        cache.clear(&account_slot(ProviderId::Claude, Some(dir)));
+    }
+}
+
+/// Test seam for the setter's purge: seed or read an extra Claude account's
+/// last-good slot in the process cache.
+#[cfg(test)]
+pub(crate) fn seed_claude_last_good_for_test(dir: &str) {
+    let scope = AccountScope::for_test(dir);
+    lock_last_good(&PROVIDER_LAST_GOOD).replace(
+        &account_slot(ProviderId::Claude, Some(dir)),
+        ProviderCacheBinding::primary(scope),
+        empty_error_snapshot(
+            ProviderId::Claude,
+            Some(dir),
+            "oauth",
+            Utc::now(),
+            String::new(),
+            None,
+        ),
+    );
+}
+
+#[cfg(test)]
+pub(crate) fn has_claude_last_good_for_test(dir: &str) -> bool {
+    lock_last_good(&PROVIDER_LAST_GOOD)
+        .entries
+        .contains_key(&account_slot(ProviderId::Claude, Some(dir)))
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentIdentity {

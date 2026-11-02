@@ -1090,10 +1090,20 @@ struct SettingsPanel: View {
             AccountsCopy.claude, summary: AccountsCopy.claudeSummary,
             details: { hint(AccountsCopy.claudeDetails) }
         ) {
-            ForEach(claudeExtraRoots, id: \.self) { path in
+            // The core's refusals for the stored list (a pure call, no file
+            // access). A refused entry stays listed, marked, so nothing the
+            // user added disappears silently; it reaches neither registry.
+            let refusedClaudeRoots = ClaudeExtraRoots.refusals(claudeExtraRoots)
+            ForEach(Array(claudeExtraRoots.enumerated()), id: \.element) { index, path in
                 row(path) {
                     HStack(spacing: 6) {
-                        if missingClaudeRoots.contains(path) {
+                        if refusedClaudeRoots[index] != nil {
+                            Image(systemName: "xmark.octagon.fill")
+                                .font(.caption2)
+                                .foregroundStyle(.red)
+                                .help(AccountsCopy.claudeRefusedPlaceholder.localized)
+                                .accessibilityLabel(AccountsCopy.claudeRefusedPlaceholder.localized)
+                        } else if missingClaudeRoots.contains(path) {
                             Image(systemName: "exclamationmark.triangle.fill")
                                 .font(.caption2)
                                 .foregroundStyle(.orange)
@@ -1473,7 +1483,11 @@ struct SettingsPanel: View {
         panel.prompt = "Add".localized
         guard panel.runModal() == .OK, let url = panel.url else { return }
         let path = url.path
-        guard !ClaudeExtraRoots.isRejectedRoot(path), !claudeExtraRoots.contains(path) else { return }
+        // The core's rule, asked before anything is saved. Item 6 of the
+        // 2026-11-03 audit plan adds the refusal sentence under the button.
+        guard !claudeExtraRoots.contains(path),
+              ClaudeExtraRoots.refusal(adding: path, to: claudeExtraRoots) == nil
+        else { return }
         claudeExtraRoots.append(path)
         commitClaudeExtraRoots()
     }
@@ -1808,6 +1822,10 @@ enum AccountsCopy {
     static let claude = "Claude"
     static let claudeSummary = "Extra accounts join your totals."
     static let claudeDetails = "For another Claude account, run Claude Code with CLAUDE_CONFIG_DIR set to its own folder and add that folder here. Its usage joins your totals; accounts aren't shown separately."
+    /// PLACEHOLDER, pending item 6 of the 2026-11-03 audit plan, which maps
+    /// each refusal code to its own sentence: shown on a stored folder the
+    /// core refuses (`ClaudeExtraRoots.refusals`).
+    static let claudeRefusedPlaceholder = "Syrtis doesn't use this folder."
     static let pi = "Pi"
     static let piSummary = "Add another Pi sessions folder; its usage joins your totals."
     static let piDetails = [
@@ -1840,7 +1858,7 @@ enum AccountsCopy {
     static let antigravityDetails = antigravityGeneral + [autoOn, autoOff]
     /// Every string that has a translation; the product names `claude` and
     /// `antigravity` are intentionally the same in every language.
-    static let translated = [page, moreDetails, claudeSummary, claudeDetails,
+    static let translated = [page, moreDetails, claudeSummary, claudeDetails, claudeRefusedPlaceholder,
                              dshSummary, dshDetails, antigravitySummary, autoToggle, piSummary,
                              cursorSummary] + piDetails + antigravityDetails
 }

@@ -47,13 +47,43 @@ enum ClaudeExtraRoots {
         return !exists || !isDir.boolValue
     }
 
-    /// Reject the home directory itself and the filesystem root outright —
-    /// anything else is the user's call (mirrors the plan's risk table: the
-    /// core only warns on an out-of-home path, it does not block).
-    static func isRejectedRoot(_ path: String) -> Bool {
-        let standardized = (path as NSString).standardizingPath
-        let home = FileManager.default.homeDirectoryForCurrentUser.path
-        return standardized.isEmpty || standardized == "/" || standardized == home
+    /// Which entries of `configDirs` the core refuses, by index, with its fixed
+    /// reason code (`TBCore.claudeConfigDirRefusals`): home, `/`, any primary
+    /// scan root (`~/.claude`, its `projects` / `transcripts`, Claude
+    /// Desktop's Cowork tree) with its ancestors and descendants, a duplicate,
+    /// an overlap with an earlier entry, or more than eight. The core owns the
+    /// rule; this only asks it, so Swift and the setter cannot disagree.
+    ///
+    /// Asked BEFORE either registry's payload is built (`expandedPaths`,
+    /// `configDirsPayloadJSON`): the scan payload is installed by a separate
+    /// setter with no such rule, and either registry alone holding `~/.claude`
+    /// emptied the primary's window (audit P1, 2026-11-03).
+    ///
+    /// Fails closed: if the core cannot answer, every entry counts as refused
+    /// (`unavailable`), so no extra account is installed rather than one that
+    /// might be the primary's own folder.
+    static func refusals(_ configDirs: [String]) -> [Int: String] {
+        let standardized = configDirs.map { ($0 as NSString).standardizingPath }
+        let json = (try? JSONEncoder().encode(standardized)).flatMap { String(data: $0, encoding: .utf8) }
+        guard let json, let rejected = try? TBCore.claudeConfigDirRefusals(json: json) else {
+            return Dictionary(uniqueKeysWithValues: configDirs.indices.map { ($0, "unavailable") })
+        }
+        return Dictionary(rejected.map { ($0.index, $0.reason) }, uniquingKeysWith: { first, _ in first })
+    }
+
+    /// The configured directories the core accepts, standardized, in order.
+    /// Both registry payloads are built from this and nothing else.
+    static func accepted(_ configDirs: [String]) -> [String] {
+        let refused = refusals(configDirs)
+        return configDirs.indices
+            .filter { refused[$0] == nil }
+            .map { (configDirs[$0] as NSString).standardizingPath }
+    }
+
+    /// The Settings pre-check for adding `path` after `existing`: the core's
+    /// reason code, or nil when it would be accepted.
+    static func refusal(adding path: String, to existing: [String]) -> String? {
+        refusals(existing + [path])[existing.count]
     }
 
     /// Expand a user-entered `CLAUDE_CONFIG_DIR` into the two sub-roots the
@@ -68,9 +98,10 @@ enum ClaudeExtraRoots {
     /// Expand and deduplicate the configured dirs into the exact list of scan
     /// roots the engine walks. Split out so `ExtraScanRoots` can merge this
     /// list with another client's roots without decoding the encoded payload.
+    /// Refused entries (`refusals`) contribute no root.
     static func expandedPaths(_ configDirs: [String]) -> [String] {
         var seen = Set<String>()
-        return configDirs.flatMap(expand).filter { seen.insert($0).inserted }
+        return accepted(configDirs).flatMap(expand).filter { seen.insert($0).inserted }
     }
 
     /// Build the `tb_set_extra_scan_paths` payload from the persisted list:
@@ -101,12 +132,10 @@ enum ClaudeExtraRoots {
     /// the Keychain service the core derives is the SHA-256 of this exact
     /// string: `/x/.claude-work/` and `/x/.claude-work` would read different
     /// items, and only one of them exists.
+    ///
+    /// Refused entries (`refusals`) are left out, duplicates among them.
     static func configDirsPayloadJSON(_ configDirs: [String]) -> String {
-        var seen = Set<String>()
-        let standardized = configDirs
-            .map { ($0 as NSString).standardizingPath }
-            .filter { seen.insert($0).inserted }
-        let data = (try? JSONEncoder().encode(standardized)) ?? Data("[]".utf8)
+        let data = (try? JSONEncoder().encode(accepted(configDirs))) ?? Data("[]".utf8)
         return String(data: data, encoding: .utf8) ?? "[]"
     }
 
