@@ -5,6 +5,24 @@
 
 all: build
 
+# Dev and test runs read and WRITE the engine's cache under TOKSCALE_CONFIG_DIR
+# (default ~/.config/tokscale). This tree's engine writes Claude shards at
+# parser version 5 / envelope 100, which an older engine (the installed app,
+# any pre-pin build) reads as stale and rewrites from nothing, dropping the
+# Claude turns only the cache still holds. So unless the caller sets
+# TOKSCALE_CONFIG_DIR (an explicit value always wins), these targets use an
+# empty directory in the ignored build output; the first scan is cold.
+# docs/knowledge/vendor-tokscale.md#claude-cache-co-running-and-rollback
+# ponytail: delete this block once a release ships parser version 5. A direct
+# `swift run Syrtis --smoke` or `--selftest` (not via make) is not covered.
+ifeq ($(strip $(TOKSCALE_CONFIG_DIR)),)
+DEV_CONFIG_DIR := $(CURDIR)/.build/tokscale-dev
+run selftest selftest-bundled: export TOKSCALE_CONFIG_DIR := $(DEV_CONFIG_DIR)
+endif
+define make_dev_config_dir
+$(if $(DEV_CONFIG_DIR),mkdir -p "$(DEV_CONFIG_DIR)")
+endef
+
 check-docs:
 	python3 scripts/check_knowledge.py --self-test
 	python3 scripts/check_knowledge.py
@@ -22,11 +40,14 @@ build: rust
 # .build/debug, which only SwiftPM creates. Running it before a build fails on a
 # fresh or freshly cleaned checkout.
 run: build
+	@$(call make_dev_config_dir)
+	@$(if $(DEV_CONFIG_DIR),echo "make run: TOKSCALE_CONFIG_DIR=$(DEV_CONFIG_DIR) (empty cache, the first scan is cold); set TOKSCALE_CONFIG_DIR to use another")
 	swift run Syrtis
 
 # Several assertions compare against English UI copy, so the language is
 # pinned here rather than inherited from the developer's Mac.
 selftest: build
+	@$(call make_dev_config_dir)
 	swift run Syrtis --selftest -AppleLanguages "(en)"
 
 # The same suite from the configuration that ships: release, inside a .app.
@@ -85,6 +106,7 @@ selftest-bundled: rust
 # declarations the library no longer has — the exact failure the debug target
 # already guards.
 	@$(call rebuild_if_header_stale,release)
+	@$(call make_dev_config_dir)
 	BUNDLE_ID=$(SELFTEST_BUNDLE_ID) OUT_DIR=dist/selftest scripts/bundle.sh
 	dist/selftest/Syrtis.app/Contents/MacOS/Syrtis --selftest -AppleLanguages "(en)"
 
