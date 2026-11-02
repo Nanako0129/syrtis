@@ -203,7 +203,9 @@ char *tb_set_antigravity_binding(const char *json);
 // own item is read once and never written. Blocking (keychain + network):
 // call off the main thread. Success data is `{"key":"<64 hex>","label":"..."}`
 // where `key` = hex(SHA-256("antigravity-account\0" + Google sub)) and
-// `label` is the login's email (or "Antigravity account"). `err` is exactly one
+// `label` is the login's email (or "Antigravity account"). Nothing is written
+// unless Google's refresh response carries an id_token with the stored sub
+// (else account_mismatch). `err` is exactly one
 // fixed code: agy_not_signed_in, agy_login_unreadable,
 // agy_login_missing_identity, oauth_client_not_found, oauth_client_rejected,
 // refresh_rejected, refresh_unreachable, account_mismatch,

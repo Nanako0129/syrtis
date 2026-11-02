@@ -19829,6 +19829,28 @@ enum SelfTest {
                           && AntigravityAccounts.load(defaults: defaults).map(\.key) == [agKey])
             }
 
+            // AG-S10: Remove installs the registry without the key BEFORE the
+            // keychain delete, so a token write-back racing it sees the key
+            // gone. A failed delete puts the row back where it was.
+            do {
+                let fake = AGAutoFake(key: agKey, label: agEmail)
+                let (ac, defaults) = fresh(fake)
+                AntigravityAccounts.save(
+                    [.init(key: agKey, label: agEmail), .init(key: otherKey, label: "b@example.com")],
+                    defaults: defaults)
+                await ac.remove(.init(key: agKey, label: agEmail))
+                check("AG-S10 Remove installs the list without the key before deleting its item",
+                      fake.read { $0.events } == ["install:\(otherKey)", "remove:\(agKey)"])
+                AntigravityAccounts.save(
+                    [.init(key: agKey, label: agEmail), .init(key: otherKey, label: "b@example.com")],
+                    defaults: defaults)
+                fake.write { $0.removeError = .bridge("keychain_delete_failed") }
+                await ac.remove(.init(key: agKey, label: agEmail))
+                check("AG-S10 a failed delete restores the row in place and says so",
+                      AntigravityAccounts.load(defaults: defaults).map(\.key) == [agKey, otherKey]
+                          && ac.message != nil)
+            }
+
             // Dedup through BOTH accessors, gated on the primary's source.
             // The fake's marker is "m1"; an agy card fetched under it is the
             // current login's card. `primaryMarker` lets a case model a card
@@ -21304,6 +21326,10 @@ private final class AGAutoFake: @unchecked Sendable {
     var removedKeys: [String] = []
     var outcome: Result<AntigravityAutoCaptureResult, TBCoreError>
     var captureOutcome: Result<AntigravityCapturedAccount, TBCoreError> = .failure(.bridge("agy_not_signed_in"))
+    /// `install:<keys>` and `remove:<key>`, in the order the core saw them.
+    var events: [String] = []
+    /// When set, `remove` fails with it.
+    var removeError: TBCoreError?
     /// While set, an attempt blocks on it: the attempt is "in flight".
     var hold: DispatchSemaphore?
 
@@ -21360,8 +21386,18 @@ private final class AGAutoFake: @unchecked Sendable {
                     return fake.captureOutcome
                 }.get()
             },
-            remove: { key in self.write { $0.removedKeys.append(key) } },
-            install: { _ in })
+            remove: { key in
+                let error = self.read { fake -> TBCoreError? in
+                    fake.removedKeys.append(key)
+                    fake.events.append("remove:\(key)")
+                    return fake.removeError
+                }
+                if let error { throw error }
+            },
+            install: { defaults in
+                let keys = AntigravityAccounts.load(defaults: defaults).map(\.key).joined(separator: ",")
+                self.write { $0.events.append("install:\(keys)") }
+            })
     }
 }
 

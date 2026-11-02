@@ -1391,7 +1391,9 @@ pub unsafe extern "C" fn tb_set_antigravity_binding(json: *const c_char) -> *mut
 /// Copy agy's current Google login into a Syrtis-owned login-keychain item
 /// (service `com.nyanako.tokenbar.antigravity-account`, account = key). Reads
 /// agy's item once through `/usr/bin/security` and never writes it; proves the
-/// token with one refresh at Google using the client named by its `aud`.
+/// token with one refresh at Google using the client named by its `aud`, and
+/// writes only when that response carries an `id_token` with agy's stored `sub`
+/// (otherwise `account_mismatch`).
 /// Success data is `{"key":"<64 hex>","label":"<email or fallback>"}`. The
 /// error text is exactly one fixed code: `agy_not_signed_in`,
 /// `agy_login_unreadable`, `agy_login_missing_identity`,

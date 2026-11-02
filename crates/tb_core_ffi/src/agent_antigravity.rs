@@ -2952,6 +2952,10 @@ pub(crate) trait CapturedIo {
         Result<AccountScope, AccountScopeError>,
         Result<HistoryScope, AccountScopeError>,
     );
+    /// Whether `key` is in the captured-account registry right now. Swift
+    /// drops a removed key from the registry before it deletes the item, so a
+    /// key missing here is being or has been removed.
+    fn is_registered(&self, key: &str) -> bool;
     async fn quota(
         &self,
         access_token: String,
@@ -3182,6 +3186,10 @@ impl CapturedIo for SystemCapturedIo {
         )
     }
 
+    fn is_registered(&self, key: &str) -> bool {
+        captured_accounts().iter().any(|account| account.key == key)
+    }
+
     /// loadCodeAssist, then fetchAvailableModels with retrieveUserQuota as the
     /// fallback, with the same precedence as the primary remote route
     /// (`fetch_with` with no local route).
@@ -3330,7 +3338,13 @@ async fn captured_access_token<I: CapturedIo>(
         );
     }
     if let Some(rotated) = non_empty_str(&json, "refresh_token") {
-        if rotated != stored.refresh_token {
+        // Check, write, re-check (MA-32, security review S10). A Remove can
+        // land while this refresh is in flight: Swift drops the key from the
+        // registry, then deletes the item, and an unconditional `add -U` here
+        // would recreate the item it just deleted, leaving a credential on the
+        // Mac for an account the user removed. Skipped when the key is already
+        // gone; deleted again when it went during the write.
+        if rotated != stored.refresh_token && io.is_registered(key) {
             let updated = StoredCredential {
                 refresh_token: rotated.to_string(),
                 client: stored.client.clone(),
@@ -3340,7 +3354,17 @@ async fn captured_access_token<I: CapturedIo>(
             if let Some(call) = write_item_call(key, &encode_stored(&updated)) {
                 let _ = io.security(call, CAPTURED_ITEM_TIMEOUT).await;
             }
+            if !io.is_registered(key) {
+                if let Some(call) = delete_item_call(key) {
+                    let _ = io.security(call, CAPTURED_ITEM_TIMEOUT).await;
+                }
+            }
         }
+    }
+    // Remove clears this cache before its delete; a refresh that was already
+    // running must not put the removed account's token back.
+    if !io.is_registered(key) {
+        lock_tokens(cache).remove(key);
     }
     Ok(access_token)
 }
@@ -3392,7 +3416,10 @@ impl CaptureError {
 
 /// Copy agy's current login into a Syrtis-owned item and return its key and
 /// label. Nothing is written unless the token refreshed with its own issuing
-/// client and any `id_token` in that response names the same `sub`.
+/// client and the response carries an `id_token` naming the same `sub`: the
+/// key is derived from agy's stored `sub`, which is local and untrusted, so
+/// Google's answer is what proves the token belongs to it (MA-1/3). A response
+/// without an `id_token` is `AccountMismatch`, as on the automatic path.
 async fn capture_with<I: CapturedIo>(io: &I) -> Result<CapturedAccount, CaptureError> {
     let agy_item = io
         .security(
@@ -3411,10 +3438,8 @@ async fn capture_with<I: CapturedIo>(io: &I) -> Result<CapturedAccount, CaptureE
     let (client, json) = refresh_with_issuing_client(io, &login, false).await?;
 
     // The stored id_token is local and untrusted; Google's answer is not.
-    if let Some(id_token) = json.get("id_token") {
-        if response_sub(Some(id_token)).as_deref() != Some(login.sub.as_str()) {
-            return Err(CaptureError::AccountMismatch);
-        }
+    if response_sub(json.get("id_token")).as_deref() != Some(login.sub.as_str()) {
+        return Err(CaptureError::AccountMismatch);
     }
 
     let key = captured_key(&login.sub);
@@ -5785,11 +5810,27 @@ pub(crate) mod captured_test_support {
         /// When set, `quota` fails terminally with this display text.
         pub quota_terminal: Option<&'static str>,
         pub scope: TestRefreshScope,
+        /// Keys not in the registry. Empty: every key is registered.
+        pub unregistered: RefCell<std::collections::BTreeSet<String>>,
+        /// A Remove of this key (registry drop, then item delete, the order
+        /// Swift uses) that lands while the token request is in flight.
+        pub remove_during_token_post: Option<String>,
+        /// The same Remove, landing during the `-i` write: after the
+        /// write-back's registration check, before the write completes.
+        pub remove_during_write: Option<String>,
     }
 
     impl FakeIo {
+        fn simulate_remove(&self, key: &str) {
+            self.unregistered.borrow_mut().insert(key.to_string());
+            self.items.borrow_mut().remove(key);
+        }
+
         pub(crate) fn new(tag: &str) -> Self {
             Self {
+                unregistered: RefCell::new(std::collections::BTreeSet::new()),
+                remove_during_token_post: None,
+                remove_during_write: None,
                 agy_item: None,
                 artifacts: Vec::new(),
                 items: RefCell::new(BTreeMap::new()),
@@ -5863,6 +5904,9 @@ pub(crate) mod captured_test_support {
                     );
                     assert_eq!(parts[6], "-w");
                     assert_eq!(parts.len(), 8);
+                    if let Some(key) = &self.remove_during_write {
+                        self.simulate_remove(key);
+                    }
                     if self.write_status == 0 {
                         self.items
                             .borrow_mut()
@@ -5922,7 +5966,14 @@ pub(crate) mod captured_test_support {
                 client.secret.clone(),
                 refresh_token.to_string(),
             ));
+            if let Some(key) = &self.remove_during_token_post {
+                self.simulate_remove(key);
+            }
             (self.token)(client, refresh_token)
+        }
+
+        fn is_registered(&self, key: &str) -> bool {
+            !self.unregistered.borrow().contains(key)
         }
 
         fn scopes(
@@ -6112,7 +6163,10 @@ mod captured_account_tests {
         let second = secret('b');
         io.token = Box::new(move |client, _| {
             if client.secret == second {
-                Ok(token_ok("ya29.a", json!({})))
+                Ok(token_ok(
+                    "ya29.a",
+                    json!({ "id_token": jwt(json!({ "sub": "sub-a" })) }),
+                ))
             } else {
                 Ok((401, r#"{"error":"unauthorized_client"}"#.to_string()))
             }
@@ -6164,6 +6218,108 @@ mod captured_account_tests {
         }
     }
 
+    /// MA-1/3 (security review S11): a manual capture whose refresh response
+    /// carries no `id_token` writes nothing, since the key would otherwise rest
+    /// on agy's stored `sub` alone. Control: the same capture with a matching
+    /// `id_token` writes exactly once, so the refusal is about the missing
+    /// token and not a capture that never gets that far.
+    #[tokio::test]
+    async fn manual_capture_requires_an_id_token_naming_the_stored_sub() {
+        let run = |extra: Value| async move {
+            let mut io = FakeIo::new("capture-id-token");
+            io.agy_item = Some(agy_item(
+                "1//rt-a",
+                Some(claims("sub-a", AUD, "a@example.com")),
+            ));
+            io.artifacts = artifacts_where_positional_pick_differs();
+            io.token = Box::new(move |_, _| Ok(token_ok("ya29.a", extra.clone())));
+            let outcome = capture_with(&io).await;
+            let writes = io.writes().len();
+            let items = io.items.borrow().len();
+            (outcome, writes, items)
+        };
+
+        let (outcome, writes, items) = run(json!({})).await;
+        assert_eq!(outcome.err(), Some(CaptureError::AccountMismatch));
+        assert_eq!(
+            writes, 0,
+            "a response without an id_token started a `security -i` write"
+        );
+        assert_eq!(items, 0);
+
+        let (outcome, writes, items) =
+            run(json!({ "id_token": jwt(json!({ "sub": "sub-a" })) })).await;
+        assert_eq!(
+            outcome.map(|account| account.key),
+            Ok(captured_key("sub-a"))
+        );
+        assert_eq!(
+            writes, 1,
+            "control: a matching id_token writes exactly once"
+        );
+        assert_eq!(items, 1);
+    }
+
+    /// Security review S10 / MA-32: Remove (registry drop, then item delete)
+    /// lands between the token request and the write-back of a rotated refresh
+    /// token. Before the fix the write-back recreated the deleted item, leaving
+    /// the removed account's credential in the keychain. Now no write starts,
+    /// no item is left and the access token is not cached for it.
+    #[tokio::test]
+    async fn a_remove_during_the_token_request_leaves_no_item() {
+        let mut io = FakeIo::new("remove-during-refresh");
+        let key = captured_key("sub-a");
+        io.items
+            .borrow_mut()
+            .insert(key.clone(), stored_value("1//rt-a", AUD, &secret('a')));
+        io.token = Box::new(|_, _| Ok(token_ok("ya29.a", json!({ "refresh_token": "1//rt-a2" }))));
+        io.remove_during_token_post = Some(key.clone());
+        let cache = new_token_cache();
+
+        let _ = fetch_captured_with(&io, &cache, &key, "a", now()).await;
+
+        assert!(
+            io.writes().is_empty(),
+            "the write-back ran for a removed account"
+        );
+        assert!(
+            !io.items.borrow().contains_key(&key),
+            "the removed account's item is back"
+        );
+        assert!(
+            cached_keys(&cache).is_empty(),
+            "the removed account's token was cached"
+        );
+    }
+
+    /// The other interleaving: Remove lands after the write-back's
+    /// registration check but before its write completes, so the write
+    /// recreates the item. The re-check after the write deletes it again.
+    #[tokio::test]
+    async fn a_remove_during_the_write_back_is_undone_by_the_recheck() {
+        let mut io = FakeIo::new("remove-during-write");
+        let key = captured_key("sub-a");
+        io.items
+            .borrow_mut()
+            .insert(key.clone(), stored_value("1//rt-a", AUD, &secret('a')));
+        io.token = Box::new(|_, _| Ok(token_ok("ya29.a", json!({ "refresh_token": "1//rt-a2" }))));
+        io.remove_during_write = Some(key.clone());
+        let cache = new_token_cache();
+
+        let _ = fetch_captured_with(&io, &cache, &key, "a", now()).await;
+
+        assert_eq!(
+            io.writes().len(),
+            1,
+            "fixture: the write-back started before the remove"
+        );
+        assert!(
+            !io.items.borrow().contains_key(&key),
+            "the write-back left the removed account's item"
+        );
+        assert!(cached_keys(&cache).is_empty());
+    }
+
     #[test]
     fn keychain_write_keeps_the_secret_off_argv() {
         let key = captured_key("sub-a");
@@ -6187,6 +6343,12 @@ mod captured_account_tests {
             Some(claims("sub-a", AUD, "a@example.com")),
         ));
         io.artifacts = artifacts_where_positional_pick_differs();
+        io.token = Box::new(|_, _| {
+            Ok(token_ok(
+                "ya29.a",
+                json!({ "id_token": jwt(json!({ "sub": "sub-a" })) }),
+            ))
+        });
         let account = capture_with(&io).await.unwrap();
         let value = io.items.borrow()[&account.key].clone();
         for call in io.security_calls.borrow().iter() {
@@ -6501,6 +6663,12 @@ mod captured_account_tests {
         let mut io = FakeIo::new("sentinel-write");
         io.agy_item = Some(login());
         io.artifacts = artifacts_where_positional_pick_differs();
+        io.token = Box::new(|_, _| {
+            Ok(token_ok(
+                "ya29.SENTINELTOKEN",
+                json!({ "id_token": jwt(json!({ "sub": "SENTINELSUB" })) }),
+            ))
+        });
         io.write_status = 1;
         cases.push(io);
 
@@ -6704,10 +6872,15 @@ mod captured_account_tests {
             assert!(io.writes().is_empty(), "{tag}");
             assert!(io.items.borrow().is_empty(), "{tag}");
         }
-        // The manual path still accepts a response without an id_token.
+        // The manual path refuses it too since MA-1/3 (see
+        // `manual_capture_requires_an_id_token_naming_the_stored_sub`).
         let mut io = auto_io("manual-no-id-token");
         io.token = Box::new(|_, _| Ok(token_ok("ya29.a", json!({}))));
-        assert!(capture_with(&io).await.is_ok());
+        assert_eq!(
+            capture_with(&io).await.err(),
+            Some(CaptureError::AccountMismatch)
+        );
+        assert!(io.writes().is_empty());
     }
 
     #[tokio::test]

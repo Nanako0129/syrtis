@@ -85,6 +85,16 @@ enum AntigravityAccounts {
 
     private static let applyQueue = DispatchQueue(
         label: "com.nyanako.tokenbar.antigravity-accounts", qos: .userInitiated)
+
+    /// Run `body` after every install already enqueued by `apply`. Remove uses
+    /// it so the keychain delete reaches the core only once the registry
+    /// without that key is installed (security review S10): the core's token
+    /// write-back checks registration before and after writing, and a delete
+    /// that overtook the install would leave that check looking at the old
+    /// list. Blocking; never call it on the main thread.
+    static func afterPendingInstalls<T>(_ body: () throws -> T) rethrows -> T {
+        try applyQueue.sync(execute: body)
+    }
     /// Touched only on `applyQueue`.
     nonisolated(unsafe) private static var lastInstalledPayload: String?
 
@@ -204,7 +214,9 @@ final class AntigravityAutoCapture: ObservableObject {
             marker: { try TBCore.antigravityLoginMarker() },
             autoCapture: { try TBCore.antigravityAutoCapture(removedKeys: $0) },
             capture: { try TBCore.antigravityCapture() },
-            remove: { try TBCore.antigravityRemove(key: $0) },
+            remove: { key in
+                try AntigravityAccounts.afterPendingInstalls { try TBCore.antigravityRemove(key: key) }
+            },
             install: { AntigravityAccounts.apply(defaults: $0) })
     }
 
@@ -449,23 +461,30 @@ final class AntigravityAutoCapture: ObservableObject {
         await pollIfOwed()
     }
 
-    /// Delete one account's keychain copy and drop it from the list. While
+    /// Drop one account from the list, then delete its keychain copy. While
     /// automatic capture is on, the key also goes on the removed list so the
     /// next login change does not add it back.
+    ///
+    /// Registry first, delete second (security review S10): a token refresh
+    /// already in flight for this account writes a rotated token back only
+    /// while the key is registered, and re-checks after writing. With the
+    /// delete first, that write-back recreated the item just deleted. The live
+    /// `IO.remove` waits for the install (`afterPendingInstalls`).
     func remove(_ account: AntigravityAccounts.Account) async {
         guard !busy else { return }
         busy = true
         message = nil
         let io = io
         let key = account.key
+        let position = AntigravityAccounts.load(defaults: defaults).firstIndex { $0.key == key }
+        AntigravityAccounts.mutate(defaults: defaults, install: io.install) {
+            $0.filter { $0.key != key }
+        }
         let result = await Self.detached { Result { try io.remove(key) } }
         switch result {
         case .success, .failure(TBCoreError.bridge("invalid_key")):
             // An invalid key has no keychain item and no card: the core
             // registry rejects it. Dropping the row is all that is left.
-            AntigravityAccounts.mutate(defaults: defaults, install: io.install) {
-                $0.filter { $0.key != key }
-            }
             if currentAgyKey == key { currentAgyKey = nil }
             if isEnabled {
                 let removed = AntigravityAccounts.removedKeys(defaults: defaults)
@@ -474,6 +493,16 @@ final class AntigravityAutoCapture: ObservableObject {
                 }
             }
         case let .failure(error):
+            // The item is still there: put the row back where it was, so the
+            // list keeps matching the keychain and Remove can be retried.
+            if let position {
+                AntigravityAccounts.mutate(defaults: defaults, install: io.install) { accounts in
+                    guard !accounts.contains(where: { $0.key == key }) else { return accounts }
+                    var restored = accounts
+                    restored.insert(account, at: min(position, accounts.count))
+                    return restored
+                }
+            }
             message = AntigravityAccounts.message(for: error)
         }
         busy = false
