@@ -1348,4 +1348,102 @@ mod tests {
         );
         reset_registries();
     }
+
+    /// REPRODUCTION, not a fix. Registering the user's own `<home>/.claude` as
+    /// an extra Claude account. `claude_config_dirs::normalize` accepts it
+    /// (only empty, relative and `/` are refused) and `ClaudeExtraRoots.install`
+    /// sends `<dir>/projects` and `<dir>/transcripts` to the scan registry for
+    /// every stored entry, whatever the first setter answered. Either registry
+    /// alone is enough for `primary_exclusions` to remove the primary's own
+    /// transcript from its window scan. Three cases: (a) config dirs only,
+    /// (b) scan registry only, (c) both, as production installs. The dashboard
+    /// path (`model_report::run`) has no exclusion. Assertions state what a fix
+    /// should give; this test fails while the defect is present.
+    #[test]
+    fn registering_the_default_claude_dir_as_extra_keeps_the_primary_window() {
+        let _guards = lock_registries();
+        reset_registries();
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().to_path_buf();
+        let default_dir = home.join(".claude");
+        write_session(&default_dir, "primary", PRIMARY_OUTPUT);
+        let context = crate::LocalSourceContext::for_home(home.clone());
+        let key = default_dir.display().to_string();
+
+        // The production entry the window card uses, cache included.
+        let card = |account: &Account| {
+            reset_cache_only();
+            cached(&context, account, WINDOW_FROM, WINDOW_UNTIL).map(|v| output_tokens(&v))
+        };
+        let dashboard = || {
+            crate::model_report::run(&context, "").expect("model report")["totalOutput"]
+                .as_i64()
+                .unwrap()
+        };
+        let set_dirs = |dirs: &[&PathBuf]| {
+            crate::claude_config_dirs::set_from_json(
+                &serde_json::json!(dirs.iter().map(|d| d.display().to_string()).collect::<Vec<_>>())
+                    .to_string(),
+            )
+            .unwrap();
+        };
+        let set_roots = |dirs: &[&PathBuf]| {
+            crate::extra_scan_paths::set_from_json(
+                &serde_json::json!({ "claude": claude_roots(dirs) }).to_string(),
+            )
+            .unwrap();
+        };
+
+        // Control: nothing registered.
+        let control = (card(&PRIMARY), dashboard());
+        eprintln!("CONTROL primary={:?} dashboard={}", control.0, control.1);
+        assert_eq!(control.0, Ok(PRIMARY_OUTPUT), "control: primary window");
+        assert_eq!(control.1, PRIMARY_OUTPUT, "control: dashboard");
+
+        let mut results: Vec<(&str, Result<i64, String>, Result<i64, String>, i64)> = Vec::new();
+        for (name, dirs, roots) in [
+            ("a: config dirs only", true, false),
+            ("b: scan registry only", false, true),
+            ("c: both (production)", true, true),
+        ] {
+            reset_registries();
+            if dirs {
+                set_dirs(&[&default_dir]);
+            }
+            if roots {
+                set_roots(&[&default_dir]);
+            }
+            let primary = card(&PRIMARY);
+            let extra = card(&Some(key.clone()));
+            let dash = dashboard();
+            eprintln!("CASE {name}: primary={primary:?} extra_card={extra:?} dashboard={dash}");
+            results.push((name, primary, extra, dash));
+        }
+
+        // Ancestor, both registries: `<home>` itself (the Swift UI refuses it,
+        // the core does not).
+        reset_registries();
+        set_dirs(&[&home]);
+        set_roots(&[&home]);
+        let anc = (card(&PRIMARY), card(&Some(home.display().to_string())), dashboard());
+        eprintln!("CASE <home> both: primary={:?} extra_card={:?} dashboard={}", anc.0, anc.1, anc.2);
+        reset_registries();
+
+        for (name, primary, _, dash) in &results {
+            assert_eq!(*dash, PRIMARY_OUTPUT, "{name}: dashboard total");
+            assert_eq!(
+                *primary,
+                Ok(PRIMARY_OUTPUT),
+                "{name}: the primary window lost its own transcript"
+            );
+        }
+        assert_eq!(anc.0, Ok(PRIMARY_OUTPUT), "<home> both: the primary window lost its transcript");
+    }
+
+    fn reset_cache_only() {
+        crate::WINDOW_USAGE_CACHE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+    }
 }
