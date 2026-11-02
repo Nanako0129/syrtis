@@ -148,9 +148,10 @@ fn nested_exclusions(dir: &str, own: &[PathBuf]) -> Vec<PathBuf> {
                 .cloned(),
         );
     }
-    // The engine canonicalises an exclusion before matching it, so one that is
-    // nested only as spelled (`D/.claude` a symlink back to `D` or above)
-    // would cover this account's own roots and empty its window. Such an
+    // The engine matches a file against an exclusion both as found (lexically
+    // normalised) and canonicalised, and canonicalises the exclusion too, so
+    // one that is nested only as spelled (`D/.claude` a symlink back to `D` or
+    // above) would cover this account's own roots and empty its window. Such an
     // entry is dropped: counted twice beats confidently zero.
     let canonical = |path: &Path| std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     let own: Vec<PathBuf> = own.iter().map(|root| canonical(root)).collect();
@@ -1035,8 +1036,9 @@ mod tests {
     }
 
     /// A configured `D/.claude` that is a symlink back to `D` is nested only as
-    /// spelled. The engine canonicalises exclusions, so listing it would cover
-    /// D's own roots and read D as zero; it is left out instead.
+    /// spelled. The engine also matches an exclusion by its canonical form, so
+    /// listing it would cover D's own roots and read D as zero; it is left out
+    /// instead.
     #[cfg(unix)]
     #[test]
     fn a_nested_path_that_resolves_to_the_account_itself_is_not_excluded() {
@@ -1054,6 +1056,60 @@ mod tests {
         let outer = scan(&context, &Some(d.display().to_string()));
 
         assert_eq!(output_tokens(&outer), D_OUTPUT, "D's own roots were excluded: {outer}");
+        reset_registries();
+    }
+
+    /// A primary transcript that is a symlink into an extra account's folder.
+    /// The engine judges each file both as found and by its canonical path, so
+    /// the link is the extra account's file and the primary's window leaves it
+    /// out. At the previous pin `15204f4`, before engine PR #76 (merged as
+    /// `76ee5d4`), only the scan root was compared, so the primary counted the
+    /// link's target a second time. The extra account's own window still reads
+    /// its target.
+    ///
+    /// The control at the end is what makes the first assertion mean something:
+    /// with no extra account registered and no `.cc-mirror` variant, nothing
+    /// excludes the link, and the primary reads it (1,000 + 7,000).
+    #[cfg(unix)]
+    #[test]
+    fn a_primary_transcript_symlinked_into_an_extra_account_is_not_the_primarys() {
+        let _guards = lock_registries();
+        reset_registries();
+        let fixture = account_fixture();
+        let target = fixture.d.join("projects/proj/d.jsonl");
+        assert!(target.is_file(), "the fixture has no target to link to");
+        let link = fixture.home.join(".claude/projects/proj/link.jsonl");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        // Fixture sources only: a CLAUDE_CONFIG_DIR or TOKSCALE_EXTRA_DIRS in the
+        // test process's environment must not add roots to either scan.
+        let context = crate::LocalSourceContext {
+            home_dir: Some(fixture.home.clone()),
+            use_env_roots: false,
+        };
+
+        let primary = scan(&context, &PRIMARY);
+        let extra = scan(&context, &Some(fixture.d.display().to_string()));
+
+        assert_eq!(
+            output_tokens(&primary),
+            PRIMARY_OUTPUT,
+            "the primary counted a transcript that lives in an extra account: {primary}"
+        );
+        assert_eq!(output_tokens(&extra), D_OUTPUT, "{extra}");
+
+        // Control: drop the exclusion's inputs (both registries, and the
+        // variants that would reach `work-d` by another route, which would
+        // read the same message and hide the link behind a dedup). The link is
+        // then walked and counted, so the 1,000 above is the exclusion at work.
+        reset_registries();
+        std::fs::remove_dir_all(fixture.home.join(".cc-mirror")).unwrap();
+        let unexcluded = scan(&context, &PRIMARY);
+        assert_eq!(
+            output_tokens(&unexcluded),
+            PRIMARY_OUTPUT + D_OUTPUT,
+            "without the exclusion the symlinked transcript is not walked, so \
+             the assertion above proves nothing: {unexcluded}"
+        );
         reset_registries();
     }
 

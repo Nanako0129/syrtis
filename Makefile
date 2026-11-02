@@ -5,6 +5,28 @@
 
 all: build
 
+# `make run` starts the dev app against the engine's cache directory, by default
+# ~/.config/tokscale, which an installed app shares. This tree's engine writes
+# Claude shards at parser version 5 / envelope 100; an older engine (the
+# installed app, any pre-pin build) reads those as stale and rewrites them from
+# nothing, dropping the Claude turns only the cache still holds. So unless
+# TOKSCALE_CONFIG_DIR is set to a non-blank value (empty or whitespace-only is
+# treated as unset here; the engine would read whitespace as a relative path),
+# `make run` points it at an ignored directory in the build output. TOKSCALE_CONFIG_DIR also roots the
+# Config-rooted sources (Antigravity cache, Trae, Warp), settings.json and the
+# pricing cache, so the dev app sees those from that directory too.
+# Not guarded, on purpose: `make selftest` / `make selftest-bundled` (the
+# release gate runs the latter, and an override changes what it exercises;
+# SelfTest left the engine cache untouched in the two runs measured) and a
+# `swift run` invoked directly.
+# docs/knowledge/vendor-tokscale.md#claude-cache-co-running-and-rollback
+# ponytail: delete this block once a release ships parser version 5.
+ifeq ($(strip $(TOKSCALE_CONFIG_DIR)),)
+DEV_CONFIG_DIR := $(CURDIR)/.build/tokscale-dev
+# Kept in a variable: commas inside $(if ...) would split its arguments.
+DEV_CONFIG_NOTE := make run: TOKSCALE_CONFIG_DIR=$(DEV_CONFIG_DIR); the Claude cache, the Config-rooted sources (Antigravity cache, Trae, Warp), settings.json and the pricing cache come from there, not ~/.config/tokscale, and the first run starts empty
+endif
+
 check-docs:
 	python3 scripts/check_knowledge.py --self-test
 	python3 scripts/check_knowledge.py
@@ -22,7 +44,8 @@ build: rust
 # .build/debug, which only SwiftPM creates. Running it before a build fails on a
 # fresh or freshly cleaned checkout.
 run: build
-	swift run Syrtis
+	@$(if $(DEV_CONFIG_DIR),echo "$(DEV_CONFIG_NOTE)")
+	$(if $(DEV_CONFIG_DIR),TOKSCALE_CONFIG_DIR="$(DEV_CONFIG_DIR)" )swift run Syrtis
 
 # Several assertions compare against English UI copy, so the language is
 # pinned here rather than inherited from the developer's Mac.

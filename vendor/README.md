@@ -4,7 +4,7 @@ id: vendor-readme
 kind: reference
 scope: repository
 read_when: advancing or auditing the vendor/tokscale-core consumer pin
-last_verified: 2026-10-28
+last_verified: 2026-11-02
 sources: [".gitmodules", "vendor/tokscale-core", "docs/knowledge/vendor-tokscale.md"]
 ---
 
@@ -19,8 +19,8 @@ repository as a Git submodule. Consumer integration rules are documented in
 |---|---|
 | Path | `vendor/tokscale-core` |
 | Repository | `https://github.com/Nanako0129/tokscale-core.git` |
-| Reviewed pin | `15204f4e870716da9f0b42216ad63d98f1c5a320` |
-| Upstream and local-patch ledger | Immutable [`UPSTREAM.md`](https://github.com/Nanako0129/tokscale-core/blob/15204f4e870716da9f0b42216ad63d98f1c5a320/UPSTREAM.md) |
+| Reviewed pin | `8535394b092c64dbd98e12d81f47d6eca8142752` |
+| Upstream and local-patch ledger | Immutable [`UPSTREAM.md`](https://github.com/Nanako0129/tokscale-core/blob/8535394b092c64dbd98e12d81f47d6eca8142752/UPSTREAM.md) |
 
 ## Ownership
 
@@ -32,6 +32,11 @@ build wiring.
 Do not edit shared Rust source inside the TokenBar submodule. Land and verify
 engine changes in `tokscale-core`, then advance this pin to the reviewed engine
 commit and run the TokenBar consumer gates.
+
+## Cache consequences of the current pin
+
+Claude cache compatibility, the co-running hazard and the ordered rollback live
+in [`docs/knowledge/vendor-tokscale.md`](../docs/knowledge/vendor-tokscale.md#claude-cache-co-running-and-rollback).
 
 ## Checkout
 
