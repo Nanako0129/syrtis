@@ -17490,8 +17490,11 @@ enum SelfTest {
             "ACCOUNTS-PAGE every Accounts copy key exists in zh-Hant and zh-Hans: \(accountsCopyMissing)")
         let agyDetails = AccountsCopy.antigravityDetails.joined(separator: "\n")
         expect(
-            ["login keychain", "token service and Cloud Code quota service", "revoke access in Google Account"]
+            ["login keychain", "refresh token to Google's token service", "Cloud Code quota service",
+             "macOS may ask", "revoke access in Google Account"]
                 .allSatisfy(agyDetails.contains)
+                && ["refresh token to Google's token service", "macOS may ask"]
+                    .allSatisfy(AccountsCopy.confirmBody.contains)
                 && AccountsCopy.claudeDetails.contains("CLAUDE_CONFIG_DIR")
                 && AccountsCopy.dsh == "DeepSeek Harness"
                 && AccountsCopy.dshDetails.contains("<DSH_HOME>/sessions")
@@ -19827,6 +19830,80 @@ enum SelfTest {
                 check("AG-5 manual Capture takes the key off the removed list",
                       AntigravityAccounts.removedKeys(defaults: defaults) == [otherKey]
                           && AntigravityAccounts.load(defaults: defaults).map(\.key) == [agKey])
+            }
+
+            // AG-8 (security review S12). Turning automatic capture on asks
+            // first, and nothing is written until the answer: while the
+            // confirmation is showing, both poll hooks still see the switch
+            // off and make no marker query and no capture call, and Cancel
+            // leaves the setting unwritten. Mutation: write the setting before
+            // confirming.
+            do {
+                let fake = AGAutoFake(key: agKey, label: agEmail)
+                let (ac, defaults) = fresh(fake)
+                var writtenWhilePending: Any?
+                var startedWhilePending = 0
+                let turnedOn = await ac.turnOn {
+                    writtenWhilePending = defaults.object(forKey: AntigravityAutoCapture.enabledKey)
+                    if let task = TrayAnimator.pollAntigravityAutoCapture(defaults: defaults, autoCapture: ac) {
+                        startedWhilePending += 1
+                        await task.value
+                    }
+                    await TrayAnimator.prepareAntigravityAutoCapture(
+                        defaults: defaults, autoCapture: ac, setBinding: { _, _ in })?.value
+                    return false
+                }
+                check("AG-8 a pending confirmation writes nothing and makes no marker or capture call",
+                      writtenWhilePending == nil && startedWhilePending == 0
+                          && fake.read { $0.markerCalls } == 0 && fake.read { $0.attempts } == 0)
+                check("AG-8 Cancel writes nothing and calls nothing",
+                      !turnedOn && defaults.object(forKey: AntigravityAutoCapture.enabledKey) == nil
+                          && fake.read { $0.markerCalls } == 0 && fake.read { $0.attempts } == 0
+                          && fake.read { $0.captures } == 0)
+                // The Settings route: the popover is pending until answered.
+                let request = Task { await ac.requestTurnOn() }
+                await until { ac.confirmPending }
+                let pendingThroughSettings = ac.confirmPending && !ac.isEnabled
+                    && fake.read { $0.markerCalls } == 0
+                ac.answerTurnOn(false)
+                await request.value
+                check("AG-8 the Settings confirmation is pending until answered, and No writes nothing",
+                      pendingThroughSettings && !ac.confirmPending
+                          && defaults.object(forKey: AntigravityAutoCapture.enabledKey) == nil)
+                // Control: confirming turns it on and makes the first attempt.
+                let confirmed = await ac.turnOn { true }
+                check("AG-8 control: confirming turns automatic capture on and attempts once",
+                      confirmed && ac.isEnabled && fake.read { $0.attempts } == 1)
+            }
+
+            // AG-8 upgrade (maintainer decision 2026-11-03): a switch already
+            // on stays on, with no confirmation, and polls as before.
+            do {
+                let fake = AGAutoFake(key: agKey, label: agEmail)
+                let (_, defaults) = fresh(fake)
+                defaults.set(true, forKey: AntigravityAutoCapture.enabledKey)
+                let upgraded = AntigravityAutoCapture(io: fake.io(), defaults: defaults)
+                await TrayAnimator.pollAntigravityAutoCapture(defaults: defaults, autoCapture: upgraded)?.value
+                check("AG-8 a switch already on at upgrade stays on with no prompt and keeps capturing",
+                      upgraded.isEnabled && !upgraded.confirmPending && fake.read { $0.attempts } == 1)
+            }
+
+            // AG-8 MA-24: outside a user session the shared instance's core
+            // calls all fail before reaching the core.
+            do {
+                var inert = true
+                for flag in ["--demo", "--smoke", "--selftest", "--icon-gallery"] {
+                    let io = AntigravityAutoCapture.IO.forRuntime(["Syrtis", flag])
+                    let calls: [() throws -> Void] = [
+                        { _ = try io.marker() }, { _ = try io.capture() },
+                        { _ = try io.autoCapture([]) }, { try io.remove(agKey) },
+                    ]
+                    for call in calls {
+                        do { try call(); inert = false } catch TBCoreError.bridge("not_user_runtime") {
+                        } catch { inert = false }
+                    }
+                }
+                check("AG-8 --demo (and every non-user run) never reaches the core's capture calls", inert)
             }
 
             // AG-S10: Remove installs the registry without the key BEFORE the

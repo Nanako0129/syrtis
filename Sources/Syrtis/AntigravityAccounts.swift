@@ -218,12 +218,27 @@ final class AntigravityAutoCapture: ObservableObject {
                 try AntigravityAccounts.afterPendingInstalls { try TBCore.antigravityRemove(key: key) }
             },
             install: { AntigravityAccounts.apply(defaults: $0) })
+
+        /// For a run that is not a user session (`--demo`, `--smoke`,
+        /// `--selftest`, `--icon-gallery`): every call fails before reaching
+        /// the core, so no marker query, keychain read, capture or delete runs
+        /// there whatever the stored toggle says (MA-24).
+        static let inert = IO(
+            marker: { throw TBCoreError.bridge("not_user_runtime") },
+            autoCapture: { _ in throw TBCoreError.bridge("not_user_runtime") },
+            capture: { throw TBCoreError.bridge("not_user_runtime") },
+            remove: { _ in throw TBCoreError.bridge("not_user_runtime") },
+            install: { _ in })
+
+        static func forRuntime(_ arguments: [String] = CommandLine.arguments) -> IO {
+            CursorSync.isUserRuntime(arguments) ? .live : .inert
+        }
     }
 
     static let enabledKey = "tokenbar.antigravity.autoCapture"
 
     /// Replaced only by the selftest, with a fake `IO` and a throwaway suite.
-    static var shared = AntigravityAutoCapture(io: .live, defaults: .standard)
+    static var shared = AntigravityAutoCapture(io: .forRuntime(), defaults: .standard)
 
     let io: IO
     let defaults: UserDefaults
@@ -398,10 +413,50 @@ final class AntigravityAutoCapture: ObservableObject {
         await poll()
     }
 
+    /// Turning automatic capture ON from Settings: the confirmation first,
+    /// then `setEnabled(true)`. Port of Syrtis-Windows `TurnOn(confirm)`
+    /// (security review S12). Until the user confirms, the setting is not
+    /// written, so both poll loops still see it off and make no marker query
+    /// and no capture call; Cancel writes nothing and calls nothing. A switch
+    /// already on at upgrade never passes through here and stays on with no
+    /// prompt (maintainer decision 2026-11-03). Returns whether it turned on.
+    @discardableResult
+    func turnOn(confirm: @MainActor () async -> Bool) async -> Bool {
+        guard await confirm() else { return false }
+        await setEnabled(true)
+        return true
+    }
+
+    /// The Settings confirmation is showing (`requestTurnOn`).
+    @Published private(set) var confirmPending = false
+    private var pendingAnswer: CheckedContinuation<Bool, Never>?
+
+    /// `turnOn` with the Settings popover as the confirmation; it resolves
+    /// through `answerTurnOn`. A second request while one is showing answers
+    /// the first with No.
+    func requestTurnOn() async {
+        await turnOn {
+            await withCheckedContinuation { continuation in
+                pendingAnswer?.resume(returning: false)
+                pendingAnswer = continuation
+                confirmPending = true
+            }
+        }
+    }
+
+    /// The popover's answer. Cancel, Escape, clicking away and leaving the page
+    /// are all No.
+    func answerTurnOn(_ yes: Bool) {
+        confirmPending = false
+        pendingAnswer?.resume(returning: yes)
+        pendingAnswer = nil
+    }
+
     /// The Settings toggle. On: forget the last marker and try now. Off: stop
     /// watching agy's login; the current account stays, still bound to its
     /// marker, so a manual capture's dedup survives (maintainer decision
-    /// 2026-10-03). Either way a pause ends.
+    /// 2026-10-03). Either way a pause ends. Settings turns it on only through
+    /// `turnOn` / `requestTurnOn`.
     func setEnabled(_ on: Bool) async {
         defaults.set(on, forKey: Self.enabledKey)
         paused = false
@@ -529,6 +584,7 @@ final class AntigravityAutoCapture: ObservableObject {
         paused = false
         unavailable = false
         message = nil
+        answerTurnOn(false)
     }
 }
 

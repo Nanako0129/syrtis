@@ -1456,11 +1456,48 @@ struct SettingsPanel: View {
                     .foregroundStyle(.orange)
                     .fixedSize(horizontal: false, vertical: true)
             }
+            // On asks first (`requestTurnOn`); nothing is written until the
+            // user confirms, and the switch stays off meanwhile.
             toggleRow(
                 AccountsCopy.autoToggle,
                 isOn: Binding(
                     get: { antigravityAutoCaptureOn },
-                    set: { on in Task { await antigravityAutoCapture.setEnabled(on) } }))
+                    set: { on in
+                        Task {
+                            if on {
+                                await antigravityAutoCapture.requestTurnOn()
+                            } else {
+                                await antigravityAutoCapture.setEnabled(false)
+                            }
+                        }
+                    }))
+                .popover(
+                    isPresented: Binding(
+                        get: { antigravityAutoCapture.confirmPending },
+                        set: { if !$0 { antigravityAutoCapture.answerTurnOn(false) } }),
+                    arrowEdge: .bottom
+                ) {
+                    VStack(alignment: .leading, spacing: 10) {
+                        Text(AccountsCopy.confirmTitle.localized)
+                            .font(.callout.weight(.semibold))
+                        hint(AccountsCopy.confirmBody)
+                        HStack {
+                            Spacer()
+                            Button(AccountsCopy.confirmCancel.localized) {
+                                antigravityAutoCapture.answerTurnOn(false)
+                            }
+                            .keyboardShortcut(.cancelAction)
+                            // No default-action shortcut: Return must not consent.
+                            Button(AccountsCopy.confirmOk.localized) {
+                                antigravityAutoCapture.answerTurnOn(true)
+                            }
+                        }
+                        .controlSize(.small)
+                    }
+                    .frame(width: 280, alignment: .leading)
+                    .padding(12)
+                }
+                .onDisappear { antigravityAutoCapture.answerTurnOn(false) }
             if antigravityAutoCaptureOn, antigravityAutoCapture.paused {
                 Text("Automatic capture is paused because the login keychain didn't answer. Press Capture to resume.".localized)
                     .font(.caption2)
@@ -1842,8 +1879,16 @@ enum AccountsCopy {
     static let antigravitySummary = "Capture a Google account agy signs into."
     static let autoToggle = "Capture accounts agy signs into automatically"
     static let recipe = "To add another Google account:\n1. Sign agy in to that account.\n2. Press Capture current agy login.\n3. Sign agy back in to your main account."
-    static let captureReads = "Capture reads agy's saved Google login once when you press the button, and once each time agy's sign-in changes while automatic capture is on. The copy is kept in this Mac's login keychain. Syrtis uses it only with Google's token service and Cloud Code quota service, and its requests identify as Antigravity."
-    static let autoOn = "When on, Syrtis copies the sign-in of each account agy signs into to this Mac's login keychain: once when you turn this on, then whenever agy's sign-in changes. Turning it off keeps the copies. An account you remove stays removed until you press Capture."
+    // Copy below marked PENDING APPROVAL: drafted in .agent-local/plans/
+    // multi-account-mac-copy-draft.md with the code fact each sentence
+    // states; the maintainer approves it verbatim before merge.
+    static let captureReads = "Capture reads agy's saved Google sign-in once when you press the button and, while automatic capture is on, again each time agy rewrites its saved sign-in (including its routine refresh). macOS may ask you to allow this. The copy is kept in this Mac's login keychain. Syrtis sends its refresh token to Google's token service and the access token it gets back to Google's Cloud Code quota service, where its requests identify as Antigravity."
+    static let autoOn = "When on, Syrtis reads agy's sign-in once when you turn this on, then again each time agy rewrites its saved sign-in (including its routine refresh), and keeps a copy of each account in this Mac's login keychain, updated when it changes. Turning it off keeps the copies. An account you remove while this is on stays removed until you sign agy in to it and press Capture."
+    /// The confirmation before the switch turns on (security review S12/S13).
+    static let confirmTitle = "Turn on automatic capture?"
+    static let confirmBody = "Syrtis reads agy's current sign-in now and again each time agy rewrites its saved sign-in, and keeps a copy of each account in this Mac's login keychain without asking again. To check a new sign-in, Syrtis sends agy's refresh token to Google's token service. macOS may ask you to allow access to agy's keychain item. Accounts you remove while this is on stay removed until you sign agy in to them and press Capture."
+    static let confirmOk = "Turn On"
+    static let confirmCancel = "Cancel"
     static let autoOff = "Turn this on to keep reading agy's current account through its captured sign-in, shown as one OAUTH card, so Syrtis rarely needs to run agy. With it off, a Capture lasts only until agy next refreshes its sign-in (usually within an hour); after that the main card runs agy again."
     static let remove = "Remove deletes only the copy on this Mac. Google still accepts it until you revoke access in Google Account → third-party access, which also signs Antigravity out of that account."
 
@@ -1856,11 +1901,12 @@ enum AccountsCopy {
     }
     /// Every Antigravity paragraph, for presence checks.
     static let antigravityDetails = antigravityGeneral + [autoOn, autoOff]
+    static let antigravityConfirm = [confirmTitle, confirmBody, confirmOk, confirmCancel]
     /// Every string that has a translation; the product names `claude` and
     /// `antigravity` are intentionally the same in every language.
     static let translated = [page, moreDetails, claudeSummary, claudeDetails, claudeRefusedPlaceholder,
                              dshSummary, dshDetails, antigravitySummary, autoToggle, piSummary,
-                             cursorSummary] + piDetails + antigravityDetails
+                             cursorSummary] + piDetails + antigravityDetails + antigravityConfirm
 }
 
 /// ⓘ next to a section header; the popover holds the long explanation.
