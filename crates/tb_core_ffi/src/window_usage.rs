@@ -1474,8 +1474,8 @@ mod tests {
         }
 
         // Accepted: a folder inside `~/.claude` but outside its scan roots
-        // (slice coordinator, 2026-11-03). It registers, keeps its own card,
-        // and the primary window keeps its total.
+        // (the primary scans only those roots). It registers, keeps its own
+        // card, and the primary window keeps its total.
         let inside_claude = default_dir.join("accounts/work");
         write_session(&inside_claude, "inside", INSIDE_CLAUDE_OUTPUT);
         reset_registries();

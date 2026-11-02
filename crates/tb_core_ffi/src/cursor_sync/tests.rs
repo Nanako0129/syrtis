@@ -256,18 +256,15 @@ fn fixture() -> Fixture {
 }
 
 fn stop(state: State, reason: Option<&'static str>) -> Outcome {
-    Outcome {
-        stop: Stop::new(state, reason),
-        events: 0,
-        duplicate_of: None,
-    }
+    Outcome::stopped(Stop::new(state, reason))
 }
 
+/// A walk that wrote a file with new bytes.
 fn ok(events: usize) -> Outcome {
     Outcome {
-        stop: Stop::new(State::Ok, None),
         events,
-        duplicate_of: None,
+        changed: true,
+        ..stop(State::Ok, None)
     }
 }
 
@@ -584,7 +581,7 @@ fn stored_account_that_differs_from_the_token_is_refused() {
         let (url, seen) = serve(vec![json_ok(&page(1, &["a"]))]);
         assert_eq!(
             run_with(&db, &tmp.path().join("sync"), &url, limits(), &|| true),
-            stop(State::Error, Some("account_mismatch"))
+            Outcome::refused(Stop::error("account_mismatch"))
         );
         assert!(seen.lock().unwrap().is_empty());
     }
@@ -2590,4 +2587,290 @@ fn a_profile_removed_mid_walk_does_not_cover_its_account() {
     );
     assert!(covers_account(Stop::error("rate_limited")));
     assert!(!covers_account(Stop::new(State::Disabled, None)));
+}
+
+// --- multi-account audit fixes (macOS slice M, item 4) ------------------------
+
+fn target<'a>(db: &'a Path, url: &'a str) -> Target<'a> {
+    Target {
+        db_path: db,
+        url,
+        https_only: false,
+        file_stem: &stem,
+    }
+}
+
+/// A profile root with no login database: it reports `notSignedIn`.
+fn empty_root(base: &Path, name: &str) -> PathBuf {
+    let root = base.join(name);
+    std::fs::create_dir_all(&root).unwrap();
+    root
+}
+
+/// MA-22: a profile that now resolves to `duplicate` (signed in to the account
+/// an earlier profile covered) drops the usage file of the account it held
+/// before, under its lock, so that account is no longer registered. Its current
+/// account's copy stays (same file name; the takeover keeps the newest).
+#[test]
+fn a_duplicate_profile_drops_its_old_accounts_file() {
+    let _guard = lock();
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let default_db = login_db(&tmp.path().join("default"), &valid_token(), USER);
+    let root = profile_root(tmp.path(), "b", &valid_token(), USER);
+    let registry = RwLock::new(multi(&home, true, vec![profile(PROFILE_A, &root)]));
+    let a_dir = profile_dir(&home, PROFILE_A);
+    let old = usage_file(&a_dir, 'e', &[], 0);
+    let current = a_dir.join(format!("usage.{}.json", stem(USER).unwrap()));
+    std::fs::write(&current, "{}").unwrap();
+    assert!(
+        newest_per_account(&registry.read().unwrap())
+            .iter()
+            .any(|p| p.ends_with(old.file_name().unwrap())),
+        "control: the old account's file is registered before the round"
+    );
+    let (url, _) = serve(vec![json_ok(&page(1, &["a"])), json_ok(&page(1, &["a"]))]);
+    let status = sync_round(&default_db, &url, &registry);
+    assert_eq!(states(&status), ["ok", "duplicate"]);
+    assert!(!old.exists(), "the old account's file stayed");
+    assert!(current.exists(), "the current account's copy was removed");
+    assert_eq!(status["cleanupFailedProfiles"], serde_json::json!([]));
+    let registered = newest_per_account(&registry.read().unwrap());
+    assert!(
+        registered
+            .iter()
+            .all(|p| !p.ends_with(old.file_name().unwrap())),
+        "{registered:?}"
+    );
+    assert_eq!(registered.len(), 1);
+}
+
+/// MA-22: a duplicate whose old file cannot be deleted says so (by profile id,
+/// never a path), and a removal that did happen still counts as a change.
+#[cfg(unix)]
+#[test]
+fn a_duplicates_failed_cleanup_is_reported() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let _guard = lock();
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let default_db = login_db(&tmp.path().join("default"), &valid_token(), USER);
+    let root = profile_root(tmp.path(), "b", &valid_token(), USER);
+    let registry = RwLock::new(multi(&home, true, vec![profile(PROFILE_A, &root)]));
+    let a_dir = profile_dir(&home, PROFILE_A);
+    let stuck = usage_file(&a_dir, 'e', &[], 0);
+    let mode =
+        |m: u32| std::fs::set_permissions(&a_dir, std::fs::Permissions::from_mode(m)).unwrap();
+    mode(0o500);
+    let (url, _) = serve(vec![json_ok(&page(1, &["a"])), json_ok(&page(1, &["a"]))]);
+    let status = sync_round(&default_db, &url, &registry);
+    mode(0o700);
+    assert_eq!(states(&status), ["ok", "duplicate"]);
+    assert!(stuck.exists(), "fixture: the delete was not refused");
+    assert_eq!(
+        status["cleanupFailedProfiles"],
+        serde_json::json!([PROFILE_A])
+    );
+    // Control: once the file can go, nothing is reported.
+    let status = sync_round(&default_db, &url, &registry);
+    assert!(!stuck.exists());
+    assert_eq!(status["cleanupFailedProfiles"], serde_json::json!([]));
+}
+
+/// MA-30: the 60 s background budget applies once every profile that could
+/// write a file has one. A profile whose last round could not write one however
+/// long it ran (no login, a duplicate, a refusal by the login reader) no longer
+/// holds every later round at the full budget. "Sync Now" always takes the full
+/// one, and so does a profile changed since (another root).
+#[test]
+fn a_profile_that_cannot_write_a_file_does_not_hold_the_full_budget() {
+    let _guard = lock();
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let default_db = login_db(&tmp.path().join("default"), &valid_token(), USER);
+    let empty = empty_root(tmp.path(), "empty");
+    let same = profile_root(tmp.path(), "same", &valid_token(), USER);
+    // The login reader refuses a database that is not a regular file.
+    let refused = tmp.path().join("refused");
+    std::fs::create_dir_all(refused.join("User/globalStorage/state.vscdb")).unwrap();
+    let registry = RwLock::new(multi(
+        &home,
+        true,
+        vec![
+            profile(PROFILE_A, &empty),
+            profile(PROFILE_B, &same),
+            profile(PROFILE_C, &refused),
+        ],
+    ));
+    let (url, _) = serve(vec![json_ok(&page(1, &["a"])); 8]);
+    let round = |explicit: bool| {
+        let source = || registry.read().unwrap().clone();
+        let status = sync_with(
+            explicit,
+            None,
+            &target(&default_db, &url),
+            &source,
+            Some(limits()),
+        )
+        .0;
+        (
+            states(&status),
+            ROUND_BUDGET.with(std::cell::Cell::get).unwrap(),
+        )
+    };
+    let (seen_states, budget) = round(false);
+    assert_eq!(
+        seen_states,
+        ["ok", "notSignedIn", "duplicate", "error:db_not_file"]
+    );
+    assert_eq!(budget, FULL_BUDGET, "the default had no file yet");
+    assert_eq!(round(false).1, BACKGROUND_BUDGET);
+    assert_eq!(round(true).1, FULL_BUDGET, "Sync Now");
+    assert_eq!(round(false).1, BACKGROUND_BUDGET);
+    registry.write().unwrap().profiles[0].root = tmp.path().join("moved");
+    assert_eq!(
+        round(false).1,
+        FULL_BUDGET,
+        "a changed profile's first round"
+    );
+    // Control: an outage is not a profile that cannot write; it keeps the full
+    // budget until a file exists.
+    let lonely = tmp.path().join("lonely");
+    let down = profile_root(tmp.path(), "down", &other_token(), OTHER_USER);
+    *registry.write().unwrap() = multi(&lonely, true, vec![profile(PROFILE_A, &down)]);
+    let unreachable = "http://127.0.0.1:1/api/usage";
+    let source = || registry.read().unwrap().clone();
+    for _ in 0..2 {
+        let status = sync_with(
+            false,
+            None,
+            &target(&tmp.path().join("absent.vscdb"), unreachable),
+            &source,
+            Some(limits()),
+        )
+        .0;
+        assert_eq!(states(&status), ["notSignedIn", "offline:unreachable"]);
+        assert_eq!(ROUND_BUDGET.with(std::cell::Cell::get), Some(FULL_BUDGET));
+    }
+}
+
+/// MA-32: `commit_file` asks `still_wanted` before it creates the dir or the
+/// lock, so a profile removed or switched off during its last page creates
+/// nothing. (The check is not atomic with the creation; the second one, under
+/// the lock, is what stops a write.)
+#[test]
+fn a_commit_no_longer_wanted_creates_no_dir_and_no_lock() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp
+        .path()
+        .join("app")
+        .join(PROFILES_DIR_NAME)
+        .join(PROFILE_A);
+    let stop = commit_file(&dir, &stem(USER).unwrap(), &[], &|| false).unwrap_err();
+    assert_eq!(stop, Stop::new(State::Disabled, None));
+    assert!(!tmp.path().join("app").exists(), "something was created");
+    // Control: wanted, it creates the dir, lock and file.
+    assert!(commit_file(&dir, &stem(USER).unwrap(), &[], &|| true).unwrap());
+    assert!(dir.join(LOCK_FILE_NAME).exists());
+}
+
+/// MA-34: `changed` only when a usage file's bytes changed. A walk whose bytes
+/// equal the file's rewrites nothing and is not `changed`, but its modified
+/// time still moves so `lastSuccessMs` dates this walk. Same-length different
+/// bytes ("a" then "b") are a change, so the length check alone is not enough.
+#[test]
+fn an_identical_walk_changes_nothing() {
+    let _guard = lock();
+    let f = fixture();
+    let (url, _) = serve(vec![
+        json_ok(&page(1, &["a"])),
+        json_ok(&page(1, &["a"])),
+        json_ok(&page(1, &["b"])),
+    ]);
+    let on = registry(true, &f.dir);
+    let first = sync_status(&f, &url, &on);
+    assert_eq!(first["changed"], true);
+    let path = expected_file(&f.dir);
+    let bytes = std::fs::read(&path).unwrap();
+    std::thread::sleep(Duration::from_millis(50));
+    let again = sync_status(&f, &url, &on);
+    assert_eq!(states(&again), ["ok"]);
+    assert_eq!(
+        again["changed"], false,
+        "an identical rewrite read as a change"
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    assert!(
+        again["lastSuccessMs"].as_u64() > first["lastSuccessMs"].as_u64(),
+        "{again} {first}"
+    );
+    let new = sync_status(&f, &url, &on);
+    assert_eq!(new["changed"], true);
+    assert_ne!(std::fs::read(&path).unwrap(), bytes);
+    assert_eq!(
+        std::fs::read(&path).unwrap().len(),
+        bytes.len(),
+        "fixture: same length"
+    );
+}
+
+/// MA-8: the core refuses Cursor's own folder (the default profile) and a
+/// folder already listed, by directory identity as well as by path, so the
+/// Swift check at add time is only a pre-check. The push is refused whole and
+/// the registry is untouched.
+#[cfg(unix)]
+#[test]
+fn the_core_refuses_cursors_own_folder_and_a_duplicate_folder() {
+    let _guard = lock();
+    set_for_test(Config::default());
+    let home = tempfile::tempdir().unwrap();
+    let own = home.path().join("Library/Application Support/Cursor");
+    std::fs::create_dir_all(&own).unwrap();
+    let other = home.path().join("other");
+    std::fs::create_dir_all(&other).unwrap();
+    let alias = home.path().join("alias");
+    std::os::unix::fs::symlink(&own, &alias).unwrap();
+    let other_alias = home.path().join("other-alias");
+    std::os::unix::fs::symlink(&other, &other_alias).unwrap();
+    let push = |profiles: serde_json::Value| {
+        set_in(
+            home.path(),
+            serde_json::json!({"enabled": true, "bundleId": BUNDLE, "profiles": profiles}),
+        )
+    };
+    let entry = |id: &str, root: &Path| serde_json::json!({"id": id, "root": root});
+    for (name, profiles) in [
+        (
+            "own folder by path",
+            serde_json::json!([entry(PROFILE_A, &own)]),
+        ),
+        (
+            "own folder by symlink",
+            serde_json::json!([entry(PROFILE_A, &alias)]),
+        ),
+        (
+            "listed twice by path",
+            serde_json::json!([entry(PROFILE_A, &other), entry(PROFILE_B, &other)]),
+        ),
+        (
+            "listed twice by symlink",
+            serde_json::json!([entry(PROFILE_A, &other), entry(PROFILE_B, &other_alias)]),
+        ),
+    ] {
+        assert!(push(profiles).is_err(), "{name} was accepted");
+        assert_eq!(config(), Config::default(), "{name} changed the registry");
+    }
+    // Control: two different folders are accepted.
+    let ok = push(serde_json::json!([
+        entry(PROFILE_A, &other),
+        entry(PROFILE_B, &home.path().join("third"))
+    ]));
+    assert!(ok.is_ok(), "{ok:?}");
+    // A folder that does not exist yet can only match by path.
+    assert!(push(serde_json::json!([
+        entry(PROFILE_A, &home.path().join("third")),
+        entry(PROFILE_B, &home.path().join("third"))
+    ]))
+    .is_err());
+    set_for_test(Config::default());
 }

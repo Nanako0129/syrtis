@@ -1736,9 +1736,12 @@ unsafe fn set_cursor_sync_from_c(json: *const c_char) -> Result<serde_json::Valu
 /// `{"state":"ok|partial|expired|notSignedIn|offline|error|disabled|cliPresent",
 /// "events":N,"lastSuccessMs":ms|null,"reason"?:"<fixed code>",
 /// "changed":bool,"profiles":[{"id","state","events","lastSuccessMs","reason"?,
-/// "duplicateOf"?}]}`. `changed`: some profile wrote its file this round
-/// (every successful walk rewrites it), so the scan caches were invalidated
-/// and views must refresh, whatever the headline state. `app_dir_rejected`: the appDir no longer
+/// "duplicateOf"?}],"cleanupFailedProfiles":[<profile id>]}`. `changed`: a usage
+/// file's bytes changed this round (written with new content, or removed from
+/// a duplicate profile); a walk whose bytes equal the file's rewrites nothing
+/// and is not a change. The scan caches were then invalidated and views must
+/// refresh, whatever the headline state. `cleanupFailedProfiles`: duplicate
+/// profiles whose old account's file could not be deleted. `app_dir_rejected`: the appDir no longer
 /// passes the checks above; nothing is read, written or registered from it.
 /// The top-level `state` is `ok` when every profile is `ok` or `duplicate`
 /// (the account was already covered this round by the profile `duplicateOf`:

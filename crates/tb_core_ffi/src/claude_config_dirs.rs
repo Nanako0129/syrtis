@@ -83,10 +83,9 @@ pub(crate) fn primary_scan_roots(home: &Path) -> [PathBuf; 3] {
 /// its own transcripts (the P1 of the 2026-11-03 multi-account audit).
 ///
 /// A folder inside `~/.claude` but outside its scan roots, such as
-/// `~/.claude/accounts/work`, is allowed (slice coordinator, 2026-11-03,
-/// pending maintainer review):
-/// the primary never scans it, Syrtis-Windows accepts it too, and refusing it
-/// would drop accounts users already keep there.
+/// `~/.claude/accounts/work`, is allowed: the primary scans only those roots,
+/// so such a folder does not reduce the primary's usage, and refusing it would
+/// drop accounts users already keep there.
 pub(crate) fn collides_with_primary(path: &Path, home: &Path) -> bool {
     let claude = folded(&home.join(".claude"));
     claude.starts_with(folded(path))
@@ -341,8 +340,8 @@ mod tests {
         }
         assert_eq!(codes(&["/Users/x"], home), vec![(0, "home_directory")]);
         assert_eq!(codes(&["/Users/X/"], home), vec![(0, "home_directory")]);
-        // Inside `~/.claude` but outside its scan roots: allowed (slice
-        // coordinator, 2026-11-03), unlike `~/.claude/projects/p` above.
+        // Inside `~/.claude` but outside its scan roots: allowed (the primary
+        // scans only those roots), unlike `~/.claude/projects/p` above.
         assert!(codes(
             &["/Users/x/.claude/accounts/work", "/Users/x/.claude/w"],
             home
