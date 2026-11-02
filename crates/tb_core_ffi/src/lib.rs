@@ -1327,10 +1327,12 @@ pub unsafe extern "C" fn tb_set_claude_config_dirs(json: *const c_char) -> *mut 
 /// `tb_set_claude_config_dirs` would refuse, without registering anything.
 /// Success data is `{"rejected":[{"index":i,"reason":"<code>"}]}`. The codes:
 /// `empty_path`, `not_absolute`, `filesystem_root`, `home_unknown`,
-/// `home_directory`, `primary_scan_root` (equals, contains or sits inside
-/// `~/.claude`, its `projects` / `transcripts`, or Claude Desktop's
-/// `~/Library/Application Support/Claude/local-agent-mode-sessions`, compared
-/// without case), `duplicate`, `overlap` (contains or sits inside an earlier
+/// `home_directory`, `primary_scan_root` (`~/.claude` or an ancestor of it, or
+/// equals, contains or sits inside `~/.claude/projects`, `~/.claude/transcripts`
+/// or Claude Desktop's
+/// `~/Library/Application Support/Claude/local-agent-mode-sessions`; a folder
+/// in `~/.claude` outside those is allowed; compared without case),
+/// `duplicate`, `overlap` (contains or sits inside an earlier
 /// accepted entry) and `limit_reached` (more than 8). Earlier entries win.
 /// Swift runs this before building either registry's payload, so a refused
 /// directory reaches neither. Malformed input is the error

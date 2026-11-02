@@ -107,8 +107,9 @@ fn registered_roots_under(dir: &str) -> Vec<PathBuf> {
 /// Excluding neither is how the extra account's transcripts land on the primary
 /// card, which is what issue #258 reports.
 ///
-/// Never excludes the primary's own roots (`claude_config_dirs::primary_scan_roots`
-/// under `home`), whatever a registry holds. The config-dir setter and Swift
+/// Never excludes a path that collides with the primary's own roots
+/// (`claude_config_dirs::collides_with_primary` under `home`), whatever a
+/// registry holds. The config-dir setter and Swift
 /// refuse those directories, but the scan registry has no such rule and either
 /// registry alone was enough to empty the primary window (audit P1, 2026-11-03),
 /// so this is the guard that does not depend on both callers getting it right.
@@ -121,11 +122,7 @@ fn primary_exclusions(home: Option<&Path>) -> Vec<PathBuf> {
         excluded.extend(roots.iter().cloned());
     }
     if let Some(home) = home {
-        let own = crate::claude_config_dirs::primary_scan_roots(home);
-        excluded.retain(|path| {
-            !own.iter()
-                .any(|root| crate::claude_config_dirs::overlaps(path, root))
-        });
+        excluded.retain(|path| !crate::claude_config_dirs::collides_with_primary(path, home));
     }
     excluded
 }
@@ -629,6 +626,7 @@ mod tests {
 
     const PRIMARY_OUTPUT: i64 = 1_000;
     const COWORK_OUTPUT: i64 = 300;
+    const INSIDE_CLAUDE_OUTPUT: i64 = 70;
     const D_OUTPUT: i64 = 7_000;
     const E_OUTPUT: i64 = 500;
     const SUB_OUTPUT: i64 = 90;
@@ -1373,9 +1371,11 @@ mod tests {
     /// Three cases for `~/.claude`: (a) config dirs only, (b) scan registry only,
     /// (c) both, as production installs. Then, both registries, every other
     /// shape of primary root (S6): `<home>` (ancestor), `~/.claude/projects`
-    /// (a root itself), `~/Library/Application Support/Claude` (ancestor of the
-    /// Cowork tree, whose transcript is in the fixture) and `~/.CLAUDE` (case
-    /// alias). The config-dir setter is judged against the fixture home, as
+    /// (a root itself), `~/.claude/projects/x` (inside one),
+    /// `~/Library/Application Support/Claude` (ancestor of the Cowork tree,
+    /// whose transcript is in the fixture) and `~/.CLAUDE` (case alias). Last,
+    /// `~/.claude/accounts/work`, inside `~/.claude` but outside its scan
+    /// roots, is accepted with its own card. The config-dir setter is judged against the fixture home, as
     /// production judges it against the process home. The dashboard path
     /// (`model_report::run`) has no exclusion and is the control.
     #[test]
@@ -1430,6 +1430,7 @@ mod tests {
 
         let upper = home.join(".CLAUDE");
         let projects = default_dir.join("projects");
+        let inside_projects = projects.join("x");
         for (name, extra, dirs, roots) in [
             ("a: ~/.claude, config dirs only", &default_dir, true, false),
             (
@@ -1441,6 +1442,7 @@ mod tests {
             ("c: ~/.claude, both (production)", &default_dir, true, true),
             ("<home>, both", &home, true, true),
             ("~/.claude/projects, both", &projects, true, true),
+            ("~/.claude/projects/x, both", &inside_projects, true, true),
             (
                 "~/Library/Application Support/Claude, both",
                 &app_support,
@@ -1470,6 +1472,35 @@ mod tests {
                 );
             }
         }
+
+        // Accepted: a folder inside `~/.claude` but outside its scan roots
+        // (slice coordinator, 2026-11-03). It registers, keeps its own card,
+        // and the primary window keeps its total.
+        let inside_claude = default_dir.join("accounts/work");
+        write_session(&inside_claude, "inside", INSIDE_CLAUDE_OUTPUT);
+        reset_registries();
+        set_dirs(&[&inside_claude]);
+        set_roots(&[&inside_claude]);
+        assert_eq!(
+            crate::claude_config_dirs::snapshot(),
+            vec![inside_claude.display().to_string()],
+            "~/.claude/accounts/work was refused, though no primary scan root holds it"
+        );
+        assert_eq!(
+            card(&PRIMARY),
+            Ok(expected),
+            "~/.claude/accounts/work: primary window"
+        );
+        assert_eq!(
+            card(&Some(inside_claude.display().to_string())),
+            Ok(INSIDE_CLAUDE_OUTPUT),
+            "~/.claude/accounts/work: its own card"
+        );
+        assert_eq!(
+            dashboard(),
+            expected + INSIDE_CLAUDE_OUTPUT,
+            "~/.claude/accounts/work: dashboard"
+        );
         reset_registries();
     }
 

@@ -48,10 +48,12 @@ enum ClaudeExtraRoots {
     }
 
     /// Which entries of `configDirs` the core refuses, by index, with its fixed
-    /// reason code (`TBCore.claudeConfigDirRefusals`): home, `/`, any primary
-    /// scan root (`~/.claude`, its `projects` / `transcripts`, Claude
-    /// Desktop's Cowork tree) with its ancestors and descendants, a duplicate,
-    /// an overlap with an earlier entry, or more than eight. The core owns the
+    /// reason code (`TBCore.claudeConfigDirRefusals`): home, `/`, `~/.claude`
+    /// and its ancestors, any primary scan root (`~/.claude/projects`,
+    /// `~/.claude/transcripts`, Claude Desktop's Cowork tree) with its
+    /// ancestors and descendants, a duplicate, an overlap with an earlier
+    /// entry, or more than eight. Another folder inside `~/.claude` is
+    /// allowed. The core owns the
     /// rule; this only asks it, so Swift and the setter cannot disagree.
     ///
     /// Asked BEFORE either registry's payload is built (`expandedPaths`,

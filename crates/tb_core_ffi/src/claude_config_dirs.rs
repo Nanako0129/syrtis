@@ -37,7 +37,8 @@ pub(crate) enum Refusal {
     /// Fails closed rather than accepting a directory that might be them.
     HomeUnknown,
     HomeDirectory,
-    /// Equals, contains or sits inside one of `primary_scan_roots`.
+    /// `collides_with_primary`: `~/.claude` or an ancestor of it, or a primary
+    /// scan root, its ancestor or its descendant.
     PrimaryScanRoot,
     Duplicate,
     /// Contains or sits inside a directory accepted earlier in the list.
@@ -61,23 +62,37 @@ impl Refusal {
     }
 }
 
-/// Every directory the primary Claude account's scan reads under `home`, the
-/// one list behind three consumers: this setter, the Swift pre-check (through
-/// `tb_claude_config_dir_refusals`) and `window_usage::primary_exclusions`.
-/// `~/.claude` itself is listed because both of its scan roots sit in it, and
-/// the Cowork sessions tree because the engine discovers
-/// `<session>/.claude/projects` roots under it (`discover_cowork_project_roots`).
-/// An extra account at any of these, inside one, or at an ancestor of one,
-/// would make the primary window exclude its own transcripts (the P1 of the
-/// 2026-11-03 multi-account audit).
-pub(crate) fn primary_scan_roots(home: &Path) -> [PathBuf; 4] {
+/// Every directory the primary Claude account's scan reads under `home`: its
+/// two roots in `~/.claude`, and the Cowork sessions tree, under which the
+/// engine discovers `<session>/.claude/projects` roots
+/// (`discover_cowork_project_roots`).
+pub(crate) fn primary_scan_roots(home: &Path) -> [PathBuf; 3] {
     let claude = home.join(".claude");
     [
         claude.join("projects"),
         claude.join("transcripts"),
         home.join("Library/Application Support/Claude/local-agent-mode-sessions"),
-        claude,
     ]
+}
+
+/// The one rule behind three consumers: this setter, the Swift pre-check
+/// (through `tb_claude_config_dir_refusals`) and
+/// `window_usage::primary_exclusions`. True for `~/.claude` itself and every
+/// ancestor of it, and for each primary scan root, its ancestors and its
+/// descendants. An extra account there would make the primary window exclude
+/// its own transcripts (the P1 of the 2026-11-03 multi-account audit).
+///
+/// A folder inside `~/.claude` but outside its scan roots, such as
+/// `~/.claude/accounts/work`, is allowed (slice coordinator, 2026-11-03,
+/// pending maintainer review):
+/// the primary never scans it, Syrtis-Windows accepts it too, and refusing it
+/// would drop accounts users already keep there.
+pub(crate) fn collides_with_primary(path: &Path, home: &Path) -> bool {
+    let claude = folded(&home.join(".claude"));
+    claude.starts_with(folded(path))
+        || primary_scan_roots(home)
+            .iter()
+            .any(|root| overlaps(path, root))
 }
 
 /// Lower-cased for comparison. The default APFS volume is case-insensitive, so
@@ -117,10 +132,7 @@ fn refusal(raw: &str, home: Option<&Path>, accepted: &[String]) -> Result<String
     if folded(path) == folded(home) {
         return Err(Refusal::HomeDirectory);
     }
-    if primary_scan_roots(home)
-        .iter()
-        .any(|root| overlaps(path, root))
-    {
+    if collides_with_primary(path, home) {
         return Err(Refusal::PrimaryScanRoot);
     }
     if accepted
@@ -311,7 +323,7 @@ mod tests {
             "/Users/x/.claude/projects",
             "/Users/x/.claude/projects/p",
             "/Users/x/.claude/transcripts",
-            "/Users/x/.claude/work",
+            "/Users/x/.claude/transcripts/t",
             "/Users/x/Library",
             "/Users/x/Library/Application Support/Claude",
             "/Users/x/library/application support/claude",
@@ -329,6 +341,13 @@ mod tests {
         }
         assert_eq!(codes(&["/Users/x"], home), vec![(0, "home_directory")]);
         assert_eq!(codes(&["/Users/X/"], home), vec![(0, "home_directory")]);
+        // Inside `~/.claude` but outside its scan roots: allowed (slice
+        // coordinator, 2026-11-03), unlike `~/.claude/projects/p` above.
+        assert!(codes(
+            &["/Users/x/.claude/accounts/work", "/Users/x/.claude/w"],
+            home
+        )
+        .is_empty());
         // Control: siblings that share a prefix but not a component.
         assert!(codes(
             &[
