@@ -3,6 +3,53 @@
     <channel>
         <title>TokenBar updates</title>
         <item>
+            <title>2.11.0</title>
+            <pubDate>Tue, 03 Nov 2026 12:46:38 +0000</pubDate>
+            <link>https://github.com/Nanako0129/syrtis/releases/tag/v2.11.0</link>
+            <sparkle:version>1755</sparkle:version>
+            <sparkle:shortVersionString>2.11.0</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
+            <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
+            <description><![CDATA[<b>Before you update:</b>
+<ul>
+<li>The first launch after updating reads all your Claude logs again, once. On the maintainer's data (5,323 files, 11 GB) the first refresh took about 30 s and 34 to 58 s of CPU, depending on machine load. It can take longer with more history, and the menu bar title and the popover's background reports can wait behind it. Droid, Qwen, Roo Code, Kilo Code and Cline are also read again once.</li>
+<li>Going back to v2.10.0 or earlier loses Claude turns that only the cache still holds, because Claude Code has since compacted them out of its own logs, unless you restore a backup. Make the copy before you install: quit Syrtis and any tokscale process, copy cache/source-message-cache-v2/claude/ from ~/.config/tokscale (or the folder TOKSCALE_CONFIG_DIR names), and only then install; the updater starts v2.11.0 right away and its first scan rewrites that folder. To go back: quit everything that runs v2.11.0, put that folder back, then start the older version. Start no other version before the restore is finished. An older build that scans the same folder after v2.11.0 has written to it does the same damage.</li>
+</ul>
+<b>Features:</b>
+<ul>
+<li>Settings has an Accounts page. Claude, Antigravity and Cursor moved there from General, next to new sections for Pi and DeepSeek Harness. Turning on Cursor sync now opens a confirmation (Cancel or Continue) and enables nothing until Continue.</li>
+<li>Pi can read additional folders ("Add folder…" in Settings -&gt; Accounts -&gt; Pi), such as usage-only exports from headless runs that write nothing under ~/.pi/agent/sessions. Thanks @savourylie.</li>
+<li>DeepSeek Harness can read the sessions folder of another DSH home; its usage joins your DSH total. Thanks @darkskygit.</li>
+<li>Several Cursor profiles sync into one Cursor total: add a folder you start Cursor with using --user-data-dir under Settings -&gt; Accounts -&gt; Cursor, up to 32 profiles. An account signed in to several profiles is downloaded once. Thanks @ohari5336.</li>
+<li>Antigravity conversation databases in ~/.gemini/antigravity/conversations, where the Antigravity desktop app writes, are read and shown as "Antigravity Extension" inside the Antigravity tab. Thanks @rsimenok.</li>
+<li>A custom OpenCode database location is scanned: OPENCODE_DB, or scanner.opencodeDbPaths in tokscale's settings.json. OPENCODE_DB is read when Syrtis starts, and a database whose file name is not opencode.db or opencode-&lt;channel&gt;.db is skipped. Thanks @sunjeel25, whose Windows report this was ported from.</li>
+</ul>
+<b>Fixes:</b>
+<ul>
+<li>Claude input tokens were overcounted for some requests. On the maintainer's data Claude input went from 47.96M to 19.63M (-59.1%) and cost moved -0.23%.</li>
+<li>A transcript symlinked into an extra Claude account's folder was counted for the main account too; it now counts for the extra account only.</li>
+<li>Opening the popover after idle is faster. On copies of the maintainer's data the first open after two idle minutes took 3.7 s instead of 14.5 s, and mean CPU went from 13.4% to 0.8% (the second run had a lighter machine load, so indicative).</li>
+<li>Background refreshes, including the forced Data refresh, scan on one worker thread instead of two, and price lookups cost less CPU. In a 10-minute run on the maintainer's data, total CPU went from 71.0 s to 58.9 s and the 10-second windows above 100% from 4 to 1, the one left being the first launch above. Measured in the engine on a heavily loaded machine, one graph computation took a median of 7.68 s of CPU instead of 10.42 s, with identical reports.</li>
+<li>Codex usage dropped out of reports once sessions 7 days or older were compressed to .jsonl.zst; Syrtis now decodes them. The reporter measured about 5.06B of 12.59B Codex tokens missing over 15 days on one Mac. Thanks @patrick-fu.</li>
+<li>Roo Code and Kilo Code tasks in VS Code are now scanned. A positive cost reported by Roo Code, Kilo Code or Cline is kept instead of re-estimated, so cost totals shift. For Roo Code and Kilo Code rows dated 2025-11-02 UTC or later, input no longer includes the cache buckets twice, so input totals drop. Some rows change provider; check saved assignments under Settings -&gt; Usage attribution.</li>
+<li>Hermes reasoning is no longer counted twice, Qwen's cached prompt tokens leave its input count, and totals and estimated cost drop for both. Droid replies are counted on the date each was written. Kilo CLI skips migration stub rows.</li>
+<li>Costs now use each vendor's own price, not a reseller's. Price tables list some models twice, once at the vendor's price and once at a reseller's (for example Perplexity's), and Syrtis sometimes picked the reseller's. On the maintainer's data the total dropped 1.54% ($521.12), $452.16 of it on claude-sonnet-5-5, whose reseller row charged 2x for cache reads.</li>
+<li>Antigravity Gemini 3.8 Flash route labels now show as one model, gemini-3.8-flash, and nameless Antigravity CLI rows get a model. A usage attribution saved for a renamed label or changed provider no longer matches; assign it again. Thanks @qqeet for tokscale-core#34.</li>
+<li>OpenRouter's published cache rates are kept instead of dropped. Thanks @kizaki-R.</li>
+<li>With Reduce Transparency on (Accessibility &gt; Display), Settings cards no longer turn dark grey. Thanks @yellowsoar.</li>
+<li>The Antigravity switch under Settings -&gt; Dashboard -&gt; Client tabs (top bar) can bring a hidden tab back again. Thanks @savourylie.</li>
+<li>A refused folder add now opens an alert with a one-sentence reason. Claude config dirs also refuse ~/.claude itself and every folder already read for the main Claude account (the list holds at most 8), which could previously zero the main account's usage in its quota windows.</li>
+<li>Antigravity: turning on automatic capture asks first ("Turn on automatic capture?"), a failed automatic capture shows a sentence instead of nothing, and Remove no longer lets an in-flight refresh write the account back.</li>
+<li>The Accounts page copy says where the Claude sign-in is read, that it isn't logged and which host gets which token, and a Cursor cleanup failure or refused sync now says so.</li>
+</ul>
+<b>Known issue:</b>
+<ul>
+<li>Capturing an Antigravity CLI (agy) login fails with agy 1.4.12, the version checked: agy no longer stores the account identity Syrtis reads. Capture current agy login and automatic capture stop with "agy's saved login doesn't say which Google account it is. Sign agy in again, then try again." v2.10.0 reads the same field, so this is not new. A fix is planned for the next release.</li>
+</ul>
+]]></description>
+            <enclosure url="https://github.com/Nanako0129/syrtis/releases/download/v2.11.0/Syrtis.app.tar.gz" length="14847944" type="application/octet-stream" sparkle:edSignature="ckeBuRpfTo9BtwpNXX9JsObXvAtBXYl0HJwoGAmVTa1zVC7lVW44M73CdB/IWA+OpxErqhgCkSPUMu78in/ECw=="/>
+        </item>
+        <item>
             <title>2.10.0</title>
             <pubDate>Sat, 24 Oct 2026 17:25:40 +0000</pubDate>
             <link>https://github.com/Nanako0129/syrtis/releases/tag/v2.10.0</link>
@@ -71,28 +118,6 @@
 </ul>
 ]]></description>
             <enclosure url="https://github.com/Nanako0129/syrtis/releases/download/v2.8.0/Syrtis.app.tar.gz" length="14110799" type="application/octet-stream" sparkle:edSignature="fy+RIdXFbtctl+3wbxRYUqq4iRvp8Tw7vAl0sqIBmxjrGZWLOax/B9JN6xqgCvGGQ9mOg7eahBuC89A4AhHsBQ=="/>
-        </item>
-        <item>
-            <title>2.7.0</title>
-            <pubDate>Sat, 10 Oct 2026 02:05:42 +0000</pubDate>
-            <link>https://github.com/Nanako0129/syrtis/releases/tag/v2.7.0</link>
-            <sparkle:version>1576</sparkle:version>
-            <sparkle:shortVersionString>2.7.0</sparkle:shortVersionString>
-            <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
-            <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
-            <description><![CDATA[<b>Features:</b>
-<ul>
-<li>Grok Bot usage now appears on the Grok Build &amp; Bot tab instead of the Cursor tab. If you had assigned Cursor's xAI usage to Grok Bot by hand, check that choice.</li>
-<li>When Syrtis knows which captured account agy is signed into, the main Antigravity card reads that account's quota (label OAUTH) instead of running agy. If agy's sign-in changes, that round runs agy as before.</li>
-</ul>
-<b>Fixes:</b>
-<ul>
-<li>Rotating, panning or zooming the 3D chart no longer stutters.</li>
-<li>Dragging the Glass tint slider no longer stutters.</li>
-<li>A limits card with an error no longer shows empty "No data" rows under the message.</li>
-</ul>
-]]></description>
-            <enclosure url="https://github.com/Nanako0129/syrtis/releases/download/v2.7.0/Syrtis.app.tar.gz" length="14009335" type="application/octet-stream" sparkle:edSignature="7UX2KYRlsBbEF6YZdOUzdpq7WoKiwMwEsko7mOGXtQ8DBJHBlGGwGXWqt/dpRg1QGR/lEd4Xt7uWP4OPPCSoDA=="/>
         </item>
         <item>
             <title>1.1.1</title>
