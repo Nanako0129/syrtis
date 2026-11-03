@@ -98,6 +98,19 @@ enum AntigravityAccounts {
     /// Touched only on `applyQueue`.
     nonisolated(unsafe) private static var lastInstalledPayload: String?
 
+    /// Whether the core registry this process last installed no longer lists
+    /// `key`. Blocking: waits for every install already enqueued, so the answer
+    /// is about the install that dropped the key. A failed install leaves the
+    /// previous payload (which still lists it) as the last installed one, so a
+    /// Remove whose install failed must not go on to delete the keychain item
+    /// (the core's token write-back would then see a registered key whose
+    /// item is gone). Never call it on the main thread.
+    static func registryDropped(_ key: String) -> Bool {
+        afterPendingInstalls {
+            !decode(lastInstalledPayload).contains { $0.key == key }
+        }
+    }
+
     /// `accounts` with `captured` added, or its label refreshed when the same
     /// Google account was captured before.
     static func adding(_ captured: Account, to accounts: [Account]) -> [Account] {
@@ -196,6 +209,8 @@ final class AntigravityAutoCapture: ObservableObject {
         var autoCapture: @Sendable ([String]) throws -> AntigravityAutoCaptureResult
         var capture: @Sendable () throws -> AntigravityCapturedAccount
         var remove: @Sendable (String) throws -> Void
+        /// After the install that drops `key`: did it land in the core?
+        var registryDropped: @Sendable (String) -> Bool
         /// Install the stored list in the core (`AntigravityAccounts.apply`).
         var install: @MainActor (UserDefaults) -> Void
 
@@ -206,6 +221,7 @@ final class AntigravityAutoCapture: ObservableObject {
             remove: { key in
                 try AntigravityAccounts.afterPendingInstalls { try TBCore.antigravityRemove(key: key) }
             },
+            registryDropped: { AntigravityAccounts.registryDropped($0) },
             install: { AntigravityAccounts.apply(defaults: $0) })
 
         /// For a run that is not a user session (`--demo`, `--smoke`,
@@ -217,6 +233,7 @@ final class AntigravityAutoCapture: ObservableObject {
             autoCapture: { _ in throw TBCoreError.bridge("not_user_runtime") },
             capture: { throw TBCoreError.bridge("not_user_runtime") },
             remove: { _ in throw TBCoreError.bridge("not_user_runtime") },
+            registryDropped: { _ in false },
             install: { _ in })
 
         static func forRuntime(_ arguments: [String] = CommandLine.arguments) -> IO {
@@ -524,8 +541,26 @@ final class AntigravityAutoCapture: ObservableObject {
         AntigravityAccounts.mutate(defaults: defaults, install: io.install) {
             $0.filter { $0.key != key }
         }
-        let result = await Self.detached { Result { try io.remove(key) } }
-        switch result {
+        // The keychain item goes only once the core registry without the key is
+        // installed (S10). If that install failed, nothing is deleted: the row
+        // comes back and the existing delete-failed sentence is shown.
+        let outcome: Result<Void, Error> = await Self.detached {
+            guard io.registryDropped(key) else {
+                return .failure(TBCoreError.bridge("keychain_delete_failed"))
+            }
+            let first = Result { try io.remove(key) }
+            // A delete that reports failure may still have left no item (the
+            // core's write-back re-check deletes it when the key left the
+            // registry). The core counts an already-missing item as removed,
+            // so asking once more tells the two apart; an item that is still
+            // there fails again and the failure stands.
+            if case let .failure(error) = first {
+                if case TBCoreError.bridge("invalid_key") = error { return first }
+                if case .success = Result(catching: { try io.remove(key) }) { return .success(()) }
+            }
+            return first
+        }
+        switch outcome {
         case .success, .failure(TBCoreError.bridge("invalid_key")):
             // An invalid key has no keychain item and no card: the core
             // registry rejects it. Dropping the row is all that is left.

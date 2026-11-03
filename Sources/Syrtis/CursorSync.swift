@@ -123,10 +123,32 @@ enum CursorSync {
         profiles.isEmpty ? [Copy.privacy] : [Copy.privacy, Copy.profilesPrivacy]
     }
 
-    typealias SetConfig = @Sendable (String) -> Bool?
+    /// What an accepted `tb_set_cursor_sync` push reports: whether the cleanup
+    /// left files behind, and the profiles the core left out of the push
+    /// (index in the pushed list to reason). A boolean literal means "no
+    /// refusals", so a test's `{ _ in false }` stays a clean push.
+    struct Push: ExpressibleByBooleanLiteral, Equatable, Sendable {
+        var cleanupFailed: Bool
+        var rejected: [Int: String] = [:]
+        init(booleanLiteral value: Bool) { cleanupFailed = value }
+        init(cleanupFailed: Bool, rejected: [Int: String] = [:]) {
+            self.cleanupFailed = cleanupFailed
+            self.rejected = rejected
+        }
+    }
+
+    /// `nil` = the core refused the whole push.
+    typealias SetConfig = @Sendable (String) -> Push?
     typealias Sync = @Sendable (Bool) -> CursorSyncStatus?
     /// The real core calls; tests inject spies in their place.
-    static let coreSetConfig: SetConfig = { (try? TBCore.setCursorSync(json: $0))?.cleanupFailed }
+    static let coreSetConfig: SetConfig = { json in
+        guard let result = try? TBCore.setCursorSync(json: json) else { return nil }
+        return Push(
+            cleanupFailed: result.cleanupFailed,
+            rejected: Dictionary(
+                (result.rejectedProfiles ?? []).map { ($0.index, $0.reason) },
+                uniquingKeysWith: { first, _ in first }))
+    }
     static let coreSync: Sync = { try? TBCore.cursorSync(explicit: $0) }
 
     /// `{"enabled","bundleId","profiles":[{"id","root"}],"cliTakeoverConfirmed"}`
@@ -187,11 +209,12 @@ enum CursorSync {
         static let useSyrtis = "Use Syrtis Sync"
         static let keepCLI = "Keep tokscale CLI Data"
         static let cleanupFailed = "Cursor sync is off, but some downloaded usage couldn't be deleted. Restart Syrtis to retry."
-        /// PENDING APPROVAL (`multi-account-mac-copy-draft.md`, section 5). An
-        /// accepted on push that could not finish the orphan cleanup
-        /// (`cursor_sync::set_from_json`: `cleanupFailed`); the next accepted
-        /// push, at launch or on any of these settings, runs it again.
-        static let orphanCleanupFailed = "Some downloaded Cursor usage that is no longer needed couldn't be deleted. Syrtis tries again when it starts and when you change these settings."
+        /// Approved copy (`multi-account-mac-copy-draft.md`, section 7). Stale
+        /// downloaded usage that could not be deleted: after an accepted on push
+        /// (`cursor_sync::set_from_json` `cleanupFailed`) or a round where a
+        /// duplicate profile's old file stayed (`cleanupFailedProfiles`). Both
+        /// run again: the next accepted push, and every sync round.
+        static let staleCleanupFailed = "Some downloaded Cursor usage that is no longer needed couldn't be deleted. Syrtis will try again."
         /// The core refused the settings (`tb_set_cursor_sync` error): nothing syncs.
         static let configRejected = "Cursor sync couldn't be set up, so nothing is being synced."
         /// Accounts page, profile list (CMP-520). The default profile's row.
@@ -227,7 +250,7 @@ enum CursorSync {
         static var all: [String] {
             [title, toggle, privacy, `continue`, cancel, turnOff, lastSynced, partial, expired, notSignedIn,
              offline, error, cliPresent, syncNow, syncing, cliQuestion, useSyrtis, keepCLI, cleanupFailed,
-             configRejected, orphanCleanupFailed, defaultProfile, addProfile, duplicate, profilesPrivacy, cantAdd, cantRead,
+             configRejected, staleCleanupFailed, defaultProfile, addProfile, duplicate, profilesPrivacy, cantAdd, cantRead,
              removeFolder]
         }
     }
@@ -241,10 +264,11 @@ enum CursorSync {
     ]
 
     /// The cleanup failure to show under the switch. While the switch shows
-    /// off, the off push's (its copy says sync is off); while on, the on
-    /// push's orphan cleanup.
-    static func cleanupLine(syncOn: Bool, cleanupFailed: Bool, orphanCleanupFailed: Bool) -> String? {
-        if syncOn { return orphanCleanupFailed ? Copy.orphanCleanupFailed.localized : nil }
+    /// off, the off push's (its copy says sync is off); while on, the stale
+    /// usage that could not be deleted: an on push's orphan cleanup or a
+    /// duplicate profile's old file.
+    static func cleanupLine(syncOn: Bool, cleanupFailed: Bool, staleCleanupFailed: Bool) -> String? {
+        if syncOn { return staleCleanupFailed ? Copy.staleCleanupFailed.localized : nil }
         return cleanupFailed ? Copy.cleanupFailed.localized : nil
     }
 
@@ -253,6 +277,16 @@ enum CursorSync {
     /// never share one.
     static func rowLabel(_ profile: Profile) -> String {
         (profile.root as NSString).abbreviatingWithTildeInPath
+    }
+
+    /// What a profile row says: the core left its folder out of the push (it is
+    /// Cursor's own folder or repeats an earlier one: the fixed
+    /// `Copy.cantAdd`), else its own last round (`rowLine`).
+    static func profileRowLine(
+        id: String, refused: [String: String], status: CursorSyncStatus.Profile?
+    ) -> String? {
+        if refused[id] != nil { return Copy.cantAdd.localized }
+        return status.flatMap(rowLine)
     }
 
     /// A profile row's line: the duplicate note, the permanent-failure line,
@@ -304,6 +338,14 @@ final class CursorSyncController: ObservableObject {
     /// cleared by each accepted on push; reset when sync turns off, where
     /// `cleanupFailed` speaks instead.
     @Published private(set) var orphanCleanupFailed = false
+    /// The last sync round could not delete a duplicate profile's old account
+    /// file (`cleanupFailedProfiles`). Set from every round's status.
+    @Published private(set) var roundCleanupFailed = false
+    /// Stale downloaded usage the app could not delete, from either source.
+    var staleCleanupFailed: Bool { orphanCleanupFailed || roundCleanupFailed }
+    /// Profiles (by id) the core left out of the last accepted on push, with
+    /// the reason; the rest of the push took effect.
+    @Published private(set) var refusedProfiles: [String: String] = [:]
     /// The Settings switch was turned on and its confirmation is open. It gates
     /// that switch only: `confirmEnable()` enables nothing unless this is set.
     /// The Overview notice answers through `answerNotice`, a separate path.
@@ -343,21 +385,25 @@ final class CursorSyncController: ObservableObject {
         // run`): no sync there.
         guard CursorSync.isUserRuntime(arguments), let bundleID, !bundleID.isEmpty else { return }
         let json = CursorSync.configJSON(bundleID: bundleID, defaults: defaults, arguments: arguments)
+        let listed = CursorSync.profiles(defaults: defaults)
         let run = CursorSync.shouldSync(defaults: defaults, arguments: arguments)
         loop?.cancel()
         generation &+= 1
         // An off push retries the cleanup: hide the last failure until it reports.
-        if !run { state = nil; lastSuccessMs = nil; cleanupFailed = false; orphanCleanupFailed = false; profileStates = [:] }
+        if !run {
+            state = nil; lastSuccessMs = nil; cleanupFailed = false; orphanCleanupFailed = false
+            roundCleanupFailed = false; refusedProfiles = [:]; profileStates = [:]
+        }
         let previous = configPush
         let push = Task { [weak self] in
             await previous?.value
-            let failed = await Task.detached(priority: .utility) { setConfig(json) }.value
+            let pushed = await Task.detached(priority: .utility) { setConfig(json) }.value
             // nil is a rejected push. A rejected on push is shown (the core
             // kept its previous config, so sync would silently not run),
             // clears the rows' stale outcomes and stops the schedule; the next
             // accepted on push clears it.
             if run, let self {
-                if failed == nil {
+                if pushed == nil {
                     self.state = CursorSync.configRejectedState
                     self.profileStates = [:]
                 } else if self.state == CursorSync.configRejectedState {
@@ -366,10 +412,20 @@ final class CursorSyncController: ObservableObject {
             }
             // An off push's outcome is `cleanupFailed` (the copy says sync is
             // off); an accepted on push's, which deletes only orphaned profile
-            // dirs, is `orphanCleanupFailed`. A rejected push (nil) ran no
-            // cleanup and leaves both as they were.
-            if let failed {
-                if run { self?.orphanCleanupFailed = failed } else { self?.cleanupFailed = failed }
+            // dirs, is `orphanCleanupFailed`, and its per-entry refusals mark
+            // their rows (the other profiles took effect). A rejected push
+            // (nil) ran no cleanup and leaves all of these as they were.
+            if let pushed {
+                if run {
+                    self?.orphanCleanupFailed = pushed.cleanupFailed
+                    self?.refusedProfiles = Dictionary(
+                        pushed.rejected.compactMap { index, reason in
+                            listed.indices.contains(index) ? (listed[index].id, reason) : nil
+                        },
+                        uniquingKeysWith: { first, _ in first })
+                } else {
+                    self?.cleanupFailed = pushed.cleanupFailed
+                }
             }
         }
         configPush = push
@@ -417,6 +473,7 @@ final class CursorSyncController: ObservableObject {
             guard let result else { state = "error"; profileStates = [:]; continue }
             state = result.state
             lastSuccessMs = result.lastSuccessMs
+            roundCleanupFailed = !(result.cleanupFailedProfiles ?? []).isEmpty
             profileStates = Dictionary(
                 (result.profiles ?? []).map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
             // A round that wrote a file already invalidated the core's

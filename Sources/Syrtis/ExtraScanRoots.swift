@@ -152,15 +152,22 @@ enum ExtraScanRoots {
     /// setter is full-replace, so `claude` is always present, while `pi` and
     /// `dsh` appear only when non-empty: an absent key already means "no roots
     /// for that client". That also keeps every pre-DSH payload byte-identical.
+    ///
+    /// `claudeAccepted`: the directories the core already accepted for these
+    /// `claudeConfigDirs`, when the caller has asked the core once and
+    /// reuses the answer (`ClaudeExtraRoots.applyPayloads`); nil asks here.
     static func payloadJSON(
-        claudeConfigDirs: [String], piRoots: [String], dshRoots: [String]
+        claudeConfigDirs: [String], claudeAccepted: [String]? = nil, piRoots: [String], dshRoots: [String]
     ) -> String {
         let piPaths = standardizedUnique(piRoots)
         let dshPaths = standardizedUnique(dshRoots)
+        let claudeRoots = ClaudeExtraRoots.Classified(
+            refused: [:], accepted: claudeAccepted ?? ClaudeExtraRoots.accepted(claudeConfigDirs)
+        ).expanded
         guard !piPaths.isEmpty || !dshPaths.isEmpty else {
-            return ClaudeExtraRoots.payloadJSON(claudeConfigDirs)
+            return ClaudeExtraRoots.payloadJSON(expanded: claudeRoots)
         }
-        var json = "{\"claude\":\(encode(ClaudeExtraRoots.expandedPaths(claudeConfigDirs)))"
+        var json = "{\"claude\":\(encode(claudeRoots))"
         if !piPaths.isEmpty { json += ",\"pi\":\(encode(piPaths))" }
         if !dshPaths.isEmpty { json += ",\"dsh\":\(encode(dshPaths))" }
         return json + "}"
@@ -199,15 +206,17 @@ enum ExtraScanRoots {
     static func apply(
         then completion: (@Sendable @MainActor (ExtraScanPathsResult?) -> Void)? = nil
     ) {
-        ClaudeExtraRoots.apply(scanPayload: { currentPayload() }, then: completion)
+        ClaudeExtraRoots.apply(scanPayload: { currentPayload(claudeAccepted: $0) }, then: completion)
     }
 
     /// The payload `apply` hands to the core, built from the persisted lists.
     /// A separate function so SelfTest observes the production path;
     /// `dshDefaults` is only for a scratch suite.
-    static func currentPayload(dshDefaults: UserDefaults = .standard) -> String {
+    static func currentPayload(
+        dshDefaults: UserDefaults = .standard, claudeAccepted: [String]? = nil
+    ) -> String {
         payloadJSON(
-            claudeConfigDirs: ClaudeExtraRoots.load(),
+            claudeConfigDirs: ClaudeExtraRoots.load(), claudeAccepted: claudeAccepted,
             piRoots: Pi.load(), dshRoots: Dsh.load(defaults: dshDefaults))
     }
 

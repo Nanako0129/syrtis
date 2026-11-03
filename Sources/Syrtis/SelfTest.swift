@@ -17563,7 +17563,7 @@ enum SelfTest {
                            AccountsCopy.addPrompt, AccountsCopy.removeHelp, AccountsCopy.unreadableFolders,
                            AccountsCopy.rejectedPaths, AccountsCopy.capturing, AccountsCopy.captureCurrent,
                            AccountsCopy.autoPaused, AccountsCopy.autoUnavailable, AccountsCopy.removeNamed,
-                           CursorSync.Copy.orphanCleanupFailed, CursorSync.Copy.cleanupFailed]
+                           CursorSync.Copy.staleCleanupFailed, CursorSync.Copy.cleanupFailed]
         let outsideTranslated = (agyMessages + viewStrings + AccountsCopy.refusalCodes.map(AccountsCopy.refusalSentence))
             .filter { !AccountsCopy.translated.contains($0) }
         expect(outsideTranslated.isEmpty,
@@ -17604,6 +17604,32 @@ enum SelfTest {
                 && addDsh(listed[0], listed) == .init(list: listed, refusalLine: sentence("duplicate"))
                 && addDsh(fresh, listed) == .init(list: listed + [fresh], refusalLine: nil),
             "ACCOUNTS-PAGE a refused add of a Claude, Pi or DSH folder shows its reason's fixed sentence and saves nothing; an accepted add shows none")
+
+        // One apply asks the core's rule once and builds both payloads from the
+        // answer; one render of the list asks once. The payloads equal the
+        // ones the single-purpose builders make. Mutation: the config-dir
+        // payload asks again.
+        do {
+            let calls = UncheckedBox<Int>(0)
+            let real = ClaudeExtraRoots.coreRefusals
+            ClaudeExtraRoots.coreRefusals = { calls.value += 1; return try real($0) }
+            defer { ClaudeExtraRoots.coreRefusals = real }
+            let dirs = ["/tmp/syrtis-selftest-accounts/a", home, "/tmp/syrtis-selftest-accounts/b"]
+            let both = ClaudeExtraRoots.applyPayloads(configDirs: dirs, scanPayload: {
+                ExtraScanRoots.payloadJSON(claudeConfigDirs: dirs, claudeAccepted: $0, piRoots: [], dshRoots: [])
+            })
+            let applyCalls = calls.value
+            calls.value = 0
+            let rendered = ClaudeExtraRoots.classify(dirs)
+            let renderCalls = calls.value
+            ClaudeExtraRoots.coreRefusals = real
+            expect(applyCalls == 1 && renderCalls == 1
+                       && both.scan == ClaudeExtraRoots.payloadJSON(dirs)
+                       && both.configDirs == ClaudeExtraRoots.configDirsPayloadJSON(dirs)
+                       && rendered.refused[1] == "home_directory"
+                       && rendered.expanded.count == 4,
+                   "ACCOUNTS-PAGE one apply and one render each ask the core's rule once and reuse the answer; apply asked \(applyCalls), render \(renderCalls)")
+        }
 
         // MA-42: a Remove button is named by the row's whole label, so two rows
         // sharing a last path component never share a name. Mutation: the last
@@ -18271,7 +18297,7 @@ enum SelfTest {
             defaults.removePersistentDomain(forName: suite)
             defaults.set(true, forKey: CursorSync.noticeKey)
             let pushes = UncheckedBox<[String]>([])
-            let slowOn: @Sendable (String) -> Bool? = { json in
+            let slowOn: CursorSync.SetConfig = { json in
                 if json.contains(#""enabled":true"#) { Thread.sleep(forTimeInterval: 0.3) }
                 pushes.value.append(json.contains(#""enabled":true"#) ? "on" : "off")
                 return false
@@ -18371,7 +18397,7 @@ enum SelfTest {
             let slowSync: @Sendable (Bool) -> CursorSyncStatus? = { _ in
                 log.value.append("sync"); Thread.sleep(forTimeInterval: 0.2); return ok
             }
-            let slowPush: @Sendable (String) -> Bool? = { _ in
+            let slowPush: CursorSync.SetConfig = { _ in
                 Thread.sleep(forTimeInterval: 0.2); log.value.append("push"); return false
             }
             let controller = CursorSyncController()
@@ -18490,7 +18516,7 @@ enum SelfTest {
                 defaults.set(on, forKey: CursorSync.enabledKey)
                 let before = pushes.value
                 controller.reconfigure(refresh: false, defaults: defaults, arguments: ["Syrtis"], bundleID: "x.y",
-                                       setConfig: { _ in pushes.value += 1; return failed }, sync: none)
+                                       setConfig: { _ in pushes.value += 1; return .init(cleanupFailed: failed) }, sync: none)
                 seen.append(controller.cleanupFailed)
                 for _ in 0..<200 where pushes.value == before {
                     try? await Task.sleep(nanoseconds: 10_000_000)
@@ -18516,7 +18542,7 @@ enum SelfTest {
             let none: @Sendable (Bool) -> CursorSyncStatus? = { _ in nil }
             let controller = CursorSyncController()
             var seen: [Bool] = []
-            let push: (Bool, Bool?) async -> Void = { on, result in
+            let push: (Bool, CursorSync.Push?) async -> Void = { on, result in
                 defaults.set(on, forKey: CursorSync.enabledKey)
                 let landed = UncheckedBox<Bool>(false)
                 controller.reconfigure(refresh: false, defaults: defaults, arguments: ["Syrtis"], bundleID: "x.y",
@@ -18533,12 +18559,91 @@ enum SelfTest {
         }
         expect(cursorOrphan == [true, true, false, false],
                "CURSOR-SYNC an on-push orphan cleanup failure is shown until an on push succeeds; got \(String(describing: cursorOrphan))")
-        expect(CursorSync.cleanupLine(syncOn: true, cleanupFailed: false, orphanCleanupFailed: true)
-                   == CursorSync.Copy.orphanCleanupFailed.localized
-                && CursorSync.cleanupLine(syncOn: true, cleanupFailed: true, orphanCleanupFailed: false) == nil
-                && CursorSync.cleanupLine(syncOn: false, cleanupFailed: true, orphanCleanupFailed: true)
+        // Per-entry refusal: the core leaves a profile out of a push (Cursor's
+        // own folder, or a repeat) and the others take effect; the row of the
+        // refused profile says so with the fixed sentence, and nothing else
+        // changes. Cleared by the next accepted on push without it and by an
+        // off push. Mutation: ignore `rejected`.
+        let cursorRefused: [Bool]? = awaitMainActorValue {
+            let suite = "tokenbar.selftest.cursorSyncRefused"
+            let defaults = UserDefaults(suiteName: suite)!
+            defer { defaults.removePersistentDomain(forName: suite) }
+            defaults.removePersistentDomain(forName: suite)
+            defaults.set(true, forKey: CursorSync.noticeKey)
+            let first = "0A1B2C3D-0000-4000-8000-00000000000A", second = "0A1B2C3D-0000-4000-8000-00000000000B"
+            CursorSync.saveProfiles(
+                [.init(id: first, root: "/Volumes/selftest/a"), .init(id: second, root: "/Volumes/selftest/b")],
+                defaults: defaults)
+            let none: @Sendable (Bool) -> CursorSyncStatus? = { _ in nil }
+            let controller = CursorSyncController()
+            let push: (CursorSync.Push?, Bool) async -> Void = { result, on in
+                defaults.set(on, forKey: CursorSync.enabledKey)
+                let landed = UncheckedBox<Bool>(false)
+                controller.reconfigure(refresh: false, defaults: defaults, arguments: ["Syrtis"], bundleID: "x.y",
+                                       setConfig: { _ in landed.value = true; return result }, sync: none)
+                for _ in 0..<200 where !landed.value { try? await Task.sleep(nanoseconds: 10_000_000) }
+                try? await Task.sleep(nanoseconds: 50_000_000)
+            }
+            var ok: [Bool] = []
+            await push(.init(cleanupFailed: false, rejected: [1: "cursor_default"]), true)
+            ok.append(controller.refusedProfiles == [second: "cursor_default"])
+            ok.append(CursorSync.profileRowLine(id: second, refused: controller.refusedProfiles, status: nil)
+                == CursorSync.Copy.cantAdd.localized)
+            ok.append(CursorSync.profileRowLine(id: first, refused: controller.refusedProfiles, status: nil) == nil)
+            await push(nil, true)
+            ok.append(controller.refusedProfiles == [second: "cursor_default"])
+            await push(false, true)
+            ok.append(controller.refusedProfiles.isEmpty)
+            await push(.init(cleanupFailed: false, rejected: [0: "duplicate", 9: "duplicate"]), true)
+            ok.append(controller.refusedProfiles == [first: "duplicate"])
+            await push(false, false)
+            ok.append(controller.refusedProfiles.isEmpty)
+            return ok
+        }
+        expect(cursorRefused == [true, true, true, true, true, true, true],
+               "CURSOR-PROFILES a profile the core leaves out of a push is marked with the fixed sentence, the others are untouched, and it clears with the next accepted push; got \(String(describing: cursorRefused))")
+
+        // A duplicate profile's old file that could not be deleted
+        // (`cleanupFailedProfiles` of a sync round) shows the same sentence as
+        // an on-push failure, and clears with the next round that deleted it.
+        // Mutation: ignore `cleanupFailedProfiles`.
+        let cursorRoundCleanup: [Bool]? = awaitMainActorValue {
+            let suite = "tokenbar.selftest.cursorSyncRoundCleanup"
+            let defaults = UserDefaults(suiteName: suite)!
+            defer { defaults.removePersistentDomain(forName: suite) }
+            defaults.removePersistentDomain(forName: suite)
+            defaults.set(true, forKey: CursorSync.noticeKey)
+            let status = { (failed: String) in
+                try? JSONDecoder().decode(
+                    CursorSyncStatus.self,
+                    from: Data(#"{"state":"ok","events":1,"lastSuccessMs":1,"changed":true,"cleanupFailedProfiles":\#(failed)}"#.utf8))
+            }
+            let next = UncheckedBox<CursorSyncStatus?>(status(#"["0A1B2C3D-0000-4000-8000-00000000000A"]"#))
+            let sync: @Sendable (Bool) -> CursorSyncStatus? = { _ in next.value }
+            let controller = CursorSyncController()
+            var ok: [Bool] = []
+            await controller.runSync(explicit: true, defaults: defaults, arguments: ["Syrtis"], sync: sync)
+            ok.append(controller.roundCleanupFailed && controller.staleCleanupFailed
+                && CursorSync.cleanupLine(syncOn: true, cleanupFailed: false, staleCleanupFailed: controller.staleCleanupFailed)
+                    == CursorSync.Copy.staleCleanupFailed.localized)
+            next.value = status("[]")
+            await controller.runSync(explicit: true, defaults: defaults, arguments: ["Syrtis"], sync: sync)
+            ok.append(!controller.roundCleanupFailed && !controller.staleCleanupFailed)
+            // A status without the field (an older core) is no failure.
+            next.value = try? JSONDecoder().decode(
+                CursorSyncStatus.self, from: Data(#"{"state":"ok","events":1,"lastSuccessMs":1,"changed":false}"#.utf8))
+            await controller.runSync(explicit: true, defaults: defaults, arguments: ["Syrtis"], sync: sync)
+            ok.append(!controller.roundCleanupFailed)
+            return ok
+        }
+        expect(cursorRoundCleanup == [true, true, true],
+               "CURSOR-SYNC a duplicate's failed cleanup (cleanupFailedProfiles) shows the stale-usage sentence and clears with the next round; got \(String(describing: cursorRoundCleanup))")
+        expect(CursorSync.cleanupLine(syncOn: true, cleanupFailed: false, staleCleanupFailed: true)
+                   == CursorSync.Copy.staleCleanupFailed.localized
+                && CursorSync.cleanupLine(syncOn: true, cleanupFailed: true, staleCleanupFailed: false) == nil
+                && CursorSync.cleanupLine(syncOn: false, cleanupFailed: true, staleCleanupFailed: true)
                     == CursorSync.Copy.cleanupFailed.localized
-                && CursorSync.cleanupLine(syncOn: false, cleanupFailed: false, orphanCleanupFailed: true) == nil,
+                && CursorSync.cleanupLine(syncOn: false, cleanupFailed: false, staleCleanupFailed: true) == nil,
                "CURSOR-SYNC the cleanup line under the switch follows the switch (on: orphan failure; off: off-push failure)")
         // The real FFI, so the Swift decode of `cleanupFailed` is exercised:
         // a read-only dir refuses the delete. Isolation (CMP-520 13b): a
@@ -20075,7 +20180,7 @@ enum SelfTest {
                     defaults: defaults)
                 await ac.remove(.init(key: agKey, label: agEmail))
                 check("AG-S10 Remove installs the list without the key before deleting its item",
-                      fake.read { $0.events } == ["install:\(otherKey)", "remove:\(agKey)"])
+                      fake.read { $0.events } == ["install:\(otherKey)", "check-dropped", "remove:\(agKey)"])
                 AntigravityAccounts.save(
                     [.init(key: agKey, label: agEmail), .init(key: otherKey, label: "b@example.com")],
                     defaults: defaults)
@@ -20084,6 +20189,47 @@ enum SelfTest {
                 check("AG-S10 a failed delete restores the row in place and says so",
                       AntigravityAccounts.load(defaults: defaults).map(\.key) == [agKey, otherKey]
                           && ac.message != nil)
+            }
+
+            // A failed install must not be followed by a delete: the core still
+            // lists the key, so its write-back would see a registered key whose
+            // item is gone. The row stays and the delete-failed sentence shows.
+            // Mutation: delete without asking whether the install landed.
+            do {
+                let fake = AGAutoFake(key: agKey, label: agEmail)
+                let (ac, defaults) = fresh(fake)
+                AntigravityAccounts.save(
+                    [.init(key: agKey, label: agEmail), .init(key: otherKey, label: "b@example.com")],
+                    defaults: defaults)
+                fake.write { $0.installFailed = true }
+                await ac.remove(.init(key: agKey, label: agEmail))
+                check("AG-S10 a failed registry install deletes nothing, keeps the row and shows the delete-failed sentence",
+                      fake.read { $0.removedKeys }.isEmpty
+                          && AntigravityAccounts.load(defaults: defaults).map(\.key) == [agKey, otherKey]
+                          && ac.message == AccountsCopy.agyDeleteFailed)
+                // Control: the same Remove with the install landing deletes once.
+                fake.write { $0.installFailed = false }
+                await ac.remove(.init(key: agKey, label: agEmail))
+                check("AG-S10 control: once the install lands the item is deleted",
+                      fake.read { $0.removedKeys } == [agKey]
+                          && AntigravityAccounts.load(defaults: defaults).map(\.key) == [otherKey])
+            }
+
+            // A delete that reports failure but leaves no item (the core's
+            // write-back re-check already deleted it) is a removal: asking the
+            // core again finds the item gone, and the row is not restored.
+            // Mutation: trust the first failure.
+            do {
+                let fake = AGAutoFake(key: agKey, label: agEmail)
+                let (ac, defaults) = fresh(fake)
+                AntigravityAccounts.save(
+                    [.init(key: agKey, label: agEmail), .init(key: otherKey, label: "b@example.com")],
+                    defaults: defaults)
+                fake.write { $0.removeErrorOnce = .bridge("keychain_delete_failed") }
+                await ac.remove(.init(key: agKey, label: agEmail))
+                check("AG-S10 a delete failure whose item is already gone counts as removed: no restored row, no message",
+                      AntigravityAccounts.load(defaults: defaults).map(\.key) == [otherKey]
+                          && ac.message == nil && fake.read { $0.removedKeys } == [agKey, agKey])
             }
 
             // Dedup through BOTH accessors, gated on the primary's source.
@@ -21587,6 +21733,11 @@ private final class AGAutoFake: @unchecked Sendable {
     var events: [String] = []
     /// When set, `remove` fails with it.
     var removeError: TBCoreError?
+    /// When set, only the next `remove` fails with it (the item is gone by the
+    /// time it is asked again).
+    var removeErrorOnce: TBCoreError?
+    /// When set, the install that drops a key did not land in the core.
+    var installFailed = false
     /// While set, an attempt blocks on it: the attempt is "in flight".
     var hold: DispatchSemaphore?
 
@@ -21647,9 +21798,16 @@ private final class AGAutoFake: @unchecked Sendable {
                 let error = self.read { fake -> TBCoreError? in
                     fake.removedKeys.append(key)
                     fake.events.append("remove:\(key)")
-                    return fake.removeError
+                    defer { fake.removeErrorOnce = nil }
+                    return fake.removeErrorOnce ?? fake.removeError
                 }
                 if let error { throw error }
+            },
+            registryDropped: { _ in
+                self.read { fake in
+                    fake.events.append("check-dropped")
+                    return !fake.installFailed
+                }
             },
             install: { defaults in
                 let keys = AntigravityAccounts.load(defaults: defaults).map(\.key).joined(separator: ",")

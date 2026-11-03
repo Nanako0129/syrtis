@@ -1100,7 +1100,8 @@ struct SettingsPanel: View {
             // The core's refusals for the stored list (a pure call, no file
             // access). A refused entry stays listed, marked, so nothing the
             // user added disappears silently; it reaches neither registry.
-            let refusedClaudeRoots = ClaudeExtraRoots.refusals(claudeExtraRoots)
+            let claudeRoots = ClaudeExtraRoots.classify(claudeExtraRoots)
+            let refusedClaudeRoots = claudeRoots.refused
             ForEach(Array(claudeExtraRoots.enumerated()), id: \.element) { index, path in
                 row(path) {
                     HStack(spacing: 6) {
@@ -1143,7 +1144,7 @@ struct SettingsPanel: View {
             // clients' roots. See `ExtraScanRoots.clientHint`.
             let claudeHint = ExtraScanRoots.clientHint(
                 claudeExtraRootsResult, client: "claude",
-                requested: ClaudeExtraRoots.expandedPaths(claudeExtraRoots).count)
+                requested: claudeRoots.expanded.count)
             if let claudeHint, claudeHint.unreadable > 0 {
                 hint(AccountsCopy.unreadableFolders.localized(
                     claudeHint.unreadable, claudeHint.registered))
@@ -1351,7 +1352,7 @@ struct SettingsPanel: View {
             if let line = CursorSync.cleanupLine(
                 syncOn: CursorSync.toggleShowsOn(enabled: cursorSyncOn, acknowledged: cursorNoticeAck),
                 cleanupFailed: cursorSync.cleanupFailed,
-                orphanCleanupFailed: cursorSync.orphanCleanupFailed)
+                staleCleanupFailed: cursorSync.staleCleanupFailed)
             {
                 Text(line)
                     .font(.caption2)
@@ -1402,14 +1403,17 @@ struct SettingsPanel: View {
         _ label: String, id: String, syncOn: Bool, @ViewBuilder trailing: () -> some View
     ) -> some View {
         row(label, trailing: trailing)
-        if syncOn, let status = cursorSync.profileStates[id] {
-            if let line = CursorSync.rowLine(status) {
-                Text(line)
-                    .font(.caption2)
-                    .foregroundStyle(["ok", "duplicate"].contains(status.state) ? Color.secondary : Color.orange)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .padding(.horizontal, 10)
-            }
+        if syncOn,
+           let line = CursorSync.profileRowLine(
+               id: id, refused: cursorSync.refusedProfiles, status: cursorSync.profileStates[id])
+        {
+            let calm = cursorSync.refusedProfiles[id] == nil
+                && ["ok", "duplicate"].contains(cursorSync.profileStates[id]?.state ?? "")
+            Text(line)
+                .font(.caption2)
+                .foregroundStyle(calm ? Color.secondary : Color.orange)
+                .fixedSize(horizontal: false, vertical: true)
+                .padding(.horizontal, 10)
         }
     }
 

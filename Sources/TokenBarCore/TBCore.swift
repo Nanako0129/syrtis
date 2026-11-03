@@ -208,6 +208,21 @@ public struct CursorSyncConfigResult: Decodable, Equatable, Sendable {
     public let removedFiles: Int
     /// Some of those files could not be deleted.
     public let cleanupFailed: Bool
+    /// Profiles left out of this push, by index in the pushed list: the
+    /// folder is Cursor's own (`cursor_default`) or repeats an earlier entry
+    /// (`duplicate`). The default and the other profiles are registered.
+    /// Absent from a result that predates per-entry refusal.
+    public let rejectedProfiles: [RejectedProfile]?
+
+    public struct RejectedProfile: Decodable, Equatable, Sendable {
+        public let index: Int
+        public let reason: String
+
+        public init(index: Int, reason: String) {
+            self.index = index
+            self.reason = reason
+        }
+    }
 }
 
 /// Result of `tb_cursor_sync`.
@@ -220,8 +235,15 @@ public struct CursorSyncStatus: Decodable, Equatable, Sendable {
     public let lastSuccessMs: Int64?
     /// A fixed diagnostic code (e.g. `rate_limited`); never account data.
     public let reason: String?
-    /// Some profile wrote its file this round, whatever `state` says.
+    /// A usage file's bytes changed this round (written with new content, or a
+    /// duplicate profile's old account file removed), whatever `state` says.
+    /// A walk whose bytes equal the file's only touches its modified time and
+    /// is not a change.
     public let changed: Bool
+    /// Profiles (`default` or a UUID) whose stale usage file could not be
+    /// deleted this round: a duplicate's old account file. Absent from a
+    /// status that predates it.
+    public let cleanupFailedProfiles: [String]?
     /// Each profile's own outcome, the default (`id` `default`) first. Absent
     /// from a status that predates CMP-520.
     public let profiles: [Profile]?

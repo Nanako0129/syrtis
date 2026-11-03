@@ -50,7 +50,8 @@ enum ClaudeExtraRoots {
     /// Which entries of `configDirs` the core refuses, by index, with its fixed
     /// reason code (`TBCore.claudeConfigDirRefusals`): home, `/`, `~/.claude`
     /// and its ancestors, any primary scan root (`~/.claude/projects`,
-    /// `~/.claude/transcripts`, Claude Desktop's Cowork tree) with its
+    /// `~/.claude/transcripts`, Claude Desktop's Cowork tree, a default-layout
+    /// `~/.cc-mirror/<variant>/config/projects`) with its
     /// ancestors and descendants, a duplicate, an overlap with an earlier
     /// entry, or more than eight. Another folder inside `~/.claude` is
     /// allowed. The core owns the
@@ -67,19 +68,43 @@ enum ClaudeExtraRoots {
     static func refusals(_ configDirs: [String]) -> [Int: String] {
         let standardized = configDirs.map { ($0 as NSString).standardizingPath }
         let json = (try? JSONEncoder().encode(standardized)).flatMap { String(data: $0, encoding: .utf8) }
-        guard let json, let rejected = try? TBCore.claudeConfigDirRefusals(json: json) else {
+        guard let json, let rejected = try? coreRefusals(json) else {
             return Dictionary(uniqueKeysWithValues: configDirs.indices.map { ($0, "unavailable") })
         }
         return Dictionary(rejected.map { ($0.index, $0.reason) }, uniquingKeysWith: { first, _ in first })
     }
 
+    /// The core's pure rule. A seam only so a test can count the calls: one
+    /// apply and one render each ask once (`classify`).
+    nonisolated(unsafe) static var coreRefusals: (String) throws -> [RejectedConfigDir] = {
+        try TBCore.claudeConfigDirRefusals(json: $0)
+    }
+
+    /// One answer of the core's rule for a configured list: what it refuses,
+    /// by index, and what it accepts (standardized, in order). Compute it once
+    /// per apply and per render and reuse it; each call crosses the FFI.
+    struct Classified {
+        let refused: [Int: String]
+        let accepted: [String]
+        /// The two scan sub-roots of every accepted dir, deduplicated.
+        var expanded: [String] {
+            var seen = Set<String>()
+            return accepted.flatMap(ClaudeExtraRoots.expand).filter { seen.insert($0).inserted }
+        }
+    }
+
+    static func classify(_ configDirs: [String]) -> Classified {
+        let refused = refusals(configDirs)
+        let accepted = configDirs.indices
+            .filter { refused[$0] == nil }
+            .map { (configDirs[$0] as NSString).standardizingPath }
+        return Classified(refused: refused, accepted: accepted)
+    }
+
     /// The configured directories the core accepts, standardized, in order.
     /// Both registry payloads are built from this and nothing else.
     static func accepted(_ configDirs: [String]) -> [String] {
-        let refused = refusals(configDirs)
-        return configDirs.indices
-            .filter { refused[$0] == nil }
-            .map { (configDirs[$0] as NSString).standardizingPath }
+        classify(configDirs).accepted
     }
 
     /// The Settings pre-check for adding `path` after `existing`: the core's
@@ -102,8 +127,7 @@ enum ClaudeExtraRoots {
     /// list with another client's roots without decoding the encoded payload.
     /// Refused entries (`refusals`) contribute no root.
     static func expandedPaths(_ configDirs: [String]) -> [String] {
-        var seen = Set<String>()
-        return accepted(configDirs).flatMap(expand).filter { seen.insert($0).inserted }
+        classify(configDirs).expanded
     }
 
     /// Build the `tb_set_extra_scan_paths` payload from the persisted list:
@@ -115,7 +139,11 @@ enum ClaudeExtraRoots {
     /// returns this exact string when no Pi or DSH roots are configured, so an
     /// upgrade does not look like a scan-root change.
     static func payloadJSON(_ configDirs: [String]) -> String {
-        let object = ["claude": expandedPaths(configDirs)]
+        payloadJSON(expanded: expandedPaths(configDirs))
+    }
+
+    static func payloadJSON(expanded: [String]) -> String {
+        let object = ["claude": expanded]
         let data = (try? JSONEncoder().encode(object)) ?? Data("{}".utf8)
         return String(data: data, encoding: .utf8) ?? "{}"
     }
@@ -137,8 +165,22 @@ enum ClaudeExtraRoots {
     ///
     /// Refused entries (`refusals`) are left out, duplicates among them.
     static func configDirsPayloadJSON(_ configDirs: [String]) -> String {
-        let data = (try? JSONEncoder().encode(accepted(configDirs))) ?? Data("[]".utf8)
+        configDirsPayloadJSON(accepted: accepted(configDirs))
+    }
+
+    static func configDirsPayloadJSON(accepted: [String]) -> String {
+        let data = (try? JSONEncoder().encode(accepted)) ?? Data("[]".utf8)
         return String(data: data, encoding: .utf8) ?? "[]"
+    }
+
+    /// Both payloads of one apply, from ONE ask of the core: the scan payload
+    /// (`scanPayload` receives the accepted directories) and the config-dir
+    /// payload. Two asks per apply were two FFI calls for one answer.
+    static func applyPayloads(
+        configDirs: [String], scanPayload: ([String]) -> String
+    ) -> (scan: String, configDirs: String) {
+        let accepted = classify(configDirs).accepted
+        return (scanPayload(accepted), configDirsPayloadJSON(accepted: accepted))
     }
 
     /// Which of `paths` are missing right now, resolved off the calling actor.
@@ -493,13 +535,11 @@ enum ClaudeExtraRoots {
     /// since neither side reports an error. Serial means the last save is
     /// also the last registered.
     static func apply(
-        scanPayload: @escaping @Sendable @MainActor () -> String,
+        scanPayload: @escaping @Sendable @MainActor ([String]) -> String,
         then completion: (@Sendable @MainActor (ExtraScanPathsResult?) -> Void)? = nil
     ) {
         Task { @MainActor in
-            let configDirs = load()
-            let json = scanPayload()
-            let configDirsJSON = configDirsPayloadJSON(configDirs)
+            let (json, configDirsJSON) = applyPayloads(configDirs: load(), scanPayload: scanPayload)
             // Both applies for one save are enqueued here before either
             // reaches the queue below, and the main actor runs them in order,
             // so the second finds the payloads already claimed. It still
