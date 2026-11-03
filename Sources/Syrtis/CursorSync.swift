@@ -209,7 +209,7 @@ enum CursorSync {
         /// Approved copy (`multi-account-mac-copy-draft.md`, section 7). Shown
         /// while stale downloaded usage is known to remain. When each cleanup
         /// runs again: the orphan cleanup of an on push (a removed profile's
-        /// dir, an earlier appDir) runs only on the next accepted on push, at
+        /// dir, an earlier appDir) runs on the next accepted on push (an earlier appDir is retried by each one while Syrtis keeps running, not after a relaunch), at
         /// launch or after any Cursor setting changes, and the line clears
         /// when that push reports no failure. A duplicate profile's old
         /// account file is dropped in every round in which that profile is

@@ -299,8 +299,9 @@ char *tb_set_keychain_consent(const char *json);
 // `cursor-profiles` (the parent folder of the added profiles could not be
 // read), or `appDir` (a previous appDir that now fails the checks or
 // whose files could not all be deleted, so files may be left there; every
-// accepted push retries it until it is clean, and a refused appDir never used
-// before is not reported). Other invalid input is an error and leaves the registry
+// accepted push retries it until it is clean while Syrtis keeps running, after
+// a relaunch it is no longer known and is not retried; a refused appDir never
+// used before is not reported). Other invalid input is an error and leaves the registry
 // unchanged. While enabled with a complete
 // synced file, and the tokscale CLI's Cursor dir holds no usage files (or
 // `cliTakeoverConfirmed`), reports read Cursor from the newest synced file of

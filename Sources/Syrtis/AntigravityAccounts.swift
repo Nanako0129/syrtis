@@ -320,12 +320,10 @@ final class AntigravityAutoCapture: ObservableObject {
             marker = try? await Self.detached({ try io.marker() })
             checking = false
         }
-        // A marker query that fails is shown with the existing "unavailable"
-        // sentence instead of passing silently; the next poll recomputes it.
-        guard let marker else {
-            unavailable = true
-            return await pollIfOwed()
-        }
+        // A failed marker query (a timeout, a stray `security` exit) is
+        // transient: `unavailable` stays as it was and the next poll asks
+        // again. Only a "present" marker means this Mac cannot be watched.
+        guard let marker else { return await pollIfOwed() }
         unavailable = marker == "present"
         guard marker != lastAttemptedMarker, !busy else { return await pollIfOwed() }
         // The toggle is checked here, right before an attempt, and not only by
@@ -383,6 +381,11 @@ final class AntigravityAutoCapture: ObservableObject {
             } else {
                 message = AntigravityAccounts.message(for: error)
             }
+            // Google could not be reached: transient, so the next check retries
+            // this marker and a success clears the sentence. Every other failure
+            // (a rejected token, a keychain error) keeps the marker, so Google is
+            // not asked again until agy's login changes.
+            if case TBCoreError.bridge("refresh_unreachable") = error { lastAttemptedMarker = nil }
         }
         busy = false
         await pollIfOwed()
@@ -482,6 +485,7 @@ final class AntigravityAutoCapture: ObservableObject {
             await poll()
         } else {
             unavailable = false
+            message = nil
         }
     }
 

@@ -17655,7 +17655,10 @@ enum SelfTest {
             alert.show(CursorSync.Copy.cantAdd)
             let cursorAlert = alert.message == CursorSync.Copy.cantAdd
             alert.dismiss()
-            expect(none && claudeAlert && piAlert && dshAlert && cursorAlert && alert.message == nil,
+            // The title outlives the dismissal, so it never reads empty while
+            // the alert animates out. Mutation: `dismiss` clears the title.
+            let titleKept = alert.title == CursorSync.Copy.cantAdd
+            expect(none && claudeAlert && piAlert && dshAlert && cursorAlert && titleKept && alert.message == nil,
                    "ACCOUNTS-PAGE a refused Claude, Pi, DSH or Cursor add raises the alert with its approved sentence, an accepted add raises none, and OK dismisses it")
         }
 
@@ -20139,12 +20142,14 @@ enum SelfTest {
                       duringFlight == (1, 1))
             }
 
-            // A failed attempt is not retried for the same marker.
+            // A failed attempt (here a token Google rejected; an unreachable
+            // Google is the transient case, see AG-9) is not retried for the
+            // same marker.
             do {
                 let fake = AGAutoFake(key: agKey, label: agEmail)
                 let (ac, defaults) = fresh(fake)
                 defaults.set(true, forKey: AntigravityAutoCapture.enabledKey)
-                fake.write { $0.outcome = .failure(.bridge("refresh_unreachable")) }
+                fake.write { $0.outcome = .failure(.bridge("refresh_rejected")) }
                 for _ in 0..<3 { await ac.poll() }
                 check("AG-5 a failed attempt is not retried while the marker is unchanged",
                       fake.read { $0.attempts } == 1 && ac.currentAgyKey == nil)
@@ -20198,7 +20203,27 @@ enum SelfTest {
                 probe.write { $0.markerUnreadableAfterAttempt = true; $0.marker = "m-next" }
                 await pc.poll()
                 await pc.poll()
-                check("AG-9 a failing marker query shows the unavailable sentence", pc.unavailable)
+                check("AG-9 a failing marker query is transient: it leaves unavailable unchanged", !pc.unavailable)
+                // Switching capture off clears the failure sentence.
+                fake.write { $0.outcome = .failure(.bridge("refresh_rejected")); $0.marker = "m-off" }
+                await ac.poll()
+                let shownBeforeOff = ac.message == AccountsCopy.agyRejected
+                await ac.setEnabled(false)
+                check("AG-9 turning capture off clears the failure sentence", shownBeforeOff && ac.message == nil)
+                // Google unreachable is retried on the next check and a success
+                // clears the sentence; a rejection is not retried for the same
+                // marker. Mutation: keep the marker on unreachable.
+                let net = AGAutoFake(key: agKey, label: agEmail)
+                let (nc, _) = fresh(net)
+                net.write { $0.outcome = .failure(.bridge("refresh_unreachable")) }
+                await nc.setEnabled(true)
+                let unreachableShown = nc.message == AccountsCopy.agyUnreachable
+                await nc.poll()
+                let retried = net.read { $0.attempts } == 2
+                net.write { $0.outcome = .success(.init(status: "captured", key: agKey, label: agEmail)) }
+                await nc.poll()
+                check("AG-9 an unreachable Google is retried for the same marker and a success clears the sentence",
+                      unreachableShown && retried && nc.message == nil && nc.currentAgyKey == agKey)
             }
 
             // A login change is seen BEFORE the fetch that follows it: the

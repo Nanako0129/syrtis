@@ -89,8 +89,10 @@ const PROFILES_DIR_NAME: &str = "cursor-profiles";
 /// The default profile's id in statuses and results; not a UUID, so it can
 /// never collide with an added profile's.
 const DEFAULT_PROFILE_ID: &str = "default";
-/// `cleanupFailedProfiles` entry: the appDir in use until this push no
-/// longer passes `check_app_dir`, so nothing in it was cleaned.
+/// `cleanupFailedProfiles` entry: a previous appDir that no longer passes
+/// `check_app_dir` (nothing in it was cleaned) or whose files could not all be
+/// deleted. It is remembered in `STALE_APP_DIRS` and retried by every accepted
+/// push while Syrtis keeps running; after a relaunch it is no longer known.
 const APP_DIR_FAILURE: &str = "appDir";
 /// Bounds the per-sync work one config can ask for.
 const MAX_PROFILES: usize = 32;
@@ -118,7 +120,8 @@ static CONFIG: LazyLock<RwLock<Config>> = LazyLock::new(|| RwLock::new(Config::d
 
 /// Previous appDirs whose files could not be cleaned (refused by
 /// `check_app_dir` now, or a delete failed); every accepted push retries them
-/// until they are clean.
+/// until they are clean, while Syrtis keeps running. Not persisted: after a
+/// relaunch the previous appDir is no longer known and is not retried.
 static STALE_APP_DIRS: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
 
 pub(crate) fn config() -> Config {
@@ -433,7 +436,7 @@ pub(crate) fn set_from_json(raw: &str, home: Option<&Path>) -> Result<serde_json
     // appDir with no earlier one has nothing of ours: no failure. A previous
     // appDir that could not be cleaned is kept in `STALE_APP_DIRS` and tried
     // again by every accepted push until it is clean, so a later push with
-    // the same appDir cannot hide the failure.
+    // the same appDir cannot hide the failure (in this process only).
     {
         let mut stale = STALE_APP_DIRS
             .lock()
@@ -487,8 +490,8 @@ struct Cleanup {
     removed: usize,
     /// What could not be fully cleaned: a profile id (`default` or a UUID)
     /// whose files could not all be deleted, `cursor-profiles` (that parent
-    /// folder could not be read), or `appDir` (the previous appDir was
-    /// refused, so nothing in it was cleaned).
+    /// folder could not be read), or `appDir` (a previous appDir was refused
+    /// or its files could not all be deleted; see `STALE_APP_DIRS`).
     failed: Vec<String>,
 }
 
@@ -1564,8 +1567,8 @@ fn sync_with(
     };
     // Any profile that completed a walk this round holds a current usage file,
     // whether or not its bytes changed (`changed` is bytes, not completion).
-    let walked = outcomes.iter().any(|o| o.stop.state == State::Ok);
-    let cli_present = walked && takeover(&config(), home) == Takeover::Blocked;
+    let completed_walk = outcomes.iter().any(|o| o.stop.state == State::Ok);
+    let cli_present = completed_walk && takeover(&config(), home) == Takeover::Blocked;
     let state = if cli_present {
         State::CliPresent
     } else {

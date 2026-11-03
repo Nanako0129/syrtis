@@ -1711,8 +1711,9 @@ fn invalidate_scan_caches() {
 /// deleted), `cursor-profiles` (the parent folder of the added profiles could
 /// not be read), or `appDir` (a previous appDir that now fails the checks or
 /// whose files could not all be deleted, so files may be left there; every
-/// accepted push retries it until it is clean, and a refused appDir never used
-/// before is not reported). A profile whose root is Cursor's own folder
+/// accepted push retries it until it is clean while Syrtis keeps running, after
+/// a relaunch it is no longer known and is not retried; a refused appDir never
+/// used before is not reported). A profile whose root is Cursor's own folder
 /// (`cursor_default`) or repeats an earlier entry (`duplicate`; same path or
 /// same directory, the first entry wins) is left out and listed by its index
 /// in the pushed list; the default and the other profiles are registered and

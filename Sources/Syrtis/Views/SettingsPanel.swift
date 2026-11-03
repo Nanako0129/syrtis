@@ -1079,7 +1079,7 @@ struct SettingsPanel: View {
             // One alert for every list's refused add: the approved sentence is
             // the title (the system adds the localized OK button).
             .alert(
-                (addRefusal.message ?? "").localized,
+                addRefusal.title.localized,
                 isPresented: Binding(
                     get: { addRefusal.message != nil }, set: { if !$0 { addRefusal.dismiss() } }),
                 actions: {})

@@ -237,11 +237,17 @@ enum ExtraScanRoots {
 @MainActor
 final class AddRefusalAlert: ObservableObject {
     @Published private(set) var message: String?
+    /// The last sentence shown, kept after `dismiss` so the alert's title does
+    /// not turn empty while it animates out.
+    private(set) var title = ""
 
     /// An add's refusal sentence: raises the alert; nil (an accepted add)
     /// leaves things as they are.
     func show(_ sentence: String?) {
-        if let sentence { message = sentence }
+        if let sentence {
+            title = sentence
+            message = sentence
+        }
     }
 
     func dismiss() { message = nil }
