@@ -101,6 +101,13 @@ fn primary_scan_roots(home: &Path) -> Vec<PathBuf> {
     roots
 }
 
+// Reads of the disk by `PrimaryRoots::for_home` on this thread, so a test can
+// show a call reads once, not once per entry.
+#[cfg(test)]
+thread_local! {
+    static FOR_HOME_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// The primary's scan roots under one home, read once. `collides` is the one
 /// rule behind three consumers: the config-dir setter, the Swift pre-check
 /// (through `tb_claude_config_dir_refusals`) and
@@ -120,6 +127,8 @@ pub(crate) struct PrimaryRoots {
 
 impl PrimaryRoots {
     pub(crate) fn for_home(home: &Path) -> Self {
+        #[cfg(test)]
+        FOR_HOME_READS.with(|reads| reads.set(reads.get() + 1));
         Self {
             claude: folded(&home.join(".claude")),
             roots: primary_scan_roots(home),
@@ -153,7 +162,10 @@ pub(crate) fn overlaps(a: &Path, b: &Path) -> bool {
 pub(crate) fn check(input: &[String], home: Option<&Path>) -> (Vec<String>, Vec<(usize, Refusal)>) {
     let mut accepted: Vec<String> = Vec::new();
     let mut refused: Vec<(usize, Refusal)> = Vec::new();
-    let primary = home.map(PrimaryRoots::for_home);
+    // Read the disk only when there is something to judge.
+    let primary = home
+        .filter(|_| !input.is_empty())
+        .map(PrimaryRoots::for_home);
     for (index, raw) in input.iter().enumerate() {
         match refusal(raw, home.zip(primary.as_ref()), &accepted) {
             Ok(dir) => accepted.push(dir),
@@ -350,6 +362,22 @@ mod tests {
             .into_iter()
             .map(|(index, reason)| (index, reason.code()))
             .collect()
+    }
+
+    /// The primary's roots are read from the disk once per call, not once per
+    /// entry: `check` over several entries reads once, over none reads not at
+    /// all. Mutation: build the roots inside the loop.
+    #[test]
+    fn the_primary_roots_are_read_once_per_check() {
+        let tmp = tempfile::tempdir().unwrap();
+        let reads = || FOR_HOME_READS.with(std::cell::Cell::get);
+        let before = reads();
+        let many: Vec<String> = (0..5).map(|i| format!("/x/account-{i}")).collect();
+        check(&many, Some(tmp.path()));
+        assert_eq!(reads() - before, 1, "one read for five entries");
+        let before = reads();
+        check(&[], Some(tmp.path()));
+        assert_eq!(reads() - before, 0, "nothing to judge, nothing read");
     }
 
     /// The cc-mirror roots are the engine's own discovery, so each variant is
