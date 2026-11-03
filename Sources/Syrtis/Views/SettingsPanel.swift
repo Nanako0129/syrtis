@@ -121,6 +121,8 @@ struct SettingsPanel: View {
     /// (`AccountsCopy.refusalSentence`), shown under that Add button until the
     /// next add or remove.
     @State private var claudeAddRefusal: String?
+    /// An Add is asking the core: one at a time.
+    @State private var claudeAdding = false
     /// The core's answer for the stored Claude list, recorded by every apply
     /// (its rule reads the disk, so it is asked off the main thread); a page
     /// that appears before any apply has answered asks once itself.
@@ -1142,6 +1144,7 @@ struct SettingsPanel: View {
                     .font(.caption)
             }
             .buttonStyle(.plain)
+            .disabled(claudeAdding)
             .padding(.horizontal, 10)
             if let line = claudeAddRefusal { hint(line) }
             // Per-client share of the merged result — the raw counts span both
@@ -1161,7 +1164,7 @@ struct SettingsPanel: View {
             }
         }
         .onAppear { refreshMissingClaudeRoots() }
-        .task { await claudeRoots.refresh(claudeExtraRoots) }
+        .task(id: claudeExtraRoots) { await claudeRoots.refresh(claudeExtraRoots) }
     }
 
     /// Extra directories of Pi session-format JSONL files. A headless runner
@@ -1555,9 +1558,11 @@ struct SettingsPanel: View {
         // saved; a refusal shows its sentence under the button and saves
         // nothing.
         let path = url.path
+        claudeAdding = true
         Task {
             let line = await claudeRoots.add(
                 path, current: { claudeExtraRoots }, set: { claudeExtraRoots = $0 })
+            claudeAdding = false
             claudeAddRefusal = line
             if line == nil { commitClaudeExtraRoots() }
         }

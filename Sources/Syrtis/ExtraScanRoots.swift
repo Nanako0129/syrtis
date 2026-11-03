@@ -152,16 +152,8 @@ enum ExtraScanRoots {
     /// setter is full-replace, so `claude` is always present, while `pi` and
     /// `dsh` appear only when non-empty: an absent key already means "no roots
     /// for that client". That also keeps every pre-DSH payload byte-identical.
-    static func payloadJSON(
-        claudeConfigDirs: [String], piRoots: [String], dshRoots: [String]
-    ) -> String {
-        payloadJSON(
-            claudeAccepted: ClaudeExtraRoots.accepted(claudeConfigDirs), piRoots: piRoots, dshRoots: dshRoots)
-    }
-
-    /// The same payload from directories the core already accepted
-    /// (`ClaudeExtraRoots.classify`), for a caller that asked once and reuses
-    /// the answer.
+    /// `claudeAccepted`: the directories the core accepted for the configured
+    /// Claude list (`ClaudeExtraRoots.classify`), asked once by the caller.
     static func payloadJSON(
         claudeAccepted: [String], piRoots: [String], dshRoots: [String]
     ) -> String {

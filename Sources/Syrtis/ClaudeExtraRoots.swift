@@ -57,8 +57,8 @@ enum ClaudeExtraRoots {
     /// allowed. The core owns the
     /// rule; this only asks it, so Swift and the setter cannot disagree.
     ///
-    /// Asked BEFORE either registry's payload is built (`expandedPaths`,
-    /// `configDirsPayloadJSON`): the scan payload is installed by a separate
+    /// Asked BEFORE either registry's payload is built (`classify`,
+    /// `expand(accepted:)`, `configDirsPayloadJSON(accepted:)`): the scan payload is installed by a separate
     /// setter with no such rule, and either registry alone holding `~/.claude`
     /// emptied the primary's window (audit P1, 2026-11-03).
     ///
@@ -104,12 +104,6 @@ enum ClaudeExtraRoots {
         return Classified(refused: refused, accepted: accepted)
     }
 
-    /// The configured directories the core accepts, standardized, in order.
-    /// Both registry payloads are built from this and nothing else.
-    static func accepted(_ configDirs: [String]) -> [String] {
-        classify(configDirs).accepted
-    }
-
     /// The Settings pre-check for adding `path` after `existing`: the core's
     /// reason code, or nil when it would be accepted.
     static func refusal(adding path: String, to existing: [String]) -> String? {
@@ -125,15 +119,9 @@ enum ClaudeExtraRoots {
         return ["\(base)/projects", "\(base)/transcripts"]
     }
 
-    /// Expand and deduplicate the configured dirs into the exact list of scan
-    /// roots the engine walks. Split out so `ExtraScanRoots` can merge this
-    /// list with another client's roots without decoding the encoded payload.
-    /// Refused entries (`refusals`) contribute no root.
-    static func expandedPaths(_ configDirs: [String]) -> [String] {
-        expand(accepted: accepted(configDirs))
-    }
-
-    /// The two scan sub-roots of every accepted directory, deduplicated.
+    /// The two scan sub-roots of every accepted directory (`classify`),
+    /// deduplicated: the exact list of scan roots the engine walks. Refused
+    /// entries contribute no root.
     static func expand(accepted: [String]) -> [String] {
         var seen = Set<String>()
         return accepted.flatMap(expand).filter { seen.insert($0).inserted }
@@ -147,10 +135,6 @@ enum ClaudeExtraRoots {
     /// Claude-only, and kept byte-compatible: `ExtraScanRoots.payloadJSON`
     /// returns this exact string when no Pi or DSH roots are configured, so an
     /// upgrade does not look like a scan-root change.
-    static func payloadJSON(_ configDirs: [String]) -> String {
-        payloadJSON(expanded: expandedPaths(configDirs))
-    }
-
     static func payloadJSON(expanded: [String]) -> String {
         let object = ["claude": expanded]
         let data = (try? JSONEncoder().encode(object)) ?? Data("{}".utf8)
@@ -172,11 +156,8 @@ enum ClaudeExtraRoots {
     /// string: `/x/.claude-work/` and `/x/.claude-work` would read different
     /// items, and only one of them exists.
     ///
-    /// Refused entries (`refusals`) are left out, duplicates among them.
-    static func configDirsPayloadJSON(_ configDirs: [String]) -> String {
-        configDirsPayloadJSON(accepted: accepted(configDirs))
-    }
-
+    /// `accepted` is the core's answer for the configured list (`classify`):
+    /// refused entries are left out, duplicates among them.
     static func configDirsPayloadJSON(accepted: [String]) -> String {
         let data = (try? JSONEncoder().encode(accepted)) ?? Data("[]".utf8)
         return String(data: data, encoding: .utf8) ?? "[]"
@@ -231,7 +212,7 @@ enum ClaudeExtraRoots {
     /// Overridable so a self-test can move the roots DURING a fetch — the
     /// property under test — without writing the real defaults key.
     nonisolated(unsafe) static var appliedProvider: @Sendable () -> String = {
-        UserDefaults.standard.string(forKey: appliedKey) ?? payloadJSON([])
+        UserDefaults.standard.string(forKey: appliedKey) ?? payloadJSON(expanded: [])
     }
 
     static var appliedPayloadJSON: String { appliedProvider() }
@@ -292,7 +273,7 @@ enum ClaudeExtraRoots {
 
     /// Test seam only: back to the pre-apply state.
     static func resetAppliedForTesting() {
-        appliedProvider = { UserDefaults.standard.string(forKey: appliedKey) ?? payloadJSON([]) }
+        appliedProvider = { UserDefaults.standard.string(forKey: appliedKey) ?? payloadJSON(expanded: []) }
         UserDefaults.standard.removeObject(forKey: appliedKey)
     }
 
@@ -314,7 +295,7 @@ enum ClaudeExtraRoots {
 
     /// Overridable for the same reason `appliedProvider` is.
     nonisolated(unsafe) static var appliedConfigDirsProvider: @Sendable () -> String = {
-        UserDefaults.standard.string(forKey: appliedConfigDirsKey) ?? configDirsPayloadJSON([])
+        UserDefaults.standard.string(forKey: appliedConfigDirsKey) ?? configDirsPayloadJSON(accepted: [])
     }
 
     static var appliedConfigDirsJSON: String { appliedConfigDirsProvider() }
@@ -335,7 +316,7 @@ enum ClaudeExtraRoots {
     /// Test seam only: back to the pre-apply state.
     static func resetAppliedConfigDirsForTesting() {
         appliedConfigDirsProvider = {
-            UserDefaults.standard.string(forKey: appliedConfigDirsKey) ?? configDirsPayloadJSON([])
+            UserDefaults.standard.string(forKey: appliedConfigDirsKey) ?? configDirsPayloadJSON(accepted: [])
         }
         UserDefaults.standard.removeObject(forKey: appliedConfigDirsKey)
     }
@@ -365,7 +346,7 @@ enum ClaudeExtraRoots {
     /// The canonical empty-account-list payload, compared against directly
     /// rather than checking the source list for emptiness — the check has to
     /// run on the same encoded string `install` already holds.
-    private static let emptyConfigDirsJSON = configDirsPayloadJSON([])
+    private static let emptyConfigDirsJSON = configDirsPayloadJSON(accepted: [])
 
     /// Test seam only: forget that this process has installed anything.
     @MainActor
@@ -536,6 +517,7 @@ enum ClaudeExtraRoots {
     @MainActor
     static func apply(
         scanPayload: @escaping @Sendable @MainActor ([String]) -> String,
+        setConfigDirs: @escaping @Sendable (String) -> Bool = realSetConfigDirs,
         then completion: (@Sendable @MainActor (ExtraScanPathsResult?) -> Void)? = nil
     ) {
         let previous = applyChain
@@ -546,11 +528,17 @@ enum ClaudeExtraRoots {
             // later save would not be the last registered.
             await previous?.value
             let configDirs = load()
-            let classified = await Task.detached(priority: .userInitiated) { classify(configDirs) }.value
+            // A Pi or DSH apply leaves the Claude list as it was: the recorded
+            // classification of this very list is reused instead of asking the
+            // core again.
+            let model = ClaudeRootsListModel.shared
+            let classified: Classified
+            if model.listed == configDirs {
+                classified = model.classified
+            } else {
+                classified = await Task.detached(priority: .userInitiated) { classify(configDirs) }.value
+            }
             let accepted = classified.accepted
-            // The apply's own classification is what gets registered, so it is
-            // what the Settings marks show.
-            ClaudeRootsListModel.shared.record(configDirs, classified)
             // The core's answer is asked ONCE; both payloads are built from it.
             let json = scanPayload(accepted)
             let configDirsJSON = configDirsPayloadJSON(accepted: accepted)
@@ -564,8 +552,18 @@ enum ClaudeExtraRoots {
                 completion?(lastApplied?.result)
                 return
             }
-            install(json: json, configDirsJSON: configDirsJSON, then: completion)
+            // What gets registered is what the Settings marks show, so the
+            // classification is recorded only once the setter took it; on a
+            // failure the previous marks stay.
+            install(
+                json: json, configDirsJSON: configDirsJSON, setConfigDirs: setConfigDirs,
+                onConfigDirsSet: { ClaudeRootsListModel.shared.record(configDirs, classified) },
+                then: completion)
         }
+    }
+
+    private static let realSetConfigDirs: @Sendable (String) -> Bool = {
+        (try? TBCore.setClaudeConfigDirs(json: $0)) != nil
     }
 
     /// The tail of the applies in flight; see `apply`.
@@ -582,9 +580,8 @@ enum ClaudeExtraRoots {
     private static func install(
         json: String,
         configDirsJSON: String,
-        setConfigDirs: @escaping @Sendable (String) -> Void = {
-            _ = try? TBCore.setClaudeConfigDirs(json: $0)
-        },
+        setConfigDirs: @escaping @Sendable (String) -> Bool = realSetConfigDirs,
+        onConfigDirsSet: (@Sendable @MainActor () -> Void)? = nil,
         setScanPaths: @escaping @Sendable (String) -> ExtraScanPathsResult? = {
             try? TBCore.setExtraScanPaths(json: $0)
         },
@@ -596,7 +593,8 @@ enum ClaudeExtraRoots {
             // and separate registry from the scan roots below: this one decides
             // whose credential each Claude card is fetched with, and a failure
             // in either must not stop the other from being installed.
-            setConfigDirs(configDirsJSON)
+            let configDirsSet = setConfigDirs(configDirsJSON)
+            if configDirsSet { Task { @MainActor in onConfigDirsSet?() } }
             // Wake the quota side HERE, between the two setters, not after
             // both.
             //
@@ -731,20 +729,19 @@ enum ClaudeExtraRoots {
     ) {
         install(
             json: json, configDirsJSON: configDirsJSON,
-            setConfigDirs: setConfigDirs, setScanPaths: setScanPaths,
+            setConfigDirs: { setConfigDirs($0); return true }, setScanPaths: setScanPaths,
             then: completion, quotaSideDone: quotaSideDone)
     }
 }
 
 /// What the Settings list of Claude config dirs shows: the core's answer for
 /// the stored list, which depends on disk state (`~/.cc-mirror`), kept as view
-/// state. The source of truth is `ClaudeExtraRoots.apply`: every apply asks the
-/// core once, off the main thread, registers what it accepts and records that
-/// same classification here (`record`), so the marks always describe what was
-/// registered. `refresh` asks only for a page that appears before any apply
-/// has answered for its list. `listed` names the list `classified` answers
-/// for, so a render between an edit and its answer shows no marks and no count
-/// rather than another list's.
+/// state. `ClaudeExtraRoots.apply` records its own classification here once the
+/// setter took it (`record`), so the marks describe what was registered; the
+/// page asks again (`refresh`) each time it appears or the list changes, and an
+/// apply's answer wins over an older refresh. `listed` names the list
+/// `classified` answers for, so a render between an edit and its answer shows
+/// no marks and no count rather than another list's.
 @MainActor
 final class ClaudeRootsListModel: ObservableObject {
     static let shared = ClaudeRootsListModel()
@@ -773,31 +770,35 @@ final class ClaudeRootsListModel: ObservableObject {
         listed == list ? ClaudeExtraRoots.expand(accepted: classified.accepted).count : nil
     }
 
-    /// Ask the core about `list` unless an answer for it is already here.
+    /// Ask the core about `list`, unless an apply answers first.
     func refresh(_ list: [String]) async {
-        guard listed != list else { return }
         let asked = epoch
         let answer = await Task.detached(priority: .userInitiated) { ClaudeExtraRoots.classify(list) }.value
         guard asked == epoch, !Task.isCancelled else { return }
         record(list, answer)
     }
 
-    /// The Add click: `path` against the list as it is now, the core asked once
-    /// and off the main thread. Returns the refusal sentence, or nil once the
-    /// path is in the list. The list is read again AFTER the ask and the path
-    /// appended to that, so a remove or another add that happened meanwhile
-    /// is kept.
+    /// The Add click, one at a time (the view disables the button while this
+    /// runs). The core is asked off the main thread against the list as it is;
+    /// the path is appended only if the list is unchanged since that ask began.
+    /// If it changed, the core is asked once more against the current list, and
+    /// if it changed again the add gives up with the fixed `unavailable`
+    /// sentence. Returns the refusal sentence, or nil once the path is in.
     func add(
         _ path: String, current: @MainActor () -> [String], set: @MainActor ([String]) -> Void
     ) async -> String? {
-        let snapshot = current()
-        let code = await Task.detached(priority: .userInitiated) {
-            ClaudeExtraRoots.refusal(adding: path, to: snapshot)
-        }.value
-        if let code { return AccountsCopy.refusalSentence(code) }
-        let now = current()
-        if !now.contains(path) { set(now + [path]) }
-        return nil
+        for _ in 0..<2 {
+            let snapshot = current()
+            let code = await Task.detached(priority: .userInitiated) {
+                ClaudeExtraRoots.refusal(adding: path, to: snapshot)
+            }.value
+            if let code { return AccountsCopy.refusalSentence(code) }
+            if current() == snapshot {
+                set(snapshot + [path])
+                return nil
+            }
+        }
+        return AccountsCopy.refusalSentence("unavailable")
     }
 
     /// Test seam only: no answer.
