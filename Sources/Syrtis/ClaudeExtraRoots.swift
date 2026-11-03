@@ -68,7 +68,8 @@ enum ClaudeExtraRoots {
     /// (`unavailable`), so no extra account is installed rather than one that
     /// might be the primary's own folder.
     static func refusals(_ configDirs: [String]) -> [Int: String] {
-        // An empty list has nothing to refuse; the core would still read the disk.
+        // An empty list has nothing to refuse. The core reads nothing for it
+        // either; this only saves the FFI hop.
         guard !configDirs.isEmpty else { return [:] }
         let standardized = configDirs.map { ($0 as NSString).standardizingPath }
         let json = (try? JSONEncoder().encode(standardized)).flatMap { String(data: $0, encoding: .utf8) }
@@ -545,9 +546,11 @@ enum ClaudeExtraRoots {
             // later save would not be the last registered.
             await previous?.value
             let configDirs = load()
-            let accepted = await Task.detached(priority: .userInitiated) {
-                classify(configDirs).accepted
-            }.value
+            let classified = await Task.detached(priority: .userInitiated) { classify(configDirs) }.value
+            let accepted = classified.accepted
+            // The apply's own classification is what gets registered, so it is
+            // what the Settings marks show.
+            ClaudeRootsListModel.shared.record(configDirs, classified)
             // The core's answer is asked ONCE; both payloads are built from it.
             let json = scanPayload(accepted)
             let configDirsJSON = configDirsPayloadJSON(accepted: accepted)
@@ -733,41 +736,74 @@ enum ClaudeExtraRoots {
     }
 }
 
-/// What the Settings list of Claude config dirs shows, asked of the core off
-/// the main thread (its rule reads the disk) and kept as view state: one ask
-/// when the page appears and one each time the stored list changes, never one
-/// per render. `listed` names the list `classified` answers for, so a render
-/// between an edit and its answer shows no marks rather than another list's.
+/// What the Settings list of Claude config dirs shows: the core's answer for
+/// the stored list, which depends on disk state (`~/.cc-mirror`), kept as view
+/// state. The source of truth is `ClaudeExtraRoots.apply`: every apply asks the
+/// core once, off the main thread, registers what it accepts and records that
+/// same classification here (`record`), so the marks always describe what was
+/// registered. `refresh` asks only for a page that appears before any apply
+/// has answered for its list. `listed` names the list `classified` answers
+/// for, so a render between an edit and its answer shows no marks and no count
+/// rather than another list's.
 @MainActor
 final class ClaudeRootsListModel: ObservableObject {
+    static let shared = ClaudeRootsListModel()
+
     @Published private(set) var classified = ClaudeExtraRoots.Classified(refused: [:], accepted: [])
     @Published private(set) var listed: [String]?
+    /// Bumped by every `record`, so a `refresh` that was asked before it is
+    /// discarded instead of overwriting a newer answer.
+    private var epoch = 0
+
+    /// An apply's classification of `list`.
+    func record(_ list: [String], _ answer: ClaudeExtraRoots.Classified) {
+        epoch &+= 1
+        classified = answer
+        listed = list
+    }
 
     /// The refusals for `list`, or none until its answer has arrived.
     func refused(for list: [String]) -> [Int: String] {
         listed == list ? classified.refused : [:]
     }
 
-    /// How many scan roots `list` expands to, once its answer has arrived.
-    func expandedCount(for list: [String]) -> Int {
-        listed == list ? ClaudeExtraRoots.expand(accepted: classified.accepted).count : list.count * 2
+    /// How many scan roots `list` expands to; nil until its answer has arrived,
+    /// so no count is guessed.
+    func expandedCount(for list: [String]) -> Int? {
+        listed == list ? ClaudeExtraRoots.expand(accepted: classified.accepted).count : nil
     }
 
-    /// Ask the core about `list` (once) and keep the answer, unless this ask
-    /// was cancelled by a newer list.
+    /// Ask the core about `list` unless an answer for it is already here.
     func refresh(_ list: [String]) async {
+        guard listed != list else { return }
+        let asked = epoch
         let answer = await Task.detached(priority: .userInitiated) { ClaudeExtraRoots.classify(list) }.value
-        guard !Task.isCancelled else { return }
-        classified = answer
-        listed = list
+        guard asked == epoch, !Task.isCancelled else { return }
+        record(list, answer)
     }
 
-    /// The Add click: `path` against `list`, the core asked once and off the
-    /// main thread.
-    func adding(_ path: String, to list: [String]) async -> ExtraScanRoots.AddOutcome {
+    /// The Add click: `path` against the list as it is now, the core asked once
+    /// and off the main thread. Returns the refusal sentence, or nil once the
+    /// path is in the list. The list is read again AFTER the ask and the path
+    /// appended to that, so a remove or another add that happened meanwhile
+    /// is kept.
+    func add(
+        _ path: String, current: @MainActor () -> [String], set: @MainActor ([String]) -> Void
+    ) async -> String? {
+        let snapshot = current()
         let code = await Task.detached(priority: .userInitiated) {
-            ClaudeExtraRoots.refusal(adding: path, to: list)
+            ClaudeExtraRoots.refusal(adding: path, to: snapshot)
         }.value
-        return ExtraScanRoots.add(path, to: list, refusal: { _, _ in code })
+        if let code { return AccountsCopy.refusalSentence(code) }
+        let now = current()
+        if !now.contains(path) { set(now + [path]) }
+        return nil
+    }
+
+    /// Test seam only: no answer.
+    func resetForTesting() {
+        epoch &+= 1
+        classified = ClaudeExtraRoots.Classified(refused: [:], accepted: [])
+        listed = nil
     }
 }

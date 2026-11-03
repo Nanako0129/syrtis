@@ -17272,18 +17272,18 @@ enum SelfTest {
 
         // The production path: what `apply` hands to the core. Persist through
         // `Dsh.save` into a scratch suite and read the payload back from
-        // `currentPayload`, the function `apply` uses.
+        // `currentPayload(claudeAccepted:dshDefaults:)`, the function `apply` uses.
         let dshSuite = "tokenbar.selftest.dsh.\(UUID().uuidString)"
         if let d = UserDefaults(suiteName: dshSuite) {
             defer { d.removePersistentDomain(forName: dshSuite) }
             ExtraScanRoots.Dsh.save([dshRoot, "\(dshRoot)/"], defaults: d)
             let applied = try! JSONDecoder().decode(
                 [String: [String]].self,
-                from: Data(ExtraScanRoots.currentPayload(dshDefaults: d).utf8))
+                from: Data(ExtraScanRoots.currentPayload(claudeAccepted: [], dshDefaults: d).utf8))
             expect(
                 applied["dsh"] == [dshRoot],
                 "DSH-ROOTS the saved DSH folders reach ExtraScanRoots.currentPayload, the only "
-                    + "payload provider apply() passes to the core (mutation: currentPayload "
+                    + "payload provider apply() passes to the core (mutation: that overload "
                     + "building with dshRoots: [])")
         } else {
             expect(false, "DSH-ROOTS could not create the scratch UserDefaults suite, so the apply-path check did not run")
@@ -17607,17 +17607,22 @@ enum SelfTest {
 
         // Each production entry asks the core's rule (which reads the disk)
         // once: `ExtraScanRoots.apply`, the entry launch and every save go
-        // through, builds both registry payloads from one answer; the Settings
-        // model the view reads (`ClaudeRootsListModel`) asks once to refresh and
-        // once for an Add click. Mutations: the scan payload built with
-        // `currentPayload()` instead of from the apply's answer (asks twice);
-        // `refresh` or `adding` asking twice.
+        // through, builds both registry payloads from one answer and records
+        // that same classification for the Settings marks
+        // (`ClaudeRootsListModel.shared`); the model then needs no ask of its
+        // own for that list, asks once for an unanswered one, and once for an
+        // Add click. The marks follow the latest apply, not an earlier answer,
+        // because the rule depends on disk state. Mutations: the scan payload
+        // built with `currentPayload()` instead of from the apply's answer
+        // (asks twice); apply not recording; `refresh` or `add` asking twice.
         let asks: [Int]? = awaitMainActorValue {
             let calls = UncheckedBox<Int>(0)
             let real = ClaudeExtraRoots.coreRefusals
             ClaudeExtraRoots.coreRefusals = { calls.value += 1; return try real($0) }
             let defaults = UserDefaults.standard
             let savedList = defaults.object(forKey: ClaudeExtraRoots.storageKey)
+            let model = ClaudeRootsListModel.shared
+            model.resetForTesting()
             let dirs = ["/tmp/syrtis-selftest-accounts/a", home, "/tmp/syrtis-selftest-accounts/b"]
             let applyAndWait = {
                 await withCheckedContinuation { (done: CheckedContinuation<Void, Never>) in
@@ -17627,28 +17632,74 @@ enum SelfTest {
             ClaudeExtraRoots.save(dirs)
             await applyAndWait()
             let applyCalls = calls.value
+            let marked = model.refused(for: dirs)[1] == "home_directory" && model.expandedCount(for: dirs) == 4
+            // The apply answered for this list: the page appearing asks nothing.
             calls.value = 0
-            let model = ClaudeRootsListModel()
+            await model.refresh(dirs)
+            let afterApply = calls.value
+            // An unanswered list: one ask.
+            model.resetForTesting()
+            calls.value = 0
             await model.refresh(dirs)
             let refreshCalls = calls.value
-            let refusedHome = model.refused(for: dirs)[1] == "home_directory"
+            let noGuess = model.expandedCount(for: dirs + ["/tmp/syrtis-selftest-accounts/c"]) == nil
+            // The rule follows disk state: the second apply's answer replaces the first's.
+            ClaudeExtraRoots.coreRefusals = { _ in
+                try JSONDecoder().decode(
+                    [RejectedConfigDir].self, from: Data(#"[{"index":0,"reason":"primary_scan_root"}]"#.utf8))
+            }
+            ClaudeExtraRoots.save(["/tmp/syrtis-selftest-accounts/d"])
+            await applyAndWait()
+            let follows = model.refused(for: ["/tmp/syrtis-selftest-accounts/d"]) == [0: "primary_scan_root"]
+                && model.expandedCount(for: ["/tmp/syrtis-selftest-accounts/d"]) == 0
+            ClaudeExtraRoots.coreRefusals = { calls.value += 1; return try real($0) }
+            // An Add click asks once and the path lands.
+            let box = UncheckedBox<[String]>(dirs)
             calls.value = 0
-            let added = await model.adding("/tmp/syrtis-selftest-accounts/c", to: dirs)
+            let added = await model.add(
+                "/tmp/syrtis-selftest-accounts/c", current: { box.value }, set: { box.value = $0 })
             let addCalls = calls.value
-            let refusedAdd = await model.adding(home, to: dirs)
-            // Put the process back: no extra accounts in the core, the real rule,
-            // the user's stored list.
+            let landed = box.value == dirs + ["/tmp/syrtis-selftest-accounts/c"]
+            let refusedAdd = await model.add(home, current: { box.value }, set: { box.value = $0 })
+            // A refused add changes nothing.
+            let refusedKept = box.value == dirs + ["/tmp/syrtis-selftest-accounts/c"]
+            // A remove during the awaited ask is kept, and two overlapping adds
+            // both land (the list is read again after the ask). Mutation:
+            // appending to the list as it was before the ask.
+            ClaudeExtraRoots.coreRefusals = { json in Thread.sleep(forTimeInterval: 0.15); return try real(json) }
+            let x = "/tmp/syrtis-selftest-accounts/x", y = "/tmp/syrtis-selftest-accounts/y"
+            let shared = UncheckedBox<[String]>([dirs[0], dirs[2]])
+            let slow = Task { @MainActor in
+                await model.add(x, current: { shared.value }, set: { shared.value = $0 })
+            }
+            try? await Task.sleep(nanoseconds: 50_000_000)
+            shared.value = [dirs[0]]  // the user removes dirs[2] meanwhile
+            _ = await slow.value
+            let removeKept = shared.value == [dirs[0], x]
+            shared.value = [dirs[0]]
+            let first = Task { @MainActor in
+                await model.add(x, current: { shared.value }, set: { shared.value = $0 })
+            }
+            let second = Task { @MainActor in
+                await model.add(y, current: { shared.value }, set: { shared.value = $0 })
+            }
+            _ = await (first.value, second.value)
+            let bothLanded = Set(shared.value) == [dirs[0], x, y] && shared.value.count == 3
+            // Put the process back: no extra accounts in the core, the real
+            // rule, the user's stored list, no stale answer.
+            ClaudeExtraRoots.coreRefusals = real
             ClaudeExtraRoots.save([])
             await applyAndWait()
-            ClaudeExtraRoots.coreRefusals = real
+            model.resetForTesting()
             if let savedList { defaults.set(savedList, forKey: ClaudeExtraRoots.storageKey) }
             else { defaults.removeObject(forKey: ClaudeExtraRoots.storageKey) }
             ClaudeExtraRoots.resetAppliedForTesting()
-            return [applyCalls, refreshCalls, addCalls, refusedHome ? 1 : 0,
-                    added.refusalLine == nil ? 1 : 0, refusedAdd.refusalLine == AccountsCopy.refusalSentence("home_directory") ? 1 : 0]
+            let flags = [marked, noGuess, follows, landed, refusedKept, removeKept, bothLanded,
+                         refusedAdd == AccountsCopy.refusalSentence("home_directory")]
+            return [applyCalls, afterApply, refreshCalls, addCalls] + flags.map { $0 ? 1 : 0 }
         }
-        expect(asks == [1, 1, 1, 1, 1, 1],
-               "ACCOUNTS-PAGE apply and the Settings model each ask the core's rule once and reuse the answer (apply, refresh, add, then answers); got \(String(describing: asks))")
+        expect(asks == [1, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+               "ACCOUNTS-PAGE apply asks the core's rule once and records its answer for the marks, refresh asks once only for an unanswered list, an Add click asks once, a remove during the ask is kept and overlapping adds both land; got \(String(describing: asks))")
 
         // MA-42: a Remove button is named by the row's whole label, so two rows
         // sharing a last path component never share a name. Mutation: the last

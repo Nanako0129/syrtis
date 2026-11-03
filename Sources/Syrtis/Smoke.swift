@@ -97,9 +97,9 @@ enum Smoke {
             // The payload already leaves out what the core refuses, so the
             // setter must accept all of it; a refusal here means Swift and
             // the core disagree about the rule.
-            let accepted = ClaudeExtraRoots.accepted(configDirs)
+            let accepted = ClaudeExtraRoots.classify(configDirs).accepted
             let result = try TBCore.setClaudeConfigDirs(
-                json: ClaudeExtraRoots.configDirsPayloadJSON(configDirs))
+                json: ClaudeExtraRoots.configDirsPayloadJSON(accepted: accepted))
             guard result.registeredCount == accepted.count, result.rejected.isEmpty else {
                 throw TBCoreError.bridge(
                     "sent \(accepted.count) but registered \(result.registeredCount) "

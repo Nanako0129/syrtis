@@ -214,16 +214,10 @@ enum ExtraScanRoots {
         ClaudeExtraRoots.apply(scanPayload: { currentPayload(claudeAccepted: $0) }, then: completion)
     }
 
-    /// The payload `apply` hands to the core, built from the persisted lists.
+    /// The payload `apply` hands to the core: the persisted Pi and DSH lists
+    /// and the Claude directories the core already accepted for this apply.
     /// A separate function so SelfTest observes the production path;
     /// `dshDefaults` is only for a scratch suite.
-    static func currentPayload(dshDefaults: UserDefaults = .standard) -> String {
-        payloadJSON(
-            claudeConfigDirs: ClaudeExtraRoots.load(),
-            piRoots: Pi.load(), dshRoots: Dsh.load(defaults: dshDefaults))
-    }
-
-    /// `currentPayload` from the directories the core already accepted.
     static func currentPayload(
         claudeAccepted: [String], dshDefaults: UserDefaults = .standard
     ) -> String {

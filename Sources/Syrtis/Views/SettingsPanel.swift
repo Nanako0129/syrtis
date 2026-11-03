@@ -121,9 +121,10 @@ struct SettingsPanel: View {
     /// (`AccountsCopy.refusalSentence`), shown under that Add button until the
     /// next add or remove.
     @State private var claudeAddRefusal: String?
-    /// The core's answer for the stored Claude list, asked off the main thread
-    /// (its rule reads the disk) when the page appears and when the list changes.
-    @StateObject private var claudeRoots = ClaudeRootsListModel()
+    /// The core's answer for the stored Claude list, recorded by every apply
+    /// (its rule reads the disk, so it is asked off the main thread); a page
+    /// that appears before any apply has answered asks once itself.
+    @ObservedObject private var claudeRoots = ClaudeRootsListModel.shared
     @State private var piAddRefusal: String?
     @State private var dshAddRefusal: String?
     /// Filled off the main actor — see `ClaudeExtraRoots.missingRoots`. Empty
@@ -1145,9 +1146,11 @@ struct SettingsPanel: View {
             if let line = claudeAddRefusal { hint(line) }
             // Per-client share of the merged result — the raw counts span both
             // clients' roots. See `ExtraScanRoots.clientHint`.
-            let claudeHint = ExtraScanRoots.clientHint(
-                claudeExtraRootsResult, client: "claude",
-                requested: claudeRoots.expandedCount(for: claudeExtraRoots))
+            // No hint until the core has answered for this list: a guessed
+            // count would show a wrong "of N registered".
+            let claudeHint = claudeRoots.expandedCount(for: claudeExtraRoots).flatMap {
+                ExtraScanRoots.clientHint(claudeExtraRootsResult, client: "claude", requested: $0)
+            }
             if let claudeHint, claudeHint.unreadable > 0 {
                 hint(AccountsCopy.unreadableFolders.localized(
                     claudeHint.unreadable, claudeHint.registered))
@@ -1158,7 +1161,7 @@ struct SettingsPanel: View {
             }
         }
         .onAppear { refreshMissingClaudeRoots() }
-        .task(id: claudeExtraRoots) { await claudeRoots.refresh(claudeExtraRoots) }
+        .task { await claudeRoots.refresh(claudeExtraRoots) }
     }
 
     /// Extra directories of Pi session-format JSONL files. A headless runner
@@ -1553,11 +1556,10 @@ struct SettingsPanel: View {
         // nothing.
         let path = url.path
         Task {
-            let outcome = await claudeRoots.adding(path, to: claudeExtraRoots)
-            claudeAddRefusal = outcome.refusalLine
-            guard outcome.refusalLine == nil else { return }
-            claudeExtraRoots = outcome.list
-            commitClaudeExtraRoots()
+            let line = await claudeRoots.add(
+                path, current: { claudeExtraRoots }, set: { claudeExtraRoots = $0 })
+            claudeAddRefusal = line
+            if line == nil { commitClaudeExtraRoots() }
         }
     }
 
