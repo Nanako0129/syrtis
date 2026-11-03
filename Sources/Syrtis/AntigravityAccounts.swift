@@ -285,8 +285,14 @@ final class AntigravityAutoCapture: ObservableObject {
     /// login change cannot be detected.
     @Published private(set) var unavailable = false
     /// A sentence from `AntigravityAccounts.message(for:)` for the last manual
-    /// Capture or Remove that failed; never a raw code.
-    @Published private(set) var message: String?
+    /// Capture or Remove that failed, or automatic attempt that failed; never a
+    /// raw code.
+    @Published private(set) var message: String? {
+        didSet { autoMessage = false }
+    }
+    /// The current `message` came from an automatic attempt (set right after
+    /// the assignment that resets it).
+    private var autoMessage = false
 
     init(io: IO, defaults: UserDefaults) {
         self.io = io
@@ -337,13 +343,15 @@ final class AntigravityAutoCapture: ObservableObject {
         currentAgyKey = nil
         lastAttemptedMarker = marker
         let removed = AntigravityAccounts.removedKeys(defaults: defaults)
-        message = nil
         let result = await Self.detached { Result { try io.autoCapture(removed) } }
         switch result {
         case let .success(outcome):
             guard let key = outcome.key, let label = outcome.label,
                   outcome.status == "captured" || outcome.status == "unchanged"
             else { break }
+            // Only a success clears an automatic failure's sentence: a repeated
+            // failure (Google unreachable, retried every check) keeps it steady.
+            message = nil
             AntigravityAccounts.mutate(defaults: defaults, install: io.install) { accounts in
                 // `unchanged` keeps a label already listed; only a fresh
                 // capture refreshes it.
@@ -378,8 +386,10 @@ final class AntigravityAutoCapture: ObservableObject {
             // Shown the way a manual Capture's failure is, with the same fixed
             // sentences; "agy is not signed in" is a normal state, not a failure.
             if case TBCoreError.bridge("not_signed_in") = error {
+                message = nil
             } else {
                 message = AntigravityAccounts.message(for: error)
+                autoMessage = true
             }
             // Google could not be reached: transient, so the next check retries
             // this marker and a success clears the sentence. Every other failure
@@ -485,7 +495,9 @@ final class AntigravityAutoCapture: ObservableObject {
             await poll()
         } else {
             unavailable = false
-            message = nil
+            // Only the sentence of an automatic attempt goes: `message` also
+            // carries a manual Capture's or Remove's failure.
+            if autoMessage { message = nil }
         }
     }
 

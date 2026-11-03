@@ -20172,10 +20172,14 @@ enum SelfTest {
             }
 
             // A failed automatic attempt is shown with the same fixed sentence a
-            // manual Capture shows, cleared by the next attempt; agy being signed
-            // out is not a failure; a failing marker query shows the existing
-            // "unavailable" sentence. Mutations: swallow the failure; leave the
-            // unreadable marker silent.
+            // manual Capture shows, kept steady by repeated failures and cleared
+            // by a success or by agy being signed out (not a failure); a failed
+            // marker query is transient and leaves `unavailable` as it was;
+            // turning capture off clears an automatic sentence but not a manual
+            // one; an unreachable Google is retried for the same marker, a
+            // rejected token is not. Mutations: swallow the failure; a failed
+            // query marks or clears `unavailable`; capture off keeps or always
+            // clears the sentence; the marker kept on unreachable.
             do {
                 let fake = AGAutoFake(key: agKey, label: agEmail)
                 let (ac, defaults) = fresh(fake)
@@ -20204,12 +20208,38 @@ enum SelfTest {
                 await pc.poll()
                 await pc.poll()
                 check("AG-9 a failing marker query is transient: it leaves unavailable unchanged", !pc.unavailable)
+                // Control: once a "present" marker made it true, a failing query
+                // leaves it true.
+                let held = AGAutoFake(key: agKey, label: agEmail)
+                let (hc, _) = fresh(held)
+                held.write { $0.marker = "present"; $0.markerUnreadableAfterAttempt = true }
+                await hc.setEnabled(true)
+                let wasUnavailable = hc.unavailable
+                await hc.poll()
+                check("AG-9 a failing marker query leaves unavailable true when it was true",
+                      wasUnavailable && hc.unavailable)
                 // Switching capture off clears the failure sentence.
                 fake.write { $0.outcome = .failure(.bridge("refresh_rejected")); $0.marker = "m-off" }
                 await ac.poll()
                 let shownBeforeOff = ac.message == AccountsCopy.agyRejected
+                // A rejected token is not retried for the same marker, and a
+                // repeated failure leaves the sentence as it was.
+                let attemptsBefore = fake.read { $0.attempts }
+                await ac.poll()
+                let notRetried = fake.read { $0.attempts } == attemptsBefore
+                    && ac.message == AccountsCopy.agyRejected
                 await ac.setEnabled(false)
-                check("AG-9 turning capture off clears the failure sentence", shownBeforeOff && ac.message == nil)
+                check("AG-9 turning capture off clears the failure sentence; a rejected token is not retried",
+                      shownBeforeOff && notRetried && ac.message == nil)
+                // A manual failure's sentence survives turning capture off.
+                let manual = AGAutoFake(key: agKey, label: agEmail)
+                let (mc, _) = fresh(manual)
+                manual.write { $0.captureOutcome = .failure(.bridge("agy_not_signed_in")) }
+                await mc.manualCapture()
+                let manualShown = mc.message == AccountsCopy.agyNotSignedIn
+                await mc.setEnabled(false)
+                check("AG-9 a manual failure's sentence survives turning capture off",
+                      manualShown && mc.message == AccountsCopy.agyNotSignedIn)
                 // Google unreachable is retried on the next check and a success
                 // clears the sentence; a rejection is not retried for the same
                 // marker. Mutation: keep the marker on unreachable.

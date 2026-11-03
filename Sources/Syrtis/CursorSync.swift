@@ -208,16 +208,20 @@ enum CursorSync {
         static let cleanupFailed = "Cursor sync is off, but some downloaded usage couldn't be deleted. Restart Syrtis to retry."
         /// Approved copy (`multi-account-mac-copy-draft.md`, section 7). Shown
         /// while stale downloaded usage is known to remain. When each cleanup
-        /// runs again: the orphan cleanup of an on push (a removed profile's
-        /// dir, an earlier appDir) runs on the next accepted on push (an earlier appDir is retried by each one while Syrtis keeps running, not after a relaunch), at
-        /// launch or after any Cursor setting changes, and the line clears
-        /// when that push reports no failure. A duplicate profile's old
-        /// account file is dropped in every round in which that profile is
-        /// still a duplicate, and a successful walk drops its profile's other
-        /// usage files; in any other state (not signed in, expired, an error)
-        /// nothing retries it, so the line stays until a round shows that
-        /// profile `duplicate` or `ok` without a failure, or the profile is
-        /// removed (`staleAfter`).
+        /// runs again:
+        /// - The orphan cleanup of an on push (a removed profile's dir, an
+        ///   earlier appDir) runs on the next accepted on push, after any
+        ///   Cursor setting changes or at launch, and the line clears when
+        ///   that push reports no failure.
+        /// - An earlier appDir is retried by each accepted push only while
+        ///   Syrtis keeps running; after a relaunch it is no longer known and
+        ///   is not retried.
+        /// - A duplicate profile's old account file is dropped in every round
+        ///   in which that profile is still a duplicate, and a successful walk
+        ///   drops its profile's other usage files; in any other state (not
+        ///   signed in, expired, an error) nothing retries it, so the line
+        ///   stays until a round shows that profile `duplicate` or `ok`
+        ///   without a failure, or the profile is removed (`staleAfter`).
         static let staleCleanupFailed = "Some downloaded Cursor usage that is no longer needed couldn't be deleted. Syrtis will try again."
         /// The core refused the settings (`tb_set_cursor_sync` error): nothing syncs.
         static let configRejected = "Cursor sync couldn't be set up, so nothing is being synced."
