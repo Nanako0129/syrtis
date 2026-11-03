@@ -1328,15 +1328,20 @@ pub unsafe extern "C" fn tb_set_claude_config_dirs(json: *const c_char) -> *mut 
 /// Success data is `{"rejected":[{"index":i,"reason":"<code>"}]}`. The codes:
 /// `empty_path`, `not_absolute`, `filesystem_root`, `home_unknown`,
 /// `home_directory`, `primary_scan_root` (`~/.claude` or an ancestor of it, or
-/// equals, contains or sits inside `~/.claude/projects`, `~/.claude/transcripts`
-/// or Claude Desktop's
-/// `~/Library/Application Support/Claude/local-agent-mode-sessions`; a folder
-/// in `~/.claude` outside those is allowed; compared without case),
+/// equals, contains or sits inside `~/.claude/projects`, `~/.claude/transcripts`,
+/// Claude Desktop's
+/// `~/Library/Application Support/Claude/local-agent-mode-sessions`, or a
+/// default-layout `~/.cc-mirror/<variant>/config/projects` the engine scans:
+/// a variant with no readable `variant.json` is not scanned, and one whose
+/// `configDir` names a folder elsewhere is scanned there and that folder is
+/// allowed; a folder in `~/.claude` outside those is allowed; compared without
+/// case),
 /// `duplicate`, `overlap` (contains or sits inside an earlier
 /// accepted entry) and `limit_reached` (more than 8). Earlier entries win.
 /// Swift runs this before building either registry's payload, so a refused
-/// directory reaches neither. Malformed input is the error
-/// `invalid_config_dirs_json`.
+/// directory reaches neither. It reads the disk (`~/.cc-mirror`, each
+/// `variant.json`, the Cowork tree): call it off the main thread. Malformed
+/// input is the error `invalid_config_dirs_json`.
 ///
 /// # Safety
 /// `json` must be NULL or a valid NUL-terminated UTF-8 string.
@@ -1395,7 +1400,8 @@ pub unsafe extern "C" fn tb_set_antigravity_binding(json: *const c_char) -> *mut
 /// agy's item once through `/usr/bin/security` and never writes it; proves the
 /// token with one refresh at Google using the client named by its `aud`, and
 /// writes only when that response carries an `id_token` with agy's stored `sub`
-/// (otherwise `account_mismatch`).
+/// (`account_mismatch` when it names another account,
+/// `invalid_credential_format` when there is no usable `id_token`).
 /// Success data is `{"key":"<64 hex>","label":"<email or fallback>"}`. The
 /// error text is exactly one fixed code: `agy_not_signed_in`,
 /// `agy_login_unreadable`, `agy_login_missing_identity`,
@@ -1443,7 +1449,8 @@ pub extern "C" fn tb_antigravity_login_marker() -> *mut c_char {
 /// `{"status":"skipped_removed"}`. `unchanged` means Syrtis's own item already
 /// holds this refresh token: nothing was scanned, requested or written.
 /// `captured` requires Google's refresh response to carry an `id_token` with
-/// the stored `sub`. The error is one fixed code: the `tb_antigravity_capture`
+/// the stored `sub` (`account_mismatch` for another account's,
+/// `invalid_credential_format` when there is none). The error is one fixed code: the `tb_antigravity_capture`
 /// codes (except `agy_not_signed_in`), plus `not_signed_in` (agy has no
 /// login), `paused` (agy's item read ended any other way, e.g. a cancelled
 /// Keychain dialog or a timeout) and `invalid_removed_keys`. Blocking
@@ -1696,12 +1703,18 @@ fn invalidate_scan_caches() {
 /// before it is cleaned. Success data is
 /// `{"enabled","appDir":str|null,"profiles":[{"id","dir"}],
 /// "cliTakeoverConfirmed","removedFiles":N,"cleanupFailed":bool,
-/// "cleanupFailedProfiles":[id]}`, each id one of `default` / `<UUID>` (that
-/// profile's files could not all be deleted), `cursor-profiles` (the parent
-/// folder of the added profiles could not be read), or `appDir` (the appDir
-/// in use until this push now fails the checks, so files may be left there;
-/// a refused appDir never used before is not reported). Other invalid
-/// input is an error and leaves the registry unchanged. Invalidates the scan caches, since the
+/// "cleanupFailedProfiles":[id],"rejectedProfiles":[{"index","reason"}]}`, each
+/// id one of `default` / `<UUID>` (that profile's files could not all be
+/// deleted), `cursor-profiles` (the parent folder of the added profiles could
+/// not be read), or `appDir` (the appDir in use until this push now fails the
+/// checks, so files may be left there; a refused appDir never used before is
+/// not reported). A profile whose root is Cursor's own folder
+/// (`cursor_default`) or repeats an earlier entry (`duplicate`; same path or
+/// same directory, the first entry wins) is left out and listed by its index
+/// in the pushed list; the default and the other profiles are registered and
+/// sync. Other invalid input (bad JSON or bundle id, more than 32 profiles, an
+/// invalid or repeated id, a root that is not an absolute path) is an error
+/// and leaves the registry unchanged. Invalidates the scan caches, since the
 /// takeover depends on every field.
 ///
 /// # Safety

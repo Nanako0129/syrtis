@@ -2770,7 +2770,11 @@ fn a_commit_no_longer_wanted_creates_no_dir_and_no_lock() {
     assert_eq!(stop, Stop::new(State::Disabled, None));
     assert!(!tmp.path().join("app").exists(), "something was created");
     // Control: wanted, it creates the dir, lock and file.
-    assert!(commit_file(&dir, &stem(USER).unwrap(), &[], &|| true).unwrap());
+    assert!(
+        commit_file(&dir, &stem(USER).unwrap(), &[], &|| true)
+            .unwrap()
+            .changed
+    );
     assert!(dir.join(LOCK_FILE_NAME).exists());
 }
 
@@ -2942,4 +2946,30 @@ fn a_mixed_push_keeps_the_default_and_the_valid_profile_syncing() {
         "the refused profile got a dir"
     );
     assert_eq!(names_in(&profile_dir(&home, PROFILE_B)).len(), 1);
+}
+
+/// A successful commit that could not delete a superseded usage file (an
+/// entry named like one that is not a deletable file) reports it in
+/// `cleanupFailedProfiles` like a duplicate's cleanup does, so the app can tell
+/// the stale file is still there. Control: nothing planted, nothing reported.
+#[cfg(unix)]
+#[test]
+fn a_commit_that_could_not_drop_a_superseded_file_reports_it() {
+    let _guard = lock();
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let default_db = login_db(&tmp.path().join("default"), &valid_token(), USER);
+    let registry = RwLock::new(multi(&home, true, vec![]));
+    let (url, _) = serve(vec![json_ok(&page(1, &["a"])), json_ok(&page(1, &["a"]))]);
+    let clean = sync_round(&default_db, &url, &registry);
+    assert_eq!(states(&clean), ["ok"]);
+    assert_eq!(clean["cleanupFailedProfiles"], serde_json::json!([]));
+    let stuck = default_sync_dir(&home).join(hex_name('e'));
+    std::fs::create_dir(&stuck).unwrap();
+    let status = sync_round(&default_db, &url, &registry);
+    assert_eq!(states(&status), ["ok"]);
+    assert_eq!(
+        status["cleanupFailedProfiles"],
+        serde_json::json!(["default"])
+    );
 }

@@ -37,7 +37,7 @@ pub(crate) enum Refusal {
     /// Fails closed rather than accepting a directory that might be them.
     HomeUnknown,
     HomeDirectory,
-    /// `collides_with_primary`: `~/.claude` or an ancestor of it, or a primary
+    /// `PrimaryRoots::collides`: `~/.claude` or an ancestor of it, or a primary
     /// scan root, its ancestor or its descendant.
     PrimaryScanRoot,
     Duplicate,
@@ -64,32 +64,45 @@ impl Refusal {
 
 /// Every directory the primary Claude account's scan reads under `home`: its
 /// two roots in `~/.claude`, the Cowork sessions tree (under which the engine
-/// discovers `<session>/.claude/projects` roots, `discover_cowork_project_roots`)
-/// and the default-layout `.cc-mirror` variants' project roots,
-/// `~/.cc-mirror/<variant>/config/projects` (`cc_mirror::discover_claude_project_roots`
-/// without a `configDir` override). Their rows are tagged `cc-mirror/<variant>`
-/// by their path, so an extra account there would show on no card of its own
-/// and drop out of the primary's window. A variant whose `variant.json` names
-/// a `configDir` elsewhere is not in this list: that folder is an ordinary
-/// Claude config dir and may be an account (issue #258). One `read_dir` of
-/// `~/.cc-mirror`, no file is opened and nothing leaves the machine.
-pub(crate) fn primary_scan_roots(home: &Path) -> Vec<PathBuf> {
+/// discovers `<session>/.claude/projects` roots) and the `.cc-mirror` variants'
+/// project roots that sit under `~/.cc-mirror`.
+///
+/// The cc-mirror roots are the engine's own answer
+/// (`built_in_extra_scan_paths_for`, the public surface of
+/// `cc_mirror::discover_claude_project_roots`), so a variant is treated as the
+/// engine treats it: a `variant.json` that is missing or unreadable means the
+/// variant is not scanned and contributes nothing; no `configDir` means
+/// `<variant>/config`. Only the roots under `~/.cc-mirror` are taken: their
+/// rows are tagged `cc-mirror/<variant>` by their path, so an extra account
+/// there would show on no card of its own and drop out of the primary's window.
+/// A variant whose `configDir` names a folder elsewhere is not a primary scan
+/// root: that folder is an ordinary Claude config dir and may be an account
+/// (issue #258).
+///
+/// This reads the disk: a `read_dir` of `~/.cc-mirror`, each variant's
+/// `variant.json`, and the engine's walk of the Cowork tree. Nothing leaves the
+/// machine. Compute it once per call (`PrimaryRoots::for_home`), never per
+/// entry, and not on the main thread.
+fn primary_scan_roots(home: &Path) -> Vec<PathBuf> {
     let claude = home.join(".claude");
     let mut roots = vec![
         claude.join("projects"),
         claude.join("transcripts"),
         home.join("Library/Application Support/Claude/local-agent-mode-sessions"),
     ];
-    if let Ok(variants) = std::fs::read_dir(home.join(".cc-mirror")) {
-        roots.extend(variants.flatten().filter_map(|variant| {
-            let projects = variant.path().join("config/projects");
-            projects.is_dir().then_some(projects)
-        }));
-    }
+    let mirror = home.join(".cc-mirror");
+    let enabled = std::collections::HashSet::from([tokscale_core::ClientId::Claude]);
+    roots.extend(
+        tokscale_core::scanner::built_in_extra_scan_paths_for(&home.to_string_lossy(), &enabled)
+            .into_iter()
+            .map(|(_, path)| path)
+            .filter(|path| path.starts_with(&mirror)),
+    );
     roots
 }
 
-/// The one rule behind three consumers: this setter, the Swift pre-check
+/// The primary's scan roots under one home, read once. `collides` is the one
+/// rule behind three consumers: the config-dir setter, the Swift pre-check
 /// (through `tb_claude_config_dir_refusals`) and
 /// `window_usage::primary_exclusions`. True for `~/.claude` itself and every
 /// ancestor of it, and for each primary scan root, its ancestors and its
@@ -100,12 +113,22 @@ pub(crate) fn primary_scan_roots(home: &Path) -> Vec<PathBuf> {
 /// `~/.claude/accounts/work`, is allowed: the primary scans only those roots,
 /// so such a folder does not reduce the primary's usage, and refusing it would
 /// drop accounts users already keep there.
-pub(crate) fn collides_with_primary(path: &Path, home: &Path) -> bool {
-    let claude = folded(&home.join(".claude"));
-    claude.starts_with(folded(path))
-        || primary_scan_roots(home)
-            .iter()
-            .any(|root| overlaps(path, root))
+pub(crate) struct PrimaryRoots {
+    claude: PathBuf,
+    roots: Vec<PathBuf>,
+}
+
+impl PrimaryRoots {
+    pub(crate) fn for_home(home: &Path) -> Self {
+        Self {
+            claude: folded(&home.join(".claude")),
+            roots: primary_scan_roots(home),
+        }
+    }
+
+    pub(crate) fn collides(&self, path: &Path) -> bool {
+        self.claude.starts_with(folded(path)) || self.roots.iter().any(|root| overlaps(path, root))
+    }
 }
 
 /// Lower-cased for comparison. The default APFS volume is case-insensitive, so
@@ -122,15 +145,17 @@ pub(crate) fn overlaps(a: &Path, b: &Path) -> bool {
     a.starts_with(&b) || b.starts_with(&a)
 }
 
-/// The pure rule shared by the setter and the Swift pre-check: which entries
-/// of `input` are registered, in order, and which are refused, by index.
+/// The rule shared by the setter and the Swift pre-check: which entries of
+/// `input` are registered, in order, and which are refused, by index. It reads
+/// the disk once (`PrimaryRoots::for_home`), not once per entry.
 /// Earlier entries win: a later duplicate or overlapping entry is refused, and
 /// refused entries do not count toward the cap or against later entries.
 pub(crate) fn check(input: &[String], home: Option<&Path>) -> (Vec<String>, Vec<(usize, Refusal)>) {
     let mut accepted: Vec<String> = Vec::new();
     let mut refused: Vec<(usize, Refusal)> = Vec::new();
+    let primary = home.map(PrimaryRoots::for_home);
     for (index, raw) in input.iter().enumerate() {
-        match refusal(raw, home, &accepted) {
+        match refusal(raw, home.zip(primary.as_ref()), &accepted) {
             Ok(dir) => accepted.push(dir),
             Err(reason) => refused.push((index, reason)),
         }
@@ -138,14 +163,18 @@ pub(crate) fn check(input: &[String], home: Option<&Path>) -> (Vec<String>, Vec<
     (accepted, refused)
 }
 
-fn refusal(raw: &str, home: Option<&Path>, accepted: &[String]) -> Result<String, Refusal> {
+fn refusal(
+    raw: &str,
+    primary: Option<(&Path, &PrimaryRoots)>,
+    accepted: &[String],
+) -> Result<String, Refusal> {
     let dir = normalize(raw)?;
     let path = Path::new(&dir);
-    let home = home.ok_or(Refusal::HomeUnknown)?;
+    let (home, primary) = primary.ok_or(Refusal::HomeUnknown)?;
     if folded(path) == folded(home) {
         return Err(Refusal::HomeDirectory);
     }
-    if collides_with_primary(path, home) {
+    if primary.collides(path) {
         return Err(Refusal::PrimaryScanRoot);
     }
     if accepted
@@ -167,7 +196,8 @@ fn refusal(raw: &str, home: Option<&Path>, accepted: &[String]) -> Result<String
 }
 
 /// `check` for the FFI pre-check: `{"rejected":[{"index","reason"}]}` for a
-/// JSON array of paths, judged against the process home. Registers nothing.
+/// JSON array of paths, judged against the process home. Registers nothing,
+/// but reads the disk (see `primary_scan_roots`).
 pub(crate) fn refusals_from_json(raw: &str) -> Result<serde_json::Value, String> {
     let input: Vec<String> =
         serde_json::from_str(raw).map_err(|_| "invalid_config_dirs_json".to_string())?;
@@ -320,6 +350,73 @@ mod tests {
             .into_iter()
             .map(|(index, reason)| (index, reason.code()))
             .collect()
+    }
+
+    /// The cc-mirror roots are the engine's own discovery, so each variant is
+    /// treated as the engine treats it: a default-layout variant
+    /// (`<variant>/config/projects` with a readable `variant.json`, no
+    /// `configDir`) is a primary scan root and is refused with its ancestors
+    /// and descendants; a variant with a `configDir` override is scanned at
+    /// that folder, which is not refused; a variant with no `variant.json` or
+    /// an unreadable one is not scanned at all, so nothing there is refused.
+    #[test]
+    fn cc_mirror_roots_follow_the_engines_own_discovery() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        let write_variant = |name: &str, json: Option<&str>| {
+            let variant = home.join(".cc-mirror").join(name);
+            std::fs::create_dir_all(variant.join("config/projects")).unwrap();
+            if let Some(json) = json {
+                std::fs::write(variant.join("variant.json"), json).unwrap();
+            }
+            variant.join("config")
+        };
+        let default_layout = write_variant("default", Some("{}"));
+        let no_json = write_variant("no-json", None);
+        let bad_json = write_variant("bad-json", Some("not json"));
+        let overridden = home.join("elsewhere");
+        std::fs::create_dir_all(overridden.join("projects")).unwrap();
+        let override_variant = write_variant(
+            "override",
+            Some(&serde_json::json!({ "configDir": overridden }).to_string()),
+        );
+        let roots = PrimaryRoots::for_home(home);
+        let collides = |p: &Path| roots.collides(p);
+        // Refused: the default layout's folder, its projects root, an ancestor
+        // and a descendant.
+        for refused in [
+            default_layout.clone(),
+            default_layout.join("projects"),
+            default_layout.join("projects/p"),
+            default_layout.parent().unwrap().to_path_buf(),
+        ] {
+            assert!(collides(&refused), "{refused:?} was accepted");
+        }
+        // Accepted: an override's folder (the engine scans it, but it is an
+        // ordinary config dir), the override variant's own default folder (the
+        // engine ignores it once `configDir` is set), and variants the engine
+        // does not scan.
+        for accepted in [&overridden, &override_variant, &no_json, &bad_json] {
+            assert!(!collides(accepted), "{accepted:?} was refused");
+        }
+        // Through the rule the setter and the Swift pre-check share.
+        let list = |dirs: &[&Path]| {
+            dirs.iter()
+                .map(|d| d.display().to_string())
+                .collect::<Vec<_>>()
+        };
+        let (accepted, refused) = check(
+            &list(&[&default_layout, &overridden, &no_json, &bad_json]),
+            Some(home),
+        );
+        assert_eq!(
+            refused
+                .iter()
+                .map(|(i, r)| (*i, r.code()))
+                .collect::<Vec<_>>(),
+            vec![(0, "primary_scan_root")]
+        );
+        assert_eq!(accepted.len(), 3);
     }
 
     /// Every primary scan root, its ancestors and its descendants are refused,

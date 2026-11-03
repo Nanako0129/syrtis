@@ -820,7 +820,7 @@ fn commit_file(
     stem: &str,
     events: &[Event],
     still_wanted: &dyn Fn() -> bool,
-) -> Result<bool, Stop> {
+) -> Result<Committed, Stop> {
     let failed = || Stop::error("write_failed");
     if !still_wanted() {
         return Err(Stop::new(State::Disabled, None));
@@ -868,8 +868,19 @@ fn commit_file(
         // The rename is the commit point; a failed dir fsync cannot undo it.
         let _ = crate::agent_quota_history::sync_directory(dir);
     }
-    let removed = remove_usage_files(dir, Some(&final_name)).usage;
-    Ok(!same || removed > 0)
+    let removal = remove_usage_files(dir, Some(&final_name));
+    Ok(Committed {
+        changed: !same || removal.usage > 0,
+        cleanup_failed: removal.failed,
+    })
+}
+
+/// What a commit left: whether a usage file's bytes changed, and whether
+/// another usage file of ours (a superseded account's) could not be deleted.
+#[derive(Debug)]
+struct Committed {
+    changed: bool,
+    cleanup_failed: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -997,7 +1008,8 @@ struct Outcome {
     /// A usage file in this profile's dir was written with new bytes or
     /// removed: the data the engine reads changed.
     changed: bool,
-    /// A duplicate's cleanup could not delete one of our files (reported in
+    /// A superseded usage file of ours could not be deleted: by a duplicate's
+    /// cleanup, or after a successful commit (reported in
     /// `cleanupFailedProfiles`).
     cleanup_failed: bool,
     /// Stopped by a refusal decided where it arose, so no list of codes can
@@ -1348,11 +1360,12 @@ async fn run(
     };
     drop(cookie);
     match commit_file(dir, &stem, &events, enabled) {
-        Ok(changed) => {
+        Ok(committed) => {
             claim(&stem, true);
             Outcome {
                 events: events.len(),
-                changed,
+                changed: committed.changed,
+                cleanup_failed: committed.cleanup_failed,
                 ..stopped(Stop::new(State::Ok, None))
             }
         }

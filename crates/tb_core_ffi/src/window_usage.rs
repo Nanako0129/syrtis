@@ -108,7 +108,7 @@ fn registered_roots_under(dir: &str) -> Vec<PathBuf> {
 /// card, which is what issue #258 reports.
 ///
 /// Never excludes a path that collides with the primary's own roots
-/// (`claude_config_dirs::collides_with_primary` under `home`), whatever a
+/// (`claude_config_dirs::PrimaryRoots::collides` under `home`), whatever a
 /// registry holds. The config-dir setter and Swift
 /// refuse those directories, but the scan registry has no such rule and either
 /// registry alone was enough to empty the primary window (audit P1, 2026-11-03),
@@ -121,8 +121,10 @@ fn primary_exclusions(home: Option<&Path>) -> Vec<PathBuf> {
     if let Some(roots) = crate::extra_scan_paths::snapshot().get(CLAUDE) {
         excluded.extend(roots.iter().cloned());
     }
-    if let Some(home) = home {
-        excluded.retain(|path| !crate::claude_config_dirs::collides_with_primary(path, home));
+    if let (Some(home), false) = (home, excluded.is_empty()) {
+        // Read once for the whole list, not once per path.
+        let primary = crate::claude_config_dirs::PrimaryRoots::for_home(home);
+        excluded.retain(|path| !primary.collides(path));
     }
     excluded
 }

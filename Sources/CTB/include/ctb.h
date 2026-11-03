@@ -171,9 +171,13 @@ char *tb_set_claude_config_dirs(const char *json);
 // Success data is `{"rejected":[{"index":i,"reason":"<code>"}]}`; codes:
 // empty_path, not_absolute, filesystem_root, home_unknown, home_directory,
 // primary_scan_root (~/.claude or an ancestor of it, or equals, contains or
-// sits inside ~/.claude/projects, ~/.claude/transcripts or ~/Library/
-// Application Support/Claude/local-agent-mode-sessions; a folder in ~/.claude
-// outside those is allowed; compared without case), duplicate, overlap
+// sits inside ~/.claude/projects, ~/.claude/transcripts, ~/Library/
+// Application Support/Claude/local-agent-mode-sessions, or a default-layout
+// ~/.cc-mirror/<variant>/config/projects the engine scans (a variant with no
+// readable variant.json is not scanned; one whose configDir names a folder
+// elsewhere is scanned there and that folder is allowed); a folder in
+// ~/.claude outside those is allowed; compared without case; this reads the
+// disk, so call it off the main thread), duplicate, overlap
 // (contains or sits inside an earlier accepted entry), limit_reached (more
 // than 8). Earlier entries win. Malformed input is the error
 // invalid_config_dirs_json.
