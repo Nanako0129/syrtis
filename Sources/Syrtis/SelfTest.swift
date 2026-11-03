@@ -20254,6 +20254,23 @@ enum SelfTest {
                 await nc.poll()
                 check("AG-9 an unreachable Google is retried for the same marker and a success clears the sentence",
                       unreachableShown && retried && nc.message == nil && nc.currentAgyKey == agKey)
+                // A repeated failure keeps the sentence steady: it is still
+                // there while the next attempt is in flight, not cleared at its
+                // start. Mutation: clear `message` when an attempt starts.
+                let steady = AGAutoFake(key: agKey, label: agEmail)
+                let (sc, _) = fresh(steady)
+                steady.write { $0.outcome = .failure(.bridge("refresh_unreachable")) }
+                await sc.setEnabled(true)
+                let hold = DispatchSemaphore(value: 0)
+                steady.write { $0.hold = hold }
+                let again = Task { await sc.poll() }
+                await until { steady.read { $0.attempts } == 2 }
+                let duringAttempt = sc.message
+                steady.write { $0.hold = nil }
+                hold.signal()
+                await again.value
+                check("AG-9 a repeated automatic failure keeps its sentence while the next attempt runs",
+                      duringAttempt == AccountsCopy.agyUnreachable && sc.message == AccountsCopy.agyUnreachable)
             }
 
             // A login change is seen BEFORE the fetch that follows it: the
