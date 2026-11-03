@@ -346,12 +346,13 @@ final class AntigravityAutoCapture: ObservableObject {
         let result = await Self.detached { Result { try io.autoCapture(removed) } }
         switch result {
         case let .success(outcome):
+            // Any successful automatic outcome (skipped_removed included) clears
+            // an automatic failure's sentence; a repeated failure (Google
+            // unreachable, retried every check) keeps it steady.
+            if autoMessage { message = nil }
             guard let key = outcome.key, let label = outcome.label,
                   outcome.status == "captured" || outcome.status == "unchanged"
             else { break }
-            // Only a success clears an automatic failure's sentence: a repeated
-            // failure (Google unreachable, retried every check) keeps it steady.
-            message = nil
             AntigravityAccounts.mutate(defaults: defaults, install: io.install) { accounts in
                 // `unchanged` keeps a label already listed; only a fresh
                 // capture refreshes it.
@@ -385,9 +386,11 @@ final class AntigravityAutoCapture: ObservableObject {
         case let .failure(error):
             // Shown the way a manual Capture's failure is, with the same fixed
             // sentences; "agy is not signed in" is a normal state, not a failure.
+            // Published only while capture is still on: an attempt that was in
+            // flight when the user turned it off must not bring a sentence back.
             if case TBCoreError.bridge("not_signed_in") = error {
-                message = nil
-            } else {
+                if autoMessage { message = nil }
+            } else if isEnabled {
                 message = AntigravityAccounts.message(for: error)
                 autoMessage = true
             }

@@ -20271,6 +20271,31 @@ enum SelfTest {
                 await again.value
                 check("AG-9 a repeated automatic failure keeps its sentence while the next attempt runs",
                       duringAttempt == AccountsCopy.agyUnreachable && sc.message == AccountsCopy.agyUnreachable)
+                // A successful automatic outcome without an account (the user
+                // removed it: skipped_removed) clears the sentence too.
+                // Mutation: clear only for captured and unchanged.
+                steady.write {
+                    $0.outcome = .success(.init(status: "skipped_removed"))
+                    $0.marker = "m-skipped"
+                }
+                await sc.poll()
+                check("AG-9 a skipped_removed success clears an earlier automatic failure's sentence",
+                      sc.message == nil)
+                // An attempt still in flight when capture is turned off and then
+                // failing publishes no sentence. Mutation: publish regardless.
+                let late = AGAutoFake(key: agKey, label: agEmail)
+                let (lc, _) = fresh(late)
+                late.write { $0.outcome = .failure(.bridge("refresh_rejected")) }
+                let lateHold = DispatchSemaphore(value: 0)
+                late.write { $0.hold = lateHold }
+                let inFlight = Task { await lc.setEnabled(true) }
+                await until { late.read { $0.attempts } == 1 }
+                await lc.setEnabled(false)
+                late.write { $0.hold = nil }
+                lateHold.signal()
+                await inFlight.value
+                check("AG-9 a failure that lands after capture was turned off publishes no sentence",
+                      lc.message == nil && !lc.isEnabled)
             }
 
             // A login change is seen BEFORE the fetch that follows it: the
