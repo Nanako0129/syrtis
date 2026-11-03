@@ -17677,7 +17677,9 @@ enum SelfTest {
             ClaudeExtraRoots.save(d)
             await applyAndWait()
             let follows = model.refused(for: d) == [0: "primary_scan_root"] && model.expandedCount(for: d) == 0
-            // A setter that fails records nothing: the previous marks stay.
+            // A setter that fails records nothing: the previous marks stay. The
+            // list now accepts something new, so the apply does reach the setter.
+            ClaudeExtraRoots.coreRefusals = { _ in [] }
             ClaudeExtraRoots.save(e)
             await withCheckedContinuation { (done: CheckedContinuation<Void, Never>) in
                 ClaudeExtraRoots.apply(
