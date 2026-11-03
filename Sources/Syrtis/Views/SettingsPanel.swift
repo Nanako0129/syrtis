@@ -117,18 +117,15 @@ struct SettingsPanel: View {
     /// immediately (D1: no restart).
     @State private var claudeExtraRoots: [String] = ClaudeExtraRoots.load()
     @State private var claudeExtraRootsResult: ExtraScanPathsResult?
-    /// The last add of each list was refused: its fixed sentence
-    /// (`AccountsCopy.refusalSentence`), shown under that Add button until the
-    /// next add or remove.
-    @State private var claudeAddRefusal: String?
+    /// A refused add: its fixed sentence (`AccountsCopy.refusalSentence`),
+    /// shown in an alert (`.alert` on the Claude section serves every list).
+    @StateObject private var addRefusal = AddRefusalAlert()
     /// An Add is asking the core: one at a time.
     @State private var claudeAdding = false
     /// The core's answer for the stored Claude list, recorded by every apply
     /// (its rule reads the disk, so it is asked off the main thread); a page
     /// that appears before any apply has answered asks once itself.
     @ObservedObject private var claudeRoots = ClaudeRootsListModel.shared
-    @State private var piAddRefusal: String?
-    @State private var dshAddRefusal: String?
     /// Filled off the main actor — see `ClaudeExtraRoots.missingRoots`. Empty
     /// until the first probe lands, so a row shows no warning rather than a
     /// wrong one while the answer is still unknown.
@@ -153,8 +150,6 @@ struct SettingsPanel: View {
     @AppStorage(CursorSync.enabledKey) private var cursorSyncOn = true
     @AppStorage(CursorSync.takeoverKey) private var cursorTakeover = false
     @AppStorage(CursorSync.noticeKey) private var cursorNoticeAck = false
-    /// The last add was refused (`CursorSync.cantAdd`); cleared on the next edit.
-    @State private var cursorAddRefused = false
     /// 0 = auto (≈60% of the screen). The popover's drag handle writes the
     /// same key, so the two stay in sync.
     @AppStorage(PopoverChrome.heightKey) private var popoverHeight = 0.0
@@ -1081,6 +1076,13 @@ struct SettingsPanel: View {
     @ViewBuilder
     private func accountsPage() -> some View {
         claudeExtraRootsSection()
+            // One alert for every list's refused add: the approved sentence is
+            // the title (the system adds the localized OK button).
+            .alert(
+                (addRefusal.message ?? "").localized,
+                isPresented: Binding(
+                    get: { addRefusal.message != nil }, set: { if !$0 { addRefusal.dismiss() } }),
+                actions: {})
 
         antigravityAccountsSection()
 
@@ -1125,7 +1127,6 @@ struct SettingsPanel: View {
                         }
                         Button {
                             claudeExtraRoots.removeAll { $0 == path }
-                            claudeAddRefusal = nil
                             commitClaudeExtraRoots()
                         } label: {
                             Image(systemName: "minus.circle")
@@ -1146,7 +1147,6 @@ struct SettingsPanel: View {
             .buttonStyle(.plain)
             .disabled(claudeAdding)
             .padding(.horizontal, 10)
-            if let line = claudeAddRefusal { hint(line) }
             // Per-client share of the merged result — the raw counts span both
             // clients' roots. See `ExtraScanRoots.clientHint`.
             // No hint until the core has answered for this list: a guessed
@@ -1188,7 +1188,6 @@ struct SettingsPanel: View {
                         }
                         Button {
                             piExtraRoots.removeAll { $0 == path }
-                            piAddRefusal = nil
                             commitPiExtraRoots()
                         } label: {
                             Image(systemName: "minus.circle")
@@ -1208,7 +1207,6 @@ struct SettingsPanel: View {
             }
             .buttonStyle(.plain)
             .padding(.horizontal, 10)
-            if let line = piAddRefusal { hint(line) }
             // Per-client share of the merged result — the raw counts span both
             // clients' roots. See `ExtraScanRoots.clientHint`.
             let piHint = ExtraScanRoots.clientHint(
@@ -1245,7 +1243,6 @@ struct SettingsPanel: View {
                         }
                         Button {
                             dshExtraRoots.removeAll { $0 == path }
-                            dshAddRefusal = nil
                             commitDshExtraRoots()
                         } label: {
                             Image(systemName: "minus.circle")
@@ -1265,7 +1262,6 @@ struct SettingsPanel: View {
             }
             .buttonStyle(.plain)
             .padding(.horizontal, 10)
-            if let line = dshAddRefusal { hint(line) }
             let dshHint = ExtraScanRoots.clientHint(
                 dshExtraRootsResult, client: "dsh", requested: dshExtraRoots.count)
             if let dshHint, dshHint.unreadable > 0 {
@@ -1385,7 +1381,6 @@ struct SettingsPanel: View {
             cursorProfileRow(CursorSync.rowLabel(profile), id: profile.id, syncOn: syncOn) {
                 Button {
                     cursorSync.removeProfile(id: profile.id)
-                    cursorAddRefused = false
                 } label: {
                     Image(systemName: "minus.circle")
                         .foregroundStyle(.secondary)
@@ -1403,9 +1398,6 @@ struct SettingsPanel: View {
         }
         .buttonStyle(.plain)
         .padding(.horizontal, 10)
-        if cursorAddRefused {
-            hint(CursorSync.Copy.cantAdd)
-        }
     }
 
     @ViewBuilder
@@ -1434,7 +1426,7 @@ struct SettingsPanel: View {
         panel.allowsMultipleSelection = false
         panel.prompt = AccountsCopy.addPrompt.localized
         guard panel.runModal() == .OK, let url = panel.url else { return }
-        cursorAddRefused = !cursorSync.addProfile(root: url.path)
+        if !cursorSync.addProfile(root: url.path) { addRefusal.show(CursorSync.Copy.cantAdd) }
     }
 
     /// Extra Google accounts for Antigravity, each its own card. The copy says
@@ -1555,15 +1547,14 @@ struct SettingsPanel: View {
         panel.prompt = AccountsCopy.addPrompt.localized
         guard panel.runModal() == .OK, let url = panel.url else { return }
         // The core's rule, asked (off the main thread) before anything is
-        // saved; a refusal shows its sentence under the button and saves
-        // nothing.
+        // saved; a refusal shows its sentence in an alert and saves nothing.
         let path = url.path
         claudeAdding = true
         Task {
             let line = await claudeRoots.add(
                 path, current: { claudeExtraRoots }, set: { claudeExtraRoots = $0 })
             claudeAdding = false
-            claudeAddRefusal = line
+            addRefusal.show(line)
             if line == nil { commitClaudeExtraRoots() }
         }
     }
@@ -1588,7 +1579,7 @@ struct SettingsPanel: View {
         let outcome = ExtraScanRoots.add(
             (url.path as NSString).standardizingPath, to: piExtraRoots,
             refusal: ExtraScanRoots.Pi.refusal(adding:to:))
-        piAddRefusal = outcome.refusalLine
+        addRefusal.show(outcome.refusalLine)
         guard outcome.refusalLine == nil else { return }
         piExtraRoots = outcome.list
         commitPiExtraRoots()
@@ -1614,7 +1605,7 @@ struct SettingsPanel: View {
         let outcome = ExtraScanRoots.add(
             (url.path as NSString).standardizingPath, to: dshExtraRoots,
             refusal: ExtraScanRoots.Dsh.refusal(adding:to:))
-        dshAddRefusal = outcome.refusalLine
+        addRefusal.show(outcome.refusalLine)
         guard outcome.refusalLine == nil else { return }
         dshExtraRoots = outcome.list
         commitDshExtraRoots()
@@ -1914,7 +1905,7 @@ enum AccountsCopy {
     /// One fixed sentence per refusal reason code: the core's
     /// `claude_config_dirs::Refusal` codes, Swift's fail-closed `unavailable`,
     /// and `home_or_ancestor` for Pi and DSH (home or a folder containing it).
-    /// Shown under an Add button when the add is refused and as the help of
+    /// Shown in an alert when an add is refused and as the help of
     /// the mark on a stored Claude folder the core refuses. None carries a
     /// path or an OS error.
     static let refusalCodes = [

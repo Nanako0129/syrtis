@@ -17627,6 +17627,29 @@ enum SelfTest {
                 && addDsh(fresh, listed) == .init(list: listed + [fresh], refusalLine: nil),
             "ACCOUNTS-PAGE a refused add of a Claude, Pi or DSH folder shows its reason's fixed sentence and saves nothing; an accepted add shows none")
 
+        // A refused add raises the alert with that reason's approved sentence
+        // and an accepted one raises none; OK dismisses it. Mutation: `show`
+        // never sets the message.
+        do {
+            let alert = AddRefusalAlert()
+            alert.show(addClaude(fresh, listed).refusalLine)
+            let none = alert.message == nil
+            alert.show(addClaude(home, listed).refusalLine)
+            let claudeAlert = alert.message == sentence("home_directory")
+            alert.dismiss()
+            alert.show(addPi(listed[0], listed).refusalLine)
+            let piAlert = alert.message == sentence("duplicate")
+            alert.dismiss()
+            alert.show(addDsh("/", listed).refusalLine)
+            let dshAlert = alert.message == sentence("filesystem_root")
+            alert.dismiss()
+            alert.show(CursorSync.Copy.cantAdd)
+            let cursorAlert = alert.message == CursorSync.Copy.cantAdd
+            alert.dismiss()
+            expect(none && claudeAlert && piAlert && dshAlert && cursorAlert && alert.message == nil,
+                   "ACCOUNTS-PAGE a refused Claude, Pi, DSH or Cursor add raises the alert with its approved sentence, an accepted add raises none, and OK dismisses it")
+        }
+
         // Each production entry asks the core's rule (which reads the disk)
         // once, and records its answer for the Settings marks only after the
         // setter took it. `ExtraScanRoots.apply` builds both registry payloads
@@ -20116,6 +20139,57 @@ enum SelfTest {
                 for _ in 0..<3 { await ac.poll() }
                 check("AG-5 a failed attempt is not retried while the marker is unchanged",
                       fake.read { $0.attempts } == 1 && ac.currentAgyKey == nil)
+            }
+
+            // Turning automatic capture on when agy's current account is already
+            // in the shared keychain (another install captured it): the core
+            // answers `unchanged` with no Google request, and this install's
+            // empty registry gets the account with its label, bound to agy's
+            // marker, with no message. Mutation: ignore an `unchanged` outcome.
+            do {
+                let fake = AGAutoFake(key: agKey, label: agEmail)
+                let (ac, defaults) = fresh(fake)
+                fake.write { $0.outcome = .success(.init(status: "unchanged", key: agKey, label: agEmail)) }
+                await ac.turnOn { true }
+                check("AG-9 an unchanged outcome on an empty registry adds the account with its label and binds it",
+                      AntigravityAccounts.load(defaults: defaults) == [.init(key: agKey, label: agEmail)]
+                          && ac.currentAgyKey == agKey && ac.message == nil
+                          && fake.read { $0.attempts } == 1 && defaults.bool(forKey: AntigravityAutoCapture.enabledKey))
+            }
+
+            // A failed automatic attempt is shown with the same fixed sentence a
+            // manual Capture shows, cleared by the next attempt; agy being signed
+            // out is not a failure; a failing marker query shows the existing
+            // "unavailable" sentence. Mutations: swallow the failure; leave the
+            // unreadable marker silent.
+            do {
+                let fake = AGAutoFake(key: agKey, label: agEmail)
+                let (ac, defaults) = fresh(fake)
+                fake.write { $0.outcome = .failure(.bridge("refresh_rejected")) }
+                await ac.turnOn { true }
+                let shown = ac.message == AccountsCopy.agyRejected
+                    && AntigravityAccounts.load(defaults: defaults).isEmpty
+                fake.write { $0.outcome = .failure(.bridge("not_signed_in")); $0.marker = "m-signed-out" }
+                await ac.poll()
+                let quiet = ac.message == nil
+                fake.write { $0.outcome = .failure(.bridge("keychain_write_failed")); $0.marker = "m-write" }
+                await ac.poll()
+                let second = ac.message == AccountsCopy.agyWriteFailed
+                fake.write {
+                    $0.outcome = .success(.init(status: "captured", key: agKey, label: agEmail))
+                    $0.marker = "m-ok"
+                }
+                await ac.poll()
+                let cleared = ac.message == nil && ac.currentAgyKey == agKey
+                check("AG-9 a failed automatic attempt shows its fixed sentence, agy signed out shows none, and a later success clears it",
+                      shown && quiet && second && cleared)
+                let probe = AGAutoFake(key: agKey, label: agEmail)
+                let (pc, _) = fresh(probe)
+                await pc.setEnabled(true)
+                probe.write { $0.markerUnreadableAfterAttempt = true; $0.marker = "m-next" }
+                await pc.poll()
+                await pc.poll()
+                check("AG-9 a failing marker query shows the unavailable sentence", pc.unavailable)
             }
 
             // A login change is seen BEFORE the fetch that follows it: the

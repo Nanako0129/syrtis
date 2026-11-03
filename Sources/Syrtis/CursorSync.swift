@@ -243,7 +243,7 @@ enum CursorSync {
         /// `profilesKey`.
         static let profilesPrivacy = "Add a folder you start Cursor with using --user-data-dir to sync it too (Syrtis keeps the folder path in its settings); each profile's sign-in is handled as described above. All profiles add up to one Cursor total, and an account signed in to several profiles counts once. Removing a profile deletes its downloaded usage the next time Syrtis can."
 
-        /// Under the add button when `cantAdd` refuses a folder.
+        /// The refusal alert's text when `cantAdd` refuses a folder.
         static let cantAdd = "That folder can't be added."
         /// A row whose own reason is permanent (`permanentReasons`).
         static let cantRead = "Syrtis can't read this folder's Cursor sign-in."

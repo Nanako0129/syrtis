@@ -320,7 +320,12 @@ final class AntigravityAutoCapture: ObservableObject {
             marker = try? await Self.detached({ try io.marker() })
             checking = false
         }
-        guard let marker else { return await pollIfOwed() }
+        // A marker query that fails is shown with the existing "unavailable"
+        // sentence instead of passing silently; the next poll recomputes it.
+        guard let marker else {
+            unavailable = true
+            return await pollIfOwed()
+        }
         unavailable = marker == "present"
         guard marker != lastAttemptedMarker, !busy else { return await pollIfOwed() }
         // The toggle is checked here, right before an attempt, and not only by
@@ -334,6 +339,7 @@ final class AntigravityAutoCapture: ObservableObject {
         currentAgyKey = nil
         lastAttemptedMarker = marker
         let removed = AntigravityAccounts.removedKeys(defaults: defaults)
+        message = nil
         let result = await Self.detached { Result { try io.autoCapture(removed) } }
         switch result {
         case let .success(outcome):
@@ -370,8 +376,13 @@ final class AntigravityAutoCapture: ObservableObject {
         case .failure(TBCoreError.bridge("paused")):
             paused = true
             currentAgyKey = nil
-        case .failure:
-            break
+        case let .failure(error):
+            // Shown the way a manual Capture's failure is, with the same fixed
+            // sentences; "agy is not signed in" is a normal state, not a failure.
+            if case TBCoreError.bridge("not_signed_in") = error {
+            } else {
+                message = AntigravityAccounts.message(for: error)
+            }
         }
         busy = false
         await pollIfOwed()

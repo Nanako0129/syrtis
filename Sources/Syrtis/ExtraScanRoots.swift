@@ -118,7 +118,7 @@ enum ExtraScanRoots {
     }
 
     /// What an Add click on any of the three lists produces: the list, and the
-    /// fixed sentence to show under the button when the folder was refused.
+    /// fixed sentence to show in the refusal alert when the folder was refused.
     /// Decided here, off the view, so a test can observe the sentence.
     struct AddOutcome: Equatable {
         let list: [String]
@@ -230,4 +230,19 @@ enum ExtraScanRoots {
         let data = (try? JSONEncoder().encode(paths)) ?? Data("[]".utf8)
         return String(data: data, encoding: .utf8) ?? "[]"
     }
+}
+
+/// The refused add the Settings alert shows: the approved sentence of its
+/// reason (English; the alert localizes it), or nil when no alert is up.
+@MainActor
+final class AddRefusalAlert: ObservableObject {
+    @Published private(set) var message: String?
+
+    /// An add's refusal sentence: raises the alert; nil (an accepted add)
+    /// leaves things as they are.
+    func show(_ sentence: String?) {
+        if let sentence { message = sentence }
+    }
+
+    func dismiss() { message = nil }
 }
