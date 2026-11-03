@@ -91,6 +91,10 @@ pub(crate) fn user_home_dir() -> Option<PathBuf> {
 #[cfg(test)]
 extern "C" fn isolate_test_config() {
     use fs2::FileExt;
+    // Also pins the global rayon pool before any test thread can create a
+    // default one through a bare `par_iter`; `caller_priority_picks_the_pool`
+    // reads it back. Done first: the early returns below skip the rest.
+    LazyLock::force(&RAYON_INIT);
     // An explicit override (the tail benchmark) wins.
     if std::env::var_os("TOKSCALE_CONFIG_DIR").is_some() {
         let _ = TEST_CONFIG_LOCK.set(None);
@@ -379,18 +383,110 @@ fn serialize_agent_usage_payload(
     })
 }
 
-/// Cap rayon's global thread pool to 2 workers. tokscale-core uses rayon for
-/// parallel log parsing (55+ par_iter sites); the default pool size is num_cpus
-/// which is fine for a one-shot CLI but ruinous for a resident menu-bar daemon:
-/// each idle worker busy-waits before parking, and every 10s poll wakes the
-/// entire pool for trivial mtime-check work. 2 threads keep I/O parallelism
-/// while cutting idle spinning overhead by ~80%.
+/// Workers in rayon's global pool, which serves user-initiated calls (popover
+/// load, manual Refresh). tokscale-core uses rayon for parallel log parsing (55+
+/// par_iter sites); the default pool size is num_cpus, which is fine for a
+/// one-shot CLI but ruinous for a resident menu-bar daemon: each idle worker
+/// busy-waits before parking, and every poll wakes the whole pool. Two keep
+/// I/O parallelism for the popover's concurrent scans: with one worker the
+/// popover's first graph took 15.6-16.9 s against 9.3-13.6 s with two (four
+/// alternating `--launch-timeline` runs each, warm cache, real data).
+const RAYON_THREADS: usize = 2;
+
 static RAYON_INIT: LazyLock<()> = LazyLock::new(|| {
     rayon::ThreadPoolBuilder::new()
-        .num_threads(2)
+        .num_threads(RAYON_THREADS)
         .build_global()
         .ok();
 });
+
+/// One worker for the CPU-bound scan entries in `BACKGROUND_SCAN_ENTRIES`, when
+/// their caller runs at utility or background QoS (the tray title graph, the
+/// popover's 60 s poll of the graph and reports). Those calls serialize on this
+/// one worker: a second one queues until the first finishes. Everything else
+/// keeps the caller's thread and the global pool, including `tb_agent_usage` and
+/// `tb_cursor_sync` (network, up to tens of seconds) and the live-rate tail tick
+/// (about 1 s of CPU per 30 s, which must not wait behind a graph).
+///
+/// Measured: a warm compute uses about 1.05 cores however many workers it is
+/// given (graph 6.0 s CPU in 5.7 s wall at two workers), so the second worker
+/// mostly spins. With every utility call on one worker, in 10-minute runs on a
+/// copy of a real config, the first-launch re-read took 76.5 s of CPU at two
+/// workers against 50.8 s at one (59.4 s and 57.4 s wall), and the title graph's
+/// 10 s window peaked at 82% of a core against 39%. A build failure falls back
+/// to the global pool.
+static BACKGROUND_POOL: LazyLock<Option<rayon::ThreadPool>> = LazyLock::new(|| {
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(1)
+        .thread_name(|i| format!("tb-background-{i}"))
+        .build()
+        .ok()
+});
+
+/// Whether the calling thread runs at utility or background QoS. Swift's
+/// `Task.detached(priority:)` already carries the caller's intent, and
+/// `UsageDataSource` passes `.utility` for every periodic call and
+/// `.userInitiated` for the popover's, so the FFI reads it from the thread
+/// instead of growing a parameter on every entry point. Other platforms have no
+/// such signal and keep the global pool.
+#[cfg(target_os = "macos")]
+fn caller_is_background() -> bool {
+    use std::ffi::c_void;
+    // qos_class_t values from <sys/qos.h>.
+    const QOS_CLASS_UTILITY: u32 = 0x11;
+    const QOS_CLASS_BACKGROUND: u32 = 0x09;
+    extern "C" {
+        fn pthread_self() -> *mut c_void;
+        fn pthread_get_qos_class_np(
+            thread: *mut c_void,
+            qos_class: *mut u32,
+            relative_priority: *mut i32,
+        ) -> i32;
+    }
+    let (mut class, mut relative) = (0u32, 0i32);
+    let rc = unsafe { pthread_get_qos_class_np(pthread_self(), &mut class, &mut relative) };
+    rc == 0 && (class == QOS_CLASS_UTILITY || class == QOS_CLASS_BACKGROUND)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn caller_is_background() -> bool {
+    false
+}
+
+/// Entries that walk and parse session sources and take their caller's priority
+/// from `UsageDataSource`. `tb_probe` is a diagnostic and stays off the list.
+const BACKGROUND_SCAN_ENTRIES: &[&str] = &[
+    "tb_graph",
+    "tb_refresh_graph",
+    "tb_model_report",
+    "tb_hourly_report",
+    "tb_agents_report",
+    "tb_window_usage",
+];
+
+/// Run an FFI body on the pool that matches its entry and its caller's priority:
+/// the one-worker pool for a listed scan entry called at utility or background
+/// QoS, the caller's thread and the global pool otherwise.
+fn run_on_caller_pool(name: &str, body: impl FnOnce() -> *mut c_char) -> *mut c_char {
+    if BACKGROUND_SCAN_ENTRIES.contains(&name) && caller_is_background() {
+        if let Some(pool) = BACKGROUND_POOL.as_ref() {
+            // `ThreadPool::install` needs a `Send` closure and result; an FFI
+            // body captures raw C pointers and returns one. The closure runs
+            // once, on the pool's worker, while this thread blocks in
+            // `install`, and nothing else touches what it captured.
+            struct AssertSend<T>(T);
+            unsafe impl<T> Send for AssertSend<T> {}
+            impl<R, F: FnOnce() -> R> AssertSend<F> {
+                fn run(self) -> AssertSend<R> {
+                    AssertSend((self.0)())
+                }
+            }
+            let job = AssertSend(body);
+            return pool.install(move || job.run()).0;
+        }
+    }
+    body()
+}
 
 /// year → (computed-at, source token, mapped graph payload). Same role as
 /// the Tauri AppState cache, plus a change token: when the cache entry ages
@@ -477,7 +573,7 @@ fn envelope(result: Result<serde_json::Value, String>) -> *mut c_char {
 /// in-flight flag without stamping on a tick panic so the tail re-parses next.
 fn guarded(name: &str, body: impl FnOnce() -> *mut c_char) -> *mut c_char {
     LazyLock::force(&RAYON_INIT);
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)) {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_on_caller_pool(name, body))) {
         Ok(ptr) => ptr,
         Err(payload) => {
             let detail = payload
@@ -1804,6 +1900,55 @@ mod tests {
     use usage_tail::UsageTailer;
 
     static QUOTA_CURVE_TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+    /// Through the real `guarded`: a listed scan entry called at utility QoS
+    /// runs on the one-worker background pool, an unlisted entry at the same QoS
+    /// (the paths `tb_agent_usage`, `tb_cursor_sync` and the tail tick take) and
+    /// a listed entry at user-initiated QoS stay on the global pool of
+    /// `RAYON_THREADS`. The global pool is pinned in `isolate_test_config`, so a
+    /// bare `par_iter` elsewhere cannot have created a default one.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn caller_priority_picks_the_pool() {
+        use rayon::prelude::*;
+        extern "C" {
+            fn pthread_set_qos_class_self_np(qos_class: u32, relative_priority: i32) -> i32;
+        }
+        const QOS_CLASS_USER_INITIATED: u32 = 0x19;
+        const QOS_CLASS_UTILITY: u32 = 0x11;
+        // The width of the pool a body's parallel iterator runs on, as that
+        // body sees it, for an entry called at the given QoS.
+        let width_for = |entry: &'static str, qos: u32| {
+            std::thread::spawn(move || {
+                assert_eq!(unsafe { pthread_set_qos_class_self_np(qos, 0) }, 0);
+                let seen = std::sync::atomic::AtomicUsize::new(0);
+                guarded(entry, || {
+                    let widths: Vec<usize> = (0..64)
+                        .into_par_iter()
+                        .map(|_| rayon::current_num_threads())
+                        .collect();
+                    assert!(widths.windows(2).all(|w| w[0] == w[1]));
+                    seen.store(widths[0], std::sync::atomic::Ordering::SeqCst);
+                    std::ptr::null_mut()
+                });
+                seen.load(std::sync::atomic::Ordering::SeqCst)
+            })
+            .join()
+            .unwrap()
+        };
+        assert_eq!(RAYON_THREADS, 2);
+        for entry in BACKGROUND_SCAN_ENTRIES {
+            assert_eq!(width_for(entry, QOS_CLASS_UTILITY), 1, "{entry} at utility");
+            assert_eq!(
+                width_for(entry, QOS_CLASS_USER_INITIATED),
+                RAYON_THREADS,
+                "{entry} at user-initiated"
+            );
+        }
+        for entry in ["tb_agent_usage", "tb_cursor_sync", "tb_tokens_per_min", "tb_usage_trace"] {
+            assert_eq!(width_for(entry, QOS_CLASS_UTILITY), RAYON_THREADS, "{entry} at utility");
+        }
+    }
 
     /// Nothing calls `isolate_test_config` but the loader, so a platform that
     /// skips the initializer list, or a temp dir it cannot create, would put
