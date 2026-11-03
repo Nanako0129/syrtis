@@ -20290,12 +20290,15 @@ enum SelfTest {
                 late.write { $0.hold = lateHold }
                 let inFlight = Task { await lc.setEnabled(true) }
                 await until { late.read { $0.attempts } == 1 }
+                // Recorded before turning capture off: if `until` timed out, the
+                // attempt never started and the check below would pass vacuously.
+                let lateStarted = late.read { $0.attempts } == 1
                 await lc.setEnabled(false)
                 late.write { $0.hold = nil }
                 lateHold.signal()
                 await inFlight.value
                 check("AG-9 a failure that lands after capture was turned off publishes no sentence",
-                      lc.message == nil && !lc.isEnabled)
+                      lateStarted && lc.message == nil && !lc.isEnabled)
             }
 
             // A login change is seen BEFORE the fetch that follows it: the
