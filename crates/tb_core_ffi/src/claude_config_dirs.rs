@@ -71,7 +71,8 @@ impl Refusal {
 /// The cc-mirror roots follow the engine's own decision
 /// (`cc_mirror::discover_claude_project_roots`, which is private to the engine;
 /// `cc_mirror_roots_match_the_engines_discovery` pins this copy against the
-/// engine's public `built_in_extra_scan_paths_for` on one fixture): a variant
+/// engine's public `built_in_extra_scan_paths_for` on one fixture; the engine
+/// function is private, and that test is what guards the copy): a variant
 /// is scanned at `<config dir>/projects` when its `variant.json` parses and
 /// that folder exists, the config dir being `configDir` (`~/` is home, a
 /// relative path is relative to the variant folder; an empty one counts as
@@ -134,7 +135,9 @@ fn cc_mirror_roots(home: &Path) -> Vec<PathBuf> {
                     None => variant.join(raw),
                 })
                 .unwrap_or_else(|| variant.join("config"));
-            let projects = config.join("projects");
+            // `..` is resolved lexically first: `~/.cc-mirror/v/../../work` is
+            // not under `~/.cc-mirror`.
+            let projects = lexical(&config.join("projects"));
             (projects.starts_with(&mirror) && projects.is_dir()).then_some(projects)
         })
         .collect()
@@ -184,7 +187,27 @@ impl PrimaryRoots {
 /// not resolved (MA-9 symlink identity is deferred): comparing spelling avoids
 /// a `stat` on a path that may sit on a stalled mount.
 fn folded(path: &Path) -> PathBuf {
-    PathBuf::from(path.to_string_lossy().to_lowercase())
+    PathBuf::from(lexical(path).to_string_lossy().to_lowercase())
+}
+
+/// `path` with `.` and `..` components resolved lexically (no disk access), so
+/// `~/.cc-mirror/v/../../work` is `~/work` and `/a/b/../.claude` compares as
+/// `/a/.claude`. A `..` at the root stays at the root.
+fn lexical(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for part in path.components() {
+        match part {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !out.pop() {
+                    out.push("..");
+                }
+            }
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 /// `a` equals, contains or sits inside `b`, component-wise and ignoring case.
@@ -454,6 +477,10 @@ mod tests {
         variant("wrong-type", with(serde_json::json!(5)), true);
         variant("wrong-name-type", Some(r#"{"name": 5}"#.into()), true);
         variant("no-projects", Some("{}".into()), false);
+        // `..` climbs out of `~/.cc-mirror`: the engine scans ~/work/projects,
+        // which is not a mirror root.
+        std::fs::create_dir_all(home.join("work/projects")).unwrap();
+        variant("dotdot", with("../../work".into()), true);
         let file_variant = mirror.join("projects-is-a-file");
         std::fs::create_dir_all(file_variant.join("config")).unwrap();
         std::fs::write(file_variant.join("variant.json"), "{}").unwrap();
@@ -465,23 +492,43 @@ mod tests {
             &enabled,
         )
         .into_iter()
-        .map(|(_, path)| path)
+        .map(|(_, path)| lexical(&path))
         .filter(|path| path.starts_with(&mirror))
         .collect();
         let mut ours = cc_mirror_roots(home);
         engine.sort();
         ours.sort();
-        assert!(!engine.is_empty(), "fixture: the engine found nothing");
-        assert_eq!(ours, engine);
-        // Control: the fixture really contains shapes the engine skips and
-        // roots it takes from outside `~/.cc-mirror`.
-        assert!(engine.len() < 11);
-        assert!(tokscale_core::scanner::built_in_extra_scan_paths_for(
-            &home.to_string_lossy(),
-            &enabled
-        )
-        .iter()
-        .any(|(_, path)| !path.starts_with(&mirror)));
+        // Exactly the variants the engine scans under `~/.cc-mirror`: the
+        // default layout, an empty `configDir`, a relative one, and an
+        // absolute one that points into another variant's folder.
+        let mut expected = vec![
+            mirror.join("default/config/projects"),
+            mirror.join("empty/config/projects"),
+            mirror.join("relative/rel/projects"),
+            mirror.join("shared/projects"),
+        ];
+        expected.sort();
+        assert_eq!(engine, expected, "the engine's own answer");
+        assert_eq!(ours, expected);
+    }
+
+    /// `.` and `..` are resolved lexically before comparing, so a spelling that
+    /// reaches a primary root through `..` is refused and one that climbs out
+    /// of it is not.
+    #[test]
+    fn dot_components_are_resolved_before_comparing() {
+        let home = Some(Path::new("/Users/x"));
+        assert_eq!(
+            codes(
+                &[
+                    "/Users/x/a/../.claude/projects",
+                    "/Users/x/./.claude/transcripts/p"
+                ],
+                home
+            ),
+            vec![(0, "primary_scan_root"), (1, "primary_scan_root")]
+        );
+        assert!(codes(&["/Users/x/.claude/projects/../../work"], home).is_empty());
     }
 
     /// The primary's roots are read from the disk once per call, not once per
