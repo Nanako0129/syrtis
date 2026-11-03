@@ -19,8 +19,8 @@ repository as a Git submodule. Consumer integration rules are documented in
 |---|---|
 | Path | `vendor/tokscale-core` |
 | Repository | `https://github.com/Nanako0129/tokscale-core.git` |
-| Reviewed pin | `9ad70f63071a1b130079b130535e619756975704` |
-| Upstream and local-patch ledger | Immutable [`UPSTREAM.md`](https://github.com/Nanako0129/tokscale-core/blob/9ad70f63071a1b130079b130535e619756975704/UPSTREAM.md) |
+| Reviewed pin | `0ece74befada3f56fd37312cdc5fdcb517e93429` |
+| Upstream and local-patch ledger | Immutable [`UPSTREAM.md`](https://github.com/Nanako0129/tokscale-core/blob/0ece74befada3f56fd37312cdc5fdcb517e93429/UPSTREAM.md) |
 
 ## Ownership
 
