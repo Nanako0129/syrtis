@@ -199,11 +199,15 @@ fn lexical(path: &Path) -> PathBuf {
     for part in path.components() {
         match part {
             Component::CurDir => {}
-            Component::ParentDir => {
-                if !out.pop() {
-                    out.push("..");
+            // Pop only a real name: `..` at the root stays at the root, and a
+            // leading `..` of a relative path is kept, not cancelled by the next.
+            Component::ParentDir => match out.components().next_back() {
+                Some(Component::Normal(_)) => {
+                    out.pop();
                 }
-            }
+                Some(Component::RootDir | Component::Prefix(_)) => {}
+                _ => out.push(".."),
+            },
             other => out.push(other),
         }
     }
@@ -517,6 +521,14 @@ mod tests {
     /// of it is not.
     #[test]
     fn dot_components_are_resolved_before_comparing() {
+        // `..` at the root stays at the root; a relative path keeps its own `..`s.
+        assert_eq!(
+            lexical(Path::new("/../Users/x/.claude")),
+            PathBuf::from("/Users/x/.claude")
+        );
+        assert_eq!(lexical(Path::new("../../x")), PathBuf::from("../../x"));
+        assert_eq!(lexical(Path::new("a/../../x")), PathBuf::from("../x"));
+
         let home = Some(Path::new("/Users/x"));
         assert_eq!(
             codes(
