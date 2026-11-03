@@ -49,9 +49,18 @@ struct DefaultsSnapshot {
     private let defaults: UserDefaults
     private let saved: [(key: String, value: Any?)]
 
-    init(keys: [String], defaults: UserDefaults = .standard) {
+    /// Read from the persistent domain, not `object(forKey:)`: that also
+    /// answers from the argument domain (`-key value` on the command line) and
+    /// registered defaults, and `restore()` would write such a temporary value
+    /// into the user's real preferences. `domain` is the persistent domain's
+    /// name: the app's for `.standard`, the suite's for a scratch suite.
+    init(
+        keys: [String], defaults: UserDefaults = .standard,
+        domain: String = Bundle.main.bundleIdentifier ?? ProcessInfo.processInfo.processName
+    ) {
         self.defaults = defaults
-        saved = keys.map { ($0, defaults.object(forKey: $0)) }
+        let stored = defaults.persistentDomain(forName: domain) ?? [:]
+        saved = keys.map { ($0, stored[$0]) }
     }
 
     /// Set each key back to what it held, or remove it if it held nothing.
@@ -21931,15 +21940,20 @@ enum SelfTest {
             scratch.removePersistentDomain(forName: suite)
             scratch.set("kept", forKey: "present-deleted")
             scratch.set("old", forKey: "present-changed")
-            let snapshot = DefaultsSnapshot(keys: ["present-deleted", "present-changed", "absent"], defaults: scratch)
+            // A registered default is not a stored value: it must stay unstored.
+            scratch.register(defaults: ["registered-only": "temporary"])
+            let snapshot = DefaultsSnapshot(
+                keys: ["present-deleted", "present-changed", "absent", "registered-only"],
+                defaults: scratch, domain: suite)
             scratch.removeObject(forKey: "present-deleted")
             scratch.set("new", forKey: "present-changed")
             scratch.set("created", forKey: "absent")
             snapshot.restore()
             expect(scratch.string(forKey: "present-deleted") == "kept"
                        && scratch.string(forKey: "present-changed") == "old"
-                       && scratch.object(forKey: "absent") == nil,
-                   "DEFAULTS-SNAPSHOT restore puts back deleted and changed keys and removes ones that did not exist")
+                       && scratch.object(forKey: "absent") == nil
+                       && scratch.persistentDomain(forName: suite)?["registered-only"] == nil,
+                   "DEFAULTS-SNAPSHOT restore puts back deleted and changed keys, removes ones that did not exist, and never stores a registered default")
         }
         accountsDefaults.restore()
 

@@ -2973,3 +2973,91 @@ fn a_commit_that_could_not_drop_a_superseded_file_reports_it() {
         serde_json::json!(["default"])
     );
 }
+
+/// `cliPresent` follows a completed walk, not a byte change: with tokscale CLI
+/// Cursor files present and the takeover unconfirmed, a second round that
+/// writes the identical bytes (`changed: false`) still reports `cliPresent`,
+/// so the prompt does not vanish after a quiet round. Control: with no CLI
+/// files the same rounds report `ok`.
+#[test]
+fn an_unchanged_round_still_reports_cli_present() {
+    let _guard = lock();
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let default_db = login_db(&tmp.path().join("default"), &valid_token(), USER);
+    let config = multi(&home, true, vec![]);
+    set_for_test(config.clone());
+    let registry = RwLock::new(config);
+    let (url, _) = serve(vec![json_ok(&page(1, &["a"])); 4]);
+    let state = |status: &serde_json::Value| status["state"].as_str().unwrap().to_string();
+    let first = sync_round_in(&default_db, &url, &registry, limits(), Some(&home));
+    assert_eq!(
+        (state(&first), first["changed"].clone()),
+        ("ok".into(), true.into())
+    );
+    let cli = home.join(".config/tokscale/cursor-cache");
+    std::fs::create_dir_all(&cli).unwrap();
+    std::fs::write(cli.join("usage.csv"), "x").unwrap();
+    let again = sync_round_in(&default_db, &url, &registry, limits(), Some(&home));
+    assert_eq!(again["changed"], false, "fixture: identical bytes");
+    assert_eq!(
+        state(&again),
+        "cliPresent",
+        "the prompt vanished after a quiet round"
+    );
+    // Control: without the CLI files the identical round is plain ok.
+    std::fs::remove_file(cli.join("usage.csv")).unwrap();
+    let control = sync_round_in(&default_db, &url, &registry, limits(), Some(&home));
+    assert_eq!(
+        (state(&control), control["changed"].clone()),
+        ("ok".into(), false.into())
+    );
+    set_for_test(Config::default());
+}
+
+/// A previous appDir that could not be cleaned stays reported by every
+/// accepted push until it is clean: a later push with the same appDir does not
+/// hide it. The retry also removes the files once the cause is gone.
+#[cfg(unix)]
+#[test]
+fn a_previous_app_dir_that_could_not_be_cleaned_is_retried_until_clean() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let _guard = lock();
+    set_for_test(Config::default());
+    let home = tempfile::tempdir().unwrap();
+    let first = home
+        .path()
+        .join("Library/Application Support/com.example.first");
+    let cache = first.join("cursor-cache");
+    std::fs::create_dir_all(&cache).unwrap();
+    std::fs::write(cache.join(hex_name('a')), "{}").unwrap();
+    std::fs::write(cache.join(LOCK_FILE_NAME), "").unwrap();
+    let push = |bundle: &str| {
+        set_in(
+            home.path(),
+            serde_json::json!({"enabled": true, "bundleId": bundle}),
+        )
+        .unwrap()
+    };
+    push("com.example.first");
+    // Move to another appDir while the old one cannot be cleaned.
+    std::fs::set_permissions(&cache, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let moved = push("com.example.second");
+    assert_eq!(moved["cleanupFailed"], true);
+    assert_eq!(
+        moved["cleanupFailedProfiles"],
+        serde_json::json!(["appDir"])
+    );
+    // The same appDir again: still reported, not forgotten.
+    let again = push("com.example.second");
+    assert_eq!(again["cleanupFailed"], true, "a later push hid the failure");
+    assert!(cache.join(hex_name('a')).exists());
+    // The cause goes away: the next push cleans it and reports nothing.
+    std::fs::set_permissions(&cache, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let healed = push("com.example.second");
+    assert_eq!(healed["cleanupFailed"], false);
+    assert_eq!(healed["removedFiles"], 1);
+    assert!(!cache.join(hex_name('a')).exists());
+    assert_eq!(push("com.example.second")["cleanupFailed"], false);
+    set_for_test(Config::default());
+}

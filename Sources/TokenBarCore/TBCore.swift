@@ -554,8 +554,9 @@ public enum TBCore {
     /// Which entries of a JSON array of Claude config directories the core
     /// refuses, by index and fixed code, without registering anything. The
     /// one rule behind `setClaudeConfigDirs` and the primary window's guard;
-    /// Swift runs it before building either registry's payload. Pure: no file
-    /// is read, so it is safe on the main actor.
+    /// Swift runs it before building either registry's payload. It reads the
+    /// disk (`~/.cc-mirror` and each variant's `variant.json`), so call it off
+    /// the main actor.
     public static func claudeConfigDirRefusals(json: String) throws -> [RejectedConfigDir] {
         let result: ClaudeConfigDirRefusals = try unwrap(
             json.withCString { tb_claude_config_dir_refusals($0) })

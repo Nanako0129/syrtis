@@ -116,6 +116,11 @@ pub(crate) struct Config {
 
 static CONFIG: LazyLock<RwLock<Config>> = LazyLock::new(|| RwLock::new(Config::default()));
 
+/// Previous appDirs whose files could not be cleaned (refused by
+/// `check_app_dir` now, or a delete failed); every accepted push retries them
+/// until they are clean.
+static STALE_APP_DIRS: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
 pub(crate) fn config() -> Config {
     #[cfg(test)]
     if let Some(config) = THREAD_CONFIG.with(|c| c.borrow().clone()) {
@@ -425,14 +430,36 @@ pub(crate) fn set_from_json(raw: &str, home: Option<&Path>) -> Result<serde_json
     let mut cleanup = Cleanup::default();
     // The appDir in use until now (files may be left there) is cleaned only
     // if it still passes the checks; otherwise it is reported. A refused new
-    // appDir with no earlier one has nothing of ours: no failure.
-    if let Some(old_app) = old.app_dir.as_deref() {
-        if new.app_dir.as_deref() != Some(old_app) {
-            match home.map(|home| check_app_dir(old_app, home)) {
-                Some(Ok(())) => cleanup.everything(old_app),
-                _ => cleanup.failed.push(APP_DIR_FAILURE.to_string()),
+    // appDir with no earlier one has nothing of ours: no failure. A previous
+    // appDir that could not be cleaned is kept in `STALE_APP_DIRS` and tried
+    // again by every accepted push until it is clean, so a later push with
+    // the same appDir cannot hide the failure.
+    {
+        let mut stale = STALE_APP_DIRS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(old_app) = old.app_dir.as_deref() {
+            if new.app_dir.as_deref() != Some(old_app) && !stale.iter().any(|d| d == old_app) {
+                stale.push(old_app.to_path_buf());
             }
         }
+        // An appDir that is the current one again is cleaned by the passes below.
+        stale.retain(|dir| new.app_dir.as_deref() != Some(dir.as_path()));
+        stale.retain(|dir| {
+            let mut attempt = Cleanup::default();
+            let clean = match home.map(|home| check_app_dir(dir, home)) {
+                Some(Ok(())) => {
+                    attempt.everything(dir);
+                    attempt.failed.is_empty()
+                }
+                _ => false,
+            };
+            cleanup.removed += attempt.removed;
+            if !clean && !cleanup.failed.iter().any(|id| id == APP_DIR_FAILURE) {
+                cleanup.failed.push(APP_DIR_FAILURE.to_string());
+            }
+            !clean
+        });
     }
     match (new.app_dir.as_deref(), new.enabled) {
         (Some(app_dir), true) => cleanup.orphans(app_dir, &new.profiles),
@@ -1535,7 +1562,10 @@ fn sync_with(
     } else {
         headline(&outcomes)
     };
-    let cli_present = changed && takeover(&config(), home) == Takeover::Blocked;
+    // Any profile that completed a walk this round holds a current usage file,
+    // whether or not its bytes changed (`changed` is bytes, not completion).
+    let walked = outcomes.iter().any(|o| o.stop.state == State::Ok);
+    let cli_present = walked && takeover(&config(), home) == Takeover::Blocked;
     let state = if cli_present {
         State::CliPresent
     } else {
@@ -1615,6 +1645,10 @@ pub(crate) fn set_thread_config_for_test(config: Option<Config>) {
 #[cfg(test)]
 pub(crate) fn set_for_test(config: Config) {
     *CONFIG.write().unwrap_or_else(|p| p.into_inner()) = config;
+    STALE_APP_DIRS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .clear();
 }
 
 #[cfg(test)]

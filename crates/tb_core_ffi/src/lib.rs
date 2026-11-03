@@ -1709,9 +1709,10 @@ fn invalidate_scan_caches() {
 /// "cleanupFailedProfiles":[id],"rejectedProfiles":[{"index","reason"}]}`, each
 /// id one of `default` / `<UUID>` (that profile's files could not all be
 /// deleted), `cursor-profiles` (the parent folder of the added profiles could
-/// not be read), or `appDir` (the appDir in use until this push now fails the
-/// checks, so files may be left there; a refused appDir never used before is
-/// not reported). A profile whose root is Cursor's own folder
+/// not be read), or `appDir` (a previous appDir that now fails the checks or
+/// whose files could not all be deleted, so files may be left there; every
+/// accepted push retries it until it is clean, and a refused appDir never used
+/// before is not reported). A profile whose root is Cursor's own folder
 /// (`cursor_default`) or repeats an earlier entry (`duplicate`; same path or
 /// same directory, the first entry wins) is left out and listed by its index
 /// in the pushed list; the default and the other profiles are registered and

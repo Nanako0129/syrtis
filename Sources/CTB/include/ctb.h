@@ -297,9 +297,10 @@ char *tb_set_keychain_consent(const char *json);
 // Each id of `cleanupFailedProfiles` is `default`
 // or `<UUID>` (that profile's files could not all be deleted),
 // `cursor-profiles` (the parent folder of the added profiles could not be
-// read), or `appDir` (the appDir in use until this push now fails the
-// checks, so files may be left there; a refused appDir never used before is
-// not reported). Other invalid input is an error and leaves the registry
+// read), or `appDir` (a previous appDir that now fails the checks or
+// whose files could not all be deleted, so files may be left there; every
+// accepted push retries it until it is clean, and a refused appDir never used
+// before is not reported). Other invalid input is an error and leaves the registry
 // unchanged. While enabled with a complete
 // synced file, and the tokscale CLI's Cursor dir holds no usage files (or
 // `cliTakeoverConfirmed`), reports read Cursor from the newest synced file of
