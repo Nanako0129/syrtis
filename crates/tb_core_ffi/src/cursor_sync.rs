@@ -89,8 +89,10 @@ const PROFILES_DIR_NAME: &str = "cursor-profiles";
 /// The default profile's id in statuses and results; not a UUID, so it can
 /// never collide with an added profile's.
 const DEFAULT_PROFILE_ID: &str = "default";
-/// `cleanupFailedProfiles` entry: the appDir in use until this push no
-/// longer passes `check_app_dir`, so nothing in it was cleaned.
+/// `cleanupFailedProfiles` entry: a previous appDir that no longer passes
+/// `check_app_dir` (nothing in it was cleaned) or whose files could not all be
+/// deleted. It is remembered in `STALE_APP_DIRS` and retried by every accepted
+/// push while Syrtis keeps running; after a relaunch it is no longer known.
 const APP_DIR_FAILURE: &str = "appDir";
 /// Bounds the per-sync work one config can ask for.
 const MAX_PROFILES: usize = 32;
@@ -115,6 +117,12 @@ pub(crate) struct Config {
 }
 
 static CONFIG: LazyLock<RwLock<Config>> = LazyLock::new(|| RwLock::new(Config::default()));
+
+/// Previous appDirs whose files could not be cleaned (refused by
+/// `check_app_dir` now, or a delete failed); every accepted push retries them
+/// until they are clean, while Syrtis keeps running. Not persisted: after a
+/// relaunch the previous appDir is no longer known and is not retried.
+static STALE_APP_DIRS: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
 
 pub(crate) fn config() -> Config {
     #[cfg(test)]
@@ -303,6 +311,28 @@ fn validate_root(raw: &str) -> Result<PathBuf, String> {
     Ok(root)
 }
 
+/// Cursor's own user-data folder, the default profile's.
+fn cursor_own_root(home: &Path) -> PathBuf {
+    home.join("Library/Application Support/Cursor")
+}
+
+/// The folder's file identity (device and inode, a final symlink followed),
+/// so another spelling of one folder (a symlink, a firmlink, another case on
+/// a case-insensitive volume) compares equal. `None` for a folder that
+/// cannot be read (gone, unmounted): never an identity match, so it can only
+/// match by path.
+fn folder_identity(path: &Path) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt as _;
+    let meta = std::fs::metadata(path).ok()?;
+    meta.is_dir().then(|| (meta.dev(), meta.ino()))
+}
+
+/// Whether `a` and `b` name one folder: the same path, or the same
+/// directory identity.
+fn same_folder(a: &Path, b: &Path) -> bool {
+    a == b || folder_identity(a).is_some_and(|identity| Some(identity) == folder_identity(b))
+}
+
 /// An off push is always accepted: it turns sync (and so the takeover) off
 /// whatever else it carries. Only its bundle id is read; an appDir that
 /// fails `app_dir_for` becomes `None`, and nothing in it is touched.
@@ -326,7 +356,16 @@ fn parse_off(raw: &str, home: Option<&Path>) -> Option<Config> {
     })
 }
 
-fn parse_config(raw: &str, home: Option<&Path>) -> Result<Config, String> {
+/// The registry from an on push, plus the profiles refused for their root
+/// (`{"index","reason"}`, index in the pushed list; reasons `cursor_default`
+/// and `duplicate`). Whole-push errors stay for what makes the list itself
+/// unusable (bad JSON, bundle id, too many profiles, an invalid or repeated
+/// id, a root that is not an absolute path): a refused root drops only its own
+/// profile, so the default profile and the other profiles keep syncing.
+fn parse_config(
+    raw: &str,
+    home: Option<&Path>,
+) -> Result<(Config, Vec<serde_json::Value>), String> {
     let input: SetInput =
         serde_json::from_str(raw).map_err(|_| "invalid cursor sync JSON".to_string())?;
     let app_dir = app_dir_for(&input.bundle_id, home)?;
@@ -334,31 +373,55 @@ fn parse_config(raw: &str, home: Option<&Path>) -> Result<Config, String> {
         return Err("too many cursor profiles".to_string());
     }
     let mut profiles: Vec<Profile> = Vec::with_capacity(input.profiles.len());
-    for profile in input.profiles {
-        if !valid_profile_id(&profile.id) || profiles.iter().any(|p| p.id == profile.id) {
+    let mut ids: Vec<String> = Vec::with_capacity(input.profiles.len());
+    let mut rejected = Vec::new();
+    let own = home.map(cursor_own_root);
+    for (index, profile) in input.profiles.into_iter().enumerate() {
+        if !valid_profile_id(&profile.id) || ids.contains(&profile.id) {
             return Err("cursor profile id is invalid".to_string());
         }
-        profiles.push(Profile {
-            id: profile.id,
-            root: validate_root(&profile.root)?,
-        });
+        ids.push(profile.id.clone());
+        let root = validate_root(&profile.root)?;
+        // The Swift check at add time is a pre-check of these two rules, which
+        // the core owns: Cursor's own folder is the default profile (a second
+        // read of the same login), and a folder already listed (an earlier
+        // entry wins) would be a second profile on the same database.
+        let reason = if own.as_deref().is_some_and(|own| same_folder(&root, own)) {
+            Some("cursor_default")
+        } else if profiles.iter().any(|p| same_folder(&root, &p.root)) {
+            Some("duplicate")
+        } else {
+            None
+        };
+        match reason {
+            Some(reason) => rejected.push(serde_json::json!({"index": index, "reason": reason})),
+            None => profiles.push(Profile {
+                id: profile.id,
+                root,
+            }),
+        }
     }
-    Ok(Config {
-        enabled: input.enabled,
-        app_dir: Some(app_dir),
-        profiles,
-        cli_takeover_confirmed: input.cli_takeover_confirmed,
-    })
+    Ok((
+        Config {
+            enabled: input.enabled,
+            app_dir: Some(app_dir),
+            profiles,
+            cli_takeover_confirmed: input.cli_takeover_confirmed,
+        },
+        rejected,
+    ))
 }
 
 /// Replace the registry from
 /// `{"enabled":bool,"bundleId":"a.b","profiles":[{"id":"<UUID>","root":"/abs"}],"cliTakeoverConfirmed":bool}`.
-/// Invalid input leaves the registry untouched. Cleanup (P3-7, B2): turning
+/// Invalid input leaves the registry untouched; a profile whose root is
+/// Cursor's own folder or repeats an earlier one is left out and reported in
+/// `rejectedProfiles` by index (`parse_config`). Cleanup (P3-7, B2): turning
 /// sync off deletes our files from every profile dir; while on, dirs of
 /// profiles no longer listed (orphans) are emptied of our files and removed.
 pub(crate) fn set_from_json(raw: &str, home: Option<&Path>) -> Result<serde_json::Value, String> {
-    let new = match parse_off(raw, home) {
-        Some(off) => off,
+    let (new, rejected_profiles) = match parse_off(raw, home) {
+        Some(off) => (off, Vec::new()),
         None => parse_config(raw, home)?,
     };
     let old = {
@@ -370,14 +433,36 @@ pub(crate) fn set_from_json(raw: &str, home: Option<&Path>) -> Result<serde_json
     let mut cleanup = Cleanup::default();
     // The appDir in use until now (files may be left there) is cleaned only
     // if it still passes the checks; otherwise it is reported. A refused new
-    // appDir with no earlier one has nothing of ours: no failure.
-    if let Some(old_app) = old.app_dir.as_deref() {
-        if new.app_dir.as_deref() != Some(old_app) {
-            match home.map(|home| check_app_dir(old_app, home)) {
-                Some(Ok(())) => cleanup.everything(old_app),
-                _ => cleanup.failed.push(APP_DIR_FAILURE.to_string()),
+    // appDir with no earlier one has nothing of ours: no failure. A previous
+    // appDir that could not be cleaned is kept in `STALE_APP_DIRS` and tried
+    // again by every accepted push until it is clean, so a later push with
+    // the same appDir cannot hide the failure (in this process only).
+    {
+        let mut stale = STALE_APP_DIRS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(old_app) = old.app_dir.as_deref() {
+            if new.app_dir.as_deref() != Some(old_app) && !stale.iter().any(|d| d == old_app) {
+                stale.push(old_app.to_path_buf());
             }
         }
+        // An appDir that is the current one again is cleaned by the passes below.
+        stale.retain(|dir| new.app_dir.as_deref() != Some(dir.as_path()));
+        stale.retain(|dir| {
+            let mut attempt = Cleanup::default();
+            let clean = match home.map(|home| check_app_dir(dir, home)) {
+                Some(Ok(())) => {
+                    attempt.everything(dir);
+                    attempt.failed.is_empty()
+                }
+                _ => false,
+            };
+            cleanup.removed += attempt.removed;
+            if !clean && !cleanup.failed.iter().any(|id| id == APP_DIR_FAILURE) {
+                cleanup.failed.push(APP_DIR_FAILURE.to_string());
+            }
+            !clean
+        });
     }
     match (new.app_dir.as_deref(), new.enabled) {
         (Some(app_dir), true) => cleanup.orphans(app_dir, &new.profiles),
@@ -396,6 +481,7 @@ pub(crate) fn set_from_json(raw: &str, home: Option<&Path>) -> Result<serde_json
         "removedFiles": cleanup.removed,
         "cleanupFailed": !cleanup.failed.is_empty(),
         "cleanupFailedProfiles": cleanup.failed,
+        "rejectedProfiles": rejected_profiles,
     }))
 }
 
@@ -404,8 +490,8 @@ struct Cleanup {
     removed: usize,
     /// What could not be fully cleaned: a profile id (`default` or a UUID)
     /// whose files could not all be deleted, `cursor-profiles` (that parent
-    /// folder could not be read), or `appDir` (the previous appDir was
-    /// refused, so nothing in it was cleaned).
+    /// folder could not be read), or `appDir` (a previous appDir was refused
+    /// or its files could not all be deleted; see `STALE_APP_DIRS`).
     failed: Vec<String>,
 }
 
@@ -600,17 +686,30 @@ fn complete_file(dir: &Path) -> Option<(PathBuf, SystemTime)> {
 // ---------------------------------------------------------------------------
 // Files.
 
+/// What a delete pass did: `removed` counts every file of ours (usage files
+/// and temp leftovers), `usage` only the usage files, which are what the
+/// engine reads (a temp file never changes what is counted).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct Removal {
+    removed: usize,
+    usage: usize,
+    failed: bool,
+}
+
 /// Delete Syrtis usage files (and temp leftovers) in `dir` except `keep`.
-/// Never touches anything else. Caller holds the dir lock. Returns the count
-/// removed and whether any of ours could not be (or the dir not be read).
-fn remove_usage_files(dir: &Path, keep: Option<&str>) -> (usize, bool) {
+/// Never touches anything else. Caller holds the dir lock. `failed`: any of
+/// ours could not be deleted, or the dir could not be read.
+fn remove_usage_files(dir: &Path, keep: Option<&str>) -> Removal {
     let Ok(entries) = std::fs::read_dir(dir) else {
-        return (0, true);
+        return Removal {
+            failed: true,
+            ..Removal::default()
+        };
     };
-    let (mut removed, mut failed) = (0, false);
+    let mut result = Removal::default();
     for entry in entries {
         let Ok(entry) = entry else {
-            failed = true;
+            result.failed = true;
             continue;
         };
         let name = entry.file_name();
@@ -619,12 +718,15 @@ fn remove_usage_files(dir: &Path, keep: Option<&str>) -> (usize, bool) {
             continue;
         }
         match std::fs::remove_file(entry.path()) {
-            Ok(()) => removed += 1,
+            Ok(()) => {
+                result.removed += 1;
+                result.usage += usize::from(is_sync_file_name(&name));
+            }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(_) => failed = true,
+            Err(_) => result.failed = true,
         }
     }
-    (removed, failed)
+    result
 }
 
 /// B2: exactly our file names, `usage.<64 hex>.json` and our temp prefix.
@@ -639,11 +741,24 @@ fn is_ours(name: &str) -> bool {
 /// lock file and `rmdir` it, which succeeds only if nothing else is left
 /// (never `remove_dir_all`).
 fn remove_usage_files_locked(dir: &Path, remove_dir: bool) -> (usize, bool) {
+    let result = locked_removal(dir, None, remove_dir);
+    (result.removed, result.failed)
+}
+
+/// `remove_usage_files_locked` that spares `keep` (a usage file name) and
+/// reports the usage files separately.
+fn locked_removal(dir: &Path, keep: Option<&str>, remove_dir: bool) -> Removal {
+    let nothing = Removal::default();
     // Only a real directory: never follow a symlink to delete elsewhere.
     match std::fs::symlink_metadata(dir) {
         Ok(meta) if meta.is_dir() => {}
-        Ok(_) => return (0, false),
-        Err(error) => return (0, error.kind() != std::io::ErrorKind::NotFound),
+        Ok(_) => return nothing,
+        Err(error) => {
+            return Removal {
+                failed: error.kind() != std::io::ErrorKind::NotFound,
+                ..nothing
+            }
+        }
     }
     let locked = crate::agent_quota_history::open_owner_only(&dir.join(LOCK_FILE_NAME))
         .ok()
@@ -656,14 +771,17 @@ fn remove_usage_files_locked(dir: &Path, remove_dir: bool) -> (usize, bool) {
                 entry.map_or(true, |entry| is_ours(&entry.file_name().to_string_lossy()))
             })
         });
-        return (0, holds_ours);
+        return Removal {
+            failed: holds_ours,
+            ..nothing
+        };
     }
-    let (removed, failed) = remove_usage_files(dir, None);
-    if remove_dir && !failed {
+    let result = remove_usage_files(dir, keep);
+    if remove_dir && !result.failed {
         let _ = std::fs::remove_file(dir.join(LOCK_FILE_NAME));
         let _ = std::fs::remove_dir(dir);
     }
-    (removed, failed)
+    result
 }
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -683,17 +801,60 @@ struct UsageFile<'a> {
     usage_events_display: &'a [Event],
 }
 
+/// Whether the usage file at `path` already holds exactly `bytes`; if so its
+/// modified time is set to now, on the same handle, so it still dates the
+/// last complete walk (`lastSuccessMs`, the newest copy per account) without
+/// a rewrite. Any failure answers `false`: the caller then writes as usual.
+/// A symlink or a non-regular file is never read (it is replaced instead);
+/// the length is compared first, so a file of another size is not read.
+fn refresh_if_same(path: &Path, bytes: &[u8]) -> bool {
+    use std::io::Read as _;
+    (|| -> std::io::Result<bool> {
+        let meta = std::fs::symlink_metadata(path)?;
+        if !meta.is_file() || meta.len() != bytes.len() as u64 {
+            return Ok(false);
+        }
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)?;
+        if file.metadata()?.len() != bytes.len() as u64 {
+            return Ok(false);
+        }
+        let mut old = Vec::with_capacity(bytes.len());
+        file.read_to_end(&mut old)?;
+        if old != bytes {
+            return Ok(false);
+        }
+        file.set_modified(SystemTime::now())?;
+        Ok(true)
+    })()
+    .unwrap_or(false)
+}
+
 /// Write the complete walk: dir 0700, temp 0600, fsync, atomic rename, dir
-/// fsync, then drop every other usage file. `still_wanted` is re-checked
-/// under the lock so a concurrent disable (which deletes under the same lock)
-/// can never be undone by a walk finishing after it.
+/// fsync, then drop every other usage file. Returns whether a usage file's
+/// content changed: a file whose bytes already equal the new ones is not
+/// rewritten (only its modified time moves to now), so an identical walk
+/// changes nothing, unless a superseded usage file was removed (an orphan
+/// temp does not count).
+///
+/// `still_wanted` is checked before anything is created, so a profile or
+/// switch turned off earlier (say, during its last page) creates no dir and
+/// no lock file. That check is not atomic with the creation: a removal racing
+/// it can still leave an empty dir and lock file. It is checked again under
+/// the lock, which is what guarantees that no usage file is written after a
+/// concurrent disable or removal, because those delete under the same lock.
 fn commit_file(
     dir: &Path,
     stem: &str,
     events: &[Event],
     still_wanted: &dyn Fn() -> bool,
-) -> Result<(), Stop> {
+) -> Result<Committed, Stop> {
     let failed = || Stop::error("write_failed");
+    if !still_wanted() {
+        return Err(Stop::new(State::Disabled, None));
+    }
     // An added profile's dir sits in `cursor-profiles`: that must be a real
     // directory too, or `create_dir_all` would follow a symlink there.
     if dir.parent().and_then(Path::file_name) == Some(PROFILES_DIR_NAME.as_ref()) {
@@ -713,29 +874,43 @@ fn commit_file(
     })
     .map_err(|_| failed())?;
     let final_name = format!("usage.{stem}.json");
-    let temp_path = dir.join(temp_file_name());
-    let written = (|| {
-        let mut options = std::fs::OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt as _;
-            options.mode(0o600);
+    let same = refresh_if_same(&dir.join(&final_name), &payload);
+    if !same {
+        let temp_path = dir.join(temp_file_name());
+        let written = (|| {
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt as _;
+                options.mode(0o600);
+            }
+            let mut file = options.open(&temp_path)?;
+            file.write_all(&payload)?;
+            file.sync_all()?;
+            drop(file);
+            tokscale_core::fs_atomic::replace_file(&temp_path, &dir.join(&final_name))
+        })();
+        if written.is_err() {
+            let _ = std::fs::remove_file(&temp_path);
+            return Err(failed());
         }
-        let mut file = options.open(&temp_path)?;
-        file.write_all(&payload)?;
-        file.sync_all()?;
-        drop(file);
-        tokscale_core::fs_atomic::replace_file(&temp_path, &dir.join(&final_name))
-    })();
-    if written.is_err() {
-        let _ = std::fs::remove_file(&temp_path);
-        return Err(failed());
+        // The rename is the commit point; a failed dir fsync cannot undo it.
+        let _ = crate::agent_quota_history::sync_directory(dir);
     }
-    // The rename is the commit point; a failed dir fsync cannot undo it.
-    let _ = crate::agent_quota_history::sync_directory(dir);
-    let _ = remove_usage_files(dir, Some(&final_name));
-    Ok(())
+    let removal = remove_usage_files(dir, Some(&final_name));
+    Ok(Committed {
+        changed: !same || removal.usage > 0,
+        cleanup_failed: removal.failed,
+    })
+}
+
+/// What a commit left: whether a usage file's bytes changed, and whether
+/// another usage file of ours (a superseded account's) could not be deleted.
+#[derive(Debug)]
+struct Committed {
+    changed: bool,
+    cleanup_failed: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -860,6 +1035,51 @@ struct Outcome {
     /// For `Duplicate`: the index (in this round's slots) of the profile that
     /// already covered the same account. Never the account itself.
     duplicate_of: Option<usize>,
+    /// A usage file in this profile's dir was written with new bytes or
+    /// removed: the data the engine reads changed.
+    changed: bool,
+    /// A superseded usage file of ours could not be deleted: by a duplicate's
+    /// cleanup, or after a successful commit (reported in
+    /// `cleanupFailedProfiles`).
+    cleanup_failed: bool,
+    /// Stopped by a refusal decided where it arose, so no list of codes can
+    /// miss one: every `Err` the login reader returns (all its refusals; no
+    /// login is `Ok(None)`), a token that cannot be read or does not match
+    /// its account, no installation key, a cookie that cannot be built, an
+    /// appDir that fails its checks (so no storage to write to).
+    refused: bool,
+}
+
+impl Outcome {
+    fn stopped(stop: Stop) -> Self {
+        Self {
+            stop,
+            events: 0,
+            duplicate_of: None,
+            changed: false,
+            cleanup_failed: false,
+            refused: false,
+        }
+    }
+
+    fn refused(stop: Stop) -> Self {
+        Self {
+            refused: true,
+            ..Self::stopped(stop)
+        }
+    }
+}
+
+/// Outcomes that write no file however long the round runs: a duplicate, no
+/// login, an expired session, or a refusal (`Outcome::refused`). A profile
+/// whose last round ended so does not ask for the full budget while it has
+/// no file; a timeout, an outage or a spent budget does.
+fn writes_no_file(outcome: &Outcome) -> bool {
+    outcome.refused
+        || matches!(
+            outcome.stop.state,
+            State::Duplicate | State::NotSignedIn | State::Expired
+        )
 }
 
 // ---------------------------------------------------------------------------
@@ -1103,11 +1323,7 @@ async fn run(
     claim: &mut dyn FnMut(&str, bool) -> Option<usize>,
     checked: bool,
 ) -> Outcome {
-    let stopped = |stop| Outcome {
-        stop,
-        events: 0,
-        duplicate_of: None,
-    };
+    let stopped = Outcome::stopped;
     if !enabled() {
         return stopped(Stop::new(State::Disabled, None));
     }
@@ -1119,11 +1335,11 @@ async fn run(
     let login = match read {
         Ok(Some(login)) => login,
         Ok(None) => return stopped(Stop::new(State::NotSignedIn, None)),
-        Err(reason) => return stopped(Stop::error(reason)),
+        Err(reason) => return Outcome::refused(Stop::error(reason)),
     };
     let (user, exp) = match token_user(&login) {
         Ok(found) => found,
-        Err(stop) => return stopped(stop),
+        Err(stop) => return Outcome::refused(stop),
     };
     // C0.5: Cursor refreshes the token only while it runs, and an expired
     // one is answered with a redirect to WorkOS. Decide locally; send nothing.
@@ -1131,23 +1347,35 @@ async fn run(
         return stopped(Stop::new(State::Expired, None));
     }
     let Some(stem) = (target.file_stem)(&user) else {
-        return stopped(Stop::error("key_unavailable"));
+        return Outcome::refused(Stop::error("key_unavailable"));
     };
     // B1: an account already covered this round by an earlier profile is
     // not walked again (saves requests, avoids 429); its file name is the
-    // same, so the takeover keeps one copy.
+    // same, so the takeover keeps one copy. Any other account's file this
+    // profile still holds (it was signed in to that one before) goes, under
+    // its lock, the way a commit drops superseded files; otherwise the
+    // takeover would keep counting that old account (MA-22). This
+    // account's own copy stays: it is the same file name, so the takeover
+    // still keeps only the newest.
     if let Some(first) = claim(&stem, false) {
+        // The switch and the appDir are re-checked first: nothing is deleted
+        // for a profile or appDir that is no longer wanted.
+        if !enabled() {
+            return stopped(Stop::new(State::Disabled, None));
+        }
+        let cleaned = locked_removal(dir, Some(&format!("usage.{stem}.json")), false);
         return Outcome {
-            stop: Stop::new(State::Duplicate, None),
-            events: 0,
             duplicate_of: Some(first),
+            changed: cleaned.usage > 0,
+            cleanup_failed: cleaned.failed,
+            ..stopped(Stop::new(State::Duplicate, None))
         };
     }
     let Ok(mut cookie) = reqwest::header::HeaderValue::from_str(&format!(
         "WorkosCursorSessionToken={user}%3A%3A{}",
         login.access_token
     )) else {
-        return stopped(Stop::error("token_unreadable"));
+        return Outcome::refused(Stop::error("token_unreadable"));
     };
     cookie.set_sensitive(true);
     drop(login);
@@ -1162,12 +1390,13 @@ async fn run(
     };
     drop(cookie);
     match commit_file(dir, &stem, &events, enabled) {
-        Ok(()) => {
+        Ok(committed) => {
             claim(&stem, true);
             Outcome {
-                stop: Stop::new(State::Ok, None),
                 events: events.len(),
-                duplicate_of: None,
+                changed: committed.changed,
+                cleanup_failed: committed.cleanup_failed,
+                ..stopped(Stop::new(State::Ok, None))
             }
         }
         Err(stop) => stopped(stop),
@@ -1177,9 +1406,50 @@ async fn run(
 // ---------------------------------------------------------------------------
 // Entry point (single-flight).
 
-/// The last status, behind the single-flight lock. A caller arriving while a
-/// sync runs waits for it and returns its status instead of starting another.
-static IN_FLIGHT: Mutex<Option<serde_json::Value>> = Mutex::new(None);
+/// What the last round left, behind the single-flight lock. A caller
+/// arriving while a sync runs waits for it and returns its status instead of
+/// starting another.
+struct LastRound {
+    status: Option<serde_json::Value>,
+    /// The slots (`Slot::key`: id and root) whose outcome wrote no file
+    /// however long the round ran (`writes_no_file`). A slot with another
+    /// root is not in it, so its first round may take the full budget.
+    no_file: Vec<(String, Option<PathBuf>)>,
+}
+
+static IN_FLIGHT: Mutex<LastRound> = Mutex::new(LastRound {
+    status: None,
+    no_file: Vec::new(),
+});
+
+#[cfg(test)]
+thread_local! {
+    /// The budget the last round on this thread chose.
+    static ROUND_BUDGET: std::cell::Cell<Option<Duration>> = const { std::cell::Cell::new(None) };
+}
+
+impl Slot {
+    /// A profile as the next round recognises it: its id and root. The dir
+    /// is derived from the id, so it is not part of the key.
+    fn key(&self) -> (String, Option<PathBuf>) {
+        (self.id.clone(), self.root.clone())
+    }
+}
+
+/// The round's budget: full for "Sync now" and while some profile has no
+/// complete file but could write one; background otherwise. A profile whose last round could not write a
+/// file however long it ran (`writes_no_file`) does not hold every later
+/// round at the full budget.
+fn round_budget(explicit: bool, slots: &[Slot], no_file: &[(String, Option<PathBuf>)]) -> Duration {
+    let wants_full = slots
+        .iter()
+        .any(|slot| complete_file(&slot.dir).is_none() && !no_file.contains(&slot.key()));
+    if explicit || wants_full {
+        FULL_BUDGET
+    } else {
+        BACKGROUND_BUDGET
+    }
+}
 
 /// Run one sync against Cursor. Returns the status JSON and whether a synced
 /// file changed (the caller then invalidates scan caches).
@@ -1223,12 +1493,15 @@ fn sync_with(
     config: &(dyn Fn() -> Config + Sync),
     test_limits: Option<Limits>,
 ) -> (serde_json::Value, bool) {
-    let mut slot = match IN_FLIGHT.try_lock() {
-        Ok(slot) => slot,
+    let mut last = match IN_FLIGHT.try_lock() {
+        Ok(last) => last,
         Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
         Err(std::sync::TryLockError::WouldBlock) => {
-            let slot = IN_FLIGHT.lock().unwrap_or_else(|p| p.into_inner());
-            return (slot.clone().unwrap_or(serde_json::Value::Null), false);
+            let last = IN_FLIGHT.lock().unwrap_or_else(|p| p.into_inner());
+            return (
+                last.status.clone().unwrap_or(serde_json::Value::Null),
+                false,
+            );
         }
     };
     let start = config();
@@ -1243,13 +1516,9 @@ fn sync_with(
         _ => true,
     };
     let app_dir_rejected = !app_dir_ok();
-    let budget =
-        if app_dir_rejected || explicit || profiles.iter().any(|p| complete_file(&p.dir).is_none())
-        {
-            FULL_BUDGET
-        } else {
-            BACKGROUND_BUDGET
-        };
+    let budget = round_budget(explicit, &profiles, &last.no_file);
+    #[cfg(test)]
+    ROUND_BUDGET.with(|cell| cell.set(Some(budget)));
     let limits = test_limits.unwrap_or(Limits::production(budget));
     // One budget for the whole round, so several profiles cannot hold
     // IN_FLIGHT for longer than one would. (A database read that blocks in
@@ -1260,17 +1529,9 @@ fn sync_with(
     for (index, profile) in profiles.iter().enumerate() {
         let remaining = deadline.saturating_duration_since(Instant::now());
         let outcome = if app_dir_rejected {
-            Outcome {
-                stop: Stop::error("app_dir_rejected"),
-                events: 0,
-                duplicate_of: None,
-            }
+            Outcome::refused(Stop::error("app_dir_rejected"))
         } else if remaining.is_zero() {
-            Outcome {
-                stop: Stop::new(State::Partial, Some("budget_exhausted")),
-                events: 0,
-                duplicate_of: None,
-            }
+            Outcome::stopped(Stop::new(State::Partial, Some("budget_exhausted")))
         } else {
             let still_wanted = || profile.still_in(&start, &config()) && app_dir_ok();
             let mut claim = |stem: &str, record: bool| {
@@ -1298,13 +1559,16 @@ fn sync_with(
         };
         outcomes.push(outcome);
     }
-    let changed = outcomes.iter().any(|o| o.stop.state == State::Ok);
+    let changed = outcomes.iter().any(|o| o.changed);
     let head = if profiles.is_empty() {
         Stop::new(State::Disabled, None)
     } else {
         headline(&outcomes)
     };
-    let cli_present = changed && takeover(&config(), home) == Takeover::Blocked;
+    // Any profile that completed a walk this round holds a current usage file,
+    // whether or not its bytes changed (`changed` is bytes, not completion).
+    let completed_walk = outcomes.iter().any(|o| o.stop.state == State::Ok);
+    let cli_present = completed_walk && takeover(&config(), home) == Takeover::Blocked;
     let state = if cli_present {
         State::CliPresent
     } else {
@@ -1344,12 +1608,24 @@ fn sync_with(
         "lastSuccessMs": profiles.iter().filter_map(|p| last_success_ms(&p.dir)).max(),
         "changed": changed,
         "profiles": per_profile,
+        "cleanupFailedProfiles": profiles
+            .iter()
+            .zip(&outcomes)
+            .filter(|(_, outcome)| outcome.cleanup_failed)
+            .map(|(profile, _)| profile.id.as_str())
+            .collect::<Vec<_>>(),
     });
     // `cliPresent` has no reason; another profile's must not ride along.
     if let Some(reason) = head.reason.filter(|_| !cli_present) {
         status["reason"] = reason.into();
     }
-    *slot = Some(status.clone());
+    last.no_file = profiles
+        .iter()
+        .zip(&outcomes)
+        .filter(|(_, outcome)| writes_no_file(outcome))
+        .map(|(profile, _)| profile.key())
+        .collect();
+    last.status = Some(status.clone());
     (status, changed)
 }
 
@@ -1372,6 +1648,10 @@ pub(crate) fn set_thread_config_for_test(config: Option<Config>) {
 #[cfg(test)]
 pub(crate) fn set_for_test(config: Config) {
     *CONFIG.write().unwrap_or_else(|p| p.into_inner()) = config;
+    STALE_APP_DIRS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .clear();
 }
 
 #[cfg(test)]

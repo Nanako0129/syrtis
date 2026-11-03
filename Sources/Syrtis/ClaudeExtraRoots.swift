@@ -7,10 +7,10 @@ import TokenBarCore
 /// account — `<dir>/projects` and `<dir>/transcripts` (D2 in the extra-root
 /// plan) — and is pushed to the Rust registry via `TBCore.setExtraScanPaths`.
 ///
-/// Usage from these roots merges into the single reported total; there is no
-/// per-account breakdown. Settings must say so explicitly (see
-/// `SettingsPanel`'s hint copy) so a user adding a second account does not
-/// expect a split view that does not exist.
+/// Usage from these roots merges into the single reported total (token
+/// counts have no per-account breakdown), while each folder's quota window is
+/// its own card with its own account pill (`configDirsPayloadJSON`). The
+/// Settings copy (`AccountsCopy.claudeDetails`) says both.
 enum ClaudeExtraRoots {
     static let storageKey = "tokenbar.claude.extraConfigDirs"
     /// Incremented once the core has accepted a new root set. Views observe
@@ -47,13 +47,67 @@ enum ClaudeExtraRoots {
         return !exists || !isDir.boolValue
     }
 
-    /// Reject the home directory itself and the filesystem root outright —
-    /// anything else is the user's call (mirrors the plan's risk table: the
-    /// core only warns on an out-of-home path, it does not block).
-    static func isRejectedRoot(_ path: String) -> Bool {
-        let standardized = (path as NSString).standardizingPath
-        let home = FileManager.default.homeDirectoryForCurrentUser.path
-        return standardized.isEmpty || standardized == "/" || standardized == home
+    /// Which entries of `configDirs` the core refuses, by index, with its fixed
+    /// reason code (`TBCore.claudeConfigDirRefusals`): home, `/`, `~/.claude`
+    /// and its ancestors, any primary scan root (`~/.claude/projects`,
+    /// `~/.claude/transcripts`, Claude Desktop's Cowork tree, a default-layout
+    /// `~/.cc-mirror/<variant>/config/projects`) with its
+    /// ancestors and descendants, a duplicate, an overlap with an earlier
+    /// entry, or more than eight. Another folder inside `~/.claude` is
+    /// allowed. The core owns the
+    /// rule; this only asks it, so Swift and the setter cannot disagree.
+    ///
+    /// Asked BEFORE either registry's payload is built (`classify`,
+    /// `expand(accepted:)`, `configDirsPayloadJSON(accepted:)`): the scan payload is installed by a separate
+    /// setter with no such rule, and either registry alone holding `~/.claude`
+    /// emptied the primary's window (audit P1, 2026-11-03).
+    ///
+    /// Blocking (see `coreRefusals`): call it off the main thread.
+    ///
+    /// Fails closed: if the core cannot answer, every entry counts as refused
+    /// (`unavailable`), so no extra account is installed rather than one that
+    /// might be the primary's own folder.
+    static func refusals(_ configDirs: [String]) -> [Int: String] {
+        // An empty list has nothing to refuse. The core reads nothing for it
+        // either; this only saves the FFI hop.
+        guard !configDirs.isEmpty else { return [:] }
+        let standardized = configDirs.map { ($0 as NSString).standardizingPath }
+        let json = (try? JSONEncoder().encode(standardized)).flatMap { String(data: $0, encoding: .utf8) }
+        guard let json, let rejected = try? coreRefusals(json) else {
+            return Dictionary(uniqueKeysWithValues: configDirs.indices.map { ($0, "unavailable") })
+        }
+        return Dictionary(rejected.map { ($0.index, $0.reason) }, uniquingKeysWith: { first, _ in first })
+    }
+
+    /// The core's rule, which reads the disk (`~/.cc-mirror`, each
+    /// `variant.json`, the Cowork tree) and so blocks: never call it on the
+    /// main thread. A seam so a test can count the calls: one apply and one
+    /// render of the list each ask once (`classify`).
+    nonisolated(unsafe) static var coreRefusals: (String) throws -> [RejectedConfigDir] = {
+        try TBCore.claudeConfigDirRefusals(json: $0)
+    }
+
+    /// One answer of the core's rule for a configured list: what it refuses,
+    /// by index, and what it accepts (standardized, in order). Compute it once
+    /// per apply and per render and reuse it; each call crosses the FFI and
+    /// reads the disk.
+    struct Classified {
+        let refused: [Int: String]
+        let accepted: [String]
+    }
+
+    static func classify(_ configDirs: [String]) -> Classified {
+        let refused = refusals(configDirs)
+        let accepted = configDirs.indices
+            .filter { refused[$0] == nil }
+            .map { (configDirs[$0] as NSString).standardizingPath }
+        return Classified(refused: refused, accepted: accepted)
+    }
+
+    /// The Settings pre-check for adding `path` after `existing`: the core's
+    /// reason code, or nil when it would be accepted.
+    static func refusal(adding path: String, to existing: [String]) -> String? {
+        refusals(existing + [path])[existing.count]
     }
 
     /// Expand a user-entered `CLAUDE_CONFIG_DIR` into the two sub-roots the
@@ -65,12 +119,12 @@ enum ClaudeExtraRoots {
         return ["\(base)/projects", "\(base)/transcripts"]
     }
 
-    /// Expand and deduplicate the configured dirs into the exact list of scan
-    /// roots the engine walks. Split out so `ExtraScanRoots` can merge this
-    /// list with another client's roots without decoding the encoded payload.
-    static func expandedPaths(_ configDirs: [String]) -> [String] {
+    /// The two scan sub-roots of every accepted directory (`classify`),
+    /// deduplicated: the exact list of scan roots the engine walks. Refused
+    /// entries contribute no root.
+    static func expand(accepted: [String]) -> [String] {
         var seen = Set<String>()
-        return configDirs.flatMap(expand).filter { seen.insert($0).inserted }
+        return accepted.flatMap(expand).filter { seen.insert($0).inserted }
     }
 
     /// Build the `tb_set_extra_scan_paths` payload from the persisted list:
@@ -81,8 +135,8 @@ enum ClaudeExtraRoots {
     /// Claude-only, and kept byte-compatible: `ExtraScanRoots.payloadJSON`
     /// returns this exact string when no Pi or DSH roots are configured, so an
     /// upgrade does not look like a scan-root change.
-    static func payloadJSON(_ configDirs: [String]) -> String {
-        let object = ["claude": expandedPaths(configDirs)]
+    static func payloadJSON(expanded: [String]) -> String {
+        let object = ["claude": expanded]
         let data = (try? JSONEncoder().encode(object)) ?? Data("{}".utf8)
         return String(data: data, encoding: .utf8) ?? "{}"
     }
@@ -101,12 +155,11 @@ enum ClaudeExtraRoots {
     /// the Keychain service the core derives is the SHA-256 of this exact
     /// string: `/x/.claude-work/` and `/x/.claude-work` would read different
     /// items, and only one of them exists.
-    static func configDirsPayloadJSON(_ configDirs: [String]) -> String {
-        var seen = Set<String>()
-        let standardized = configDirs
-            .map { ($0 as NSString).standardizingPath }
-            .filter { seen.insert($0).inserted }
-        let data = (try? JSONEncoder().encode(standardized)) ?? Data("[]".utf8)
+    ///
+    /// `accepted` is the core's answer for the configured list (`classify`):
+    /// refused entries are left out, duplicates among them.
+    static func configDirsPayloadJSON(accepted: [String]) -> String {
+        let data = (try? JSONEncoder().encode(accepted)) ?? Data("[]".utf8)
         return String(data: data, encoding: .utf8) ?? "[]"
     }
 
@@ -159,7 +212,7 @@ enum ClaudeExtraRoots {
     /// Overridable so a self-test can move the roots DURING a fetch — the
     /// property under test — without writing the real defaults key.
     nonisolated(unsafe) static var appliedProvider: @Sendable () -> String = {
-        UserDefaults.standard.string(forKey: appliedKey) ?? payloadJSON([])
+        UserDefaults.standard.string(forKey: appliedKey) ?? payloadJSON(expanded: [])
     }
 
     static var appliedPayloadJSON: String { appliedProvider() }
@@ -220,7 +273,7 @@ enum ClaudeExtraRoots {
 
     /// Test seam only: back to the pre-apply state.
     static func resetAppliedForTesting() {
-        appliedProvider = { UserDefaults.standard.string(forKey: appliedKey) ?? payloadJSON([]) }
+        appliedProvider = { UserDefaults.standard.string(forKey: appliedKey) ?? payloadJSON(expanded: []) }
         UserDefaults.standard.removeObject(forKey: appliedKey)
     }
 
@@ -242,7 +295,7 @@ enum ClaudeExtraRoots {
 
     /// Overridable for the same reason `appliedProvider` is.
     nonisolated(unsafe) static var appliedConfigDirsProvider: @Sendable () -> String = {
-        UserDefaults.standard.string(forKey: appliedConfigDirsKey) ?? configDirsPayloadJSON([])
+        UserDefaults.standard.string(forKey: appliedConfigDirsKey) ?? configDirsPayloadJSON(accepted: [])
     }
 
     static var appliedConfigDirsJSON: String { appliedConfigDirsProvider() }
@@ -263,7 +316,7 @@ enum ClaudeExtraRoots {
     /// Test seam only: back to the pre-apply state.
     static func resetAppliedConfigDirsForTesting() {
         appliedConfigDirsProvider = {
-            UserDefaults.standard.string(forKey: appliedConfigDirsKey) ?? configDirsPayloadJSON([])
+            UserDefaults.standard.string(forKey: appliedConfigDirsKey) ?? configDirsPayloadJSON(accepted: [])
         }
         UserDefaults.standard.removeObject(forKey: appliedConfigDirsKey)
     }
@@ -293,7 +346,7 @@ enum ClaudeExtraRoots {
     /// The canonical empty-account-list payload, compared against directly
     /// rather than checking the source list for emptiness — the check has to
     /// run on the same encoded string `install` already holds.
-    private static let emptyConfigDirsJSON = configDirsPayloadJSON([])
+    private static let emptyConfigDirsJSON = configDirsPayloadJSON(accepted: [])
 
     /// Test seam only: forget that this process has installed anything.
     @MainActor
@@ -461,14 +514,34 @@ enum ClaudeExtraRoots {
     /// leave the core scanning a list UserDefaults no longer holds, silently,
     /// since neither side reports an error. Serial means the last save is
     /// also the last registered.
+    @MainActor
     static func apply(
-        scanPayload: @escaping @Sendable @MainActor () -> String,
+        scanPayload: @escaping @Sendable @MainActor ([String]) -> String,
+        setConfigDirs: @escaping @Sendable (String) -> Bool = realSetConfigDirs,
         then completion: (@Sendable @MainActor (ExtraScanPathsResult?) -> Void)? = nil
     ) {
-        Task { @MainActor in
+        let previous = applyChain
+        applyChain = Task { @MainActor in
+            // Each apply waits for the one before it: the core's rule reads the
+            // disk, so it is asked off the main actor (below), and without the
+            // chain two saves could finish asking in either order and the
+            // later save would not be the last registered.
+            await previous?.value
             let configDirs = load()
-            let json = scanPayload()
-            let configDirsJSON = configDirsPayloadJSON(configDirs)
+            // A Pi or DSH apply leaves the Claude list as it was: the recorded
+            // classification of this very list is reused instead of asking the
+            // core again.
+            let model = ClaudeRootsListModel.shared
+            let classified: Classified
+            if model.listed == configDirs {
+                classified = model.classified
+            } else {
+                classified = await Task.detached(priority: .userInitiated) { classify(configDirs) }.value
+            }
+            let accepted = classified.accepted
+            // The core's answer is asked ONCE; both payloads are built from it.
+            let json = scanPayload(accepted)
+            let configDirsJSON = configDirsPayloadJSON(accepted: accepted)
             // Both applies for one save are enqueued here before either
             // reaches the queue below, and the main actor runs them in order,
             // so the second finds the payloads already claimed. It still
@@ -479,9 +552,22 @@ enum ClaudeExtraRoots {
                 completion?(lastApplied?.result)
                 return
             }
-            install(json: json, configDirsJSON: configDirsJSON, then: completion)
+            // What gets registered is what the Settings marks show, so the
+            // classification is recorded only once the setter took it; on a
+            // failure the previous marks stay.
+            install(
+                json: json, configDirsJSON: configDirsJSON, setConfigDirs: setConfigDirs,
+                onConfigDirsSet: { ClaudeRootsListModel.shared.record(configDirs, classified) },
+                then: completion)
         }
     }
+
+    private static let realSetConfigDirs: @Sendable (String) -> Bool = {
+        (try? TBCore.setClaudeConfigDirs(json: $0)) != nil
+    }
+
+    /// The tail of the applies in flight; see `apply`.
+    @MainActor private static var applyChain: Task<Void, Never>?
 
     /// The half of `apply` that actually talks to the core, split out so the
     /// coalescing decision above is not buried in it.
@@ -494,9 +580,8 @@ enum ClaudeExtraRoots {
     private static func install(
         json: String,
         configDirsJSON: String,
-        setConfigDirs: @escaping @Sendable (String) -> Void = {
-            _ = try? TBCore.setClaudeConfigDirs(json: $0)
-        },
+        setConfigDirs: @escaping @Sendable (String) -> Bool = realSetConfigDirs,
+        onConfigDirsSet: (@Sendable @MainActor () -> Void)? = nil,
         setScanPaths: @escaping @Sendable (String) -> ExtraScanPathsResult? = {
             try? TBCore.setExtraScanPaths(json: $0)
         },
@@ -508,7 +593,8 @@ enum ClaudeExtraRoots {
             // and separate registry from the scan roots below: this one decides
             // whose credential each Claude card is fetched with, and a failure
             // in either must not stop the other from being installed.
-            setConfigDirs(configDirsJSON)
+            let configDirsSet = setConfigDirs(configDirsJSON)
+            if configDirsSet { Task { @MainActor in onConfigDirsSet?() } }
             // Wake the quota side HERE, between the two setters, not after
             // both.
             //
@@ -643,7 +729,82 @@ enum ClaudeExtraRoots {
     ) {
         install(
             json: json, configDirsJSON: configDirsJSON,
-            setConfigDirs: setConfigDirs, setScanPaths: setScanPaths,
+            setConfigDirs: { setConfigDirs($0); return true }, setScanPaths: setScanPaths,
             then: completion, quotaSideDone: quotaSideDone)
+    }
+}
+
+/// What the Settings list of Claude config dirs shows: the core's answer for
+/// the stored list, which depends on disk state (`~/.cc-mirror`), kept as view
+/// state. `ClaudeExtraRoots.apply` records its own classification here once the
+/// setter took it (`record`), so the marks describe what was registered; the
+/// page asks again (`refresh`) each time it appears or the list changes, and an
+/// apply's answer wins over an older refresh. `listed` names the list
+/// `classified` answers for, so a render between an edit and its answer shows
+/// no marks and no count rather than another list's.
+@MainActor
+final class ClaudeRootsListModel: ObservableObject {
+    static let shared = ClaudeRootsListModel()
+
+    @Published private(set) var classified = ClaudeExtraRoots.Classified(refused: [:], accepted: [])
+    @Published private(set) var listed: [String]?
+    /// Bumped by every `record`, so a `refresh` that was asked before it is
+    /// discarded instead of overwriting a newer answer.
+    private var epoch = 0
+
+    /// An apply's classification of `list`.
+    func record(_ list: [String], _ answer: ClaudeExtraRoots.Classified) {
+        epoch &+= 1
+        classified = answer
+        listed = list
+    }
+
+    /// The refusals for `list`, or none until its answer has arrived.
+    func refused(for list: [String]) -> [Int: String] {
+        listed == list ? classified.refused : [:]
+    }
+
+    /// How many scan roots `list` expands to; nil until its answer has arrived,
+    /// so no count is guessed.
+    func expandedCount(for list: [String]) -> Int? {
+        listed == list ? ClaudeExtraRoots.expand(accepted: classified.accepted).count : nil
+    }
+
+    /// Ask the core about `list`, unless an apply answers first.
+    func refresh(_ list: [String]) async {
+        let asked = epoch
+        let answer = await Task.detached(priority: .userInitiated) { ClaudeExtraRoots.classify(list) }.value
+        guard asked == epoch, !Task.isCancelled else { return }
+        record(list, answer)
+    }
+
+    /// The Add click, one at a time (the view disables the button while this
+    /// runs). The core is asked off the main thread against the list as it is;
+    /// the path is appended only if the list is unchanged since that ask began.
+    /// If it changed, the core is asked once more against the current list, and
+    /// if it changed again the add gives up with the fixed `unavailable`
+    /// sentence. Returns the refusal sentence, or nil once the path is in.
+    func add(
+        _ path: String, current: @MainActor () -> [String], set: @MainActor ([String]) -> Void
+    ) async -> String? {
+        for _ in 0..<2 {
+            let snapshot = current()
+            let code = await Task.detached(priority: .userInitiated) {
+                ClaudeExtraRoots.refusal(adding: path, to: snapshot)
+            }.value
+            if let code { return AccountsCopy.refusalSentence(code) }
+            if current() == snapshot {
+                set(snapshot + [path])
+                return nil
+            }
+        }
+        return AccountsCopy.refusalSentence("unavailable")
+    }
+
+    /// Test seam only: no answer.
+    func resetForTesting() {
+        epoch &+= 1
+        classified = ClaudeExtraRoots.Classified(refused: [:], accepted: [])
+        listed = nil
     }
 }

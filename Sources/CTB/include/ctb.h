@@ -153,10 +153,15 @@ char *tb_set_extra_scan_paths(const char *json);
 // `CLAUDE_CONFIG_DIR`-isolated accounts that each get their own quota card.
 // `json` is an array of absolute directory paths, e.g.
 // `["/Users/x/.claude-work"]`, full-replace semantics ([] clears it). Success
-// data is `{"registeredCount":N,"rejected":[{"path","reason"}]}`; a path is
-// rejected when it is empty, relative, the filesystem root, or a repeat.
-// Existence is NOT probed: whether a directory is readable right now says
-// nothing about which account its credential belongs to.
+// data is `{"registeredCount":N,"rejected":[{"index":i,"reason":"<code>"}]}`,
+// with the rule and codes of tb_claude_config_dir_refusals; the path is never
+// echoed. Invalidates the scan caches and drops removed accounts' last-good
+// cards.
+// Existence of the configured directories is NOT probed: whether one is
+// readable right now says nothing about which account its credential belongs
+// to. The call still reads the disk (the primary's scan roots: ~/.cc-mirror and
+// each variant's variant.json, once per call, as tb_claude_config_dir_refusals
+// does), so call it off the main thread.
 //
 // This is not `tb_set_extra_scan_paths`. That one takes the expanded
 // `<dir>/projects` and `<dir>/transcripts` sub-roots and decides which
@@ -164,6 +169,22 @@ char *tb_set_extra_scan_paths(const char *json);
 // themselves and decides whose credential each quota card is fetched with.
 // Passing one where the other is expected fails silently in both directions.
 char *tb_set_claude_config_dirs(const char *json);
+// Which entries of a JSON array of Claude config directories
+// tb_set_claude_config_dirs would refuse, without registering anything.
+// Success data is `{"rejected":[{"index":i,"reason":"<code>"}]}`; codes:
+// empty_path, not_absolute, filesystem_root, home_unknown, home_directory,
+// primary_scan_root (~/.claude or an ancestor of it, or equals, contains or
+// sits inside ~/.claude/projects, ~/.claude/transcripts, ~/Library/
+// Application Support/Claude/local-agent-mode-sessions, or a default-layout
+// ~/.cc-mirror/<variant>/config/projects the engine scans (a variant with no
+// readable variant.json is not scanned; one whose configDir names a folder
+// elsewhere is scanned there and that folder is allowed); a folder in
+// ~/.claude outside those is allowed; compared without case; this reads the
+// disk, so call it off the main thread), duplicate, overlap
+// (contains or sits inside an earlier accepted entry), limit_reached (more
+// than 8). Earlier entries win. Malformed input is the error
+// invalid_config_dirs_json.
+char *tb_claude_config_dir_refusals(const char *json);
 // Replace the process-wide registry of captured Antigravity accounts. `json`
 // is `[{"key":"<64 lowercase hex>","label":"<display label>"}]`, full-replace
 // semantics ([] clears it). Each entry becomes its own Antigravity quota card
@@ -190,7 +211,10 @@ char *tb_set_antigravity_binding(const char *json);
 // own item is read once and never written. Blocking (keychain + network):
 // call off the main thread. Success data is `{"key":"<64 hex>","label":"..."}`
 // where `key` = hex(SHA-256("antigravity-account\0" + Google sub)) and
-// `label` is the login's email (or "Antigravity account"). `err` is exactly one
+// `label` is the login's email (or "Antigravity account"). Nothing is written
+// unless Google's refresh response carries an id_token with the stored sub
+// (account_mismatch when it names another account, invalid_credential_format
+// when there is no usable id_token). `err` is exactly one
 // fixed code: agy_not_signed_in, agy_login_unreadable,
 // agy_login_missing_identity, oauth_client_not_found, oauth_client_rejected,
 // refresh_rejected, refresh_unreachable, account_mismatch,
@@ -265,12 +289,19 @@ char *tb_set_keychain_consent(const char *json);
 // left untouched, and the appDir in use until then is re-checked before it
 // is cleaned. Success data is `{"enabled","appDir":str|null,
 // "profiles":[{"id","dir"}],"cliTakeoverConfirmed","removedFiles":N,
-// "cleanupFailed":bool,"cleanupFailedProfiles":[id]}`; each id is `default`
+// "cleanupFailed":bool,"cleanupFailedProfiles":[id],
+// "rejectedProfiles":[{"index","reason"}]}`; a profile whose root is Cursor's
+// own folder (`cursor_default`) or repeats an earlier entry (`duplicate`;
+// same path or same directory) is left out and listed by its index in the
+// pushed list, while the default and the other profiles are registered.
+// Each id of `cleanupFailedProfiles` is `default`
 // or `<UUID>` (that profile's files could not all be deleted),
 // `cursor-profiles` (the parent folder of the added profiles could not be
-// read), or `appDir` (the appDir in use until this push now fails the
-// checks, so files may be left there; a refused appDir never used before is
-// not reported). Other invalid input is an error and leaves the registry
+// read), or `appDir` (a previous appDir that now fails the checks or
+// whose files could not all be deleted, so files may be left there; every
+// accepted push retries it until it is clean while Syrtis keeps running, after
+// a relaunch it is no longer known and is not retried; a refused appDir never
+// used before is not reported). Other invalid input is an error and leaves the registry
 // unchanged. While enabled with a complete
 // synced file, and the tokscale CLI's Cursor dir holds no usage files (or
 // `cliTakeoverConfirmed`), reports read Cursor from the newest synced file of
@@ -285,9 +316,12 @@ char *tb_set_cursor_sync(const char *json);
 // `{"state":"ok|partial|expired|notSignedIn|offline|error|disabled|cliPresent",
 // "events":N,"lastSuccessMs":ms|null,"reason"?:"<fixed code>","changed":bool,
 // "profiles":[{"id","state","events","lastSuccessMs","reason"?,
-// "duplicateOf"?}]}`. `changed`: some profile wrote its file (every
-// successful walk rewrites it; scan caches were invalidated, refresh views
-// whatever the headline state). A profile whose account an earlier profile
+// "duplicateOf"?}],"cleanupFailedProfiles":[id]}`. `changed`: a usage file's
+// bytes changed (written with new content, or a duplicate profile's old
+// account file removed); a walk whose bytes equal the file's only touches its
+// modified time and is not a change. Scan caches were invalidated; refresh
+// views whatever the headline state. `cleanupFailedProfiles`: profiles whose
+// stale usage file (a duplicate's old account) could not be deleted. A profile whose account an earlier profile
 // already covered this round is `duplicate` with `duplicateOf` = that
 // profile's id. Every walk failure covers its account except one specific to
 // that profile's session or to this machine: expired (local expiry, 401,

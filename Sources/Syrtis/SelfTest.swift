@@ -21,6 +21,65 @@ private final class UncheckedBox<Value>: @unchecked Sendable {
     init(_ value: Value) { self.value = value }
 }
 
+/// The accepted-list entry points, for tests that hand them a list the core
+/// would accept as it is: the production code builds both payloads from the
+/// core's answer (`ClaudeExtraRoots.classify`) and has no entry that classifies
+/// by itself.
+extension ClaudeExtraRoots {
+    static func payloadJSON(_ accepted: [String]) -> String {
+        payloadJSON(expanded: expand(accepted: accepted))
+    }
+
+    static func configDirsPayloadJSON(_ accepted: [String]) -> String {
+        configDirsPayloadJSON(accepted: accepted.map { ($0 as NSString).standardizingPath })
+    }
+}
+
+extension ExtraScanRoots {
+    static func payloadJSON(claudeConfigDirs: [String], piRoots: [String], dshRoots: [String]) -> String {
+        payloadJSON(claudeAccepted: claudeConfigDirs, piRoots: piRoots, dshRoots: dshRoots)
+    }
+}
+
+/// The values of some standard-domain keys, put back later. Checks that reset
+/// or overwrite the Accounts page's preferences (`resetAppliedForTesting`
+/// removes the applied-roots key outright) would otherwise leave the
+/// developer's own defaults deleted after a run.
+struct DefaultsSnapshot {
+    private let defaults: UserDefaults
+    private let saved: [(key: String, value: Any?)]
+
+    /// Read from the persistent domain, not `object(forKey:)`: that also
+    /// answers from the argument domain (`-key value` on the command line) and
+    /// registered defaults, and `restore()` would write such a temporary value
+    /// into the user's real preferences. `domain` is the persistent domain's
+    /// name: the app's for `.standard`, the suite's for a scratch suite.
+    init(
+        keys: [String], defaults: UserDefaults = .standard,
+        domain: String = Bundle.main.bundleIdentifier ?? ProcessInfo.processInfo.processName
+    ) {
+        self.defaults = defaults
+        let stored = defaults.persistentDomain(forName: domain) ?? [:]
+        saved = keys.map { ($0, stored[$0]) }
+    }
+
+    /// Set each key back to what it held, or remove it if it held nothing.
+    func restore() {
+        for (key, value) in saved {
+            if let value { defaults.set(value, forKey: key) } else { defaults.removeObject(forKey: key) }
+        }
+    }
+
+    /// The Accounts page's keys, every one a check there may delete.
+    @MainActor static let accountsKeys = [
+        ClaudeExtraRoots.storageKey, ClaudeExtraRoots.generationKey, ClaudeExtraRoots.appliedKey,
+        ClaudeExtraRoots.appliedConfigDirsKey, ExtraScanRoots.Pi.storageKey, ExtraScanRoots.Dsh.storageKey,
+        AntigravityAccounts.storageKey, AntigravityAccounts.removedKeysKey, AntigravityAutoCapture.enabledKey,
+        AntigravityAutoCapture.currentKey, CursorSync.enabledKey, CursorSync.noticeKey, CursorSync.takeoverKey,
+        CursorSync.profilesKey,
+    ]
+}
+
 @MainActor
 private final class ChartEventReceiver: NSResponder {
     var scrollEvent: NSEvent?
@@ -927,6 +986,8 @@ private struct DashboardModelTestObservation: Sendable {
 enum SelfTest {
     @MainActor static func run() -> Never {
         var failures = 0
+        // Put back at the end, whatever the checks below delete (MA-46).
+        let accountsDefaults = DefaultsSnapshot(keys: DefaultsSnapshot.accountsKeys)
         func expect(_ condition: @autoclosure () -> Bool, _ label: String) {
             if condition() {
                 print("ok   \(label)")
@@ -16978,9 +17039,9 @@ enum SelfTest {
         // credential is this quota card fetched with", where payloadJSON above
         // answers "which directories does the scanner walk", so it must carry
         // the dirs and not their sub-roots.
-        let configDirsPayload = ClaudeExtraRoots.configDirsPayloadJSON([
+        let configDirsPayload = ClaudeExtraRoots.configDirsPayloadJSON(accepted: ClaudeExtraRoots.classify([
             "/Users/x/.claude-work/", "/Users/x/.claude-work", "/Users/y/.claude-other",
-        ])
+        ]).accepted)
         let decodedConfigDirs = try! JSONDecoder().decode(
             [String].self, from: Data(configDirsPayload.utf8))
         expect(
@@ -17130,15 +17191,62 @@ enum SelfTest {
                    + "the gate is a comparison rather than a one-shot latch")
         ClaudeExtraRoots.resetAppliedConfigDirsForTesting()
 
-        // isRejectedRoot: home and root are refused; an ordinary subfolder is not.
-        let ceHome = FileManager.default.homeDirectoryForCurrentUser.path
+        // CE-P1 (audit 2026-11-03). A stored `~/.claude` (or any primary scan
+        // root) reaches NEITHER registry: not the config-dir payload and not
+        // the scan payload, which a separate setter with no such rule
+        // installs. Built through the production builders `apply` uses, with
+        // the core's rule judged against a temporary HOME. A sibling folder is
+        // the control. Then the FFI seam (MA-48): the Swift-built config JSON
+        // fed to the real setter registers exactly the control, and the
+        // unfiltered list is refused there by index and fixed code.
+        let ceHomeURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("syrtis-selftest-ce-p1-home")
+        let ceHome = ceHomeURL.path
+        let ceStored = [
+            "\(ceHome)/.claude", "\(ceHome)/.CLAUDE/", "\(ceHome)/.claude/projects",
+            "\(ceHome)/Library/Application Support/Claude", ceHome, "/",
+            "\(ceHome)/.claude-work",
+        ]
+        let ceP1 = withTemporaryHome(ceHomeURL) { () -> (String, String, String, [Int: String], String?, ClaudeConfigDirsResult?, ClaudeConfigDirsResult?) in
+            // What apply does: the core's answer once, both payloads from it.
+            let ceAccepted = ClaudeExtraRoots.classify(ceStored).accepted
+            let configJSON = ClaudeExtraRoots.configDirsPayloadJSON(accepted: ceAccepted)
+            let scanJSON = ClaudeExtraRoots.payloadJSON(expanded: ClaudeExtraRoots.expand(accepted: ceAccepted))
+            let mergedJSON = ExtraScanRoots.payloadJSON(
+                claudeAccepted: ceAccepted, piRoots: ["/tmp/syrtis-selftest-pi"], dshRoots: [])
+            let refused = ClaudeExtraRoots.refusals(ceStored)
+            let addRefusal = ClaudeExtraRoots.refusal(adding: "\(ceHome)/.claude", to: [])
+            let seam = try? TBCore.setClaudeConfigDirs(json: configJSON)
+            let raw = try? TBCore.setClaudeConfigDirs(json: String(
+                decoding: try! JSONEncoder().encode(ceStored), as: UTF8.self))
+            _ = try? TBCore.setClaudeConfigDirs(json: "[]")
+            return (configJSON, scanJSON, mergedJSON, refused, addRefusal, seam, raw)
+        }
+        let ceScan = try? JSONDecoder().decode([String: [String]].self, from: Data(ceP1.1.utf8))
+        let ceMerged = try? JSONDecoder().decode([String: [String]].self, from: Data(ceP1.2.utf8))
+        let ceWork = "\(ceHome)/.claude-work"
         expect(
-            ClaudeExtraRoots.isRejectedRoot(ceHome) && ClaudeExtraRoots.isRejectedRoot("/")
-                && !ClaudeExtraRoots.isRejectedRoot("\(ceHome)/.claude-work"),
-            "isRejectedRoot refuses the home directory and filesystem root but not an "
-                + "ordinary subfolder (mutation: refusing everything would make Settings' "
-                + "add button always a no-op; refusing nothing would let a scan-everything "
-                + "root through unwarned)")
+            ceP1.0 == String(decoding: try! JSONEncoder().encode([ceWork]), as: UTF8.self),
+            "CE-P1 a stored primary scan root yields no config-dir entry; the sibling "
+                + "control does (got \(ceP1.0))")
+        expect(
+            ceScan?["claude"] == ["\(ceWork)/projects", "\(ceWork)/transcripts"]
+                && ceMerged?["claude"] == ["\(ceWork)/projects", "\(ceWork)/transcripts"],
+            "CE-P1 a stored primary scan root yields no scan root, in the Claude-only and "
+                + "the merged payload (mutation: leave the refused dir in the scan payload)")
+        expect(
+            ceP1.3.keys.sorted() == [0, 1, 2, 3, 4, 5]
+                && ceP1.3[0] == "primary_scan_root" && ceP1.3[4] == "home_directory"
+                && ceP1.3[5] == "filesystem_root" && ceP1.4 == "primary_scan_root",
+            "CE-P1 the core's rule refuses every primary root by index with a fixed code, "
+                + "and the Settings add pre-check asks the same rule (got \(ceP1.3))")
+        expect(
+            ceP1.5?.registeredCount == 1 && ceP1.5?.rejected.isEmpty == true
+                && ceP1.6?.registeredCount == 1
+                && ceP1.6?.rejected.map(\.index) == [0, 1, 2, 3, 4, 5]
+                && ceP1.6?.rejected.first?.reason == "primary_scan_root",
+            "CE-P1 FFI seam: the Swift-built config JSON registers only the control in the "
+                + "real setter, and the setter itself refuses the unfiltered list by index")
 
         // isMissing: a real directory is present; a path that doesn't exist is missing.
         let ceTempDir = FileManager.default.temporaryDirectory.path
@@ -17195,18 +17303,18 @@ enum SelfTest {
 
         // The production path: what `apply` hands to the core. Persist through
         // `Dsh.save` into a scratch suite and read the payload back from
-        // `currentPayload`, the function `apply` uses.
+        // `currentPayload(claudeAccepted:dshDefaults:)`, the function `apply` uses.
         let dshSuite = "tokenbar.selftest.dsh.\(UUID().uuidString)"
         if let d = UserDefaults(suiteName: dshSuite) {
             defer { d.removePersistentDomain(forName: dshSuite) }
             ExtraScanRoots.Dsh.save([dshRoot, "\(dshRoot)/"], defaults: d)
             let applied = try! JSONDecoder().decode(
                 [String: [String]].self,
-                from: Data(ExtraScanRoots.currentPayload(dshDefaults: d).utf8))
+                from: Data(ExtraScanRoots.currentPayload(claudeAccepted: [], dshDefaults: d).utf8))
             expect(
                 applied["dsh"] == [dshRoot],
                 "DSH-ROOTS the saved DSH folders reach ExtraScanRoots.currentPayload, the only "
-                    + "payload provider apply() passes to the core (mutation: currentPayload "
+                    + "payload provider apply() passes to the core (mutation: that overload "
                     + "building with dshRoots: [])")
         } else {
             expect(false, "DSH-ROOTS could not create the scratch UserDefaults suite, so the apply-path check did not run")
@@ -17445,9 +17553,12 @@ enum SelfTest {
             "ACCOUNTS-PAGE every Accounts copy key exists in zh-Hant and zh-Hans: \(accountsCopyMissing)")
         let agyDetails = AccountsCopy.antigravityDetails.joined(separator: "\n")
         expect(
-            ["login keychain", "token service and Cloud Code quota service", "revoke access in Google Account"]
+            ["login keychain", "refresh token to Google's token service", "Cloud Code quota service",
+             "macOS may ask", "revoke access in Google Account"]
                 .allSatisfy(agyDetails.contains)
-                && AccountsCopy.claudeDetails.contains("CLAUDE_CONFIG_DIR")
+                && ["refresh token to Google's token service", "macOS may ask"]
+                    .allSatisfy(AccountsCopy.confirmBody.contains)
+                && AccountsCopy.claudeDetails.joined(separator: "\n").contains("CLAUDE_CONFIG_DIR")
                 && AccountsCopy.dsh == "DeepSeek Harness"
                 && AccountsCopy.dshDetails.contains("<DSH_HOME>/sessions")
                 && AccountsCopy.translated.contains(AccountsCopy.dshSummary)
@@ -17460,6 +17571,229 @@ enum SelfTest {
                 && AccountsCopy.autoToggleGroup(autoCaptureOn: false) == [AccountsCopy.autoOn, AccountsCopy.autoOff]
                 && AccountsCopy.page == SettingsPanel.Page.accounts.rawValue,
             "ACCOUNTS-PAGE Antigravity details keep the keychain / token-service / revoke facts and Claude details keep the CLAUDE_CONFIG_DIR instructions")
+
+        // Claude ⓘ (MA-25): the four questions a user asks of a credential
+        // read, and no claim that accounts aren't shown separately (each folder
+        // has its own window card).
+        let claudeInfo = AccountsCopy.claudeDetails.joined(separator: "\n")
+        expect(
+            ["Claude Code-credentials-", "macOS may ask", "doesn't log", "api.anthropic.com",
+             "platform.claude.com", "same Keychain item", "its own Claude card"].allSatisfy(claudeInfo.contains)
+                && !claudeInfo.contains("aren't shown separately"),
+            "ACCOUNTS-PAGE the Claude details name the Keychain item, that it is not logged, where the tokens go and the write-back, and drop 'accounts aren't shown separately'")
+
+        // MA-45: every string the Accounts page draws is in `translated`, found
+        // through the behavior that produces it where there is one.
+        let agyCodes = ["agy_not_signed_in", "agy_login_unreadable", "agy_login_missing_identity",
+                        "oauth_client_not_found", "oauth_client_rejected", "refresh_rejected",
+                        "refresh_unreachable", "account_mismatch", "invalid_credential_format",
+                        "keychain_write_failed", "keychain_delete_failed", "anything_else"]
+        let agyMessages = agyCodes.map { AntigravityAccounts.message(for: TBCoreError.bridge($0)) }
+            + [AntigravityAccounts.message(for: CocoaError(.fileNoSuchFile))]
+        let viewStrings = [AccountsCopy.folderMissing, AccountsCopy.addConfigDir, AccountsCopy.addFolder,
+                           AccountsCopy.addPrompt, AccountsCopy.removeHelp, AccountsCopy.unreadableFolders,
+                           AccountsCopy.rejectedPaths, AccountsCopy.capturing, AccountsCopy.captureCurrent,
+                           AccountsCopy.autoPaused, AccountsCopy.autoUnavailable, AccountsCopy.removeNamed,
+                           CursorSync.Copy.staleCleanupFailed, CursorSync.Copy.cleanupFailed]
+        let outsideTranslated = (agyMessages + viewStrings + AccountsCopy.refusalCodes.map(AccountsCopy.refusalSentence))
+            .filter { !AccountsCopy.translated.contains($0) }
+        expect(outsideTranslated.isEmpty,
+               "ACCOUNTS-PAGE every Accounts string is in AccountsCopy.translated; outside: \(outsideTranslated)")
+
+        // MA-42/45: one fixed sentence per reason code, never a path. A refused
+        // add shows it and saves nothing; an accepted add shows none. Claude
+        // asks the core, Pi and DSH their own rule. Mutation: the line dropped
+        // from a refusal.
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        let sentence = AccountsCopy.refusalSentence
+        let addClaude = { (path: String, list: [String]) in
+            ExtraScanRoots.add(path, to: list, refusal: ClaudeExtraRoots.refusal(adding:to:))
+        }
+        let addPi = { (path: String, list: [String]) in
+            ExtraScanRoots.add(path, to: list, refusal: ExtraScanRoots.Pi.refusal(adding:to:))
+        }
+        let addDsh = { (path: String, list: [String]) in
+            ExtraScanRoots.add(path, to: list, refusal: ExtraScanRoots.Dsh.refusal(adding:to:))
+        }
+        let listed = ["/tmp/syrtis-selftest-accounts/a"]
+        let fresh = "/tmp/syrtis-selftest-accounts/b"
+        expect(
+            Set(AccountsCopy.refusalSentences).count == AccountsCopy.refusalCodes.count
+                && addClaude(home, listed) == .init(list: listed, refusalLine: sentence("home_directory"))
+                && addClaude(home + "/.claude", listed) == .init(list: listed, refusalLine: sentence("primary_scan_root"))
+                && addClaude(listed[0], listed) == .init(list: listed, refusalLine: sentence("duplicate"))
+                && addClaude(listed[0] + "/inner", listed) == .init(list: listed, refusalLine: sentence("overlap"))
+                && addClaude("relative/dir", listed) == .init(list: listed, refusalLine: sentence("not_absolute"))
+                && addClaude(fresh, listed) == .init(list: listed + [fresh], refusalLine: nil)
+                && addPi(home, listed) == .init(list: listed, refusalLine: sentence("home_or_ancestor"))
+                && addPi((home as NSString).deletingLastPathComponent, listed)
+                    == .init(list: listed, refusalLine: sentence("home_or_ancestor"))
+                && addPi("/", listed) == .init(list: listed, refusalLine: sentence("filesystem_root"))
+                && addPi(listed[0], listed) == .init(list: listed, refusalLine: sentence("duplicate"))
+                && addPi(fresh, listed) == .init(list: listed + [fresh], refusalLine: nil)
+                && addDsh(home, listed) == .init(list: listed, refusalLine: sentence("home_or_ancestor"))
+                && addDsh(listed[0], listed) == .init(list: listed, refusalLine: sentence("duplicate"))
+                && addDsh(fresh, listed) == .init(list: listed + [fresh], refusalLine: nil),
+            "ACCOUNTS-PAGE a refused add of a Claude, Pi or DSH folder shows its reason's fixed sentence and saves nothing; an accepted add shows none")
+
+        // A refused add raises the alert with that reason's approved sentence
+        // and an accepted one raises none; OK dismisses it. Mutation: `show`
+        // never sets the message.
+        do {
+            let alert = AddRefusalAlert()
+            alert.show(addClaude(fresh, listed).refusalLine)
+            let none = alert.message == nil
+            alert.show(addClaude(home, listed).refusalLine)
+            let claudeAlert = alert.message == sentence("home_directory")
+            alert.dismiss()
+            alert.show(addPi(listed[0], listed).refusalLine)
+            let piAlert = alert.message == sentence("duplicate")
+            alert.dismiss()
+            alert.show(addDsh("/", listed).refusalLine)
+            let dshAlert = alert.message == sentence("filesystem_root")
+            alert.dismiss()
+            alert.show(CursorSync.Copy.cantAdd)
+            let cursorAlert = alert.message == CursorSync.Copy.cantAdd
+            alert.dismiss()
+            // The title outlives the dismissal, so it never reads empty while
+            // the alert animates out. Mutation: `dismiss` clears the title.
+            let titleKept = alert.title == CursorSync.Copy.cantAdd
+            expect(none && claudeAlert && piAlert && dshAlert && cursorAlert && titleKept && alert.message == nil,
+                   "ACCOUNTS-PAGE a refused Claude, Pi, DSH or Cursor add raises the alert with its approved sentence, an accepted add raises none, and OK dismisses it")
+        }
+
+        // Each production entry asks the core's rule (which reads the disk)
+        // once, and records its answer for the Settings marks only after the
+        // setter took it. `ExtraScanRoots.apply` builds both registry payloads
+        // from one answer; an apply that leaves the Claude list as it was (a Pi
+        // or DSH edit) reuses the recorded answer; the page appearing asks
+        // again; an Add click asks once, appends only if the list is unchanged
+        // since the ask began, asks once more if it changed, and gives up with
+        // the fixed sentence if it changed again. The asks are held at a gate
+        // so the list changes exactly while one is in flight. Mutations: the
+        // scan payload built with `currentPayload()` (asks twice); an apply
+        // that always classifies; recording before the setter; appending to the
+        // list as it was before the ask.
+        let asks: [Int]? = awaitMainActorValue {
+            let calls = UncheckedBox<Int>(0)
+            let real = ClaudeExtraRoots.coreRefusals
+            ClaudeExtraRoots.coreRefusals = { calls.value += 1; return try real($0) }
+            let defaults = UserDefaults.standard
+            let savedList = defaults.object(forKey: ClaudeExtraRoots.storageKey)
+            let model = ClaudeRootsListModel.shared
+            model.resetForTesting()
+            let dirs = ["/tmp/syrtis-selftest-accounts/a", home, "/tmp/syrtis-selftest-accounts/b"]
+            let applyAndWait = {
+                await withCheckedContinuation { (done: CheckedContinuation<Void, Never>) in
+                    ExtraScanRoots.apply { _ in done.resume() }
+                }
+            }
+            ClaudeExtraRoots.save(dirs)
+            await applyAndWait()
+            let applyCalls = calls.value
+            let marked = model.refused(for: dirs)[1] == "home_directory" && model.expandedCount(for: dirs) == 4
+            // The same Claude list again: nothing asked.
+            calls.value = 0
+            await applyAndWait()
+            let reapplyCalls = calls.value
+            // The page appearing asks again, for an answered list too.
+            calls.value = 0
+            await model.refresh(dirs)
+            let refreshCalls = calls.value
+            model.resetForTesting()
+            let noGuess = model.expandedCount(for: dirs) == nil
+            // The rule follows disk state: the next apply's answer replaces the
+            // first's.
+            ClaudeExtraRoots.coreRefusals = { _ in
+                try JSONDecoder().decode(
+                    [RejectedConfigDir].self, from: Data(#"[{"index":0,"reason":"primary_scan_root"}]"#.utf8))
+            }
+            let d = ["/tmp/syrtis-selftest-accounts/d"], e = ["/tmp/syrtis-selftest-accounts/e"]
+            ClaudeExtraRoots.save(d)
+            await applyAndWait()
+            let follows = model.refused(for: d) == [0: "primary_scan_root"] && model.expandedCount(for: d) == 0
+            // A setter that fails records nothing: the previous marks stay. The
+            // list now accepts something new, so the apply does reach the setter.
+            ClaudeExtraRoots.coreRefusals = { _ in [] }
+            ClaudeExtraRoots.save(e)
+            await withCheckedContinuation { (done: CheckedContinuation<Void, Never>) in
+                ClaudeExtraRoots.apply(
+                    scanPayload: { ExtraScanRoots.currentPayload(claudeAccepted: $0) },
+                    setConfigDirs: { _ in false }, then: { _ in done.resume() })
+            }
+            let failedKeeps = model.listed == d && model.refused(for: d) == [0: "primary_scan_root"]
+            // Gated asks from here on.
+            let gate = DispatchSemaphore(value: 0)
+            let started = UncheckedBox<Int>(0)
+            ClaudeExtraRoots.coreRefusals = { json in
+                started.value += 1
+                gate.wait()
+                return try real(json)
+            }
+            let waitForAsks = { (n: Int) in
+                for _ in 0..<2000 where started.value < n { try? await Task.sleep(nanoseconds: 5_000_000) }
+            }
+            let c = "/tmp/syrtis-selftest-accounts/c", x = "/tmp/syrtis-selftest-accounts/x"
+            let z = "/tmp/syrtis-selftest-accounts/z"
+            let box = UncheckedBox<[String]>(dirs)
+            // One ask, the path lands.
+            gate.signal()
+            let landedLine = await model.add(c, current: { box.value }, set: { box.value = $0 })
+            let landed = landedLine == nil && box.value == dirs + [c] && started.value == 1
+            // A refusal changes nothing.
+            gate.signal()
+            let refusedAdd = await model.add(home, current: { box.value }, set: { box.value = $0 })
+            let refusedKept = box.value == dirs + [c]
+            // The list changes during the ask: asked once more against the
+            // current list, then appended to it (the removal is kept).
+            started.value = 0
+            box.value = [dirs[0], dirs[2]]
+            let once = Task { @MainActor in
+                await model.add(x, current: { box.value }, set: { box.value = $0 })
+            }
+            await waitForAsks(1)
+            box.value = [dirs[0]]
+            gate.signal(); gate.signal()
+            let onceLine = await once.value
+            let removeKept = onceLine == nil && box.value == [dirs[0], x] && started.value == 2
+            // It changes again during the second ask: the add gives up with the
+            // fixed sentence and the list stays as the user left it.
+            started.value = 0
+            box.value = [dirs[0], dirs[2]]
+            let twice = Task { @MainActor in
+                await model.add(x, current: { box.value }, set: { box.value = $0 })
+            }
+            await waitForAsks(1)
+            box.value = [dirs[0]]
+            gate.signal()
+            await waitForAsks(2)
+            box.value = [dirs[0], z]
+            gate.signal()
+            let gaveUp = await twice.value == AccountsCopy.refusalSentence("unavailable")
+                && box.value == [dirs[0], z]
+            // Put the process back: the real rule, the user's stored list
+            // installed in the core and recorded for Settings.
+            ClaudeExtraRoots.coreRefusals = real
+            if let savedList { defaults.set(savedList, forKey: ClaudeExtraRoots.storageKey) }
+            else { defaults.removeObject(forKey: ClaudeExtraRoots.storageKey) }
+            await applyAndWait()
+            ClaudeExtraRoots.resetAppliedForTesting()
+            let flags = [marked, noGuess, follows, failedKeeps, landed, refusedKept, removeKept, gaveUp,
+                         refusedAdd == AccountsCopy.refusalSentence("home_directory")]
+            return [applyCalls, reapplyCalls, refreshCalls] + flags.map { $0 ? 1 : 0 }
+        }
+        expect(asks == [1, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+               "ACCOUNTS-PAGE apply asks the core's rule once, a Pi/DSH apply reuses it, the page asks again, marks are recorded only after the setter took them, and an Add asks once more if the list changed and gives up if it changed again; got \(String(describing: asks))")
+
+        // MA-42: a Remove button is named by the row's whole label, so two rows
+        // sharing a last path component never share a name. Mutation: the last
+        // component only.
+        let sameName = [CursorSync.Profile(id: "A", root: "/Volumes/one/work"),
+                        CursorSync.Profile(id: "B", root: "/Volumes/two/work")]
+        let removeNames = sameName.map { AccountsCopy.removeName(CursorSync.rowLabel($0)) }
+        expect(Set(removeNames).count == 2 && removeNames.allSatisfy { $0.hasPrefix(AccountsCopy.removeName("")) }
+                   && removeNames[0].contains("/Volumes/one/work"),
+               "ACCOUNTS-PAGE Remove buttons are named 'Remove <whole row label>' so two rows never share a name; got \(removeNames)")
 
         // MARK: - M3: a Claude card is addressed by (clientId, accountKey)
 
@@ -18074,13 +18408,13 @@ enum SelfTest {
             // 3. Test mode: reconfigure makes no core call at all.
             controller.reconfigure(
                 refresh: false, defaults: defaults, arguments: ["Syrtis", "--demo"], bundleID: "x.y",
-                setConfig: { configCalls.value.append($0); return false }, sync: sync)
+                setConfig: { configCalls.value.append($0); return .clean }, sync: sync)
             try? await Task.sleep(nanoseconds: 100_000_000)
             let demoReconfigure = configCalls.value.count + syncCalls.value
             // 4. Control: a user session acknowledged -> config pushed and a sync runs.
             controller.reconfigure(
                 refresh: false, defaults: defaults, arguments: ["Syrtis"], bundleID: "x.y",
-                setConfig: { configCalls.value.append($0); return false }, sync: sync)
+                setConfig: { configCalls.value.append($0); return .clean }, sync: sync)
             for _ in 0..<200 where syncCalls.value == 0 {
                 try? await Task.sleep(nanoseconds: 10_000_000)
             }
@@ -18089,7 +18423,7 @@ enum SelfTest {
             defaults.set(false, forKey: CursorSync.enabledKey)
             controller.reconfigure(
                 refresh: false, defaults: defaults, arguments: ["Syrtis"], bundleID: "x.y",
-                setConfig: { configCalls.value.append($0); return false }, sync: sync)
+                setConfig: { configCalls.value.append($0); return .clean }, sync: sync)
             for _ in 0..<200 where configCalls.value.count < 2 {
                 try? await Task.sleep(nanoseconds: 10_000_000)
             }
@@ -18117,10 +18451,10 @@ enum SelfTest {
             defaults.removePersistentDomain(forName: suite)
             defaults.set(true, forKey: CursorSync.noticeKey)
             let pushes = UncheckedBox<[String]>([])
-            let slowOn: @Sendable (String) -> Bool? = { json in
+            let slowOn: CursorSync.SetConfig = { json in
                 if json.contains(#""enabled":true"#) { Thread.sleep(forTimeInterval: 0.3) }
                 pushes.value.append(json.contains(#""enabled":true"#) ? "on" : "off")
-                return false
+                return .clean
             }
             let none: @Sendable (Bool) -> CursorSyncStatus? = { _ in nil }
             let controller = CursorSyncController()
@@ -18137,31 +18471,45 @@ enum SelfTest {
         expect(cursorOrder == ["on", "off"],
                "CURSOR-SYNC rapid on->off reaches the core in order, ending off; got \(String(describing: cursorOrder))")
 
+        // The core defines `changed` (a usage file's bytes changed); the app
+        // refreshes exactly on it. The same history synced again reports
+        // `changed:false` and must reload nothing. Mutation: refresh on every
+        // successful round.
         let cursorRefresh: [Bool]? = awaitMainActorValue {
             let suite = "tokenbar.selftest.cursorSyncRefresh"
             let defaults = UserDefaults(suiteName: suite)!
             defer { defaults.removePersistentDomain(forName: suite) }
             defaults.removePersistentDomain(forName: suite)
             defaults.set(true, forKey: CursorSync.noticeKey)
-            let ok = try? JSONDecoder().decode(
-                CursorSyncStatus.self, from: Data(#"{"state":"ok","events":7,"lastSuccessMs":1,"changed":true}"#.utf8))
-            let sync: @Sendable (Bool) -> CursorSyncStatus? = { _ in ok }
+            let status = { (changed: Bool) in
+                try? JSONDecoder().decode(
+                    CursorSyncStatus.self,
+                    from: Data(#"{"state":"ok","events":7,"lastSuccessMs":1,"changed":\#(changed)}"#.utf8))
+            }
+            let next = UncheckedBox<CursorSyncStatus?>(status(true))
+            let sync: @Sendable (Bool) -> CursorSyncStatus? = { _ in next.value }
             let generation = { UserDefaults.standard.integer(forKey: ClaudeExtraRoots.generationKey) }
             let controller = CursorSyncController()
             let g0 = generation()
             await controller.runSync(explicit: true, defaults: defaults, arguments: ["Syrtis"], sync: sync)
             let first = generation() != g0
+            // Same count, bytes changed: still a refresh.
             let g1 = generation()
             await controller.runSync(explicit: true, defaults: defaults, arguments: ["Syrtis"], sync: sync)
-            let sameAgain = generation() != g1
-            defaults.set(false, forKey: CursorSync.enabledKey)
-            controller.reconfigure(refresh: false, defaults: defaults, arguments: ["Syrtis"], bundleID: "x.y",
-                                   setConfig: { _ in false }, sync: sync)
-            defaults.set(true, forKey: CursorSync.enabledKey)
+            let sameCountChanged = generation() != g1
+            next.value = status(false)
             let g2 = generation()
             await controller.runSync(explicit: true, defaults: defaults, arguments: ["Syrtis"], sync: sync)
-            let afterOffOn = generation() != g2
-            return [first, sameAgain, afterOffOn]
+            let identical = generation() != g2
+            defaults.set(false, forKey: CursorSync.enabledKey)
+            controller.reconfigure(refresh: false, defaults: defaults, arguments: ["Syrtis"], bundleID: "x.y",
+                                   setConfig: { _ in .clean }, sync: sync)
+            defaults.set(true, forKey: CursorSync.enabledKey)
+            next.value = status(true)
+            let g3 = generation()
+            await controller.runSync(explicit: true, defaults: defaults, arguments: ["Syrtis"], sync: sync)
+            let afterOffOn = generation() != g3
+            return [first, sameCountChanged, identical, afterOffOn]
         }
         // A sync result that returns after sync was turned off is discarded.
         // Mutation: drop the generation/shouldSync check after the await.
@@ -18181,7 +18529,7 @@ enum SelfTest {
             try? await Task.sleep(nanoseconds: 50_000_000)
             defaults.set(false, forKey: CursorSync.enabledKey)
             controller.reconfigure(refresh: false, defaults: defaults, arguments: ["Syrtis"], bundleID: "x.y",
-                                   setConfig: { _ in false }, sync: slow)
+                                   setConfig: { _ in .clean }, sync: slow)
             await running.value
             return controller.state
         }
@@ -18203,8 +18551,8 @@ enum SelfTest {
             let slowSync: @Sendable (Bool) -> CursorSyncStatus? = { _ in
                 log.value.append("sync"); Thread.sleep(forTimeInterval: 0.2); return ok
             }
-            let slowPush: @Sendable (String) -> Bool? = { _ in
-                Thread.sleep(forTimeInterval: 0.2); log.value.append("push"); return false
+            let slowPush: CursorSync.SetConfig = { _ in
+                Thread.sleep(forTimeInterval: 0.2); log.value.append("push"); return .clean
             }
             let controller = CursorSyncController()
             // Sync Now right after a reconfigure: the push must land first.
@@ -18220,7 +18568,7 @@ enum SelfTest {
             }
             try? await Task.sleep(nanoseconds: 50_000_000)
             controller.reconfigure(refresh: false, defaults: defaults, arguments: ["Syrtis"], bundleID: "x.y",
-                                   setConfig: { _ in false }, sync: slowSync)
+                                   setConfig: { _ in .clean }, sync: slowSync)
             await running.value
             let syncs = log.value.filter { $0 == "sync" }.count
             return firstTwo + ["syncs=\(syncs >= 2)", "state=\(controller.state ?? "nil")"]
@@ -18248,7 +18596,7 @@ enum SelfTest {
             let sync: @Sendable (Bool) -> CursorSyncStatus? = { _ in log.value.append("sync"); return ok }
             let controller = CursorSyncController()
             controller.reconfigure(refresh: false, defaults: defaults, arguments: ["Syrtis"], bundleID: "x.y",
-                                   setConfig: { _ in Thread.sleep(forTimeInterval: 0.3); log.value.append("push1"); return false },
+                                   setConfig: { _ in Thread.sleep(forTimeInterval: 0.3); log.value.append("push1"); return .clean },
                                    sync: sync)
             let running = Task { @MainActor in
                 await controller.runSync(explicit: true, defaults: defaults, arguments: ["Syrtis"], sync: sync)
@@ -18261,14 +18609,14 @@ enum SelfTest {
             // The new loop's own sync is dropped while `running` holds the
             // single flight, so one sync means the rerun sent it.
             controller.reconfigure(refresh: false, defaults: defaults, arguments: ["Syrtis"], bundleID: "x.y",
-                                   setConfig: { _ in Thread.sleep(forTimeInterval: 0.2); log.value.append("push2"); return false },
+                                   setConfig: { _ in Thread.sleep(forTimeInterval: 0.2); log.value.append("push2"); return .clean },
                                    sync: sync)
             await running.value
             let order = log.value
             // Stop the loop the second reconfigure started.
             defaults.set(false, forKey: CursorSync.enabledKey)
             controller.reconfigure(refresh: false, defaults: defaults, arguments: ["Syrtis"], bundleID: "x.y",
-                                   setConfig: { _ in false }, sync: sync)
+                                   setConfig: { _ in .clean }, sync: sync)
             return order
         }
         expect(cursorWait == ["push1", "push2", "sync"],
@@ -18285,7 +18633,7 @@ enum SelfTest {
             let sync: @Sendable (Bool) -> CursorSyncStatus? = { _ in syncs.value += 1; return nil }
             let controller = CursorSyncController()
             controller.reconfigure(refresh: false, defaults: defaults, arguments: ["Syrtis"], bundleID: "x.y",
-                                   setConfig: { _ in Thread.sleep(forTimeInterval: 0.3); return false }, sync: sync)
+                                   setConfig: { _ in Thread.sleep(forTimeInterval: 0.3); return .clean }, sync: sync)
             let running = Task { @MainActor in
                 await controller.runSync(explicit: true, defaults: defaults, arguments: ["Syrtis"], sync: sync)
             }
@@ -18295,7 +18643,7 @@ enum SelfTest {
             }
             defaults.set(false, forKey: CursorSync.enabledKey)
             controller.reconfigure(refresh: false, defaults: defaults, arguments: ["Syrtis"], bundleID: "x.y",
-                                   setConfig: { _ in false }, sync: sync)
+                                   setConfig: { _ in .clean }, sync: sync)
             await running.value
             try? await Task.sleep(nanoseconds: 100_000_000)
             return syncs.value
@@ -18322,7 +18670,7 @@ enum SelfTest {
                 defaults.set(on, forKey: CursorSync.enabledKey)
                 let before = pushes.value
                 controller.reconfigure(refresh: false, defaults: defaults, arguments: ["Syrtis"], bundleID: "x.y",
-                                       setConfig: { _ in pushes.value += 1; return failed }, sync: none)
+                                       setConfig: { _ in pushes.value += 1; return .init(cleanupFailed: failed) }, sync: none)
                 seen.append(controller.cleanupFailed)
                 for _ in 0..<200 where pushes.value == before {
                     try? await Task.sleep(nanoseconds: 10_000_000)
@@ -18334,6 +18682,180 @@ enum SelfTest {
         }
         expect(cursorCleanup == [false, true, true, true, false, false],
                "CURSOR-SYNC a failed off cleanup is reported until an off cleanup succeeds; got \(String(describing: cursorCleanup))")
+        // MA-21: an accepted ON push whose orphan cleanup failed is shown
+        // (`orphanCleanupFailed`), cleared by the next accepted on push that
+        // succeeds, untouched by a rejected push, and reset when sync turns
+        // off. The line under the switch follows the switch. Mutations: drop
+        // the `run` assignment; show the off line while on.
+        let cursorOrphan: [Bool]? = awaitMainActorValue {
+            let suite = "tokenbar.selftest.cursorSyncOrphan"
+            let defaults = UserDefaults(suiteName: suite)!
+            defer { defaults.removePersistentDomain(forName: suite) }
+            defaults.removePersistentDomain(forName: suite)
+            defaults.set(true, forKey: CursorSync.noticeKey)
+            let none: @Sendable (Bool) -> CursorSyncStatus? = { _ in nil }
+            let controller = CursorSyncController()
+            var seen: [Bool] = []
+            let push: (Bool, CursorSync.Push?) async -> Void = { on, result in
+                defaults.set(on, forKey: CursorSync.enabledKey)
+                let landed = UncheckedBox<Bool>(false)
+                controller.reconfigure(refresh: false, defaults: defaults, arguments: ["Syrtis"], bundleID: "x.y",
+                                       setConfig: { _ in landed.value = true; return result }, sync: none)
+                for _ in 0..<200 where !landed.value { try? await Task.sleep(nanoseconds: 10_000_000) }
+                try? await Task.sleep(nanoseconds: 50_000_000)
+            }
+            await push(true, .init(cleanupFailed: true)); seen.append(controller.orphanCleanupFailed)
+            await push(true, nil); seen.append(controller.orphanCleanupFailed)
+            await push(true, .clean); seen.append(controller.orphanCleanupFailed)
+            await push(true, .init(cleanupFailed: true))
+            await push(false, .clean); seen.append(controller.orphanCleanupFailed)
+            return seen
+        }
+        expect(cursorOrphan == [true, true, false, false],
+               "CURSOR-SYNC an on-push orphan cleanup failure is shown until an on push succeeds; got \(String(describing: cursorOrphan))")
+        // Per-entry refusal: the core leaves a profile out of a push (Cursor's
+        // own folder, or a repeat) and the others take effect; the row of the
+        // refused profile says so with the fixed sentence, and nothing else
+        // changes. Cleared by the next accepted on push without it and by an
+        // off push. Mutation: ignore `rejected`.
+        let cursorRefused: [Bool]? = awaitMainActorValue {
+            let suite = "tokenbar.selftest.cursorSyncRefused"
+            let defaults = UserDefaults(suiteName: suite)!
+            defer { defaults.removePersistentDomain(forName: suite) }
+            defaults.removePersistentDomain(forName: suite)
+            defaults.set(true, forKey: CursorSync.noticeKey)
+            let first = "0A1B2C3D-0000-4000-8000-00000000000A", second = "0A1B2C3D-0000-4000-8000-00000000000B"
+            CursorSync.saveProfiles(
+                [.init(id: first, root: "/Volumes/selftest/a"), .init(id: second, root: "/Volumes/selftest/b")],
+                defaults: defaults)
+            let none: @Sendable (Bool) -> CursorSyncStatus? = { _ in nil }
+            let controller = CursorSyncController()
+            let push: (CursorSync.Push?, Bool) async -> Void = { result, on in
+                defaults.set(on, forKey: CursorSync.enabledKey)
+                let landed = UncheckedBox<Bool>(false)
+                controller.reconfigure(refresh: false, defaults: defaults, arguments: ["Syrtis"], bundleID: "x.y",
+                                       setConfig: { _ in landed.value = true; return result }, sync: none)
+                for _ in 0..<200 where !landed.value { try? await Task.sleep(nanoseconds: 10_000_000) }
+                try? await Task.sleep(nanoseconds: 50_000_000)
+            }
+            var ok: [Bool] = []
+            await push(.init(cleanupFailed: false, rejected: [1: "cursor_default"]), true)
+            ok.append(controller.refusedProfiles == [second: "cursor_default"])
+            ok.append(CursorSync.profileRowLine(id: second, refused: controller.refusedProfiles, status: nil)
+                == CursorSync.Copy.cantAdd.localized)
+            ok.append(CursorSync.profileRowLine(id: first, refused: controller.refusedProfiles, status: nil) == nil)
+            await push(nil, true)
+            ok.append(controller.refusedProfiles == [second: "cursor_default"])
+            await push(.clean, true)
+            ok.append(controller.refusedProfiles.isEmpty)
+            await push(.init(cleanupFailed: false, rejected: [0: "duplicate", 9: "duplicate"]), true)
+            ok.append(controller.refusedProfiles == [first: "duplicate"])
+            await push(.clean, false)
+            ok.append(controller.refusedProfiles.isEmpty)
+            return ok
+        }
+        expect(cursorRefused == [true, true, true, true, true, true, true],
+               "CURSOR-PROFILES a profile the core leaves out of a push is marked with the fixed sentence, the others are untouched, and it clears with the next accepted push; got \(String(describing: cursorRefused))")
+
+        // A stale usage file a sync round could not delete (a duplicate's old
+        // account file, or a commit's superseded one) shows the same sentence
+        // as an on-push failure, and stays until a round shows its profile
+        // `duplicate` or `ok` without a failure, or the profile is removed: in
+        // any other state nothing retries the delete. Mutation: the line
+        // follows only the latest round's failures.
+        let cursorRoundCleanup: [Bool]? = awaitMainActorValue {
+            let suite = "tokenbar.selftest.cursorSyncRoundCleanup"
+            let defaults = UserDefaults(suiteName: suite)!
+            defer { defaults.removePersistentDomain(forName: suite) }
+            defaults.removePersistentDomain(forName: suite)
+            defaults.set(true, forKey: CursorSync.noticeKey)
+            let b = "0A1B2C3D-0000-4000-8000-00000000000B"
+            let status = { (second: String?, failed: [String]) -> CursorSyncStatus? in
+                let rows = ["default": "ok"].merging(second.map { [b: $0] } ?? [:]) { first, _ in first }
+                    .sorted { $0.key < $1.key }
+                    .map { #"{"id":"\#($0.key)","state":"\#($0.value)","events":0,"lastSuccessMs":1}"# }
+                    .joined(separator: ",")
+                let failedJSON = failed.map { "\"\($0)\"" }.joined(separator: ",")
+                return try? JSONDecoder().decode(
+                    CursorSyncStatus.self,
+                    from: Data(#"{"state":"ok","events":1,"lastSuccessMs":1,"changed":true,"profiles":[\#(rows)],"cleanupFailedProfiles":[\#(failedJSON)]}"#.utf8))
+            }
+            let next = UncheckedBox<CursorSyncStatus?>(status("duplicate", [b]))
+            let sync: @Sendable (Bool) -> CursorSyncStatus? = { _ in next.value }
+            let controller = CursorSyncController()
+            var ok: [Bool] = []
+            let round: (CursorSyncStatus?) async -> Void = { result in
+                next.value = result
+                await controller.runSync(explicit: true, defaults: defaults, arguments: ["Syrtis"], sync: sync)
+            }
+            await round(status("duplicate", [b]))
+            ok.append(controller.staleProfiles == [b] && controller.staleCleanupFailed
+                && CursorSync.cleanupLine(syncOn: true, cleanupFailed: false, staleCleanupFailed: true)
+                    == CursorSync.Copy.staleCleanupFailed.localized)
+            // The profile stops being a duplicate and cannot retry: still shown.
+            await round(status("notSignedIn", []))
+            ok.append(controller.staleProfiles == [b])
+            await round(status("expired", []))
+            ok.append(controller.staleProfiles == [b])
+            // A round that ran its cleanup without a failure clears it.
+            await round(status("duplicate", []))
+            ok.append(controller.staleProfiles.isEmpty && !controller.staleCleanupFailed)
+            // A successful walk's own failure is stale too, cleared by an ok round.
+            await round(status("ok", [b]))
+            ok.append(controller.staleProfiles == [b])
+            await round(status("ok", []))
+            ok.append(controller.staleProfiles.isEmpty)
+            // Removing the profile clears it.
+            await round(status("duplicate", [b]))
+            ok.append(controller.staleProfiles == [b])
+            await round(status(nil, []))
+            ok.append(controller.staleProfiles.isEmpty)
+            // A status without the field (an older core) is no failure.
+            await round(try? JSONDecoder().decode(
+                CursorSyncStatus.self, from: Data(#"{"state":"ok","events":1,"lastSuccessMs":1,"changed":false}"#.utf8)))
+            ok.append(controller.staleProfiles.isEmpty)
+            return ok
+        }
+        expect(cursorRoundCleanup == [true, true, true, true, true, true, true, true, true],
+               "CURSOR-SYNC a stale file a round could not delete keeps its line until that profile is duplicate or ok without a failure, or removed; got \(String(describing: cursorRoundCleanup))")
+
+        // A push that finishes after a newer reconfigure changes nothing: an
+        // on push still running when sync is turned off must not set the
+        // refusals or the cleanup failure after the off reset. Mutation: the
+        // generation guard dropped.
+        let cursorStalePush: [Bool]? = awaitMainActorValue {
+            let suite = "tokenbar.selftest.cursorSyncStalePush"
+            let defaults = UserDefaults(suiteName: suite)!
+            defer { defaults.removePersistentDomain(forName: suite) }
+            defaults.removePersistentDomain(forName: suite)
+            defaults.set(true, forKey: CursorSync.noticeKey)
+            let first = "0A1B2C3D-0000-4000-8000-00000000000A"
+            CursorSync.saveProfiles([.init(id: first, root: "/Volumes/selftest/a")], defaults: defaults)
+            let none: @Sendable (Bool) -> CursorSyncStatus? = { _ in nil }
+            let controller = CursorSyncController()
+            let onPush: CursorSync.SetConfig = { _ in
+                Thread.sleep(forTimeInterval: 0.3)
+                return .init(cleanupFailed: true, rejected: [0: "duplicate"])
+            }
+            defaults.set(true, forKey: CursorSync.enabledKey)
+            controller.reconfigure(refresh: false, defaults: defaults, arguments: ["Syrtis"], bundleID: "x.y",
+                                   setConfig: onPush, sync: none)
+            defaults.set(false, forKey: CursorSync.enabledKey)
+            controller.reconfigure(refresh: false, defaults: defaults, arguments: ["Syrtis"], bundleID: "x.y",
+                                   setConfig: { _ in .clean }, sync: none)
+            try? await Task.sleep(nanoseconds: 700_000_000)
+            return [!controller.orphanCleanupFailed, controller.refusedProfiles.isEmpty, controller.state == nil,
+                    !controller.cleanupFailed]
+        }
+        expect(cursorStalePush == [true, true, true, true],
+               "CURSOR-SYNC an on push finishing after sync was turned off changes nothing; got \(String(describing: cursorStalePush))")
+        expect(CursorSync.cleanupLine(syncOn: true, cleanupFailed: false, staleCleanupFailed: true)
+                   == CursorSync.Copy.staleCleanupFailed.localized
+                && CursorSync.cleanupLine(syncOn: true, cleanupFailed: true, staleCleanupFailed: false) == nil
+                && CursorSync.cleanupLine(syncOn: false, cleanupFailed: true, staleCleanupFailed: true)
+                    == CursorSync.Copy.cleanupFailed.localized
+                && CursorSync.cleanupLine(syncOn: false, cleanupFailed: false, staleCleanupFailed: true) == nil,
+               "CURSOR-SYNC the cleanup line under the switch follows the switch (on: orphan failure; off: off-push failure)")
         // The real FFI, so the Swift decode of `cleanupFailed` is exercised:
         // a read-only dir refuses the delete. Isolation (CMP-520 13b): a
         // SelfTest-only bundle id under a temporary HOME, so an off push can
@@ -18420,7 +18942,7 @@ enum SelfTest {
             // Stop the loop.
             defaults.set(false, forKey: CursorSync.enabledKey)
             controller.reconfigure(refresh: false, defaults: defaults, arguments: ["Syrtis"], bundleID: "x.y",
-                                   setConfig: { _ in false }, sync: sync)
+                                   setConfig: { _ in .clean }, sync: sync)
             return [line, "syncs=\(syncs.value)"]
         }
         expect(cursorRejected == [CursorSync.Copy.configRejected.localized, "syncs=0"],
@@ -18466,7 +18988,7 @@ enum SelfTest {
             cursorFirmlinkSkipped.value = firmlinked == nil
             let pushes = UncheckedBox<[String]>([])
             let syncs = UncheckedBox<Int>(0)
-            let setConfig: CursorSync.SetConfig = { pushes.value.append($0); return false }
+            let setConfig: CursorSync.SetConfig = { pushes.value.append($0); return .clean }
             let sync: CursorSync.Sync = { _ in syncs.value += 1; return nil }
             let user = ["Syrtis"]
             let controller = CursorSyncController()
@@ -18563,7 +19085,7 @@ enum SelfTest {
             // Stop the loop.
             defaults.set(false, forKey: CursorSync.enabledKey)
             controller.reconfigure(refresh: false, defaults: defaults, arguments: user, bundleID: "x.y",
-                                   setConfig: { _ in false }, sync: sync)
+                                   setConfig: { _ in .clean }, sync: sync)
             return ok
         }
         expect(cursorProfiles?.values.allSatisfy { $0 } == true,
@@ -18583,8 +19105,8 @@ enum SelfTest {
             }
             expect(missing.isEmpty, "CURSOR-PROFILES Accounts page Cursor section copy resolves in \(locale): missing \(missing)")
         }
-        expect(cursorRefresh == [true, true, true],
-               "CURSOR-SYNC every round that wrote refreshes, including two in a row with the same count, and after off->on; got \(String(describing: cursorRefresh))")
+        expect(cursorRefresh == [true, true, false, true],
+               "CURSOR-SYNC a round refreshes exactly when the core reports changed (including two in a row with the same count and after off->on) and an identical rewrite reloads nothing; got \(String(describing: cursorRefresh))")
         // CMP-520 FIX 1: one profile wrote while another failed — the
         // headline is `error`, but the core changed the data, so the
         // dashboard refreshes. Mutation: refresh only on `state == "ok"`.
@@ -19620,15 +20142,163 @@ enum SelfTest {
                       duringFlight == (1, 1))
             }
 
-            // A failed attempt is not retried for the same marker.
+            // A failed attempt (here a token Google rejected; an unreachable
+            // Google is the transient case, see AG-9) is not retried for the
+            // same marker.
             do {
                 let fake = AGAutoFake(key: agKey, label: agEmail)
                 let (ac, defaults) = fresh(fake)
                 defaults.set(true, forKey: AntigravityAutoCapture.enabledKey)
-                fake.write { $0.outcome = .failure(.bridge("refresh_unreachable")) }
+                fake.write { $0.outcome = .failure(.bridge("refresh_rejected")) }
                 for _ in 0..<3 { await ac.poll() }
                 check("AG-5 a failed attempt is not retried while the marker is unchanged",
                       fake.read { $0.attempts } == 1 && ac.currentAgyKey == nil)
+            }
+
+            // Turning automatic capture on when agy's current account is already
+            // in the shared keychain (another install captured it): the core
+            // answers `unchanged` with no Google request, and this install's
+            // empty registry gets the account with its label, bound to agy's
+            // marker, with no message. Mutation: ignore an `unchanged` outcome.
+            do {
+                let fake = AGAutoFake(key: agKey, label: agEmail)
+                let (ac, defaults) = fresh(fake)
+                fake.write { $0.outcome = .success(.init(status: "unchanged", key: agKey, label: agEmail)) }
+                await ac.turnOn { true }
+                check("AG-9 an unchanged outcome on an empty registry adds the account with its label and binds it",
+                      AntigravityAccounts.load(defaults: defaults) == [.init(key: agKey, label: agEmail)]
+                          && ac.currentAgyKey == agKey && ac.message == nil
+                          && fake.read { $0.attempts } == 1 && defaults.bool(forKey: AntigravityAutoCapture.enabledKey))
+            }
+
+            // A failed automatic attempt is shown with the same fixed sentence a
+            // manual Capture shows, kept steady by repeated failures and cleared
+            // by a success or by agy being signed out (not a failure); a failed
+            // marker query is transient and leaves `unavailable` as it was;
+            // turning capture off clears an automatic sentence but not a manual
+            // one; an unreachable Google is retried for the same marker, a
+            // rejected token is not. Mutations: swallow the failure; a failed
+            // query marks or clears `unavailable`; capture off keeps or always
+            // clears the sentence; the marker kept on unreachable.
+            do {
+                let fake = AGAutoFake(key: agKey, label: agEmail)
+                let (ac, defaults) = fresh(fake)
+                fake.write { $0.outcome = .failure(.bridge("refresh_rejected")) }
+                await ac.turnOn { true }
+                let shown = ac.message == AccountsCopy.agyRejected
+                    && AntigravityAccounts.load(defaults: defaults).isEmpty
+                fake.write { $0.outcome = .failure(.bridge("not_signed_in")); $0.marker = "m-signed-out" }
+                await ac.poll()
+                let quiet = ac.message == nil
+                fake.write { $0.outcome = .failure(.bridge("keychain_write_failed")); $0.marker = "m-write" }
+                await ac.poll()
+                let second = ac.message == AccountsCopy.agyWriteFailed
+                fake.write {
+                    $0.outcome = .success(.init(status: "captured", key: agKey, label: agEmail))
+                    $0.marker = "m-ok"
+                }
+                await ac.poll()
+                let cleared = ac.message == nil && ac.currentAgyKey == agKey
+                check("AG-9 a failed automatic attempt shows its fixed sentence, agy signed out shows none, and a later success clears it",
+                      shown && quiet && second && cleared)
+                let probe = AGAutoFake(key: agKey, label: agEmail)
+                let (pc, _) = fresh(probe)
+                await pc.setEnabled(true)
+                probe.write { $0.markerUnreadableAfterAttempt = true; $0.marker = "m-next" }
+                await pc.poll()
+                await pc.poll()
+                check("AG-9 a failing marker query is transient: it leaves unavailable unchanged", !pc.unavailable)
+                // Control: once a "present" marker made it true, a failing query
+                // leaves it true.
+                let held = AGAutoFake(key: agKey, label: agEmail)
+                let (hc, _) = fresh(held)
+                held.write { $0.marker = "present"; $0.markerUnreadableAfterAttempt = true }
+                await hc.setEnabled(true)
+                let wasUnavailable = hc.unavailable
+                await hc.poll()
+                check("AG-9 a failing marker query leaves unavailable true when it was true",
+                      wasUnavailable && hc.unavailable)
+                // Switching capture off clears the failure sentence.
+                fake.write { $0.outcome = .failure(.bridge("refresh_rejected")); $0.marker = "m-off" }
+                await ac.poll()
+                let shownBeforeOff = ac.message == AccountsCopy.agyRejected
+                // A rejected token is not retried for the same marker, and a
+                // repeated failure leaves the sentence as it was.
+                let attemptsBefore = fake.read { $0.attempts }
+                await ac.poll()
+                let notRetried = fake.read { $0.attempts } == attemptsBefore
+                    && ac.message == AccountsCopy.agyRejected
+                await ac.setEnabled(false)
+                check("AG-9 turning capture off clears the failure sentence; a rejected token is not retried",
+                      shownBeforeOff && notRetried && ac.message == nil)
+                // A manual failure's sentence survives turning capture off.
+                let manual = AGAutoFake(key: agKey, label: agEmail)
+                let (mc, _) = fresh(manual)
+                manual.write { $0.captureOutcome = .failure(.bridge("agy_not_signed_in")) }
+                await mc.manualCapture()
+                let manualShown = mc.message == AccountsCopy.agyNotSignedIn
+                await mc.setEnabled(false)
+                check("AG-9 a manual failure's sentence survives turning capture off",
+                      manualShown && mc.message == AccountsCopy.agyNotSignedIn)
+                // Google unreachable is retried on the next check and a success
+                // clears the sentence; a rejection is not retried for the same
+                // marker. Mutation: keep the marker on unreachable.
+                let net = AGAutoFake(key: agKey, label: agEmail)
+                let (nc, _) = fresh(net)
+                net.write { $0.outcome = .failure(.bridge("refresh_unreachable")) }
+                await nc.setEnabled(true)
+                let unreachableShown = nc.message == AccountsCopy.agyUnreachable
+                await nc.poll()
+                let retried = net.read { $0.attempts } == 2
+                net.write { $0.outcome = .success(.init(status: "captured", key: agKey, label: agEmail)) }
+                await nc.poll()
+                check("AG-9 an unreachable Google is retried for the same marker and a success clears the sentence",
+                      unreachableShown && retried && nc.message == nil && nc.currentAgyKey == agKey)
+                // A repeated failure keeps the sentence steady: it is still
+                // there while the next attempt is in flight, not cleared at its
+                // start. Mutation: clear `message` when an attempt starts.
+                let steady = AGAutoFake(key: agKey, label: agEmail)
+                let (sc, _) = fresh(steady)
+                steady.write { $0.outcome = .failure(.bridge("refresh_unreachable")) }
+                await sc.setEnabled(true)
+                let hold = DispatchSemaphore(value: 0)
+                steady.write { $0.hold = hold }
+                let again = Task { await sc.poll() }
+                await until { steady.read { $0.attempts } == 2 }
+                let duringAttempt = sc.message
+                steady.write { $0.hold = nil }
+                hold.signal()
+                await again.value
+                check("AG-9 a repeated automatic failure keeps its sentence while the next attempt runs",
+                      duringAttempt == AccountsCopy.agyUnreachable && sc.message == AccountsCopy.agyUnreachable)
+                // A successful automatic outcome without an account (the user
+                // removed it: skipped_removed) clears the sentence too.
+                // Mutation: clear only for captured and unchanged.
+                steady.write {
+                    $0.outcome = .success(.init(status: "skipped_removed"))
+                    $0.marker = "m-skipped"
+                }
+                await sc.poll()
+                check("AG-9 a skipped_removed success clears an earlier automatic failure's sentence",
+                      sc.message == nil)
+                // An attempt still in flight when capture is turned off and then
+                // failing publishes no sentence. Mutation: publish regardless.
+                let late = AGAutoFake(key: agKey, label: agEmail)
+                let (lc, _) = fresh(late)
+                late.write { $0.outcome = .failure(.bridge("refresh_rejected")) }
+                let lateHold = DispatchSemaphore(value: 0)
+                late.write { $0.hold = lateHold }
+                let inFlight = Task { await lc.setEnabled(true) }
+                await until { late.read { $0.attempts } == 1 }
+                // Recorded before turning capture off: if `until` timed out, the
+                // attempt never started and the check below would pass vacuously.
+                let lateStarted = late.read { $0.attempts } == 1
+                await lc.setEnabled(false)
+                late.write { $0.hold = nil }
+                lateHold.signal()
+                await inFlight.value
+                check("AG-9 a failure that lands after capture was turned off publishes no sentence",
+                      lateStarted && lc.message == nil && !lc.isEnabled)
             }
 
             // A login change is seen BEFORE the fetch that follows it: the
@@ -19782,6 +20452,143 @@ enum SelfTest {
                 check("AG-5 manual Capture takes the key off the removed list",
                       AntigravityAccounts.removedKeys(defaults: defaults) == [otherKey]
                           && AntigravityAccounts.load(defaults: defaults).map(\.key) == [agKey])
+            }
+
+            // AG-8 (security review S12). Turning automatic capture on asks
+            // first, and nothing is written until the answer: while the
+            // confirmation is showing, both poll hooks still see the switch
+            // off and make no marker query and no capture call, and Cancel
+            // leaves the setting unwritten. Mutation: write the setting before
+            // confirming.
+            do {
+                let fake = AGAutoFake(key: agKey, label: agEmail)
+                let (ac, defaults) = fresh(fake)
+                var writtenWhilePending: Any?
+                var startedWhilePending = 0
+                let turnedOn = await ac.turnOn {
+                    writtenWhilePending = defaults.object(forKey: AntigravityAutoCapture.enabledKey)
+                    if let task = TrayAnimator.pollAntigravityAutoCapture(defaults: defaults, autoCapture: ac) {
+                        startedWhilePending += 1
+                        await task.value
+                    }
+                    await TrayAnimator.prepareAntigravityAutoCapture(
+                        defaults: defaults, autoCapture: ac, setBinding: { _, _ in })?.value
+                    return false
+                }
+                check("AG-8 a pending confirmation writes nothing and makes no marker or capture call",
+                      writtenWhilePending == nil && startedWhilePending == 0
+                          && fake.read { $0.markerCalls } == 0 && fake.read { $0.attempts } == 0)
+                check("AG-8 Cancel writes nothing and calls nothing",
+                      !turnedOn && defaults.object(forKey: AntigravityAutoCapture.enabledKey) == nil
+                          && fake.read { $0.markerCalls } == 0 && fake.read { $0.attempts } == 0
+                          && fake.read { $0.captures } == 0)
+                // The Settings route: the popover is pending until answered.
+                let request = Task { await ac.requestTurnOn() }
+                await until { ac.confirmPending }
+                let pendingThroughSettings = ac.confirmPending && !ac.isEnabled
+                    && fake.read { $0.markerCalls } == 0
+                ac.answerTurnOn(false)
+                await request.value
+                check("AG-8 the Settings confirmation is pending until answered, and No writes nothing",
+                      pendingThroughSettings && !ac.confirmPending
+                          && defaults.object(forKey: AntigravityAutoCapture.enabledKey) == nil)
+                // Control: confirming turns it on and makes the first attempt.
+                let confirmed = await ac.turnOn { true }
+                check("AG-8 control: confirming turns automatic capture on and attempts once",
+                      confirmed && ac.isEnabled && fake.read { $0.attempts } == 1)
+            }
+
+            // AG-8 upgrade (maintainer decision 2026-11-03): a switch already
+            // on stays on, with no confirmation, and polls as before.
+            do {
+                let fake = AGAutoFake(key: agKey, label: agEmail)
+                let (_, defaults) = fresh(fake)
+                defaults.set(true, forKey: AntigravityAutoCapture.enabledKey)
+                let upgraded = AntigravityAutoCapture(io: fake.io(), defaults: defaults)
+                await TrayAnimator.pollAntigravityAutoCapture(defaults: defaults, autoCapture: upgraded)?.value
+                check("AG-8 a switch already on at upgrade stays on with no prompt and keeps capturing",
+                      upgraded.isEnabled && !upgraded.confirmPending && fake.read { $0.attempts } == 1)
+            }
+
+            // AG-8 MA-24: outside a user session the shared instance's core
+            // calls all fail before reaching the core.
+            do {
+                var inert = true
+                for flag in ["--demo", "--smoke", "--selftest", "--icon-gallery"] {
+                    let io = AntigravityAutoCapture.IO.forRuntime(["Syrtis", flag])
+                    let calls: [() throws -> Void] = [
+                        { _ = try io.marker() }, { _ = try io.capture() },
+                        { _ = try io.autoCapture([]) }, { try io.remove(agKey) },
+                    ]
+                    for call in calls {
+                        do { try call(); inert = false } catch TBCoreError.bridge("not_user_runtime") {
+                        } catch { inert = false }
+                    }
+                }
+                check("AG-8 --demo (and every non-user run) never reaches the core's capture calls", inert)
+            }
+
+            // AG-S10: Remove installs the registry without the key BEFORE the
+            // keychain delete, so a token write-back racing it sees the key
+            // gone. A failed delete puts the row back where it was.
+            do {
+                let fake = AGAutoFake(key: agKey, label: agEmail)
+                let (ac, defaults) = fresh(fake)
+                AntigravityAccounts.save(
+                    [.init(key: agKey, label: agEmail), .init(key: otherKey, label: "b@example.com")],
+                    defaults: defaults)
+                await ac.remove(.init(key: agKey, label: agEmail))
+                check("AG-S10 Remove installs the list without the key before deleting its item",
+                      fake.read { $0.events } == ["install:\(otherKey)", "check-dropped", "remove:\(agKey)"])
+                AntigravityAccounts.save(
+                    [.init(key: agKey, label: agEmail), .init(key: otherKey, label: "b@example.com")],
+                    defaults: defaults)
+                fake.write { $0.removeError = .bridge("keychain_delete_failed") }
+                await ac.remove(.init(key: agKey, label: agEmail))
+                check("AG-S10 a failed delete restores the row in place and says so",
+                      AntigravityAccounts.load(defaults: defaults).map(\.key) == [agKey, otherKey]
+                          && ac.message != nil)
+            }
+
+            // A failed install must not be followed by a delete: the core still
+            // lists the key, so its write-back would see a registered key whose
+            // item is gone. The row stays and the delete-failed sentence shows.
+            // Mutation: delete without asking whether the install landed.
+            do {
+                let fake = AGAutoFake(key: agKey, label: agEmail)
+                let (ac, defaults) = fresh(fake)
+                AntigravityAccounts.save(
+                    [.init(key: agKey, label: agEmail), .init(key: otherKey, label: "b@example.com")],
+                    defaults: defaults)
+                fake.write { $0.installFailed = true }
+                await ac.remove(.init(key: agKey, label: agEmail))
+                check("AG-S10 a failed registry install deletes nothing, keeps the row and shows the delete-failed sentence",
+                      fake.read { $0.removedKeys }.isEmpty
+                          && AntigravityAccounts.load(defaults: defaults).map(\.key) == [agKey, otherKey]
+                          && ac.message == AccountsCopy.agyDeleteFailed)
+                // Control: the same Remove with the install landing deletes once.
+                fake.write { $0.installFailed = false }
+                await ac.remove(.init(key: agKey, label: agEmail))
+                check("AG-S10 control: once the install lands the item is deleted",
+                      fake.read { $0.removedKeys } == [agKey]
+                          && AntigravityAccounts.load(defaults: defaults).map(\.key) == [otherKey])
+            }
+
+            // A delete that reports failure but leaves no item (the core's
+            // write-back re-check already deleted it) is a removal: asking the
+            // core again finds the item gone, and the row is not restored.
+            // Mutation: trust the first failure.
+            do {
+                let fake = AGAutoFake(key: agKey, label: agEmail)
+                let (ac, defaults) = fresh(fake)
+                AntigravityAccounts.save(
+                    [.init(key: agKey, label: agEmail), .init(key: otherKey, label: "b@example.com")],
+                    defaults: defaults)
+                fake.write { $0.removeErrorOnce = .bridge("keychain_delete_failed") }
+                await ac.remove(.init(key: agKey, label: agEmail))
+                check("AG-S10 a delete failure whose item is already gone counts as removed: no restored row, no message",
+                      AntigravityAccounts.load(defaults: defaults).map(\.key) == [otherKey]
+                          && ac.message == nil && fake.read { $0.removedKeys } == [agKey, agKey])
             }
 
             // Dedup through BOTH accessors, gated on the primary's source.
@@ -21223,6 +22030,33 @@ enum SelfTest {
         // Bundle rename: pure decision only; never moves a real bundle.
         BundleRename.selfTest { expect($0, $1) }
 
+        // The restore itself, on a scratch suite: a present key comes back
+        // after a delete or a change, an absent one stays absent. Mutation:
+        // restore only keys that held a value.
+        do {
+            let suite = "tokenbar.selftest.defaultsSnapshot"
+            let scratch = UserDefaults(suiteName: suite)!
+            defer { scratch.removePersistentDomain(forName: suite) }
+            scratch.removePersistentDomain(forName: suite)
+            scratch.set("kept", forKey: "present-deleted")
+            scratch.set("old", forKey: "present-changed")
+            // A registered default is not a stored value: it must stay unstored.
+            scratch.register(defaults: ["registered-only": "temporary"])
+            let snapshot = DefaultsSnapshot(
+                keys: ["present-deleted", "present-changed", "absent", "registered-only"],
+                defaults: scratch, domain: suite)
+            scratch.removeObject(forKey: "present-deleted")
+            scratch.set("new", forKey: "present-changed")
+            scratch.set("created", forKey: "absent")
+            snapshot.restore()
+            expect(scratch.string(forKey: "present-deleted") == "kept"
+                       && scratch.string(forKey: "present-changed") == "old"
+                       && scratch.object(forKey: "absent") == nil
+                       && scratch.persistentDomain(forName: suite)?["registered-only"] == nil,
+                   "DEFAULTS-SNAPSHOT restore puts back deleted and changed keys, removes ones that did not exist, and never stores a registered default")
+        }
+        accountsDefaults.restore()
+
         if failures > 0 {
             print("\(failures) selftest check(s) failed")
             exit(1)
@@ -21259,6 +22093,15 @@ private final class AGAutoFake: @unchecked Sendable {
     var removedKeys: [String] = []
     var outcome: Result<AntigravityAutoCaptureResult, TBCoreError>
     var captureOutcome: Result<AntigravityCapturedAccount, TBCoreError> = .failure(.bridge("agy_not_signed_in"))
+    /// `install:<keys>` and `remove:<key>`, in the order the core saw them.
+    var events: [String] = []
+    /// When set, `remove` fails with it.
+    var removeError: TBCoreError?
+    /// When set, only the next `remove` fails with it (the item is gone by the
+    /// time it is asked again).
+    var removeErrorOnce: TBCoreError?
+    /// When set, the install that drops a key did not land in the core.
+    var installFailed = false
     /// While set, an attempt blocks on it: the attempt is "in flight".
     var hold: DispatchSemaphore?
 
@@ -21315,8 +22158,25 @@ private final class AGAutoFake: @unchecked Sendable {
                     return fake.captureOutcome
                 }.get()
             },
-            remove: { key in self.write { $0.removedKeys.append(key) } },
-            install: { _ in })
+            remove: { key in
+                let error = self.read { fake -> TBCoreError? in
+                    fake.removedKeys.append(key)
+                    fake.events.append("remove:\(key)")
+                    defer { fake.removeErrorOnce = nil }
+                    return fake.removeErrorOnce ?? fake.removeError
+                }
+                if let error { throw error }
+            },
+            registryDropped: { _ in
+                self.read { fake in
+                    fake.events.append("check-dropped")
+                    return !fake.installFailed
+                }
+            },
+            install: { defaults in
+                let keys = AntigravityAccounts.load(defaults: defaults).map(\.key).joined(separator: ",")
+                self.write { $0.events.append("install:\(keys)") }
+            })
     }
 }
 

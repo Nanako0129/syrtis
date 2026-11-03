@@ -52,9 +52,22 @@ enum ExtraScanRoots {
         /// missing path is kept and reported as missing for a later scan.
         static func isRejectedRoot(_ path: String) -> Bool {
             let standardized = standardizedPath(path)
-            if ClaudeExtraRoots.isRejectedRoot(standardized) { return true }
             let home = FileManager.default.homeDirectoryForCurrentUser.path
-            return home.hasPrefix(standardized + "/")
+            return standardized.isEmpty || standardized == "/" || standardized == home
+                || home.hasPrefix(standardized + "/")
+        }
+
+        /// The refusal reason code for adding `path` after `existing`, or nil.
+        /// Path-only like `isRejectedRoot`. Codes share `AccountsCopy.refusalSentence`
+        /// with the Claude list: `empty_path`, `filesystem_root`, `duplicate`,
+        /// and `home_or_ancestor` for home or a folder containing it.
+        static func refusal(adding path: String, to existing: [String]) -> String? {
+            let standardized = standardizedPath(path)
+            if standardized.isEmpty { return "empty_path" }
+            if standardized == "/" { return "filesystem_root" }
+            if isRejectedRoot(path) { return "home_or_ancestor" }
+            if existing.map(standardizedPath).contains(standardized) { return "duplicate" }
+            return nil
         }
 
         /// Probe paths off the main actor on the setter's serial queue. A probe
@@ -93,12 +106,34 @@ enum ExtraScanRoots {
         }
 
         static func isRejectedRoot(_ path: String) -> Bool { Pi.isRejectedRoot(path) }
+        static func refusal(adding path: String, to existing: [String]) -> String? {
+            Pi.refusal(adding: path, to: existing)
+        }
         static func missingRoots(
             in paths: [String],
             then completion: @escaping @Sendable @MainActor (Set<String>) -> Void
         ) {
             Pi.missingRoots(in: paths, then: completion)
         }
+    }
+
+    /// What an Add click on any of the three lists produces: the list, and the
+    /// fixed sentence to show in the refusal alert when the folder was refused.
+    /// Decided here, off the view, so a test can observe the sentence.
+    struct AddOutcome: Equatable {
+        let list: [String]
+        let refusalLine: String?
+    }
+
+    /// `refusal` is the list's own rule (`ClaudeExtraRoots.refusal(adding:to:)`,
+    /// `Pi.refusal`, `Dsh.refusal`); a refused folder is not added.
+    static func add(
+        _ path: String, to list: [String], refusal: (String, [String]) -> String?
+    ) -> AddOutcome {
+        if let code = refusal(path, list) {
+            return AddOutcome(list: list, refusalLine: AccountsCopy.refusalSentence(code))
+        }
+        return AddOutcome(list: list + [path], refusalLine: nil)
     }
 
     /// The complete payload for all clients.
@@ -117,15 +152,18 @@ enum ExtraScanRoots {
     /// setter is full-replace, so `claude` is always present, while `pi` and
     /// `dsh` appear only when non-empty: an absent key already means "no roots
     /// for that client". That also keeps every pre-DSH payload byte-identical.
+    /// `claudeAccepted`: the directories the core accepted for the configured
+    /// Claude list (`ClaudeExtraRoots.classify`), asked once by the caller.
     static func payloadJSON(
-        claudeConfigDirs: [String], piRoots: [String], dshRoots: [String]
+        claudeAccepted: [String], piRoots: [String], dshRoots: [String]
     ) -> String {
         let piPaths = standardizedUnique(piRoots)
         let dshPaths = standardizedUnique(dshRoots)
+        let claudeRoots = ClaudeExtraRoots.expand(accepted: claudeAccepted)
         guard !piPaths.isEmpty || !dshPaths.isEmpty else {
-            return ClaudeExtraRoots.payloadJSON(claudeConfigDirs)
+            return ClaudeExtraRoots.payloadJSON(expanded: claudeRoots)
         }
-        var json = "{\"claude\":\(encode(ClaudeExtraRoots.expandedPaths(claudeConfigDirs)))"
+        var json = "{\"claude\":\(encode(claudeRoots))"
         if !piPaths.isEmpty { json += ",\"pi\":\(encode(piPaths))" }
         if !dshPaths.isEmpty { json += ",\"dsh\":\(encode(dshPaths))" }
         return json + "}"
@@ -161,19 +199,22 @@ enum ExtraScanRoots {
     /// machinery (quota registry, applied marker, generation, cache
     /// invalidation, and quota wake) stays in `ClaudeExtraRoots`, which is
     /// where every client's apply has always run.
+    @MainActor
     static func apply(
         then completion: (@Sendable @MainActor (ExtraScanPathsResult?) -> Void)? = nil
     ) {
-        ClaudeExtraRoots.apply(scanPayload: { currentPayload() }, then: completion)
+        ClaudeExtraRoots.apply(scanPayload: { currentPayload(claudeAccepted: $0) }, then: completion)
     }
 
-    /// The payload `apply` hands to the core, built from the persisted lists.
+    /// The payload `apply` hands to the core: the persisted Pi and DSH lists
+    /// and the Claude directories the core already accepted for this apply.
     /// A separate function so SelfTest observes the production path;
     /// `dshDefaults` is only for a scratch suite.
-    static func currentPayload(dshDefaults: UserDefaults = .standard) -> String {
+    static func currentPayload(
+        claudeAccepted: [String], dshDefaults: UserDefaults = .standard
+    ) -> String {
         payloadJSON(
-            claudeConfigDirs: ClaudeExtraRoots.load(),
-            piRoots: Pi.load(), dshRoots: Dsh.load(defaults: dshDefaults))
+            claudeAccepted: claudeAccepted, piRoots: Pi.load(), dshRoots: Dsh.load(defaults: dshDefaults))
     }
 
     private static func standardizedPath(_ path: String) -> String {
@@ -189,4 +230,25 @@ enum ExtraScanRoots {
         let data = (try? JSONEncoder().encode(paths)) ?? Data("[]".utf8)
         return String(data: data, encoding: .utf8) ?? "[]"
     }
+}
+
+/// The refused add the Settings alert shows: the approved sentence of its
+/// reason (English; the alert localizes it), or nil when no alert is up.
+@MainActor
+final class AddRefusalAlert: ObservableObject {
+    @Published private(set) var message: String?
+    /// The last sentence shown, kept after `dismiss` so the alert's title does
+    /// not turn empty while it animates out.
+    private(set) var title = ""
+
+    /// An add's refusal sentence: raises the alert; nil (an accepted add)
+    /// leaves things as they are.
+    func show(_ sentence: String?) {
+        if let sentence {
+            title = sentence
+            message = sentence
+        }
+    }
+
+    func dismiss() { message = nil }
 }

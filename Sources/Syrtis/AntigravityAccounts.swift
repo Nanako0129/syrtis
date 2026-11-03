@@ -85,8 +85,31 @@ enum AntigravityAccounts {
 
     private static let applyQueue = DispatchQueue(
         label: "com.nyanako.tokenbar.antigravity-accounts", qos: .userInitiated)
+
+    /// Run `body` after every install already enqueued by `apply`. Remove uses
+    /// it so the keychain delete reaches the core only once the registry
+    /// without that key is installed (security review S10): the core's token
+    /// write-back checks registration before and after writing, and a delete
+    /// that overtook the install would leave that check looking at the old
+    /// list. Blocking; never call it on the main thread.
+    static func afterPendingInstalls<T>(_ body: () throws -> T) rethrows -> T {
+        try applyQueue.sync(execute: body)
+    }
     /// Touched only on `applyQueue`.
     nonisolated(unsafe) private static var lastInstalledPayload: String?
+
+    /// Whether the core registry this process last installed no longer lists
+    /// `key`. Blocking: waits for every install already enqueued, so the answer
+    /// is about the install that dropped the key. A failed install leaves the
+    /// previous payload (which still lists it) as the last installed one, so a
+    /// Remove whose install failed must not go on to delete the keychain item
+    /// (the core's token write-back would then see a registered key whose
+    /// item is gone). Never call it on the main thread.
+    static func registryDropped(_ key: String) -> Bool {
+        afterPendingInstalls {
+            !decode(lastInstalledPayload).contains { $0.key == key }
+        }
+    }
 
     /// `accounts` with `captured` added, or its label refreshed when the same
     /// Google account was captured before.
@@ -103,31 +126,20 @@ enum AntigravityAccounts {
     /// fixed code naming no account; it is mapped here and never shown raw.
     static func message(for error: Error) -> String {
         guard case let TBCoreError.bridge(code) = error else {
-            return "Something went wrong. Try again."
+            return AccountsCopy.agyGenericError
         }
         switch code {
-        case "agy_not_signed_in":
-            return "Couldn't read agy's login. Check that agy is signed in, and allow access if macOS asks."
-        case "agy_login_unreadable":
-            return "agy's saved login is in a format Syrtis doesn't recognize."
-        case "agy_login_missing_identity":
-            return "agy's saved login doesn't say which Google account it is. Sign agy in again, then try again."
-        case "oauth_client_not_found":
-            return "Couldn't match this login to the installed Antigravity or agy."
-        case "oauth_client_rejected", "refresh_rejected":
-            return "Google didn't accept this login. Sign agy in again, then try again."
-        case "refresh_unreachable":
-            return "Google couldn't be reached right now. Try again later."
-        case "account_mismatch":
-            return "Google answered for a different account. Nothing was saved."
-        case "invalid_credential_format":
-            return "The login had an unexpected format. Nothing was saved."
-        case "keychain_write_failed":
-            return "Couldn't save to the login keychain."
-        case "keychain_delete_failed":
-            return "Couldn't delete the copy from the login keychain."
-        default:
-            return "Something went wrong. Try again."
+        case "agy_not_signed_in": return AccountsCopy.agyNotSignedIn
+        case "agy_login_unreadable": return AccountsCopy.agyLoginUnreadable
+        case "agy_login_missing_identity": return AccountsCopy.agyMissingIdentity
+        case "oauth_client_not_found": return AccountsCopy.agyClientNotFound
+        case "oauth_client_rejected", "refresh_rejected": return AccountsCopy.agyRejected
+        case "refresh_unreachable": return AccountsCopy.agyUnreachable
+        case "account_mismatch": return AccountsCopy.agyMismatch
+        case "invalid_credential_format": return AccountsCopy.agyBadFormat
+        case "keychain_write_failed": return AccountsCopy.agyWriteFailed
+        case "keychain_delete_failed": return AccountsCopy.agyDeleteFailed
+        default: return AccountsCopy.agyGenericError
         }
     }
 }
@@ -197,6 +209,8 @@ final class AntigravityAutoCapture: ObservableObject {
         var autoCapture: @Sendable ([String]) throws -> AntigravityAutoCaptureResult
         var capture: @Sendable () throws -> AntigravityCapturedAccount
         var remove: @Sendable (String) throws -> Void
+        /// After the install that drops `key`: did it land in the core?
+        var registryDropped: @Sendable (String) -> Bool
         /// Install the stored list in the core (`AntigravityAccounts.apply`).
         var install: @MainActor (UserDefaults) -> Void
 
@@ -204,14 +218,33 @@ final class AntigravityAutoCapture: ObservableObject {
             marker: { try TBCore.antigravityLoginMarker() },
             autoCapture: { try TBCore.antigravityAutoCapture(removedKeys: $0) },
             capture: { try TBCore.antigravityCapture() },
-            remove: { try TBCore.antigravityRemove(key: $0) },
+            remove: { key in
+                try AntigravityAccounts.afterPendingInstalls { try TBCore.antigravityRemove(key: key) }
+            },
+            registryDropped: { AntigravityAccounts.registryDropped($0) },
             install: { AntigravityAccounts.apply(defaults: $0) })
+
+        /// For a run that is not a user session (`--demo`, `--smoke`,
+        /// `--selftest`, `--icon-gallery`): every call fails before reaching
+        /// the core, so no marker query, keychain read, capture or delete runs
+        /// there whatever the stored toggle says (MA-24).
+        static let inert = IO(
+            marker: { throw TBCoreError.bridge("not_user_runtime") },
+            autoCapture: { _ in throw TBCoreError.bridge("not_user_runtime") },
+            capture: { throw TBCoreError.bridge("not_user_runtime") },
+            remove: { _ in throw TBCoreError.bridge("not_user_runtime") },
+            registryDropped: { _ in false },
+            install: { _ in })
+
+        static func forRuntime(_ arguments: [String] = CommandLine.arguments) -> IO {
+            CursorSync.isUserRuntime(arguments) ? .live : .inert
+        }
     }
 
     static let enabledKey = "tokenbar.antigravity.autoCapture"
 
     /// Replaced only by the selftest, with a fake `IO` and a throwaway suite.
-    static var shared = AntigravityAutoCapture(io: .live, defaults: .standard)
+    static var shared = AntigravityAutoCapture(io: .forRuntime(), defaults: .standard)
 
     let io: IO
     let defaults: UserDefaults
@@ -252,8 +285,14 @@ final class AntigravityAutoCapture: ObservableObject {
     /// login change cannot be detected.
     @Published private(set) var unavailable = false
     /// A sentence from `AntigravityAccounts.message(for:)` for the last manual
-    /// Capture or Remove that failed; never a raw code.
-    @Published private(set) var message: String?
+    /// Capture or Remove that failed, or automatic attempt that failed; never a
+    /// raw code.
+    @Published private(set) var message: String? {
+        didSet { autoMessage = false }
+    }
+    /// The current `message` came from an automatic attempt (set right after
+    /// the assignment that resets it).
+    private var autoMessage = false
 
     init(io: IO, defaults: UserDefaults) {
         self.io = io
@@ -287,6 +326,9 @@ final class AntigravityAutoCapture: ObservableObject {
             marker = try? await Self.detached({ try io.marker() })
             checking = false
         }
+        // A failed marker query (a timeout, a stray `security` exit) is
+        // transient: `unavailable` stays as it was and the next poll asks
+        // again. Only a "present" marker means this Mac cannot be watched.
         guard let marker else { return await pollIfOwed() }
         unavailable = marker == "present"
         guard marker != lastAttemptedMarker, !busy else { return await pollIfOwed() }
@@ -304,6 +346,10 @@ final class AntigravityAutoCapture: ObservableObject {
         let result = await Self.detached { Result { try io.autoCapture(removed) } }
         switch result {
         case let .success(outcome):
+            // Any successful automatic outcome (skipped_removed included) clears
+            // an automatic failure's sentence; a repeated failure (Google
+            // unreachable, retried every check) keeps it steady.
+            if autoMessage { message = nil }
             guard let key = outcome.key, let label = outcome.label,
                   outcome.status == "captured" || outcome.status == "unchanged"
             else { break }
@@ -337,8 +383,22 @@ final class AntigravityAutoCapture: ObservableObject {
         case .failure(TBCoreError.bridge("paused")):
             paused = true
             currentAgyKey = nil
-        case .failure:
-            break
+        case let .failure(error):
+            // Shown the way a manual Capture's failure is, with the same fixed
+            // sentences; "agy is not signed in" is a normal state, not a failure.
+            // Published only while capture is still on: an attempt that was in
+            // flight when the user turned it off must not bring a sentence back.
+            if case TBCoreError.bridge("not_signed_in") = error {
+                if autoMessage { message = nil }
+            } else if isEnabled {
+                message = AntigravityAccounts.message(for: error)
+                autoMessage = true
+            }
+            // Google could not be reached: transient, so the next check retries
+            // this marker and a success clears the sentence. Every other failure
+            // (a rejected token, a keychain error) keeps the marker, so Google is
+            // not asked again until agy's login changes.
+            if case TBCoreError.bridge("refresh_unreachable") = error { lastAttemptedMarker = nil }
         }
         busy = false
         await pollIfOwed()
@@ -386,10 +446,50 @@ final class AntigravityAutoCapture: ObservableObject {
         await poll()
     }
 
+    /// Turning automatic capture ON from Settings: the confirmation first,
+    /// then `setEnabled(true)`. Port of Syrtis-Windows `TurnOn(confirm)`
+    /// (security review S12). Until the user confirms, the setting is not
+    /// written, so both poll loops still see it off and make no marker query
+    /// and no capture call; Cancel writes nothing and calls nothing. A switch
+    /// already on at upgrade never passes through here and stays on with no
+    /// prompt (maintainer decision 2026-11-03). Returns whether it turned on.
+    @discardableResult
+    func turnOn(confirm: @MainActor () async -> Bool) async -> Bool {
+        guard await confirm() else { return false }
+        await setEnabled(true)
+        return true
+    }
+
+    /// The Settings confirmation is showing (`requestTurnOn`).
+    @Published private(set) var confirmPending = false
+    private var pendingAnswer: CheckedContinuation<Bool, Never>?
+
+    /// `turnOn` with the Settings popover as the confirmation; it resolves
+    /// through `answerTurnOn`. A second request while one is showing answers
+    /// the first with No.
+    func requestTurnOn() async {
+        await turnOn {
+            await withCheckedContinuation { continuation in
+                pendingAnswer?.resume(returning: false)
+                pendingAnswer = continuation
+                confirmPending = true
+            }
+        }
+    }
+
+    /// The popover's answer. Cancel, Escape, clicking away and leaving the page
+    /// are all No.
+    func answerTurnOn(_ yes: Bool) {
+        confirmPending = false
+        pendingAnswer?.resume(returning: yes)
+        pendingAnswer = nil
+    }
+
     /// The Settings toggle. On: forget the last marker and try now. Off: stop
     /// watching agy's login; the current account stays, still bound to its
     /// marker, so a manual capture's dedup survives (maintainer decision
-    /// 2026-10-03). Either way a pause ends.
+    /// 2026-10-03). Either way a pause ends. Settings turns it on only through
+    /// `turnOn` / `requestTurnOn`.
     func setEnabled(_ on: Bool) async {
         defaults.set(on, forKey: Self.enabledKey)
         paused = false
@@ -398,6 +498,9 @@ final class AntigravityAutoCapture: ObservableObject {
             await poll()
         } else {
             unavailable = false
+            // Only the sentence of an automatic attempt goes: `message` also
+            // carries a manual Capture's or Remove's failure.
+            if autoMessage { message = nil }
         }
     }
 
@@ -449,23 +552,48 @@ final class AntigravityAutoCapture: ObservableObject {
         await pollIfOwed()
     }
 
-    /// Delete one account's keychain copy and drop it from the list. While
+    /// Drop one account from the list, then delete its keychain copy. While
     /// automatic capture is on, the key also goes on the removed list so the
     /// next login change does not add it back.
+    ///
+    /// Registry first, delete second (security review S10): a token refresh
+    /// already in flight for this account writes a rotated token back only
+    /// while the key is registered, and re-checks after writing. With the
+    /// delete first, that write-back recreated the item just deleted. The live
+    /// `IO.remove` waits for the install (`afterPendingInstalls`).
     func remove(_ account: AntigravityAccounts.Account) async {
         guard !busy else { return }
         busy = true
         message = nil
         let io = io
         let key = account.key
-        let result = await Self.detached { Result { try io.remove(key) } }
-        switch result {
+        let position = AntigravityAccounts.load(defaults: defaults).firstIndex { $0.key == key }
+        AntigravityAccounts.mutate(defaults: defaults, install: io.install) {
+            $0.filter { $0.key != key }
+        }
+        // The keychain item goes only once the core registry without the key is
+        // installed (S10). If that install failed, nothing is deleted: the row
+        // comes back and the existing delete-failed sentence is shown.
+        let outcome: Result<Void, Error> = await Self.detached {
+            guard io.registryDropped(key) else {
+                return .failure(TBCoreError.bridge("keychain_delete_failed"))
+            }
+            let first = Result { try io.remove(key) }
+            // A delete that reports failure may still have left no item (the
+            // core's write-back re-check deletes it when the key left the
+            // registry). The core counts an already-missing item as removed,
+            // so asking once more tells the two apart; an item that is still
+            // there fails again and the failure stands.
+            if case let .failure(error) = first {
+                if case TBCoreError.bridge("invalid_key") = error { return first }
+                if case .success = Result(catching: { try io.remove(key) }) { return .success(()) }
+            }
+            return first
+        }
+        switch outcome {
         case .success, .failure(TBCoreError.bridge("invalid_key")):
             // An invalid key has no keychain item and no card: the core
             // registry rejects it. Dropping the row is all that is left.
-            AntigravityAccounts.mutate(defaults: defaults, install: io.install) {
-                $0.filter { $0.key != key }
-            }
             if currentAgyKey == key { currentAgyKey = nil }
             if isEnabled {
                 let removed = AntigravityAccounts.removedKeys(defaults: defaults)
@@ -474,6 +602,16 @@ final class AntigravityAutoCapture: ObservableObject {
                 }
             }
         case let .failure(error):
+            // The item is still there: put the row back where it was, so the
+            // list keeps matching the keychain and Remove can be retried.
+            if let position {
+                AntigravityAccounts.mutate(defaults: defaults, install: io.install) { accounts in
+                    guard !accounts.contains(where: { $0.key == key }) else { return accounts }
+                    var restored = accounts
+                    restored.insert(account, at: min(position, accounts.count))
+                    return restored
+                }
+            }
             message = AntigravityAccounts.message(for: error)
         }
         busy = false
@@ -500,6 +638,7 @@ final class AntigravityAutoCapture: ObservableObject {
         paused = false
         unavailable = false
         message = nil
+        answerTurnOn(false)
     }
 }
 

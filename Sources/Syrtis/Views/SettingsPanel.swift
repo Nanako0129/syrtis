@@ -117,6 +117,15 @@ struct SettingsPanel: View {
     /// immediately (D1: no restart).
     @State private var claudeExtraRoots: [String] = ClaudeExtraRoots.load()
     @State private var claudeExtraRootsResult: ExtraScanPathsResult?
+    /// A refused add: its fixed sentence (`AccountsCopy.refusalSentence`),
+    /// shown in an alert (`.alert` on the Claude section serves every list).
+    @StateObject private var addRefusal = AddRefusalAlert()
+    /// An Add is asking the core: one at a time.
+    @State private var claudeAdding = false
+    /// The core's answer for the stored Claude list, recorded by every apply
+    /// (its rule reads the disk, so it is asked off the main thread); a page
+    /// that appears before any apply has answered asks once itself.
+    @ObservedObject private var claudeRoots = ClaudeRootsListModel.shared
     /// Filled off the main actor — see `ClaudeExtraRoots.missingRoots`. Empty
     /// until the first probe lands, so a row shows no warning rather than a
     /// wrong one while the answer is still unknown.
@@ -141,8 +150,6 @@ struct SettingsPanel: View {
     @AppStorage(CursorSync.enabledKey) private var cursorSyncOn = true
     @AppStorage(CursorSync.takeoverKey) private var cursorTakeover = false
     @AppStorage(CursorSync.noticeKey) private var cursorNoticeAck = false
-    /// The last add was refused (`CursorSync.cantAdd`); cleared on the next edit.
-    @State private var cursorAddRefused = false
     /// 0 = auto (≈60% of the screen). The popover's drag handle writes the
     /// same key, so the two stay in sync.
     @AppStorage(PopoverChrome.heightKey) private var popoverHeight = 0.0
@@ -1069,6 +1076,13 @@ struct SettingsPanel: View {
     @ViewBuilder
     private func accountsPage() -> some View {
         claudeExtraRootsSection()
+            // One alert for every list's refused add: the approved sentence is
+            // the title (the system adds the localized OK button).
+            .alert(
+                addRefusal.title.localized,
+                isPresented: Binding(
+                    get: { addRefusal.message != nil }, set: { if !$0 { addRefusal.dismiss() } }),
+                actions: {})
 
         antigravityAccountsSection()
 
@@ -1082,22 +1096,34 @@ struct SettingsPanel: View {
     /// A second (or further) Claude account isolated with `CLAUDE_CONFIG_DIR`
     /// is otherwise invisible to Syrtis's scan (see `docs/knowledge/
     /// architecture.md`'s extra-scan-paths section). Each config dir here
-    /// expands to its `projects`/`transcripts` sub-roots and merges into the
-    /// single reported total — there is no per-account breakdown.
+    /// expands to its `projects`/`transcripts` sub-roots, whose usage merges
+    /// into the single reported total; the folder's quota shows as its own
+    /// Claude card and account pill (`tb_set_claude_config_dirs`).
     @ViewBuilder
     private func claudeExtraRootsSection() -> some View {
         infoSection(
             AccountsCopy.claude, summary: AccountsCopy.claudeSummary,
-            details: { hint(AccountsCopy.claudeDetails) }
+            details: { ForEach(AccountsCopy.claudeDetails, id: \.self) { hint($0) } }
         ) {
-            ForEach(claudeExtraRoots, id: \.self) { path in
+            // The core's refusals for the stored list, from `claudeRoots` (one
+            // ask per list, off the main thread; no marks until it answers). A
+            // refused entry stays listed, marked, so nothing the user added
+            // disappears silently; it reaches neither registry.
+            let refusedClaudeRoots = claudeRoots.refused(for: claudeExtraRoots)
+            ForEach(Array(claudeExtraRoots.enumerated()), id: \.element) { index, path in
                 row(path) {
                     HStack(spacing: 6) {
-                        if missingClaudeRoots.contains(path) {
+                        if refusedClaudeRoots[index] != nil {
+                            Image(systemName: "xmark.octagon.fill")
+                                .font(.caption2)
+                                .foregroundStyle(.red)
+                                .help(AccountsCopy.refusalSentence(refusedClaudeRoots[index] ?? "").localized)
+                                .accessibilityLabel(AccountsCopy.refusalSentence(refusedClaudeRoots[index] ?? "").localized)
+                        } else if missingClaudeRoots.contains(path) {
                             Image(systemName: "exclamationmark.triangle.fill")
                                 .font(.caption2)
                                 .foregroundStyle(.orange)
-                                .help("Folder not found. Kept in case the drive is disconnected or the path needs fixing.".localized)
+                                .help(AccountsCopy.folderMissing.localized)
                         }
                         Button {
                             claudeExtraRoots.removeAll { $0 == path }
@@ -1107,32 +1133,38 @@ struct SettingsPanel: View {
                                 .foregroundStyle(.secondary)
                         }
                         .buttonStyle(.plain)
+                        .help(AccountsCopy.removeHelp.localized)
+                        .accessibilityLabel(AccountsCopy.removeName(path))
                     }
                 }
             }
             Button {
                 addClaudeExtraRoot()
             } label: {
-                Label("Add config dir…".localized, systemImage: "plus.circle")
+                Label(AccountsCopy.addConfigDir.localized, systemImage: "plus.circle")
                     .font(.caption)
             }
             .buttonStyle(.plain)
+            .disabled(claudeAdding)
             .padding(.horizontal, 10)
             // Per-client share of the merged result — the raw counts span both
             // clients' roots. See `ExtraScanRoots.clientHint`.
-            let claudeHint = ExtraScanRoots.clientHint(
-                claudeExtraRootsResult, client: "claude",
-                requested: ClaudeExtraRoots.expandedPaths(claudeExtraRoots).count)
+            // No hint until the core has answered for this list: a guessed
+            // count would show a wrong "of N registered".
+            let claudeHint = claudeRoots.expandedCount(for: claudeExtraRoots).flatMap {
+                ExtraScanRoots.clientHint(claudeExtraRootsResult, client: "claude", requested: $0)
+            }
             if let claudeHint, claudeHint.unreadable > 0 {
-                hint("%lld of %lld folders can't be read right now; Syrtis will retry on the next scan.".localized(
+                hint(AccountsCopy.unreadableFolders.localized(
                     claudeHint.unreadable, claudeHint.registered))
             }
             if let claudeHint, claudeHint.rejected > 0 {
-                hint("%lld path(s) can't be scanned and weren't added.".localized(
+                hint(AccountsCopy.rejectedPaths.localized(
                     claudeHint.rejected))
             }
         }
         .onAppear { refreshMissingClaudeRoots() }
+        .task(id: claudeExtraRoots) { await claudeRoots.refresh(claudeExtraRoots) }
     }
 
     /// Extra directories of Pi session-format JSONL files. A headless runner
@@ -1152,7 +1184,7 @@ struct SettingsPanel: View {
                             Image(systemName: "exclamationmark.triangle.fill")
                                 .font(.caption2)
                                 .foregroundStyle(.orange)
-                                .help("Folder not found. Kept in case the drive is disconnected or the path needs fixing.".localized)
+                                .help(AccountsCopy.folderMissing.localized)
                         }
                         Button {
                             piExtraRoots.removeAll { $0 == path }
@@ -1162,13 +1194,15 @@ struct SettingsPanel: View {
                                 .foregroundStyle(.secondary)
                         }
                         .buttonStyle(.plain)
+                        .help(AccountsCopy.removeHelp.localized)
+                        .accessibilityLabel(AccountsCopy.removeName(path))
                     }
                 }
             }
             Button {
                 addPiExtraRoot()
             } label: {
-                Label("Add folder…".localized, systemImage: "plus.circle")
+                Label(AccountsCopy.addFolder.localized, systemImage: "plus.circle")
                     .font(.caption)
             }
             .buttonStyle(.plain)
@@ -1178,11 +1212,11 @@ struct SettingsPanel: View {
             let piHint = ExtraScanRoots.clientHint(
                 piExtraRootsResult, client: "pi", requested: piExtraRoots.count)
             if let piHint, piHint.unreadable > 0 {
-                hint("%lld of %lld folders can't be read right now; Syrtis will retry on the next scan.".localized(
+                hint(AccountsCopy.unreadableFolders.localized(
                     piHint.unreadable, piHint.registered))
             }
             if let piHint, piHint.rejected > 0 {
-                hint("%lld path(s) can't be scanned and weren't added.".localized(
+                hint(AccountsCopy.rejectedPaths.localized(
                     piHint.rejected))
             }
         }
@@ -1205,7 +1239,7 @@ struct SettingsPanel: View {
                             Image(systemName: "exclamationmark.triangle.fill")
                                 .font(.caption2)
                                 .foregroundStyle(.orange)
-                                .help("Folder not found. Kept in case the drive is disconnected or the path needs fixing.".localized)
+                                .help(AccountsCopy.folderMissing.localized)
                         }
                         Button {
                             dshExtraRoots.removeAll { $0 == path }
@@ -1215,13 +1249,15 @@ struct SettingsPanel: View {
                                 .foregroundStyle(.secondary)
                         }
                         .buttonStyle(.plain)
+                        .help(AccountsCopy.removeHelp.localized)
+                        .accessibilityLabel(AccountsCopy.removeName(path))
                     }
                 }
             }
             Button {
                 addDshExtraRoot()
             } label: {
-                Label("Add folder…".localized, systemImage: "plus.circle")
+                Label(AccountsCopy.addFolder.localized, systemImage: "plus.circle")
                     .font(.caption)
             }
             .buttonStyle(.plain)
@@ -1229,11 +1265,11 @@ struct SettingsPanel: View {
             let dshHint = ExtraScanRoots.clientHint(
                 dshExtraRootsResult, client: "dsh", requested: dshExtraRoots.count)
             if let dshHint, dshHint.unreadable > 0 {
-                hint("%lld of %lld folders can't be read right now; Syrtis will retry on the next scan.".localized(
+                hint(AccountsCopy.unreadableFolders.localized(
                     dshHint.unreadable, dshHint.registered))
             }
             if let dshHint, dshHint.rejected > 0 {
-                hint("%lld path(s) can't be scanned and weren't added.".localized(
+                hint(AccountsCopy.rejectedPaths.localized(
                     dshHint.rejected))
             }
         }
@@ -1318,9 +1354,13 @@ struct SettingsPanel: View {
                 .buttonStyle(.plain)
                 .disabled(cursorSync.syncing)
                 .padding(.horizontal, 10)
-            } else if cursorSync.cleanupFailed {
-                // The copy says sync is off, so only while the switch shows off.
-                Text(CursorSync.Copy.cleanupFailed.localized)
+            }
+            if let line = CursorSync.cleanupLine(
+                syncOn: CursorSync.toggleShowsOn(enabled: cursorSyncOn, acknowledged: cursorNoticeAck),
+                cleanupFailed: cursorSync.cleanupFailed,
+                staleCleanupFailed: cursorSync.staleCleanupFailed)
+            {
+                Text(line)
                     .font(.caption2)
                     .foregroundStyle(Color.orange)
                     .fixedSize(horizontal: false, vertical: true)
@@ -1338,20 +1378,16 @@ struct SettingsPanel: View {
         let syncOn = CursorSync.toggleShowsOn(enabled: cursorSyncOn, acknowledged: cursorNoticeAck)
         cursorProfileRow(CursorSync.Copy.defaultProfile, id: "default", syncOn: syncOn) { EmptyView() }
         ForEach(cursorSync.profiles, id: \.id) { profile in
-            cursorProfileRow(
-                (profile.root as NSString).abbreviatingWithTildeInPath, id: profile.id, syncOn: syncOn
-            ) {
+            cursorProfileRow(CursorSync.rowLabel(profile), id: profile.id, syncOn: syncOn) {
                 Button {
                     cursorSync.removeProfile(id: profile.id)
-                    cursorAddRefused = false
                 } label: {
                     Image(systemName: "minus.circle")
                         .foregroundStyle(.secondary)
                 }
                 .buttonStyle(.plain)
-                .help("Remove".localized)
-                .accessibilityLabel(CursorSync.Copy.removeFolder.localized(
-                    (profile.root as NSString).lastPathComponent))
+                .help(AccountsCopy.removeHelp.localized)
+                .accessibilityLabel(AccountsCopy.removeName(CursorSync.rowLabel(profile)))
             }
         }
         Button {
@@ -1362,9 +1398,6 @@ struct SettingsPanel: View {
         }
         .buttonStyle(.plain)
         .padding(.horizontal, 10)
-        if cursorAddRefused {
-            hint(CursorSync.Copy.cantAdd)
-        }
     }
 
     @ViewBuilder
@@ -1372,14 +1405,17 @@ struct SettingsPanel: View {
         _ label: String, id: String, syncOn: Bool, @ViewBuilder trailing: () -> some View
     ) -> some View {
         row(label, trailing: trailing)
-        if syncOn, let status = cursorSync.profileStates[id] {
-            if let line = CursorSync.rowLine(status) {
-                Text(line)
-                    .font(.caption2)
-                    .foregroundStyle(["ok", "duplicate"].contains(status.state) ? Color.secondary : Color.orange)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .padding(.horizontal, 10)
-            }
+        if syncOn,
+           let line = CursorSync.profileRowLine(
+               id: id, refused: cursorSync.refusedProfiles, status: cursorSync.profileStates[id])
+        {
+            let calm = cursorSync.refusedProfiles[id] == nil
+                && ["ok", "duplicate"].contains(cursorSync.profileStates[id]?.state ?? "")
+            Text(line)
+                .font(.caption2)
+                .foregroundStyle(calm ? Color.secondary : Color.orange)
+                .fixedSize(horizontal: false, vertical: true)
+                .padding(.horizontal, 10)
         }
     }
 
@@ -1388,9 +1424,9 @@ struct SettingsPanel: View {
         panel.canChooseDirectories = true
         panel.canChooseFiles = false
         panel.allowsMultipleSelection = false
-        panel.prompt = "Add".localized
+        panel.prompt = AccountsCopy.addPrompt.localized
         guard panel.runModal() == .OK, let url = panel.url else { return }
-        cursorAddRefused = !cursorSync.addProfile(root: url.path)
+        if !cursorSync.addProfile(root: url.path) { addRefusal.show(CursorSync.Copy.cantAdd) }
     }
 
     /// Extra Google accounts for Antigravity, each its own card. The copy says
@@ -1426,14 +1462,15 @@ struct SettingsPanel: View {
                     }
                     .buttonStyle(.plain)
                     .disabled(busy)
-                    .help("Remove".localized)
+                    .help(AccountsCopy.removeHelp.localized)
+                    .accessibilityLabel(AccountsCopy.removeName(account.label))
                 }
             }
             Button {
                 Task { await antigravityAutoCapture.manualCapture() }
             } label: {
                 Label(
-                    (busy ? "Capturing…" : "Capture current agy login").localized,
+                    (busy ? AccountsCopy.capturing : AccountsCopy.captureCurrent).localized,
                     systemImage: "plus.circle")
                     .font(.caption)
             }
@@ -1446,18 +1483,55 @@ struct SettingsPanel: View {
                     .foregroundStyle(.orange)
                     .fixedSize(horizontal: false, vertical: true)
             }
+            // On asks first (`requestTurnOn`); nothing is written until the
+            // user confirms, and the switch stays off meanwhile.
             toggleRow(
                 AccountsCopy.autoToggle,
                 isOn: Binding(
                     get: { antigravityAutoCaptureOn },
-                    set: { on in Task { await antigravityAutoCapture.setEnabled(on) } }))
+                    set: { on in
+                        Task {
+                            if on {
+                                await antigravityAutoCapture.requestTurnOn()
+                            } else {
+                                await antigravityAutoCapture.setEnabled(false)
+                            }
+                        }
+                    }))
+                .popover(
+                    isPresented: Binding(
+                        get: { antigravityAutoCapture.confirmPending },
+                        set: { if !$0 { antigravityAutoCapture.answerTurnOn(false) } }),
+                    arrowEdge: .bottom
+                ) {
+                    VStack(alignment: .leading, spacing: 10) {
+                        Text(AccountsCopy.confirmTitle.localized)
+                            .font(.callout.weight(.semibold))
+                        hint(AccountsCopy.confirmBody)
+                        HStack {
+                            Spacer()
+                            Button(AccountsCopy.confirmCancel.localized) {
+                                antigravityAutoCapture.answerTurnOn(false)
+                            }
+                            .keyboardShortcut(.cancelAction)
+                            // No default-action shortcut: Return must not consent.
+                            Button(AccountsCopy.confirmOk.localized) {
+                                antigravityAutoCapture.answerTurnOn(true)
+                            }
+                        }
+                        .controlSize(.small)
+                    }
+                    .frame(width: 280, alignment: .leading)
+                    .padding(12)
+                }
+                .onDisappear { antigravityAutoCapture.answerTurnOn(false) }
             if antigravityAutoCaptureOn, antigravityAutoCapture.paused {
-                Text("Automatic capture is paused because the login keychain didn't answer. Press Capture to resume.".localized)
+                Text(AccountsCopy.autoPaused.localized)
                     .font(.caption2)
                     .foregroundStyle(.orange)
                     .fixedSize(horizontal: false, vertical: true)
             } else if antigravityAutoCaptureOn, antigravityAutoCapture.unavailable {
-                Text("Automatic capture is unavailable on this Mac.".localized)
+                Text(AccountsCopy.autoUnavailable.localized)
                     .font(.caption2)
                     .foregroundStyle(.orange)
                     .fixedSize(horizontal: false, vertical: true)
@@ -1470,12 +1544,19 @@ struct SettingsPanel: View {
         panel.canChooseDirectories = true
         panel.canChooseFiles = false
         panel.allowsMultipleSelection = false
-        panel.prompt = "Add".localized
+        panel.prompt = AccountsCopy.addPrompt.localized
         guard panel.runModal() == .OK, let url = panel.url else { return }
+        // The core's rule, asked (off the main thread) before anything is
+        // saved; a refusal shows its sentence in an alert and saves nothing.
         let path = url.path
-        guard !ClaudeExtraRoots.isRejectedRoot(path), !claudeExtraRoots.contains(path) else { return }
-        claudeExtraRoots.append(path)
-        commitClaudeExtraRoots()
+        claudeAdding = true
+        Task {
+            let line = await claudeRoots.add(
+                path, current: { claudeExtraRoots }, set: { claudeExtraRoots = $0 })
+            claudeAdding = false
+            addRefusal.show(line)
+            if line == nil { commitClaudeExtraRoots() }
+        }
     }
 
     private func commitClaudeExtraRoots() {
@@ -1493,13 +1574,14 @@ struct SettingsPanel: View {
         panel.canChooseDirectories = true
         panel.canChooseFiles = false
         panel.allowsMultipleSelection = false
-        panel.prompt = "Add".localized
+        panel.prompt = AccountsCopy.addPrompt.localized
         guard panel.runModal() == .OK, let url = panel.url else { return }
-        let path = (url.path as NSString).standardizingPath
-        guard !ExtraScanRoots.Pi.isRejectedRoot(path),
-            !piExtraRoots.contains(path)
-        else { return }
-        piExtraRoots.append(path)
+        let outcome = ExtraScanRoots.add(
+            (url.path as NSString).standardizingPath, to: piExtraRoots,
+            refusal: ExtraScanRoots.Pi.refusal(adding:to:))
+        addRefusal.show(outcome.refusalLine)
+        guard outcome.refusalLine == nil else { return }
+        piExtraRoots = outcome.list
         commitPiExtraRoots()
     }
 
@@ -1518,13 +1600,14 @@ struct SettingsPanel: View {
         panel.canChooseDirectories = true
         panel.canChooseFiles = false
         panel.allowsMultipleSelection = false
-        panel.prompt = "Add".localized
+        panel.prompt = AccountsCopy.addPrompt.localized
         guard panel.runModal() == .OK, let url = panel.url else { return }
-        let path = (url.path as NSString).standardizingPath
-        guard !ExtraScanRoots.Dsh.isRejectedRoot(path),
-            !dshExtraRoots.contains(path)
-        else { return }
-        dshExtraRoots.append(path)
+        let outcome = ExtraScanRoots.add(
+            (url.path as NSString).standardizingPath, to: dshExtraRoots,
+            refusal: ExtraScanRoots.Dsh.refusal(adding:to:))
+        addRefusal.show(outcome.refusalLine)
+        guard outcome.refusalLine == nil else { return }
+        dshExtraRoots = outcome.list
         commitDshExtraRoots()
     }
 
@@ -1807,7 +1890,80 @@ enum AccountsCopy {
     static let moreDetails = "More details"
     static let claude = "Claude"
     static let claudeSummary = "Extra accounts join your totals."
-    static let claudeDetails = "For another Claude account, run Claude Code with CLAUDE_CONFIG_DIR set to its own folder and add that folder here. Its usage joins your totals; accounts aren't shown separately."
+    // Copy below marked PENDING APPROVAL (Claude details, the refusal
+    // sentences, Remove names): drafted in .agent-local/plans/
+    // multi-account-mac-copy-draft.md with the code fact each sentence states;
+    // the maintainer approves it verbatim before merge.
+    /// The Claude ⓘ: how to add a folder, then the four questions a user asks
+    /// of a credential read (where from, logged, sent where, written back).
+    static let claudeDetails = [
+        "For another Claude account, run Claude Code with CLAUDE_CONFIG_DIR set to its own folder and add that folder here. Each folder you add gets its own Claude card, and its usage also joins your totals.",
+        "To show a folder's limits, Syrtis reads the Keychain item Claude Code keeps for it, named Claude Code-credentials- followed by 8 characters derived from the folder's path. macOS may ask you to allow this. Syrtis doesn't log the sign-in.",
+        "Syrtis sends the sign-in's access token to api.anthropic.com to ask for the usage. Once that token has expired, Syrtis sends the refresh token to platform.claude.com for a new one and writes the new sign-in back into the same Keychain item.",
+    ]
+
+    /// One fixed sentence per refusal reason code: the core's
+    /// `claude_config_dirs::Refusal` codes, Swift's fail-closed `unavailable`,
+    /// and `home_or_ancestor` for Pi and DSH (home or a folder containing it).
+    /// Shown in an alert when an add is refused and as the help of
+    /// the mark on a stored Claude folder the core refuses. None carries a
+    /// path or an OS error.
+    static let refusalCodes = [
+        "empty_path", "not_absolute", "filesystem_root", "home_unknown", "home_directory",
+        "home_or_ancestor", "primary_scan_root", "duplicate", "overlap", "limit_reached", "unavailable",
+    ]
+    static func refusalSentence(_ code: String) -> String {
+        switch code {
+        case "empty_path": return "This folder can't be used: no folder was chosen."
+        case "not_absolute": return "This folder can't be used: its path isn't a full path."
+        case "filesystem_root": return "This folder can't be used: it is the top-level folder (/)."
+        case "home_unknown": return "This folder can't be used: Syrtis couldn't find your home folder to check it."
+        case "home_directory": return "This folder can't be used: it is your home folder."
+        case "home_or_ancestor": return "This folder can't be used: it is your home folder or contains it."
+        case "primary_scan_root":
+            return "This folder can't be used: it is, contains or sits inside folders Syrtis already reads for your main Claude account."
+        case "duplicate": return "This folder can't be used: it is already in the list."
+        case "overlap": return "This folder can't be used: it contains, or sits inside, another folder in the list."
+        case "limit_reached": return "This folder can't be used: the list already has 8 folders."
+        default: return "This folder can't be used: Syrtis couldn't check it."
+        }
+    }
+    static var refusalSentences: [String] { refusalCodes.map(refusalSentence) }
+
+    /// Accessibility name of a row's Remove button: the row's full label, so
+    /// two rows never share a name.
+    static let removeNamed = "Remove %@"
+    static func removeName(_ rowLabel: String) -> String { removeNamed.localized(rowLabel) }
+
+    // Strings the Accounts page draws itself, kept here so `translated`
+    // (and the SelfTest check over it) covers every one.
+    static let folderMissing = "Folder not found. Kept in case the drive is disconnected or the path needs fixing."
+    static let addConfigDir = "Add config dir…"
+    static let addFolder = "Add folder…"
+    static let addPrompt = "Add"
+    static let removeHelp = "Remove"
+    static let unreadableFolders = "%lld of %lld folders can't be read right now; Syrtis will retry on the next scan."
+    static let rejectedPaths = "%lld path(s) can't be scanned and weren't added."
+    static let capturing = "Capturing…"
+    static let captureCurrent = "Capture current agy login"
+    static let autoPaused = "Automatic capture is paused because the login keychain didn't answer. Press Capture to resume."
+    static let autoUnavailable = "Automatic capture is unavailable on this Mac."
+    /// `AntigravityAccounts.message(for:)`'s sentences, shown under the Capture button.
+    static let agyGenericError = "Something went wrong. Try again."
+    static let agyNotSignedIn = "Couldn't read agy's login. Check that agy is signed in, and allow access if macOS asks."
+    static let agyLoginUnreadable = "agy's saved login is in a format Syrtis doesn't recognize."
+    static let agyMissingIdentity = "agy's saved login doesn't say which Google account it is. Sign agy in again, then try again."
+    static let agyClientNotFound = "Couldn't match this login to the installed Antigravity or agy."
+    static let agyRejected = "Google didn't accept this login. Sign agy in again, then try again."
+    static let agyUnreachable = "Google couldn't be reached right now. Try again later."
+    static let agyMismatch = "Google answered for a different account. Nothing was saved."
+    static let agyBadFormat = "The login had an unexpected format. Nothing was saved."
+    static let agyWriteFailed = "Couldn't save to the login keychain."
+    static let agyDeleteFailed = "Couldn't delete the copy from the login keychain."
+    static let antigravityMessages = [
+        agyGenericError, agyNotSignedIn, agyLoginUnreadable, agyMissingIdentity, agyClientNotFound,
+        agyRejected, agyUnreachable, agyMismatch, agyBadFormat, agyWriteFailed, agyDeleteFailed,
+    ]
     static let pi = "Pi"
     static let piSummary = "Add another Pi sessions folder; its usage joins your totals."
     static let piDetails = [
@@ -1824,8 +1980,16 @@ enum AccountsCopy {
     static let antigravitySummary = "Capture a Google account agy signs into."
     static let autoToggle = "Capture accounts agy signs into automatically"
     static let recipe = "To add another Google account:\n1. Sign agy in to that account.\n2. Press Capture current agy login.\n3. Sign agy back in to your main account."
-    static let captureReads = "Capture reads agy's saved Google login once when you press the button, and once each time agy's sign-in changes while automatic capture is on. The copy is kept in this Mac's login keychain. Syrtis uses it only with Google's token service and Cloud Code quota service, and its requests identify as Antigravity."
-    static let autoOn = "When on, Syrtis copies the sign-in of each account agy signs into to this Mac's login keychain: once when you turn this on, then whenever agy's sign-in changes. Turning it off keeps the copies. An account you remove stays removed until you press Capture."
+    // Copy below marked PENDING APPROVAL: drafted in .agent-local/plans/
+    // multi-account-mac-copy-draft.md with the code fact each sentence
+    // states; the maintainer approves it verbatim before merge.
+    static let captureReads = "Capture reads agy's saved Google sign-in once when you press the button and, while automatic capture is on, again each time agy rewrites its saved sign-in (including its routine refresh). macOS may ask you to allow this. The copy is kept in this Mac's login keychain. Syrtis sends its refresh token to Google's token service and the access token it gets back to Google's Cloud Code quota service, where its requests identify as Antigravity."
+    static let autoOn = "When on, Syrtis reads agy's sign-in once when you turn this on, then again each time agy rewrites its saved sign-in (including its routine refresh), and keeps a copy of each account in this Mac's login keychain, updated when it changes. Turning it off keeps the copies. An account you remove while this is on stays removed until you sign agy in to it and press Capture."
+    /// The confirmation before the switch turns on (security review S12/S13).
+    static let confirmTitle = "Turn on automatic capture?"
+    static let confirmBody = "Syrtis reads agy's current sign-in now and again each time agy rewrites its saved sign-in, and keeps a copy of each account in this Mac's login keychain without asking again. To check a new sign-in, Syrtis sends agy's refresh token to Google's token service. macOS may ask you to allow access to agy's keychain item. Accounts you remove while this is on stay removed until you sign agy in to them and press Capture."
+    static let confirmOk = "Turn On"
+    static let confirmCancel = "Cancel"
     static let autoOff = "Turn this on to keep reading agy's current account through its captured sign-in, shown as one OAUTH card, so Syrtis rarely needs to run agy. With it off, a Capture lasts only until agy next refreshes its sign-in (usually within an hour); after that the main card runs agy again."
     static let remove = "Remove deletes only the copy on this Mac. Google still accepts it until you revoke access in Google Account → third-party access, which also signs Antigravity out of that account."
 
@@ -1838,11 +2002,15 @@ enum AccountsCopy {
     }
     /// Every Antigravity paragraph, for presence checks.
     static let antigravityDetails = antigravityGeneral + [autoOn, autoOff]
+    static let antigravityConfirm = [confirmTitle, confirmBody, confirmOk, confirmCancel]
     /// Every string that has a translation; the product names `claude` and
     /// `antigravity` are intentionally the same in every language.
-    static let translated = [page, moreDetails, claudeSummary, claudeDetails,
-                             dshSummary, dshDetails, antigravitySummary, autoToggle, piSummary,
-                             cursorSummary] + piDetails + antigravityDetails
+    static let translated = [page, moreDetails, claudeSummary, dshSummary, dshDetails, antigravitySummary,
+                             autoToggle, piSummary, cursorSummary, removeNamed, folderMissing, addConfigDir,
+                             addFolder, addPrompt, removeHelp, unreadableFolders, rejectedPaths, capturing,
+                             captureCurrent, autoPaused, autoUnavailable]
+        + claudeDetails + refusalSentences + piDetails + antigravityDetails + antigravityConfirm
+        + antigravityMessages + CursorSync.Copy.all
 }
 
 /// ⓘ next to a section header; the popover holds the long explanation.

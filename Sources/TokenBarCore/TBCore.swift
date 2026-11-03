@@ -91,11 +91,12 @@ public struct ExtraScanPathsResult: Decodable, Equatable, Sendable {
     public let rejected: [ScanPathNote]
 }
 
-/// One directory `tb_set_claude_config_dirs` refused, and why. Unlike an
-/// unreadable scan root, nothing here fixes itself by waiting: the path is
-/// empty, relative, the filesystem root, or a repeat of one already listed.
+/// One directory `tb_set_claude_config_dirs` (or the pre-check
+/// `tb_claude_config_dir_refusals`) refused: its position in the input and a
+/// fixed code (`primary_scan_root`, `overlap`, `limit_reached`, ...). The path
+/// is never echoed back. Nothing here fixes itself by waiting.
 public struct RejectedConfigDir: Decodable, Equatable, Sendable {
-    public let path: String
+    public let index: Int
     public let reason: String
 }
 
@@ -103,6 +104,11 @@ public struct RejectedConfigDir: Decodable, Equatable, Sendable {
 public struct ClaudeConfigDirsResult: Decodable, Equatable, Sendable {
     /// Directories now fetched as their own Claude quota card.
     public let registeredCount: Int
+    public let rejected: [RejectedConfigDir]
+}
+
+/// Result of `tb_claude_config_dir_refusals`.
+public struct ClaudeConfigDirRefusals: Decodable, Equatable, Sendable {
     public let rejected: [RejectedConfigDir]
 }
 
@@ -202,6 +208,21 @@ public struct CursorSyncConfigResult: Decodable, Equatable, Sendable {
     public let removedFiles: Int
     /// Some of those files could not be deleted.
     public let cleanupFailed: Bool
+    /// Profiles left out of this push, by index in the pushed list: the
+    /// folder is Cursor's own (`cursor_default`) or repeats an earlier entry
+    /// (`duplicate`). The default and the other profiles are registered.
+    /// Absent from a result that predates per-entry refusal.
+    public let rejectedProfiles: [RejectedProfile]?
+
+    public struct RejectedProfile: Decodable, Equatable, Sendable {
+        public let index: Int
+        public let reason: String
+
+        public init(index: Int, reason: String) {
+            self.index = index
+            self.reason = reason
+        }
+    }
 }
 
 /// Result of `tb_cursor_sync`.
@@ -214,8 +235,15 @@ public struct CursorSyncStatus: Decodable, Equatable, Sendable {
     public let lastSuccessMs: Int64?
     /// A fixed diagnostic code (e.g. `rate_limited`); never account data.
     public let reason: String?
-    /// Some profile wrote its file this round, whatever `state` says.
+    /// A usage file's bytes changed this round (written with new content, or a
+    /// duplicate profile's old account file removed), whatever `state` says.
+    /// A walk whose bytes equal the file's only touches its modified time and
+    /// is not a change.
     public let changed: Bool
+    /// Profiles (`default` or a UUID) whose stale usage file could not be
+    /// deleted this round: a duplicate's old account file. Absent from a
+    /// status that predates it.
+    public let cleanupFailedProfiles: [String]?
     /// Each profile's own outcome, the default (`id` `default`) first. Absent
     /// from a status that predates CMP-520.
     public let profiles: [Profile]?
@@ -521,6 +549,18 @@ public enum TBCore {
     /// user configured — not the scan subset the core accepted.
     public static func setClaudeConfigDirs(json: String) throws -> ClaudeConfigDirsResult {
         try unwrap(json.withCString { tb_set_claude_config_dirs($0) })
+    }
+
+    /// Which entries of a JSON array of Claude config directories the core
+    /// refuses, by index and fixed code, without registering anything. The
+    /// one rule behind `setClaudeConfigDirs` and the primary window's guard;
+    /// Swift runs it before building either registry's payload. It reads the
+    /// disk (`~/.cc-mirror` and each variant's `variant.json`), so call it off
+    /// the main actor.
+    public static func claudeConfigDirRefusals(json: String) throws -> [RejectedConfigDir] {
+        let result: ClaudeConfigDirRefusals = try unwrap(
+            json.withCString { tb_claude_config_dir_refusals($0) })
+        return result.rejected
     }
 
     /// Replace the process-wide registry of captured Antigravity accounts.

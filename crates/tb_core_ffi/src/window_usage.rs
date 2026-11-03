@@ -54,10 +54,10 @@ pub(crate) fn cache_key(account: &Account, from_ms: i64, until_ms: i64) -> Cache
 /// refused: a root that is not registered is not scanned for anybody, and
 /// listing it here would claim otherwise.
 ///
-/// **Direct children only, not every descendant.** Nothing stops a user
-/// configuring both `/work` and `/work/sub` as accounts — `isRejectedRoot`
-/// refuses only the empty path, `/` and the home directory
-/// (`ClaudeExtraRoots.swift:53`) — and a prefix test would then hand `/work`
+/// **Direct children only, not every descendant.** The config-dir rule
+/// (`claude_config_dirs::check`) refuses `/work/sub` beside `/work`, but the
+/// scan registry is a separate setter with no such rule, and an older build's
+/// stored list can still hold both — and a prefix test would then hand `/work`
 /// the roots of `/work/sub`, folding one account's transcripts into the
 /// other's allowance. That is the defect this file exists to fix, reappearing
 /// on the selection side after being fixed on the exclusion side.
@@ -106,13 +106,25 @@ fn registered_roots_under(dir: &str) -> Vec<PathBuf> {
 ///
 /// Excluding neither is how the extra account's transcripts land on the primary
 /// card, which is what issue #258 reports.
-fn primary_exclusions() -> Vec<PathBuf> {
+///
+/// Never excludes a path that collides with the primary's own roots
+/// (`claude_config_dirs::PrimaryRoots::collides` under `home`), whatever a
+/// registry holds. The config-dir setter and Swift
+/// refuse those directories, but the scan registry has no such rule and either
+/// registry alone was enough to empty the primary window (audit P1, 2026-11-03),
+/// so this is the guard that does not depend on both callers getting it right.
+fn primary_exclusions(home: Option<&Path>) -> Vec<PathBuf> {
     let mut excluded: Vec<PathBuf> = crate::claude_config_dirs::snapshot()
         .into_iter()
         .map(PathBuf::from)
         .collect();
     if let Some(roots) = crate::extra_scan_paths::snapshot().get(CLAUDE) {
         excluded.extend(roots.iter().cloned());
+    }
+    if let (Some(home), false) = (home, excluded.is_empty()) {
+        // Read once for the whole list, not once per path.
+        let primary = crate::claude_config_dirs::PrimaryRoots::for_home(home);
+        excluded.retain(|path| !primary.collides(path));
     }
     excluded
 }
@@ -217,7 +229,7 @@ fn account_options(
     Ok(match account {
         None => {
             let mut options = context.report_options(None, None);
-            let excluded = primary_exclusions();
+            let excluded = primary_exclusions(context.home_dir.as_deref());
             if !excluded.is_empty() {
                 options
                     .scanner_settings
@@ -615,6 +627,8 @@ mod tests {
     }
 
     const PRIMARY_OUTPUT: i64 = 1_000;
+    const COWORK_OUTPUT: i64 = 300;
+    const INSIDE_CLAUDE_OUTPUT: i64 = 70;
     const D_OUTPUT: i64 = 7_000;
     const E_OUTPUT: i64 = 500;
     const SUB_OUTPUT: i64 = 90;
@@ -883,9 +897,10 @@ mod tests {
 
     /// Two CONFIGURED accounts where one directory sits inside the other.
     ///
-    /// Settings permits it — `isRejectedRoot` refuses only the empty path, `/`
-    /// and the home directory — so `/work` and `/work/sub` can both be real
-    /// accounts with real credentials. Selecting an account's roots by prefix
+    /// The config-dir rule now refuses the nested one (`overlap`), but the scan
+    /// registry has no such rule and an older build's stored list can hold
+    /// both, so `/work` and `/work/sub` can still both have registered roots.
+    /// Selecting an account's roots by prefix
     /// would give the outer one the inner one's transcripts, which is this
     /// issue's defect reappearing on the selection side after being fixed on
     /// the exclusion side.
@@ -1347,5 +1362,265 @@ mod tests {
             report.scanner_settings.extra_scan_paths
         );
         reset_registries();
+    }
+
+    /// Audit P1 (2026-11-03), reproduced on c6be6549 before the fix: the user's
+    /// own `<home>/.claude` registered as an extra Claude account emptied the
+    /// primary window. The config-dir setter accepted it, and
+    /// `ClaudeExtraRoots.install` sent `<dir>/projects` and `<dir>/transcripts`
+    /// to the scan registry whatever the first setter answered; either registry
+    /// alone made `primary_exclusions` remove the primary's own transcripts.
+    /// Three cases for `~/.claude`: (a) config dirs only, (b) scan registry only,
+    /// (c) both, as production installs. Then, both registries, every other
+    /// shape of primary root (S6): `<home>` (ancestor), `~/.claude/projects`
+    /// (a root itself), `~/.claude/projects/x` (inside one),
+    /// `~/Library/Application Support/Claude` (ancestor of the Cowork tree,
+    /// whose transcript is in the fixture) and `~/.CLAUDE` (case alias). Last,
+    /// `~/.claude/accounts/work`, inside `~/.claude` but outside its scan
+    /// roots, is accepted with its own card. The config-dir setter is judged against the fixture home, as
+    /// production judges it against the process home. The dashboard path
+    /// (`model_report::run`) has no exclusion and is the control.
+    #[test]
+    fn registering_the_default_claude_dir_as_extra_keeps_the_primary_window() {
+        let _guards = lock_registries();
+        reset_registries();
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().to_path_buf();
+        let default_dir = home.join(".claude");
+        write_session(&default_dir, "primary", PRIMARY_OUTPUT);
+        let app_support = home.join("Library/Application Support/Claude");
+        write_session(
+            &app_support.join("local-agent-mode-sessions/w/s/local_1/.claude"),
+            "cowork",
+            COWORK_OUTPUT,
+        );
+        let expected = PRIMARY_OUTPUT + COWORK_OUTPUT;
+        let context = crate::LocalSourceContext::for_home(home.clone());
+
+        // The production entry the window card uses, cache included.
+        let card = |account: &Account| {
+            reset_cache_only();
+            cached(&context, account, WINDOW_FROM, WINDOW_UNTIL).map(|v| output_tokens(&v))
+        };
+        let dashboard = || {
+            crate::model_report::run(&context, "").expect("model report")["totalOutput"]
+                .as_i64()
+                .unwrap()
+        };
+        let set_dirs = |dirs: &[&PathBuf]| {
+            crate::claude_config_dirs::set_from_json_with_home(
+                &serde_json::json!(dirs
+                    .iter()
+                    .map(|d| d.display().to_string())
+                    .collect::<Vec<_>>())
+                .to_string(),
+                Some(&home),
+            )
+            .unwrap();
+        };
+        let set_roots = |dirs: &[&PathBuf]| {
+            crate::extra_scan_paths::set_from_json(
+                &serde_json::json!({ "claude": claude_roots(dirs) }).to_string(),
+            )
+            .unwrap();
+        };
+
+        // Control: nothing registered.
+        let control = (card(&PRIMARY), dashboard());
+        assert_eq!(control.0, Ok(expected), "control: primary window");
+        assert_eq!(control.1, expected, "control: dashboard");
+
+        let upper = home.join(".CLAUDE");
+        let projects = default_dir.join("projects");
+        let inside_projects = projects.join("x");
+        for (name, extra, dirs, roots) in [
+            ("a: ~/.claude, config dirs only", &default_dir, true, false),
+            (
+                "b: ~/.claude, scan registry only",
+                &default_dir,
+                false,
+                true,
+            ),
+            ("c: ~/.claude, both (production)", &default_dir, true, true),
+            ("<home>, both", &home, true, true),
+            ("~/.claude/projects, both", &projects, true, true),
+            ("~/.claude/projects/x, both", &inside_projects, true, true),
+            (
+                "~/Library/Application Support/Claude, both",
+                &app_support,
+                true,
+                true,
+            ),
+            ("~/.CLAUDE, both", &upper, true, true),
+        ] {
+            reset_registries();
+            if dirs {
+                set_dirs(&[extra]);
+            }
+            if roots {
+                set_roots(&[extra]);
+            }
+            let primary = card(&PRIMARY);
+            assert_eq!(dashboard(), expected, "{name}: dashboard total");
+            assert_eq!(
+                primary,
+                Ok(expected),
+                "{name}: the primary window lost its own transcripts"
+            );
+            if dirs {
+                assert!(
+                    crate::claude_config_dirs::snapshot().is_empty(),
+                    "{name}: the config-dir setter registered a primary scan root"
+                );
+            }
+        }
+
+        // Accepted: a folder inside `~/.claude` but outside its scan roots
+        // (the primary scans only those roots). It registers, keeps its own
+        // card, and the primary window keeps its total.
+        let inside_claude = default_dir.join("accounts/work");
+        write_session(&inside_claude, "inside", INSIDE_CLAUDE_OUTPUT);
+        reset_registries();
+        set_dirs(&[&inside_claude]);
+        set_roots(&[&inside_claude]);
+        assert_eq!(
+            crate::claude_config_dirs::snapshot(),
+            vec![inside_claude.display().to_string()],
+            "~/.claude/accounts/work was refused, though no primary scan root holds it"
+        );
+        assert_eq!(
+            card(&PRIMARY),
+            Ok(expected),
+            "~/.claude/accounts/work: primary window"
+        );
+        assert_eq!(
+            card(&Some(inside_claude.display().to_string())),
+            Ok(INSIDE_CLAUDE_OUTPUT),
+            "~/.claude/accounts/work: its own card"
+        );
+        assert_eq!(
+            dashboard(),
+            expected + INSIDE_CLAUDE_OUTPUT,
+            "~/.claude/accounts/work: dashboard"
+        );
+        reset_registries();
+    }
+
+    /// The primary also scans the `.cc-mirror` variants' project roots and
+    /// counts their usage in its window. A variant whose `variant.json` names
+    /// a `configDir` elsewhere is an ordinary Claude config dir: registered as
+    /// an extra account it is NOT refused, and the primary window hands its
+    /// usage to the account's own card (issue #258; `account_fixture`
+    /// registers `work-d`, which variant `v1` names), the dashboard total
+    /// staying put. A default-layout variant (`~/.cc-mirror/<v>/config`) is a
+    /// primary scan root: its rows are tagged by path, no card of its own
+    /// could show them (measured: the account's card reads 0), so the setter
+    /// refuses it, and the `primary_exclusions` guard keeps it counted even if
+    /// the scan registry alone holds it.
+    #[test]
+    fn a_cc_mirror_config_dir_is_an_account_only_when_it_lives_elsewhere() {
+        let _guards = lock_registries();
+        reset_registries();
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().to_path_buf();
+        write_session(&home.join(".claude"), "primary", PRIMARY_OUTPUT);
+        let default_layout = home.join(".cc-mirror/v2/config");
+        let elsewhere = home.join("mirror-v1");
+        for (variant, config) in [("v1", Some(&elsewhere)), ("v2", None)] {
+            let variant_dir = home.join(".cc-mirror").join(variant);
+            std::fs::create_dir_all(&variant_dir).unwrap();
+            let body = config
+                .map(|c| serde_json::json!({ "configDir": c.to_string_lossy() }))
+                .unwrap_or_else(|| serde_json::json!({}));
+            std::fs::write(variant_dir.join("variant.json"), body.to_string()).unwrap();
+        }
+        write_session(&elsewhere, "mirror-v1", 40);
+        write_session(&default_layout, "mirror-v2", 25);
+        let total = PRIMARY_OUTPUT + 40 + 25;
+        let context = crate::LocalSourceContext::for_home(home.clone());
+        let card = |account: &Account| {
+            reset_cache_only();
+            cached(&context, account, WINDOW_FROM, WINDOW_UNTIL).map(|v| output_tokens(&v))
+        };
+        let dashboard = || {
+            crate::model_report::run(&context, "").expect("model report")["totalOutput"]
+                .as_i64()
+                .unwrap()
+        };
+        let set_dirs = |dir: &PathBuf| {
+            crate::claude_config_dirs::set_from_json_with_home(
+                &serde_json::json!([dir.display().to_string()]).to_string(),
+                Some(&home),
+            )
+            .unwrap()
+        };
+        let set_roots = |dir: &PathBuf| {
+            crate::extra_scan_paths::set_from_json(
+                &serde_json::json!({ "claude": claude_roots(&[dir]) }).to_string(),
+            )
+            .unwrap();
+        };
+        assert_eq!(
+            card(&PRIMARY),
+            Ok(total),
+            "control: the primary counts the mirrors"
+        );
+
+        // Elsewhere: accepted, moves to its own card, the total stays.
+        reset_registries();
+        assert_eq!(set_dirs(&elsewhere)["registeredCount"], 1, "refused");
+        set_roots(&elsewhere);
+        assert_eq!(card(&PRIMARY), Ok(total - 40), "elsewhere: primary window");
+        assert_eq!(
+            card(&Some(elsewhere.display().to_string())),
+            Ok(40),
+            "elsewhere: own card"
+        );
+        assert_eq!(dashboard(), total, "elsewhere: dashboard total");
+
+        // Default layout: refused by the setter, and kept counted by the
+        // primary even when only the scan registry holds it.
+        reset_registries();
+        let refused = set_dirs(&default_layout);
+        assert_eq!(
+            refused["registeredCount"], 0,
+            "the default-layout variant was registered"
+        );
+        assert_eq!(refused["rejected"][0]["reason"], "primary_scan_root");
+        set_roots(&default_layout);
+        assert_eq!(card(&PRIMARY), Ok(total), "default layout: primary window");
+        assert_eq!(dashboard(), total, "default layout: dashboard total");
+        reset_registries();
+    }
+
+    /// `primary_exclusions` reads the primary's roots once for the whole list
+    /// of registered paths, not once per path. Mutation: build `PrimaryRoots`
+    /// inside the `retain` closure.
+    #[test]
+    fn primary_exclusions_build_the_primary_roots_once() {
+        let _guards = lock_registries();
+        reset_registries();
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().to_path_buf();
+        let extras: Vec<PathBuf> = (0..4).map(|i| home.join(format!("extra-{i}"))).collect();
+        install(&claude_roots(&extras.iter().collect::<Vec<_>>()), &[]);
+        let calls = || crate::claude_config_dirs::FOR_HOME_CALLS.with(std::cell::Cell::get);
+        let before = calls();
+        let excluded = primary_exclusions(Some(&home));
+        assert_eq!(excluded.len(), 8, "fixture: eight registered roots");
+        assert_eq!(calls() - before, 1, "built once for eight paths");
+        // Control: nothing registered, nothing read.
+        reset_registries();
+        let before = calls();
+        assert!(primary_exclusions(Some(&home)).is_empty());
+        assert_eq!(calls() - before, 0);
+        reset_registries();
+    }
+
+    fn reset_cache_only() {
+        crate::WINDOW_USAGE_CACHE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
     }
 }

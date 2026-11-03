@@ -1302,10 +1302,15 @@ pub unsafe extern "C" fn tb_set_extra_scan_paths(json: *const c_char) -> *mut c_
 /// directory paths, e.g. `["/Users/x/.claude-work"]`; full-replace semantics
 /// (`[]` clears it). Each one is fetched as its own Claude quota card, using
 /// the Keychain item that directory selects. Success data is
-/// `{"registeredCount":N,"rejected":[{"path","reason"}]}`; a path is rejected
-/// when it is empty, relative, the filesystem root, or a repeat of one already
-/// in the list. Existence is not probed — whether the directory is readable
-/// right now says nothing about which account its credential belongs to.
+/// `{"registeredCount":N,"rejected":[{"index":i,"reason":"<code>"}]}`, the
+/// rule and codes of `tb_claude_config_dir_refusals`; the path is never echoed.
+/// Existence of the configured directories is not probed — whether one is
+/// readable right now says nothing about which account its credential belongs
+/// to. The call still reads the disk: judging the entries reads `~/.cc-mirror`
+/// and each variant's `variant.json` once (the same rule as
+/// `tb_claude_config_dir_refusals`), so call it off the main thread. Invalidates the scan
+/// caches (the primary window's exclusions come from this list) and drops the
+/// last-good card of every account the replace removed.
 ///
 /// This is NOT `tb_set_extra_scan_paths`. That one takes the expanded
 /// `<dir>/projects` and `<dir>/transcripts` sub-roots and decides what the
@@ -1318,6 +1323,35 @@ pub unsafe extern "C" fn tb_set_extra_scan_paths(json: *const c_char) -> *mut c_
 pub unsafe extern "C" fn tb_set_claude_config_dirs(json: *const c_char) -> *mut c_char {
     guarded("tb_set_claude_config_dirs", || {
         envelope(unsafe { set_claude_config_dirs_from_c(json) })
+    })
+}
+
+/// Which entries of a JSON array of Claude config directories
+/// `tb_set_claude_config_dirs` would refuse, without registering anything.
+/// Success data is `{"rejected":[{"index":i,"reason":"<code>"}]}`. The codes:
+/// `empty_path`, `not_absolute`, `filesystem_root`, `home_unknown`,
+/// `home_directory`, `primary_scan_root` (`~/.claude` or an ancestor of it, or
+/// equals, contains or sits inside `~/.claude/projects`, `~/.claude/transcripts`,
+/// Claude Desktop's
+/// `~/Library/Application Support/Claude/local-agent-mode-sessions`, or a
+/// default-layout `~/.cc-mirror/<variant>/config/projects` the engine scans:
+/// a variant with no readable `variant.json` is not scanned, and one whose
+/// `configDir` names a folder elsewhere is scanned there and that folder is
+/// allowed; a folder in `~/.claude` outside those is allowed; compared without
+/// case),
+/// `duplicate`, `overlap` (contains or sits inside an earlier
+/// accepted entry) and `limit_reached` (more than 8). Earlier entries win.
+/// Swift runs this before building either registry's payload, so a refused
+/// directory reaches neither. It reads the disk (`~/.cc-mirror`, each
+/// `variant.json`, the Cowork tree): call it off the main thread. Malformed
+/// input is the error `invalid_config_dirs_json`.
+///
+/// # Safety
+/// `json` must be NULL or a valid NUL-terminated UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn tb_claude_config_dir_refusals(json: *const c_char) -> *mut c_char {
+    guarded("tb_claude_config_dir_refusals", || {
+        envelope(unsafe { claude_config_dir_refusals_from_c(json) })
     })
 }
 
@@ -1367,7 +1401,10 @@ pub unsafe extern "C" fn tb_set_antigravity_binding(json: *const c_char) -> *mut
 /// Copy agy's current Google login into a Syrtis-owned login-keychain item
 /// (service `com.nyanako.tokenbar.antigravity-account`, account = key). Reads
 /// agy's item once through `/usr/bin/security` and never writes it; proves the
-/// token with one refresh at Google using the client named by its `aud`.
+/// token with one refresh at Google using the client named by its `aud`, and
+/// writes only when that response carries an `id_token` with agy's stored `sub`
+/// (`account_mismatch` when it names another account,
+/// `invalid_credential_format` when there is no usable `id_token`).
 /// Success data is `{"key":"<64 hex>","label":"<email or fallback>"}`. The
 /// error text is exactly one fixed code: `agy_not_signed_in`,
 /// `agy_login_unreadable`, `agy_login_missing_identity`,
@@ -1415,7 +1452,8 @@ pub extern "C" fn tb_antigravity_login_marker() -> *mut c_char {
 /// `{"status":"skipped_removed"}`. `unchanged` means Syrtis's own item already
 /// holds this refresh token: nothing was scanned, requested or written.
 /// `captured` requires Google's refresh response to carry an `id_token` with
-/// the stored `sub`. The error is one fixed code: the `tb_antigravity_capture`
+/// the stored `sub` (`account_mismatch` for another account's,
+/// `invalid_credential_format` when there is none). The error is one fixed code: the `tb_antigravity_capture`
 /// codes (except `agy_not_signed_in`), plus `not_signed_in` (agy has no
 /// login), `paused` (agy's item read ended any other way, e.g. a cancelled
 /// Keychain dialog or a timeout) and `invalid_removed_keys`. Blocking
@@ -1550,7 +1588,40 @@ unsafe fn set_claude_config_dirs_from_c(json: *const c_char) -> Result<serde_jso
     let raw = unsafe { CStr::from_ptr(json) }
         .to_str()
         .map_err(|_| "Claude config dirs payload is not valid UTF-8".to_string())?;
-    claude_config_dirs::set_from_json(raw)
+    apply_claude_config_dirs(raw)
+}
+
+/// Replace the account registry, then drop what was derived from the old one
+/// (MA-35). The primary window's exclusions are built from this registry, so
+/// the scan caches are invalidated (bumping `ROOT_GENERATION`, which a window
+/// scan started under the old list checks before publishing), and each removed
+/// account's last-good card is purged so a re-added folder starts clean.
+/// Swift's `applyQueue` serialises calls, so the before/after diff is not raced.
+fn apply_claude_config_dirs(raw: &str) -> Result<serde_json::Value, String> {
+    let before = claude_config_dirs::snapshot();
+    let result = claude_config_dirs::set_from_json(raw)?;
+    let after = claude_config_dirs::snapshot();
+    invalidate_scan_caches();
+    let removed: Vec<String> = before
+        .into_iter()
+        .filter(|dir| !after.contains(dir))
+        .collect();
+    agent_usage::purge_claude_accounts(&removed);
+    Ok(result)
+}
+
+/// # Safety
+/// `json` must be NULL or a valid NUL-terminated UTF-8 string.
+unsafe fn claude_config_dir_refusals_from_c(
+    json: *const c_char,
+) -> Result<serde_json::Value, String> {
+    if json.is_null() {
+        return Err("invalid_config_dirs_json".to_string());
+    }
+    let raw = unsafe { CStr::from_ptr(json) }
+        .to_str()
+        .map_err(|_| "invalid_config_dirs_json".to_string())?;
+    claude_config_dirs::refusals_from_json(raw)
 }
 
 /// # Safety
@@ -1635,12 +1706,20 @@ fn invalidate_scan_caches() {
 /// before it is cleaned. Success data is
 /// `{"enabled","appDir":str|null,"profiles":[{"id","dir"}],
 /// "cliTakeoverConfirmed","removedFiles":N,"cleanupFailed":bool,
-/// "cleanupFailedProfiles":[id]}`, each id one of `default` / `<UUID>` (that
-/// profile's files could not all be deleted), `cursor-profiles` (the parent
-/// folder of the added profiles could not be read), or `appDir` (the appDir
-/// in use until this push now fails the checks, so files may be left there;
-/// a refused appDir never used before is not reported). Other invalid
-/// input is an error and leaves the registry unchanged. Invalidates the scan caches, since the
+/// "cleanupFailedProfiles":[id],"rejectedProfiles":[{"index","reason"}]}`, each
+/// id one of `default` / `<UUID>` (that profile's files could not all be
+/// deleted), `cursor-profiles` (the parent folder of the added profiles could
+/// not be read), or `appDir` (a previous appDir that now fails the checks or
+/// whose files could not all be deleted, so files may be left there; every
+/// accepted push retries it until it is clean while Syrtis keeps running, after
+/// a relaunch it is no longer known and is not retried; a refused appDir never
+/// used before is not reported). A profile whose root is Cursor's own folder
+/// (`cursor_default`) or repeats an earlier entry (`duplicate`; same path or
+/// same directory, the first entry wins) is left out and listed by its index
+/// in the pushed list; the default and the other profiles are registered and
+/// sync. Other invalid input (bad JSON or bundle id, more than 32 profiles, an
+/// invalid or repeated id, a root that is not an absolute path) is an error
+/// and leaves the registry unchanged. Invalidates the scan caches, since the
 /// takeover depends on every field.
 ///
 /// # Safety
@@ -1675,9 +1754,12 @@ unsafe fn set_cursor_sync_from_c(json: *const c_char) -> Result<serde_json::Valu
 /// `{"state":"ok|partial|expired|notSignedIn|offline|error|disabled|cliPresent",
 /// "events":N,"lastSuccessMs":ms|null,"reason"?:"<fixed code>",
 /// "changed":bool,"profiles":[{"id","state","events","lastSuccessMs","reason"?,
-/// "duplicateOf"?}]}`. `changed`: some profile wrote its file this round
-/// (every successful walk rewrites it), so the scan caches were invalidated
-/// and views must refresh, whatever the headline state. `app_dir_rejected`: the appDir no longer
+/// "duplicateOf"?}],"cleanupFailedProfiles":[<profile id>]}`. `changed`: a usage
+/// file's bytes changed this round (written with new content, or removed from
+/// a duplicate profile); a walk whose bytes equal the file's rewrites nothing
+/// and is not a change. The scan caches were then invalidated and views must
+/// refresh, whatever the headline state. `cleanupFailedProfiles`: duplicate
+/// profiles whose old account's file could not be deleted. `app_dir_rejected`: the appDir no longer
 /// passes the checks above; nothing is read, written or registered from it.
 /// The top-level `state` is `ok` when every profile is `ok` or `duplicate`
 /// (the account was already covered this round by the profile `duplicateOf`:
@@ -1780,6 +1862,46 @@ mod tests {
         assert!(reply.contains("\"ok\":false"), "{reply}");
 
         keychain_consent::reset_for_test();
+    }
+
+    /// MA-35: the account registry feeds the primary window's exclusions, so a
+    /// replace must move the root generation (a window scanned under the old
+    /// list then refuses to publish) and drop the removed account's last-good
+    /// card. Driven through the real `extern "C"` setter.
+    #[test]
+    fn claude_config_dir_setter_bumps_the_generation_and_purges_removed_accounts() {
+        let _g = claude_config_dirs::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        claude_config_dirs::reset_for_test();
+        let set = |json: &str| {
+            let payload = CString::new(json).unwrap();
+            let raw = unsafe { tb_set_claude_config_dirs(payload.as_ptr()) };
+            let reply = unsafe { CStr::from_ptr(raw) }.to_str().unwrap().to_string();
+            unsafe { tb_free(raw) };
+            assert!(reply.contains("\"ok\":true"), "{reply}");
+        };
+        set(r#"["/w/kept","/w/gone"]"#);
+        agent_usage::seed_claude_last_good_for_test("/w/kept");
+        agent_usage::seed_claude_last_good_for_test("/w/gone");
+        let before = root_generation();
+
+        set(r#"["/w/kept"]"#);
+
+        assert!(
+            root_generation() > before,
+            "the config-dir replace did not move the generation"
+        );
+        assert!(
+            !agent_usage::has_claude_last_good_for_test("/w/gone"),
+            "the removed account's last-good card survived the replace"
+        );
+        assert!(
+            agent_usage::has_claude_last_good_for_test("/w/kept"),
+            "control: an account still listed keeps its last-good card"
+        );
+        agent_usage::purge_claude_accounts(&["/w/kept".to_string()]);
+        claude_config_dirs::reset_for_test();
     }
 
     /// Clearing the caches loses to a scan that was already running: it

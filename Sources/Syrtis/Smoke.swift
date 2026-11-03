@@ -94,14 +94,19 @@ enum Smoke {
         // refresh, and the accounts appear on the next.
         summarize("claude-accounts") {
             let configDirs = ClaudeExtraRoots.load()
+            // The payload already leaves out what the core refuses, so the
+            // setter must accept all of it; a refusal here means Swift and
+            // the core disagree about the rule.
+            let accepted = ClaudeExtraRoots.classify(configDirs).accepted
             let result = try TBCore.setClaudeConfigDirs(
-                json: ClaudeExtraRoots.configDirsPayloadJSON(configDirs))
-            guard result.registeredCount == configDirs.count, result.rejected.isEmpty else {
+                json: ClaudeExtraRoots.configDirsPayloadJSON(accepted: accepted))
+            guard result.registeredCount == accepted.count, result.rejected.isEmpty else {
                 throw TBCoreError.bridge(
-                    "configured \(configDirs.count) but registered \(result.registeredCount) "
+                    "sent \(accepted.count) but registered \(result.registeredCount) "
                         + "with \(result.rejected.count) rejected")
             }
-            return "\(result.registeredCount) extra account(s) registered"
+            return "\(result.registeredCount) extra account(s) registered, "
+                + "\(configDirs.count - accepted.count) refused"
         }
 
         // Install the user's real Keychain answer before the quota check below,
