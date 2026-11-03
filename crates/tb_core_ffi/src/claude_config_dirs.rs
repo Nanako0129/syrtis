@@ -63,16 +63,30 @@ impl Refusal {
 }
 
 /// Every directory the primary Claude account's scan reads under `home`: its
-/// two roots in `~/.claude`, and the Cowork sessions tree, under which the
-/// engine discovers `<session>/.claude/projects` roots
-/// (`discover_cowork_project_roots`).
-pub(crate) fn primary_scan_roots(home: &Path) -> [PathBuf; 3] {
+/// two roots in `~/.claude`, the Cowork sessions tree (under which the engine
+/// discovers `<session>/.claude/projects` roots, `discover_cowork_project_roots`)
+/// and the default-layout `.cc-mirror` variants' project roots,
+/// `~/.cc-mirror/<variant>/config/projects` (`cc_mirror::discover_claude_project_roots`
+/// without a `configDir` override). Their rows are tagged `cc-mirror/<variant>`
+/// by their path, so an extra account there would show on no card of its own
+/// and drop out of the primary's window. A variant whose `variant.json` names
+/// a `configDir` elsewhere is not in this list: that folder is an ordinary
+/// Claude config dir and may be an account (issue #258). One `read_dir` of
+/// `~/.cc-mirror`, no file is opened and nothing leaves the machine.
+pub(crate) fn primary_scan_roots(home: &Path) -> Vec<PathBuf> {
     let claude = home.join(".claude");
-    [
+    let mut roots = vec![
         claude.join("projects"),
         claude.join("transcripts"),
         home.join("Library/Application Support/Claude/local-agent-mode-sessions"),
-    ]
+    ];
+    if let Ok(variants) = std::fs::read_dir(home.join(".cc-mirror")) {
+        roots.extend(variants.flatten().filter_map(|variant| {
+            let projects = variant.path().join("config/projects");
+            projects.is_dir().then_some(projects)
+        }));
+    }
+    roots
 }
 
 /// The one rule behind three consumers: this setter, the Swift pre-check

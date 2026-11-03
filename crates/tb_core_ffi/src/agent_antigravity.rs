@@ -3419,7 +3419,10 @@ impl CaptureError {
 /// client and the response carries an `id_token` naming the same `sub`: the
 /// key is derived from agy's stored `sub`, which is local and untrusted, so
 /// Google's answer is what proves the token belongs to it (MA-1/3). A response
-/// without an `id_token` is `AccountMismatch`, as on the automatic path.
+/// whose `id_token` names another account is `AccountMismatch`; one with no
+/// usable `id_token` (absent, not a JWT, no `sub`) says nothing about the
+/// account, so it is `InvalidCredentialFormat` and nothing is written either
+/// way.
 async fn capture_with<I: CapturedIo>(io: &I) -> Result<CapturedAccount, CaptureError> {
     let agy_item = io
         .security(
@@ -3438,8 +3441,10 @@ async fn capture_with<I: CapturedIo>(io: &I) -> Result<CapturedAccount, CaptureE
     let (client, json) = refresh_with_issuing_client(io, &login, false).await?;
 
     // The stored id_token is local and untrusted; Google's answer is not.
-    if response_sub(json.get("id_token")).as_deref() != Some(login.sub.as_str()) {
-        return Err(CaptureError::AccountMismatch);
+    match response_sub(json.get("id_token")) {
+        None => return Err(CaptureError::InvalidCredentialFormat),
+        Some(sub) if sub != login.sub => return Err(CaptureError::AccountMismatch),
+        Some(_) => {}
     }
 
     let key = captured_key(&login.sub);
@@ -3532,7 +3537,8 @@ pub(crate) enum AutoCaptured {
 ///    client scan, no request and no write;
 /// 4. the client scan uses the throttled login-shell lookup;
 /// 5. the refresh response MUST carry an `id_token` whose `sub` equals the
-///    stored one, else `AccountMismatch` and no write.
+///    stored one, else no write: `AccountMismatch` when the `id_token` names
+///    another account, `InvalidCredentialFormat` when there is no usable one.
 async fn auto_capture_with<I: CapturedIo>(
     io: &I,
     removed_keys: &[String],
@@ -3587,8 +3593,10 @@ async fn auto_capture_with<I: CapturedIo>(
         .get("id_token")
         .and_then(Value::as_str)
         .and_then(jwt_claims);
-    if claims.as_ref().and_then(|claims| non_empty_str(claims, "sub")) != Some(login.sub.as_str()) {
-        return Err(CaptureError::AccountMismatch);
+    match claims.as_ref().and_then(|claims| non_empty_str(claims, "sub")) {
+        None => return Err(CaptureError::InvalidCredentialFormat),
+        Some(sub) if sub != login.sub => return Err(CaptureError::AccountMismatch),
+        Some(_) => {}
     }
     let label = claims
         .as_ref()
@@ -6195,10 +6203,17 @@ mod captured_account_tests {
 
     #[tokio::test]
     async fn capture_rejects_a_refresh_for_another_account() {
-        for id_token in [
-            Value::String(jwt(json!({ "sub": "sub-b" }))),
-            Value::String("not-a-jwt".to_string()),
-            Value::Null,
+        for (id_token, expected) in [
+            (
+                Value::String(jwt(json!({ "sub": "sub-b" }))),
+                CaptureError::AccountMismatch,
+            ),
+            // No usable answer about the account is not "another account".
+            (
+                Value::String("not-a-jwt".to_string()),
+                CaptureError::InvalidCredentialFormat,
+            ),
+            (Value::Null, CaptureError::InvalidCredentialFormat),
         ] {
             let mut io = FakeIo::new("capture-mismatch");
             io.agy_item = Some(agy_item(
@@ -6210,10 +6225,7 @@ mod captured_account_tests {
             io.token = Box::new(move |_, _| {
                 Ok(token_ok("ya29.a", json!({ "id_token": id_token.clone() })))
             });
-            assert_eq!(
-                capture_with(&io).await.err(),
-                Some(CaptureError::AccountMismatch)
-            );
+            assert_eq!(capture_with(&io).await.err(), Some(expected));
             assert!(io.writes().is_empty());
         }
     }
@@ -6240,7 +6252,7 @@ mod captured_account_tests {
         };
 
         let (outcome, writes, items) = run(json!({})).await;
-        assert_eq!(outcome.err(), Some(CaptureError::AccountMismatch));
+        assert_eq!(outcome.err(), Some(CaptureError::InvalidCredentialFormat));
         assert_eq!(
             writes, 0,
             "a response without an id_token started a `security -i` write"
@@ -6856,19 +6868,26 @@ mod captured_account_tests {
 
     #[tokio::test]
     async fn auto_capture_requires_googles_id_token_for_the_same_sub() {
-        for (tag, extra) in [
-            ("auto-no-id-token", json!({})),
-            ("auto-other-sub", json!({ "id_token": jwt(json!({ "sub": "sub-b" })) })),
-            ("auto-bad-id-token", json!({ "id_token": "not-a-jwt" })),
+        // Another account's id_token is a mismatch; no usable id_token says
+        // nothing about the account (InvalidCredentialFormat). Nothing is
+        // written either way.
+        for (tag, extra, expected) in [
+            ("auto-no-id-token", json!({}), CaptureError::InvalidCredentialFormat),
+            (
+                "auto-other-sub",
+                json!({ "id_token": jwt(json!({ "sub": "sub-b" })) }),
+                CaptureError::AccountMismatch,
+            ),
+            (
+                "auto-bad-id-token",
+                json!({ "id_token": "not-a-jwt" }),
+                CaptureError::InvalidCredentialFormat,
+            ),
         ] {
             let mut io = auto_io(tag);
             let extra = extra.clone();
             io.token = Box::new(move |_, _| Ok(token_ok("ya29.a", extra.clone())));
-            assert_eq!(
-                auto_capture_with(&io, &[]).await,
-                Err(CaptureError::AccountMismatch),
-                "{tag}"
-            );
+            assert_eq!(auto_capture_with(&io, &[]).await, Err(expected), "{tag}");
             assert!(io.writes().is_empty(), "{tag}");
             assert!(io.items.borrow().is_empty(), "{tag}");
         }
@@ -6878,7 +6897,7 @@ mod captured_account_tests {
         io.token = Box::new(|_, _| Ok(token_ok("ya29.a", json!({}))));
         assert_eq!(
             capture_with(&io).await.err(),
-            Some(CaptureError::AccountMismatch)
+            Some(CaptureError::InvalidCredentialFormat)
         );
         assert!(io.writes().is_empty());
     }

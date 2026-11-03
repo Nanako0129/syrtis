@@ -348,7 +348,16 @@ fn parse_off(raw: &str, home: Option<&Path>) -> Option<Config> {
     })
 }
 
-fn parse_config(raw: &str, home: Option<&Path>) -> Result<Config, String> {
+/// The registry from an on push, plus the profiles refused for their root
+/// (`{"index","reason"}`, index in the pushed list; reasons `cursor_default`
+/// and `duplicate`). Whole-push errors stay for what makes the list itself
+/// unusable (bad JSON, bundle id, too many profiles, an invalid or repeated
+/// id, a root that is not an absolute path): a refused root drops only its own
+/// profile, so the default profile and the other profiles keep syncing.
+fn parse_config(
+    raw: &str,
+    home: Option<&Path>,
+) -> Result<(Config, Vec<serde_json::Value>), String> {
     let input: SetInput =
         serde_json::from_str(raw).map_err(|_| "invalid cursor sync JSON".to_string())?;
     let app_dir = app_dir_for(&input.bundle_id, home)?;
@@ -356,43 +365,55 @@ fn parse_config(raw: &str, home: Option<&Path>) -> Result<Config, String> {
         return Err("too many cursor profiles".to_string());
     }
     let mut profiles: Vec<Profile> = Vec::with_capacity(input.profiles.len());
+    let mut ids: Vec<String> = Vec::with_capacity(input.profiles.len());
+    let mut rejected = Vec::new();
     let own = home.map(cursor_own_root);
-    for profile in input.profiles {
-        if !valid_profile_id(&profile.id) || profiles.iter().any(|p| p.id == profile.id) {
+    for (index, profile) in input.profiles.into_iter().enumerate() {
+        if !valid_profile_id(&profile.id) || ids.contains(&profile.id) {
             return Err("cursor profile id is invalid".to_string());
         }
+        ids.push(profile.id.clone());
         let root = validate_root(&profile.root)?;
         // The Swift check at add time is a pre-check of these two rules, which
         // the core owns: Cursor's own folder is the default profile (a second
-        // read of the same login), and a folder already listed would be a
-        // second profile on the same database.
-        if own.as_deref().is_some_and(|own| same_folder(&root, own)) {
-            return Err("cursor profile root is Cursor's own folder".to_string());
+        // read of the same login), and a folder already listed (an earlier
+        // entry wins) would be a second profile on the same database.
+        let reason = if own.as_deref().is_some_and(|own| same_folder(&root, own)) {
+            Some("cursor_default")
+        } else if profiles.iter().any(|p| same_folder(&root, &p.root)) {
+            Some("duplicate")
+        } else {
+            None
+        };
+        match reason {
+            Some(reason) => rejected.push(serde_json::json!({"index": index, "reason": reason})),
+            None => profiles.push(Profile {
+                id: profile.id,
+                root,
+            }),
         }
-        if profiles.iter().any(|p| same_folder(&root, &p.root)) {
-            return Err("cursor profile root is listed twice".to_string());
-        }
-        profiles.push(Profile {
-            id: profile.id,
-            root,
-        });
     }
-    Ok(Config {
-        enabled: input.enabled,
-        app_dir: Some(app_dir),
-        profiles,
-        cli_takeover_confirmed: input.cli_takeover_confirmed,
-    })
+    Ok((
+        Config {
+            enabled: input.enabled,
+            app_dir: Some(app_dir),
+            profiles,
+            cli_takeover_confirmed: input.cli_takeover_confirmed,
+        },
+        rejected,
+    ))
 }
 
 /// Replace the registry from
 /// `{"enabled":bool,"bundleId":"a.b","profiles":[{"id":"<UUID>","root":"/abs"}],"cliTakeoverConfirmed":bool}`.
-/// Invalid input leaves the registry untouched. Cleanup (P3-7, B2): turning
+/// Invalid input leaves the registry untouched; a profile whose root is
+/// Cursor's own folder or repeats an earlier one is left out and reported in
+/// `rejectedProfiles` by index (`parse_config`). Cleanup (P3-7, B2): turning
 /// sync off deletes our files from every profile dir; while on, dirs of
 /// profiles no longer listed (orphans) are emptied of our files and removed.
 pub(crate) fn set_from_json(raw: &str, home: Option<&Path>) -> Result<serde_json::Value, String> {
-    let new = match parse_off(raw, home) {
-        Some(off) => off,
+    let (new, rejected_profiles) = match parse_off(raw, home) {
+        Some(off) => (off, Vec::new()),
         None => parse_config(raw, home)?,
     };
     let old = {
@@ -430,6 +451,7 @@ pub(crate) fn set_from_json(raw: &str, home: Option<&Path>) -> Result<serde_json
         "removedFiles": cleanup.removed,
         "cleanupFailed": !cleanup.failed.is_empty(),
         "cleanupFailedProfiles": cleanup.failed,
+        "rejectedProfiles": rejected_profiles,
     }))
 }
 

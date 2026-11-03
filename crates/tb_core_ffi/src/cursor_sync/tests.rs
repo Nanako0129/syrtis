@@ -2816,11 +2816,12 @@ fn an_identical_walk_changes_nothing() {
 
 /// MA-8: the core refuses Cursor's own folder (the default profile) and a
 /// folder already listed, by directory identity as well as by path, so the
-/// Swift check at add time is only a pre-check. The push is refused whole and
-/// the registry is untouched.
+/// Swift check at add time is only a pre-check. Per entry: the refused profile
+/// is left out and reported by index with its reason, the default and the
+/// other profiles stay registered and sync (an earlier entry wins a repeat).
 #[cfg(unix)]
 #[test]
-fn the_core_refuses_cursors_own_folder_and_a_duplicate_folder() {
+fn the_core_refuses_cursors_own_folder_and_a_duplicate_folder_per_entry() {
     let _guard = lock();
     set_for_test(Config::default());
     let home = tempfile::tempdir().unwrap();
@@ -2837,40 +2838,108 @@ fn the_core_refuses_cursors_own_folder_and_a_duplicate_folder() {
             home.path(),
             serde_json::json!({"enabled": true, "bundleId": BUNDLE, "profiles": profiles}),
         )
+        .unwrap()
     };
     let entry = |id: &str, root: &Path| serde_json::json!({"id": id, "root": root});
-    for (name, profiles) in [
+    let third = home.path().join("third");
+    for (name, profiles, rejected, kept) in [
         (
             "own folder by path",
-            serde_json::json!([entry(PROFILE_A, &own)]),
+            serde_json::json!([entry(PROFILE_A, &own), entry(PROFILE_B, &third)]),
+            serde_json::json!([{"index": 0, "reason": "cursor_default"}]),
+            vec![PROFILE_B],
         ),
         (
             "own folder by symlink",
-            serde_json::json!([entry(PROFILE_A, &alias)]),
+            serde_json::json!([entry(PROFILE_A, &third), entry(PROFILE_B, &alias)]),
+            serde_json::json!([{"index": 1, "reason": "cursor_default"}]),
+            vec![PROFILE_A],
         ),
         (
             "listed twice by path",
             serde_json::json!([entry(PROFILE_A, &other), entry(PROFILE_B, &other)]),
+            serde_json::json!([{"index": 1, "reason": "duplicate"}]),
+            vec![PROFILE_A],
         ),
         (
             "listed twice by symlink",
             serde_json::json!([entry(PROFILE_A, &other), entry(PROFILE_B, &other_alias)]),
+            serde_json::json!([{"index": 1, "reason": "duplicate"}]),
+            vec![PROFILE_A],
         ),
     ] {
-        assert!(push(profiles).is_err(), "{name} was accepted");
-        assert_eq!(config(), Config::default(), "{name} changed the registry");
+        let result = push(profiles);
+        assert_eq!(result["rejectedProfiles"], rejected, "{name}");
+        // The default profile and the valid profile are registered.
+        let ids: Vec<String> = config().profiles.iter().map(|p| p.id.clone()).collect();
+        assert_eq!(ids, kept, "{name}: the valid profile was dropped");
+        assert!(config().enabled, "{name}: the config was refused whole");
+        let listed: Vec<&str> = result["profiles"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(listed[0], "default", "{name}");
+        assert_eq!(&listed[1..], &kept[..], "{name}");
     }
-    // Control: two different folders are accepted.
+    // Control: nothing refused, nothing reported.
     let ok = push(serde_json::json!([
         entry(PROFILE_A, &other),
-        entry(PROFILE_B, &home.path().join("third"))
+        entry(PROFILE_B, &third)
     ]));
-    assert!(ok.is_ok(), "{ok:?}");
+    assert_eq!(ok["rejectedProfiles"], serde_json::json!([]));
+    assert_eq!(config().profiles.len(), 2);
     // A folder that does not exist yet can only match by path.
-    assert!(push(serde_json::json!([
-        entry(PROFILE_A, &home.path().join("third")),
-        entry(PROFILE_B, &home.path().join("third"))
-    ]))
-    .is_err());
+    let twice = push(serde_json::json!([
+        entry(PROFILE_A, &third),
+        entry(PROFILE_B, &third)
+    ]));
+    assert_eq!(
+        twice["rejectedProfiles"],
+        serde_json::json!([{"index": 1, "reason": "duplicate"}])
+    );
     set_for_test(Config::default());
+}
+
+/// A mixed push syncs the default and the valid profile: the refused profile
+/// is not walked and gets no dir, and a round writes both kept files.
+#[cfg(unix)]
+#[test]
+fn a_mixed_push_keeps_the_default_and_the_valid_profile_syncing() {
+    let _guard = lock();
+    set_for_test(Config::default());
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let own = home.join("Library/Application Support/Cursor");
+    std::fs::create_dir_all(&own).unwrap();
+    let default_db = login_db(&tmp.path().join("default"), &valid_token(), USER);
+    let valid = profile_root(tmp.path(), "b", &other_token(), OTHER_USER);
+    let pushed = set_in(
+        &home,
+        serde_json::json!({
+            "enabled": true, "bundleId": BUNDLE,
+            "profiles": [
+                {"id": PROFILE_A, "root": own},
+                {"id": PROFILE_B, "root": valid},
+            ],
+        }),
+    )
+    .unwrap();
+    assert_eq!(
+        pushed["rejectedProfiles"],
+        serde_json::json!([{"index": 0, "reason": "cursor_default"}])
+    );
+    let registry = RwLock::new(config());
+    set_for_test(Config::default());
+    let (url, seen) = serve(vec![json_ok(&page(1, &["a"])), json_ok(&page(1, &["b"]))]);
+    let status = sync_round_in(&default_db, &url, &registry, limits(), Some(&home));
+    assert_eq!(states(&status), ["ok", "ok"]);
+    assert_eq!(seen.lock().unwrap().len(), 2, "one walk per kept profile");
+    assert!(expected_file(&default_sync_dir(&home)).exists());
+    assert!(
+        !profile_dir(&home, PROFILE_A).exists(),
+        "the refused profile got a dir"
+    );
+    assert_eq!(names_in(&profile_dir(&home, PROFILE_B)).len(), 1);
 }

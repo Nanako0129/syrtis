@@ -1504,6 +1504,93 @@ mod tests {
         reset_registries();
     }
 
+    /// The primary also scans the `.cc-mirror` variants' project roots and
+    /// counts their usage in its window. A variant whose `variant.json` names
+    /// a `configDir` elsewhere is an ordinary Claude config dir: registered as
+    /// an extra account it is NOT refused, and the primary window hands its
+    /// usage to the account's own card (issue #258; `account_fixture`
+    /// registers `work-d`, which variant `v1` names), the dashboard total
+    /// staying put. A default-layout variant (`~/.cc-mirror/<v>/config`) is a
+    /// primary scan root: its rows are tagged by path, no card of its own
+    /// could show them (measured: the account's card reads 0), so the setter
+    /// refuses it, and the `primary_exclusions` guard keeps it counted even if
+    /// the scan registry alone holds it.
+    #[test]
+    fn a_cc_mirror_config_dir_is_an_account_only_when_it_lives_elsewhere() {
+        let _guards = lock_registries();
+        reset_registries();
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().to_path_buf();
+        write_session(&home.join(".claude"), "primary", PRIMARY_OUTPUT);
+        let default_layout = home.join(".cc-mirror/v2/config");
+        let elsewhere = home.join("mirror-v1");
+        for (variant, config) in [("v1", Some(&elsewhere)), ("v2", None)] {
+            let variant_dir = home.join(".cc-mirror").join(variant);
+            std::fs::create_dir_all(&variant_dir).unwrap();
+            let body = config
+                .map(|c| serde_json::json!({ "configDir": c.to_string_lossy() }))
+                .unwrap_or_else(|| serde_json::json!({}));
+            std::fs::write(variant_dir.join("variant.json"), body.to_string()).unwrap();
+        }
+        write_session(&elsewhere, "mirror-v1", 40);
+        write_session(&default_layout, "mirror-v2", 25);
+        let total = PRIMARY_OUTPUT + 40 + 25;
+        let context = crate::LocalSourceContext::for_home(home.clone());
+        let card = |account: &Account| {
+            reset_cache_only();
+            cached(&context, account, WINDOW_FROM, WINDOW_UNTIL).map(|v| output_tokens(&v))
+        };
+        let dashboard = || {
+            crate::model_report::run(&context, "").expect("model report")["totalOutput"]
+                .as_i64()
+                .unwrap()
+        };
+        let set_dirs = |dir: &PathBuf| {
+            crate::claude_config_dirs::set_from_json_with_home(
+                &serde_json::json!([dir.display().to_string()]).to_string(),
+                Some(&home),
+            )
+            .unwrap()
+        };
+        let set_roots = |dir: &PathBuf| {
+            crate::extra_scan_paths::set_from_json(
+                &serde_json::json!({ "claude": claude_roots(&[dir]) }).to_string(),
+            )
+            .unwrap();
+        };
+        assert_eq!(
+            card(&PRIMARY),
+            Ok(total),
+            "control: the primary counts the mirrors"
+        );
+
+        // Elsewhere: accepted, moves to its own card, the total stays.
+        reset_registries();
+        assert_eq!(set_dirs(&elsewhere)["registeredCount"], 1, "refused");
+        set_roots(&elsewhere);
+        assert_eq!(card(&PRIMARY), Ok(total - 40), "elsewhere: primary window");
+        assert_eq!(
+            card(&Some(elsewhere.display().to_string())),
+            Ok(40),
+            "elsewhere: own card"
+        );
+        assert_eq!(dashboard(), total, "elsewhere: dashboard total");
+
+        // Default layout: refused by the setter, and kept counted by the
+        // primary even when only the scan registry holds it.
+        reset_registries();
+        let refused = set_dirs(&default_layout);
+        assert_eq!(
+            refused["registeredCount"], 0,
+            "the default-layout variant was registered"
+        );
+        assert_eq!(refused["rejected"][0]["reason"], "primary_scan_root");
+        set_roots(&default_layout);
+        assert_eq!(card(&PRIMARY), Ok(total), "default layout: primary window");
+        assert_eq!(dashboard(), total, "default layout: dashboard total");
+        reset_registries();
+    }
+
     fn reset_cache_only() {
         crate::WINDOW_USAGE_CACHE
             .lock()
