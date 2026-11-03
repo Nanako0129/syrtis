@@ -121,6 +121,9 @@ struct SettingsPanel: View {
     /// (`AccountsCopy.refusalSentence`), shown under that Add button until the
     /// next add or remove.
     @State private var claudeAddRefusal: String?
+    /// The core's answer for the stored Claude list, asked off the main thread
+    /// (its rule reads the disk) when the page appears and when the list changes.
+    @StateObject private var claudeRoots = ClaudeRootsListModel()
     @State private var piAddRefusal: String?
     @State private var dshAddRefusal: String?
     /// Filled off the main actor — see `ClaudeExtraRoots.missingRoots`. Empty
@@ -1097,11 +1100,11 @@ struct SettingsPanel: View {
             AccountsCopy.claude, summary: AccountsCopy.claudeSummary,
             details: { ForEach(AccountsCopy.claudeDetails, id: \.self) { hint($0) } }
         ) {
-            // The core's refusals for the stored list (a pure call, no file
-            // access). A refused entry stays listed, marked, so nothing the
-            // user added disappears silently; it reaches neither registry.
-            let claudeRoots = ClaudeExtraRoots.classify(claudeExtraRoots)
-            let refusedClaudeRoots = claudeRoots.refused
+            // The core's refusals for the stored list, from `claudeRoots` (one
+            // ask per list, off the main thread; no marks until it answers). A
+            // refused entry stays listed, marked, so nothing the user added
+            // disappears silently; it reaches neither registry.
+            let refusedClaudeRoots = claudeRoots.refused(for: claudeExtraRoots)
             ForEach(Array(claudeExtraRoots.enumerated()), id: \.element) { index, path in
                 row(path) {
                     HStack(spacing: 6) {
@@ -1144,7 +1147,7 @@ struct SettingsPanel: View {
             // clients' roots. See `ExtraScanRoots.clientHint`.
             let claudeHint = ExtraScanRoots.clientHint(
                 claudeExtraRootsResult, client: "claude",
-                requested: claudeRoots.expanded.count)
+                requested: claudeRoots.expandedCount(for: claudeExtraRoots))
             if let claudeHint, claudeHint.unreadable > 0 {
                 hint(AccountsCopy.unreadableFolders.localized(
                     claudeHint.unreadable, claudeHint.registered))
@@ -1155,6 +1158,7 @@ struct SettingsPanel: View {
             }
         }
         .onAppear { refreshMissingClaudeRoots() }
+        .task(id: claudeExtraRoots) { await claudeRoots.refresh(claudeExtraRoots) }
     }
 
     /// Extra directories of Pi session-format JSONL files. A headless runner
@@ -1544,14 +1548,17 @@ struct SettingsPanel: View {
         panel.allowsMultipleSelection = false
         panel.prompt = AccountsCopy.addPrompt.localized
         guard panel.runModal() == .OK, let url = panel.url else { return }
-        // The core's rule, asked before anything is saved; a refusal shows its
-        // sentence under the button and saves nothing.
-        let outcome = ExtraScanRoots.add(
-            url.path, to: claudeExtraRoots, refusal: ClaudeExtraRoots.refusal(adding:to:))
-        claudeAddRefusal = outcome.refusalLine
-        guard outcome.refusalLine == nil else { return }
-        claudeExtraRoots = outcome.list
-        commitClaudeExtraRoots()
+        // The core's rule, asked (off the main thread) before anything is
+        // saved; a refusal shows its sentence under the button and saves
+        // nothing.
+        let path = url.path
+        Task {
+            let outcome = await claudeRoots.adding(path, to: claudeExtraRoots)
+            claudeAddRefusal = outcome.refusalLine
+            guard outcome.refusalLine == nil else { return }
+            claudeExtraRoots = outcome.list
+            commitClaudeExtraRoots()
+        }
     }
 
     private func commitClaudeExtraRoots() {

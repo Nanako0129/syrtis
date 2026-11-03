@@ -152,18 +152,22 @@ enum ExtraScanRoots {
     /// setter is full-replace, so `claude` is always present, while `pi` and
     /// `dsh` appear only when non-empty: an absent key already means "no roots
     /// for that client". That also keeps every pre-DSH payload byte-identical.
-    ///
-    /// `claudeAccepted`: the directories the core already accepted for these
-    /// `claudeConfigDirs`, when the caller has asked the core once and
-    /// reuses the answer (`ClaudeExtraRoots.applyPayloads`); nil asks here.
     static func payloadJSON(
-        claudeConfigDirs: [String], claudeAccepted: [String]? = nil, piRoots: [String], dshRoots: [String]
+        claudeConfigDirs: [String], piRoots: [String], dshRoots: [String]
+    ) -> String {
+        payloadJSON(
+            claudeAccepted: ClaudeExtraRoots.accepted(claudeConfigDirs), piRoots: piRoots, dshRoots: dshRoots)
+    }
+
+    /// The same payload from directories the core already accepted
+    /// (`ClaudeExtraRoots.classify`), for a caller that asked once and reuses
+    /// the answer.
+    static func payloadJSON(
+        claudeAccepted: [String], piRoots: [String], dshRoots: [String]
     ) -> String {
         let piPaths = standardizedUnique(piRoots)
         let dshPaths = standardizedUnique(dshRoots)
-        let claudeRoots = ClaudeExtraRoots.Classified(
-            refused: [:], accepted: claudeAccepted ?? ClaudeExtraRoots.accepted(claudeConfigDirs)
-        ).expanded
+        let claudeRoots = ClaudeExtraRoots.expand(accepted: claudeAccepted)
         guard !piPaths.isEmpty || !dshPaths.isEmpty else {
             return ClaudeExtraRoots.payloadJSON(expanded: claudeRoots)
         }
@@ -203,6 +207,7 @@ enum ExtraScanRoots {
     /// machinery (quota registry, applied marker, generation, cache
     /// invalidation, and quota wake) stays in `ClaudeExtraRoots`, which is
     /// where every client's apply has always run.
+    @MainActor
     static func apply(
         then completion: (@Sendable @MainActor (ExtraScanPathsResult?) -> Void)? = nil
     ) {
@@ -212,12 +217,18 @@ enum ExtraScanRoots {
     /// The payload `apply` hands to the core, built from the persisted lists.
     /// A separate function so SelfTest observes the production path;
     /// `dshDefaults` is only for a scratch suite.
+    static func currentPayload(dshDefaults: UserDefaults = .standard) -> String {
+        payloadJSON(
+            claudeConfigDirs: ClaudeExtraRoots.load(),
+            piRoots: Pi.load(), dshRoots: Dsh.load(defaults: dshDefaults))
+    }
+
+    /// `currentPayload` from the directories the core already accepted.
     static func currentPayload(
-        dshDefaults: UserDefaults = .standard, claudeAccepted: [String]? = nil
+        claudeAccepted: [String], dshDefaults: UserDefaults = .standard
     ) -> String {
         payloadJSON(
-            claudeConfigDirs: ClaudeExtraRoots.load(), claudeAccepted: claudeAccepted,
-            piRoots: Pi.load(), dshRoots: Dsh.load(defaults: dshDefaults))
+            claudeAccepted: claudeAccepted, piRoots: Pi.load(), dshRoots: Dsh.load(defaults: dshDefaults))
     }
 
     private static func standardizedPath(_ path: String) -> String {

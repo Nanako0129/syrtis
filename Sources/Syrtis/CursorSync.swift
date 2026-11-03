@@ -125,16 +125,13 @@ enum CursorSync {
 
     /// What an accepted `tb_set_cursor_sync` push reports: whether the cleanup
     /// left files behind, and the profiles the core left out of the push
-    /// (index in the pushed list to reason). A boolean literal means "no
-    /// refusals", so a test's `{ _ in false }` stays a clean push.
-    struct Push: ExpressibleByBooleanLiteral, Equatable, Sendable {
+    /// (index in the pushed list to reason).
+    struct Push: Equatable, Sendable {
         var cleanupFailed: Bool
         var rejected: [Int: String] = [:]
-        init(booleanLiteral value: Bool) { cleanupFailed = value }
-        init(cleanupFailed: Bool, rejected: [Int: String] = [:]) {
-            self.cleanupFailed = cleanupFailed
-            self.rejected = rejected
-        }
+
+        /// Nothing left behind, nothing refused.
+        static let clean = Push(cleanupFailed: false)
     }
 
     /// `nil` = the core refused the whole push.
@@ -209,11 +206,18 @@ enum CursorSync {
         static let useSyrtis = "Use Syrtis Sync"
         static let keepCLI = "Keep tokscale CLI Data"
         static let cleanupFailed = "Cursor sync is off, but some downloaded usage couldn't be deleted. Restart Syrtis to retry."
-        /// Approved copy (`multi-account-mac-copy-draft.md`, section 7). Stale
-        /// downloaded usage that could not be deleted: after an accepted on push
-        /// (`cursor_sync::set_from_json` `cleanupFailed`) or a round where a
-        /// duplicate profile's old file stayed (`cleanupFailedProfiles`). Both
-        /// run again: the next accepted push, and every sync round.
+        /// Approved copy (`multi-account-mac-copy-draft.md`, section 7). Shown
+        /// while stale downloaded usage is known to remain. When each cleanup
+        /// runs again: the orphan cleanup of an on push (a removed profile's
+        /// dir, an earlier appDir) runs only on the next accepted on push, at
+        /// launch or after any Cursor setting changes, and the line clears
+        /// when that push reports no failure. A duplicate profile's old
+        /// account file is dropped in every round in which that profile is
+        /// still a duplicate, and a successful walk drops its profile's other
+        /// usage files; in any other state (not signed in, expired, an error)
+        /// nothing retries it, so the line stays until a round shows that
+        /// profile `duplicate` or `ok` without a failure, or the profile is
+        /// removed (`staleAfter`).
         static let staleCleanupFailed = "Some downloaded Cursor usage that is no longer needed couldn't be deleted. Syrtis will try again."
         /// The core refused the settings (`tb_set_cursor_sync` error): nothing syncs.
         static let configRejected = "Cursor sync couldn't be set up, so nothing is being synced."
@@ -279,6 +283,25 @@ enum CursorSync {
         (profile.root as NSString).abbreviatingWithTildeInPath
     }
 
+    /// The profiles with a stale usage file after a sync round. Those the round
+    /// reports (`cleanupFailedProfiles`) are stale. One that was stale and is
+    /// not reported stays stale unless this round shows its cleanup ran: the
+    /// profile is `duplicate` or `ok` (a duplicate drops its old account's file
+    /// and a successful walk drops the other usage files, both reporting any
+    /// failure), or it is no longer configured. In any other state (not signed
+    /// in, expired, an error) nothing retries the delete, so it stays.
+    /// A status without `profiles` (an older core) clears nothing.
+    static func staleAfter(_ stale: Set<String>, status: CursorSyncStatus) -> Set<String> {
+        let failed = Set(status.cleanupFailedProfiles ?? [])
+        guard let profiles = status.profiles else { return stale.union(failed) }
+        let states = Dictionary(profiles.map { ($0.id, $0.state) }, uniquingKeysWith: { first, _ in first })
+        let kept = stale.filter { id in
+            guard let state = states[id] else { return false }  // removed
+            return !["duplicate", "ok"].contains(state)
+        }
+        return kept.union(failed)
+    }
+
     /// What a profile row says: the core left its folder out of the push (it is
     /// Cursor's own folder or repeats an earlier one: the fixed
     /// `Copy.cantAdd`), else its own last round (`rowLine`).
@@ -338,11 +361,11 @@ final class CursorSyncController: ObservableObject {
     /// cleared by each accepted on push; reset when sync turns off, where
     /// `cleanupFailed` speaks instead.
     @Published private(set) var orphanCleanupFailed = false
-    /// The last sync round could not delete a duplicate profile's old account
-    /// file (`cleanupFailedProfiles`). Set from every round's status.
-    @Published private(set) var roundCleanupFailed = false
-    /// Stale downloaded usage the app could not delete, from either source.
-    var staleCleanupFailed: Bool { orphanCleanupFailed || roundCleanupFailed }
+    /// Profiles (`default` or a UUID) whose stale usage file a sync round could
+    /// not delete and that no later round has cleaned yet (`staleAfter`).
+    @Published private(set) var staleProfiles: Set<String> = []
+    /// Stale downloaded usage the app knows remains, from either source.
+    var staleCleanupFailed: Bool { orphanCleanupFailed || !staleProfiles.isEmpty }
     /// Profiles (by id) the core left out of the last accepted on push, with
     /// the reason; the rest of the push took effect.
     @Published private(set) var refusedProfiles: [String: String] = [:]
@@ -389,20 +412,25 @@ final class CursorSyncController: ObservableObject {
         let run = CursorSync.shouldSync(defaults: defaults, arguments: arguments)
         loop?.cancel()
         generation &+= 1
+        let mine = generation
         // An off push retries the cleanup: hide the last failure until it reports.
         if !run {
             state = nil; lastSuccessMs = nil; cleanupFailed = false; orphanCleanupFailed = false
-            roundCleanupFailed = false; refusedProfiles = [:]; profileStates = [:]
+            staleProfiles = []; refusedProfiles = [:]; profileStates = [:]
         }
         let previous = configPush
         let push = Task { [weak self] in
             await previous?.value
             let pushed = await Task.detached(priority: .utility) { setConfig(json) }.value
+            // A newer reconfigure (an off push, say) has taken over while this
+            // one ran: what it reports describes a configuration that no
+            // longer applies, so it changes nothing.
+            guard let self, self.generation == mine else { return }
             // nil is a rejected push. A rejected on push is shown (the core
             // kept its previous config, so sync would silently not run),
             // clears the rows' stale outcomes and stops the schedule; the next
             // accepted on push clears it.
-            if run, let self {
+            if run {
                 if pushed == nil {
                     self.state = CursorSync.configRejectedState
                     self.profileStates = [:]
@@ -417,14 +445,14 @@ final class CursorSyncController: ObservableObject {
             // (nil) ran no cleanup and leaves all of these as they were.
             if let pushed {
                 if run {
-                    self?.orphanCleanupFailed = pushed.cleanupFailed
-                    self?.refusedProfiles = Dictionary(
+                    self.orphanCleanupFailed = pushed.cleanupFailed
+                    self.refusedProfiles = Dictionary(
                         pushed.rejected.compactMap { index, reason in
                             listed.indices.contains(index) ? (listed[index].id, reason) : nil
                         },
                         uniquingKeysWith: { first, _ in first })
                 } else {
-                    self?.cleanupFailed = pushed.cleanupFailed
+                    self.cleanupFailed = pushed.cleanupFailed
                 }
             }
         }
@@ -473,7 +501,7 @@ final class CursorSyncController: ObservableObject {
             guard let result else { state = "error"; profileStates = [:]; continue }
             state = result.state
             lastSuccessMs = result.lastSuccessMs
-            roundCleanupFailed = !(result.cleanupFailedProfiles ?? []).isEmpty
+            staleProfiles = CursorSync.staleAfter(staleProfiles, status: result)
             profileStates = Dictionary(
                 (result.profiles ?? []).map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
             // A round that wrote a file already invalidated the core's

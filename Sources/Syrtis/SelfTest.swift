@@ -17605,31 +17605,50 @@ enum SelfTest {
                 && addDsh(fresh, listed) == .init(list: listed + [fresh], refusalLine: nil),
             "ACCOUNTS-PAGE a refused add of a Claude, Pi or DSH folder shows its reason's fixed sentence and saves nothing; an accepted add shows none")
 
-        // One apply asks the core's rule once and builds both payloads from the
-        // answer; one render of the list asks once. The payloads equal the
-        // ones the single-purpose builders make. Mutation: the config-dir
-        // payload asks again.
-        do {
+        // Each production entry asks the core's rule (which reads the disk)
+        // once: `ExtraScanRoots.apply`, the entry launch and every save go
+        // through, builds both registry payloads from one answer; the Settings
+        // model the view reads (`ClaudeRootsListModel`) asks once to refresh and
+        // once for an Add click. Mutations: the scan payload built with
+        // `currentPayload()` instead of from the apply's answer (asks twice);
+        // `refresh` or `adding` asking twice.
+        let asks: [Int]? = awaitMainActorValue {
             let calls = UncheckedBox<Int>(0)
             let real = ClaudeExtraRoots.coreRefusals
             ClaudeExtraRoots.coreRefusals = { calls.value += 1; return try real($0) }
-            defer { ClaudeExtraRoots.coreRefusals = real }
+            let defaults = UserDefaults.standard
+            let savedList = defaults.object(forKey: ClaudeExtraRoots.storageKey)
             let dirs = ["/tmp/syrtis-selftest-accounts/a", home, "/tmp/syrtis-selftest-accounts/b"]
-            let both = ClaudeExtraRoots.applyPayloads(configDirs: dirs, scanPayload: {
-                ExtraScanRoots.payloadJSON(claudeConfigDirs: dirs, claudeAccepted: $0, piRoots: [], dshRoots: [])
-            })
+            let applyAndWait = {
+                await withCheckedContinuation { (done: CheckedContinuation<Void, Never>) in
+                    ExtraScanRoots.apply { _ in done.resume() }
+                }
+            }
+            ClaudeExtraRoots.save(dirs)
+            await applyAndWait()
             let applyCalls = calls.value
             calls.value = 0
-            let rendered = ClaudeExtraRoots.classify(dirs)
-            let renderCalls = calls.value
+            let model = ClaudeRootsListModel()
+            await model.refresh(dirs)
+            let refreshCalls = calls.value
+            let refusedHome = model.refused(for: dirs)[1] == "home_directory"
+            calls.value = 0
+            let added = await model.adding("/tmp/syrtis-selftest-accounts/c", to: dirs)
+            let addCalls = calls.value
+            let refusedAdd = await model.adding(home, to: dirs)
+            // Put the process back: no extra accounts in the core, the real rule,
+            // the user's stored list.
+            ClaudeExtraRoots.save([])
+            await applyAndWait()
             ClaudeExtraRoots.coreRefusals = real
-            expect(applyCalls == 1 && renderCalls == 1
-                       && both.scan == ClaudeExtraRoots.payloadJSON(dirs)
-                       && both.configDirs == ClaudeExtraRoots.configDirsPayloadJSON(dirs)
-                       && rendered.refused[1] == "home_directory"
-                       && rendered.expanded.count == 4,
-                   "ACCOUNTS-PAGE one apply and one render each ask the core's rule once and reuse the answer; apply asked \(applyCalls), render \(renderCalls)")
+            if let savedList { defaults.set(savedList, forKey: ClaudeExtraRoots.storageKey) }
+            else { defaults.removeObject(forKey: ClaudeExtraRoots.storageKey) }
+            ClaudeExtraRoots.resetAppliedForTesting()
+            return [applyCalls, refreshCalls, addCalls, refusedHome ? 1 : 0,
+                    added.refusalLine == nil ? 1 : 0, refusedAdd.refusalLine == AccountsCopy.refusalSentence("home_directory") ? 1 : 0]
         }
+        expect(asks == [1, 1, 1, 1, 1, 1],
+               "ACCOUNTS-PAGE apply and the Settings model each ask the core's rule once and reuse the answer (apply, refresh, add, then answers); got \(String(describing: asks))")
 
         // MA-42: a Remove button is named by the row's whole label, so two rows
         // sharing a last path component never share a name. Mutation: the last
@@ -18254,13 +18273,13 @@ enum SelfTest {
             // 3. Test mode: reconfigure makes no core call at all.
             controller.reconfigure(
                 refresh: false, defaults: defaults, arguments: ["Syrtis", "--demo"], bundleID: "x.y",
-                setConfig: { configCalls.value.append($0); return false }, sync: sync)
+                setConfig: { configCalls.value.append($0); return .clean }, sync: sync)
             try? await Task.sleep(nanoseconds: 100_000_000)
             let demoReconfigure = configCalls.value.count + syncCalls.value
             // 4. Control: a user session acknowledged -> config pushed and a sync runs.
             controller.reconfigure(
                 refresh: false, defaults: defaults, arguments: ["Syrtis"], bundleID: "x.y",
-                setConfig: { configCalls.value.append($0); return false }, sync: sync)
+                setConfig: { configCalls.value.append($0); return .clean }, sync: sync)
             for _ in 0..<200 where syncCalls.value == 0 {
                 try? await Task.sleep(nanoseconds: 10_000_000)
             }
@@ -18269,7 +18288,7 @@ enum SelfTest {
             defaults.set(false, forKey: CursorSync.enabledKey)
             controller.reconfigure(
                 refresh: false, defaults: defaults, arguments: ["Syrtis"], bundleID: "x.y",
-                setConfig: { configCalls.value.append($0); return false }, sync: sync)
+                setConfig: { configCalls.value.append($0); return .clean }, sync: sync)
             for _ in 0..<200 where configCalls.value.count < 2 {
                 try? await Task.sleep(nanoseconds: 10_000_000)
             }
@@ -18300,7 +18319,7 @@ enum SelfTest {
             let slowOn: CursorSync.SetConfig = { json in
                 if json.contains(#""enabled":true"#) { Thread.sleep(forTimeInterval: 0.3) }
                 pushes.value.append(json.contains(#""enabled":true"#) ? "on" : "off")
-                return false
+                return .clean
             }
             let none: @Sendable (Bool) -> CursorSyncStatus? = { _ in nil }
             let controller = CursorSyncController()
@@ -18349,7 +18368,7 @@ enum SelfTest {
             let identical = generation() != g2
             defaults.set(false, forKey: CursorSync.enabledKey)
             controller.reconfigure(refresh: false, defaults: defaults, arguments: ["Syrtis"], bundleID: "x.y",
-                                   setConfig: { _ in false }, sync: sync)
+                                   setConfig: { _ in .clean }, sync: sync)
             defaults.set(true, forKey: CursorSync.enabledKey)
             next.value = status(true)
             let g3 = generation()
@@ -18375,7 +18394,7 @@ enum SelfTest {
             try? await Task.sleep(nanoseconds: 50_000_000)
             defaults.set(false, forKey: CursorSync.enabledKey)
             controller.reconfigure(refresh: false, defaults: defaults, arguments: ["Syrtis"], bundleID: "x.y",
-                                   setConfig: { _ in false }, sync: slow)
+                                   setConfig: { _ in .clean }, sync: slow)
             await running.value
             return controller.state
         }
@@ -18398,7 +18417,7 @@ enum SelfTest {
                 log.value.append("sync"); Thread.sleep(forTimeInterval: 0.2); return ok
             }
             let slowPush: CursorSync.SetConfig = { _ in
-                Thread.sleep(forTimeInterval: 0.2); log.value.append("push"); return false
+                Thread.sleep(forTimeInterval: 0.2); log.value.append("push"); return .clean
             }
             let controller = CursorSyncController()
             // Sync Now right after a reconfigure: the push must land first.
@@ -18414,7 +18433,7 @@ enum SelfTest {
             }
             try? await Task.sleep(nanoseconds: 50_000_000)
             controller.reconfigure(refresh: false, defaults: defaults, arguments: ["Syrtis"], bundleID: "x.y",
-                                   setConfig: { _ in false }, sync: slowSync)
+                                   setConfig: { _ in .clean }, sync: slowSync)
             await running.value
             let syncs = log.value.filter { $0 == "sync" }.count
             return firstTwo + ["syncs=\(syncs >= 2)", "state=\(controller.state ?? "nil")"]
@@ -18442,7 +18461,7 @@ enum SelfTest {
             let sync: @Sendable (Bool) -> CursorSyncStatus? = { _ in log.value.append("sync"); return ok }
             let controller = CursorSyncController()
             controller.reconfigure(refresh: false, defaults: defaults, arguments: ["Syrtis"], bundleID: "x.y",
-                                   setConfig: { _ in Thread.sleep(forTimeInterval: 0.3); log.value.append("push1"); return false },
+                                   setConfig: { _ in Thread.sleep(forTimeInterval: 0.3); log.value.append("push1"); return .clean },
                                    sync: sync)
             let running = Task { @MainActor in
                 await controller.runSync(explicit: true, defaults: defaults, arguments: ["Syrtis"], sync: sync)
@@ -18455,14 +18474,14 @@ enum SelfTest {
             // The new loop's own sync is dropped while `running` holds the
             // single flight, so one sync means the rerun sent it.
             controller.reconfigure(refresh: false, defaults: defaults, arguments: ["Syrtis"], bundleID: "x.y",
-                                   setConfig: { _ in Thread.sleep(forTimeInterval: 0.2); log.value.append("push2"); return false },
+                                   setConfig: { _ in Thread.sleep(forTimeInterval: 0.2); log.value.append("push2"); return .clean },
                                    sync: sync)
             await running.value
             let order = log.value
             // Stop the loop the second reconfigure started.
             defaults.set(false, forKey: CursorSync.enabledKey)
             controller.reconfigure(refresh: false, defaults: defaults, arguments: ["Syrtis"], bundleID: "x.y",
-                                   setConfig: { _ in false }, sync: sync)
+                                   setConfig: { _ in .clean }, sync: sync)
             return order
         }
         expect(cursorWait == ["push1", "push2", "sync"],
@@ -18479,7 +18498,7 @@ enum SelfTest {
             let sync: @Sendable (Bool) -> CursorSyncStatus? = { _ in syncs.value += 1; return nil }
             let controller = CursorSyncController()
             controller.reconfigure(refresh: false, defaults: defaults, arguments: ["Syrtis"], bundleID: "x.y",
-                                   setConfig: { _ in Thread.sleep(forTimeInterval: 0.3); return false }, sync: sync)
+                                   setConfig: { _ in Thread.sleep(forTimeInterval: 0.3); return .clean }, sync: sync)
             let running = Task { @MainActor in
                 await controller.runSync(explicit: true, defaults: defaults, arguments: ["Syrtis"], sync: sync)
             }
@@ -18489,7 +18508,7 @@ enum SelfTest {
             }
             defaults.set(false, forKey: CursorSync.enabledKey)
             controller.reconfigure(refresh: false, defaults: defaults, arguments: ["Syrtis"], bundleID: "x.y",
-                                   setConfig: { _ in false }, sync: sync)
+                                   setConfig: { _ in .clean }, sync: sync)
             await running.value
             try? await Task.sleep(nanoseconds: 100_000_000)
             return syncs.value
@@ -18550,11 +18569,11 @@ enum SelfTest {
                 for _ in 0..<200 where !landed.value { try? await Task.sleep(nanoseconds: 10_000_000) }
                 try? await Task.sleep(nanoseconds: 50_000_000)
             }
-            await push(true, true); seen.append(controller.orphanCleanupFailed)
+            await push(true, .init(cleanupFailed: true)); seen.append(controller.orphanCleanupFailed)
             await push(true, nil); seen.append(controller.orphanCleanupFailed)
-            await push(true, false); seen.append(controller.orphanCleanupFailed)
-            await push(true, true)
-            await push(false, false); seen.append(controller.orphanCleanupFailed)
+            await push(true, .clean); seen.append(controller.orphanCleanupFailed)
+            await push(true, .init(cleanupFailed: true))
+            await push(false, .clean); seen.append(controller.orphanCleanupFailed)
             return seen
         }
         expect(cursorOrphan == [true, true, false, false],
@@ -18592,52 +18611,109 @@ enum SelfTest {
             ok.append(CursorSync.profileRowLine(id: first, refused: controller.refusedProfiles, status: nil) == nil)
             await push(nil, true)
             ok.append(controller.refusedProfiles == [second: "cursor_default"])
-            await push(false, true)
+            await push(.clean, true)
             ok.append(controller.refusedProfiles.isEmpty)
             await push(.init(cleanupFailed: false, rejected: [0: "duplicate", 9: "duplicate"]), true)
             ok.append(controller.refusedProfiles == [first: "duplicate"])
-            await push(false, false)
+            await push(.clean, false)
             ok.append(controller.refusedProfiles.isEmpty)
             return ok
         }
         expect(cursorRefused == [true, true, true, true, true, true, true],
                "CURSOR-PROFILES a profile the core leaves out of a push is marked with the fixed sentence, the others are untouched, and it clears with the next accepted push; got \(String(describing: cursorRefused))")
 
-        // A duplicate profile's old file that could not be deleted
-        // (`cleanupFailedProfiles` of a sync round) shows the same sentence as
-        // an on-push failure, and clears with the next round that deleted it.
-        // Mutation: ignore `cleanupFailedProfiles`.
+        // A stale usage file a sync round could not delete (a duplicate's old
+        // account file, or a commit's superseded one) shows the same sentence
+        // as an on-push failure, and stays until a round shows its profile
+        // `duplicate` or `ok` without a failure, or the profile is removed: in
+        // any other state nothing retries the delete. Mutation: the line
+        // follows only the latest round's failures.
         let cursorRoundCleanup: [Bool]? = awaitMainActorValue {
             let suite = "tokenbar.selftest.cursorSyncRoundCleanup"
             let defaults = UserDefaults(suiteName: suite)!
             defer { defaults.removePersistentDomain(forName: suite) }
             defaults.removePersistentDomain(forName: suite)
             defaults.set(true, forKey: CursorSync.noticeKey)
-            let status = { (failed: String) in
-                try? JSONDecoder().decode(
+            let b = "0A1B2C3D-0000-4000-8000-00000000000B"
+            let status = { (second: String?, failed: [String]) -> CursorSyncStatus? in
+                let rows = ["default": "ok"].merging(second.map { [b: $0] } ?? [:]) { first, _ in first }
+                    .sorted { $0.key < $1.key }
+                    .map { #"{"id":"\#($0.key)","state":"\#($0.value)","events":0,"lastSuccessMs":1}"# }
+                    .joined(separator: ",")
+                let failedJSON = failed.map { "\"\($0)\"" }.joined(separator: ",")
+                return try? JSONDecoder().decode(
                     CursorSyncStatus.self,
-                    from: Data(#"{"state":"ok","events":1,"lastSuccessMs":1,"changed":true,"cleanupFailedProfiles":\#(failed)}"#.utf8))
+                    from: Data(#"{"state":"ok","events":1,"lastSuccessMs":1,"changed":true,"profiles":[\#(rows)],"cleanupFailedProfiles":[\#(failedJSON)]}"#.utf8))
             }
-            let next = UncheckedBox<CursorSyncStatus?>(status(#"["0A1B2C3D-0000-4000-8000-00000000000A"]"#))
+            let next = UncheckedBox<CursorSyncStatus?>(status("duplicate", [b]))
             let sync: @Sendable (Bool) -> CursorSyncStatus? = { _ in next.value }
             let controller = CursorSyncController()
             var ok: [Bool] = []
-            await controller.runSync(explicit: true, defaults: defaults, arguments: ["Syrtis"], sync: sync)
-            ok.append(controller.roundCleanupFailed && controller.staleCleanupFailed
-                && CursorSync.cleanupLine(syncOn: true, cleanupFailed: false, staleCleanupFailed: controller.staleCleanupFailed)
+            let round: (CursorSyncStatus?) async -> Void = { result in
+                next.value = result
+                await controller.runSync(explicit: true, defaults: defaults, arguments: ["Syrtis"], sync: sync)
+            }
+            await round(status("duplicate", [b]))
+            ok.append(controller.staleProfiles == [b] && controller.staleCleanupFailed
+                && CursorSync.cleanupLine(syncOn: true, cleanupFailed: false, staleCleanupFailed: true)
                     == CursorSync.Copy.staleCleanupFailed.localized)
-            next.value = status("[]")
-            await controller.runSync(explicit: true, defaults: defaults, arguments: ["Syrtis"], sync: sync)
-            ok.append(!controller.roundCleanupFailed && !controller.staleCleanupFailed)
+            // The profile stops being a duplicate and cannot retry: still shown.
+            await round(status("notSignedIn", []))
+            ok.append(controller.staleProfiles == [b])
+            await round(status("expired", []))
+            ok.append(controller.staleProfiles == [b])
+            // A round that ran its cleanup without a failure clears it.
+            await round(status("duplicate", []))
+            ok.append(controller.staleProfiles.isEmpty && !controller.staleCleanupFailed)
+            // A successful walk's own failure is stale too, cleared by an ok round.
+            await round(status("ok", [b]))
+            ok.append(controller.staleProfiles == [b])
+            await round(status("ok", []))
+            ok.append(controller.staleProfiles.isEmpty)
+            // Removing the profile clears it.
+            await round(status("duplicate", [b]))
+            ok.append(controller.staleProfiles == [b])
+            await round(status(nil, []))
+            ok.append(controller.staleProfiles.isEmpty)
             // A status without the field (an older core) is no failure.
-            next.value = try? JSONDecoder().decode(
-                CursorSyncStatus.self, from: Data(#"{"state":"ok","events":1,"lastSuccessMs":1,"changed":false}"#.utf8))
-            await controller.runSync(explicit: true, defaults: defaults, arguments: ["Syrtis"], sync: sync)
-            ok.append(!controller.roundCleanupFailed)
+            await round(try? JSONDecoder().decode(
+                CursorSyncStatus.self, from: Data(#"{"state":"ok","events":1,"lastSuccessMs":1,"changed":false}"#.utf8)))
+            ok.append(controller.staleProfiles.isEmpty)
             return ok
         }
-        expect(cursorRoundCleanup == [true, true, true],
-               "CURSOR-SYNC a duplicate's failed cleanup (cleanupFailedProfiles) shows the stale-usage sentence and clears with the next round; got \(String(describing: cursorRoundCleanup))")
+        expect(cursorRoundCleanup == [true, true, true, true, true, true, true, true, true],
+               "CURSOR-SYNC a stale file a round could not delete keeps its line until that profile is duplicate or ok without a failure, or removed; got \(String(describing: cursorRoundCleanup))")
+
+        // A push that finishes after a newer reconfigure changes nothing: an
+        // on push still running when sync is turned off must not set the
+        // refusals or the cleanup failure after the off reset. Mutation: the
+        // generation guard dropped.
+        let cursorStalePush: [Bool]? = awaitMainActorValue {
+            let suite = "tokenbar.selftest.cursorSyncStalePush"
+            let defaults = UserDefaults(suiteName: suite)!
+            defer { defaults.removePersistentDomain(forName: suite) }
+            defaults.removePersistentDomain(forName: suite)
+            defaults.set(true, forKey: CursorSync.noticeKey)
+            let first = "0A1B2C3D-0000-4000-8000-00000000000A"
+            CursorSync.saveProfiles([.init(id: first, root: "/Volumes/selftest/a")], defaults: defaults)
+            let none: @Sendable (Bool) -> CursorSyncStatus? = { _ in nil }
+            let controller = CursorSyncController()
+            let onPush: CursorSync.SetConfig = { _ in
+                Thread.sleep(forTimeInterval: 0.3)
+                return .init(cleanupFailed: true, rejected: [0: "duplicate"])
+            }
+            defaults.set(true, forKey: CursorSync.enabledKey)
+            controller.reconfigure(refresh: false, defaults: defaults, arguments: ["Syrtis"], bundleID: "x.y",
+                                   setConfig: onPush, sync: none)
+            defaults.set(false, forKey: CursorSync.enabledKey)
+            controller.reconfigure(refresh: false, defaults: defaults, arguments: ["Syrtis"], bundleID: "x.y",
+                                   setConfig: { _ in .clean }, sync: none)
+            try? await Task.sleep(nanoseconds: 700_000_000)
+            return [!controller.orphanCleanupFailed, controller.refusedProfiles.isEmpty, controller.state == nil,
+                    !controller.cleanupFailed]
+        }
+        expect(cursorStalePush == [true, true, true, true],
+               "CURSOR-SYNC an on push finishing after sync was turned off changes nothing; got \(String(describing: cursorStalePush))")
         expect(CursorSync.cleanupLine(syncOn: true, cleanupFailed: false, staleCleanupFailed: true)
                    == CursorSync.Copy.staleCleanupFailed.localized
                 && CursorSync.cleanupLine(syncOn: true, cleanupFailed: true, staleCleanupFailed: false) == nil
@@ -18731,7 +18807,7 @@ enum SelfTest {
             // Stop the loop.
             defaults.set(false, forKey: CursorSync.enabledKey)
             controller.reconfigure(refresh: false, defaults: defaults, arguments: ["Syrtis"], bundleID: "x.y",
-                                   setConfig: { _ in false }, sync: sync)
+                                   setConfig: { _ in .clean }, sync: sync)
             return [line, "syncs=\(syncs.value)"]
         }
         expect(cursorRejected == [CursorSync.Copy.configRejected.localized, "syncs=0"],
@@ -18777,7 +18853,7 @@ enum SelfTest {
             cursorFirmlinkSkipped.value = firmlinked == nil
             let pushes = UncheckedBox<[String]>([])
             let syncs = UncheckedBox<Int>(0)
-            let setConfig: CursorSync.SetConfig = { pushes.value.append($0); return false }
+            let setConfig: CursorSync.SetConfig = { pushes.value.append($0); return .clean }
             let sync: CursorSync.Sync = { _ in syncs.value += 1; return nil }
             let user = ["Syrtis"]
             let controller = CursorSyncController()
@@ -18874,7 +18950,7 @@ enum SelfTest {
             // Stop the loop.
             defaults.set(false, forKey: CursorSync.enabledKey)
             controller.reconfigure(refresh: false, defaults: defaults, arguments: user, bundleID: "x.y",
-                                   setConfig: { _ in false }, sync: sync)
+                                   setConfig: { _ in .clean }, sync: sync)
             return ok
         }
         expect(cursorProfiles?.values.allSatisfy { $0 } == true,
