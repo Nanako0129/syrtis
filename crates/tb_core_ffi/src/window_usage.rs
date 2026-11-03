@@ -1593,6 +1593,30 @@ mod tests {
         reset_registries();
     }
 
+    /// `primary_exclusions` reads the primary's roots once for the whole list
+    /// of registered paths, not once per path. Mutation: build `PrimaryRoots`
+    /// inside the `retain` closure.
+    #[test]
+    fn primary_exclusions_build_the_primary_roots_once() {
+        let _guards = lock_registries();
+        reset_registries();
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().to_path_buf();
+        let extras: Vec<PathBuf> = (0..4).map(|i| home.join(format!("extra-{i}"))).collect();
+        install(&claude_roots(&extras.iter().collect::<Vec<_>>()), &[]);
+        let calls = || crate::claude_config_dirs::FOR_HOME_CALLS.with(std::cell::Cell::get);
+        let before = calls();
+        let excluded = primary_exclusions(Some(&home));
+        assert_eq!(excluded.len(), 8, "fixture: eight registered roots");
+        assert_eq!(calls() - before, 1, "built once for eight paths");
+        // Control: nothing registered, nothing read.
+        reset_registries();
+        let before = calls();
+        assert!(primary_exclusions(Some(&home)).is_empty());
+        assert_eq!(calls() - before, 0);
+        reset_registries();
+    }
+
     fn reset_cache_only() {
         crate::WINDOW_USAGE_CACHE
             .lock()

@@ -157,8 +157,11 @@ char *tb_set_extra_scan_paths(const char *json);
 // with the rule and codes of tb_claude_config_dir_refusals; the path is never
 // echoed. Invalidates the scan caches and drops removed accounts' last-good
 // cards.
-// Existence is NOT probed: whether a directory is readable right now says
-// nothing about which account its credential belongs to.
+// Existence of the configured directories is NOT probed: whether one is
+// readable right now says nothing about which account its credential belongs
+// to. The call still reads the disk (the primary's scan roots: ~/.cc-mirror and
+// each variant's variant.json, once per call, as tb_claude_config_dir_refusals
+// does), so call it off the main thread.
 //
 // This is not `tb_set_extra_scan_paths`. That one takes the expanded
 // `<dir>/projects` and `<dir>/transcripts` sub-roots and decides which

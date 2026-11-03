@@ -1304,8 +1304,11 @@ pub unsafe extern "C" fn tb_set_extra_scan_paths(json: *const c_char) -> *mut c_
 /// the Keychain item that directory selects. Success data is
 /// `{"registeredCount":N,"rejected":[{"index":i,"reason":"<code>"}]}`, the
 /// rule and codes of `tb_claude_config_dir_refusals`; the path is never echoed.
-/// Existence is not probed — whether the directory is readable right now says
-/// nothing about which account its credential belongs to. Invalidates the scan
+/// Existence of the configured directories is not probed — whether one is
+/// readable right now says nothing about which account its credential belongs
+/// to. The call still reads the disk: judging the entries reads `~/.cc-mirror`
+/// and each variant's `variant.json` once (the same rule as
+/// `tb_claude_config_dir_refusals`), so call it off the main thread. Invalidates the scan
 /// caches (the primary window's exclusions come from this list) and drops the
 /// last-good card of every account the replace removed.
 ///

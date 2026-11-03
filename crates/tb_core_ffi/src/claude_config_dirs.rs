@@ -63,26 +63,29 @@ impl Refusal {
 }
 
 /// Every directory the primary Claude account's scan reads under `home`: its
-/// two roots in `~/.claude`, the Cowork sessions tree (under which the engine
-/// discovers `<session>/.claude/projects` roots) and the `.cc-mirror` variants'
+/// two roots in `~/.claude`, the Cowork sessions tree (a fixed path here; the
+/// engine discovers `<session>/.claude/projects` roots under it, and the whole
+/// tree is refused, so it is never walked) and the `.cc-mirror` variants'
 /// project roots that sit under `~/.cc-mirror`.
 ///
-/// The cc-mirror roots are the engine's own answer
-/// (`built_in_extra_scan_paths_for`, the public surface of
-/// `cc_mirror::discover_claude_project_roots`), so a variant is treated as the
-/// engine treats it: a `variant.json` that is missing or unreadable means the
-/// variant is not scanned and contributes nothing; no `configDir` means
-/// `<variant>/config`. Only the roots under `~/.cc-mirror` are taken: their
-/// rows are tagged `cc-mirror/<variant>` by their path, so an extra account
-/// there would show on no card of its own and drop out of the primary's window.
-/// A variant whose `configDir` names a folder elsewhere is not a primary scan
-/// root: that folder is an ordinary Claude config dir and may be an account
-/// (issue #258).
+/// The cc-mirror roots follow the engine's own decision
+/// (`cc_mirror::discover_claude_project_roots`, which is private to the engine;
+/// `cc_mirror_roots_match_the_engines_discovery` pins this copy against the
+/// engine's public `built_in_extra_scan_paths_for` on one fixture): a variant
+/// is scanned at `<config dir>/projects` when its `variant.json` parses and
+/// that folder exists, the config dir being `configDir` (`~/` is home, a
+/// relative path is relative to the variant folder; an empty one counts as
+/// absent) or else `<variant>/config`. Only the roots under `~/.cc-mirror` are
+/// taken: their rows are tagged `cc-mirror/<variant>` by their path, so an
+/// extra account there would show on no card of its own and drop out of the
+/// primary's window. A `configDir` naming a folder elsewhere is not a primary
+/// scan root: that folder is an ordinary Claude config dir and may be an
+/// account (issue #258).
 ///
-/// This reads the disk: a `read_dir` of `~/.cc-mirror`, each variant's
-/// `variant.json`, and the engine's walk of the Cowork tree. Nothing leaves the
-/// machine. Compute it once per call (`PrimaryRoots::for_home`), never per
-/// entry, and not on the main thread.
+/// This reads the disk: a `read_dir` of `~/.cc-mirror` and each variant's
+/// `variant.json`, one stat per variant for its `projects`. Nothing leaves the
+/// machine and no other tree is walked. Compute it once per call
+/// (`PrimaryRoots::for_home`), never per entry, and not on the main thread.
 fn primary_scan_roots(home: &Path) -> Vec<PathBuf> {
     let claude = home.join(".claude");
     let mut roots = vec![
@@ -90,22 +93,58 @@ fn primary_scan_roots(home: &Path) -> Vec<PathBuf> {
         claude.join("transcripts"),
         home.join("Library/Application Support/Claude/local-agent-mode-sessions"),
     ];
-    let mirror = home.join(".cc-mirror");
-    let enabled = std::collections::HashSet::from([tokscale_core::ClientId::Claude]);
-    roots.extend(
-        tokscale_core::scanner::built_in_extra_scan_paths_for(&home.to_string_lossy(), &enabled)
-            .into_iter()
-            .map(|(_, path)| path)
-            .filter(|path| path.starts_with(&mirror)),
-    );
+    roots.extend(cc_mirror_roots(home));
     roots
 }
 
-// Reads of the disk by `PrimaryRoots::for_home` on this thread, so a test can
-// show a call reads once, not once per entry.
+/// The engine's `variant.json`: every field it declares, so a file the engine
+/// cannot parse (a wrong type anywhere) is not parsed here either.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
+struct VariantFile {
+    name: Option<String>,
+    provider: Option<String>,
+    provider_id: Option<String>,
+    config_dir: Option<String>,
+}
+
+/// `<config dir>/projects` of each variant the engine scans, when it lies under
+/// `~/.cc-mirror` (see `primary_scan_roots`).
+fn cc_mirror_roots(home: &Path) -> Vec<PathBuf> {
+    let mirror = home.join(".cc-mirror");
+    let Ok(variants) = std::fs::read_dir(&mirror) else {
+        return Vec::new();
+    };
+    variants
+        .flatten()
+        .filter_map(|entry| {
+            let variant = entry.path();
+            let file: VariantFile =
+                serde_json::from_str(&std::fs::read_to_string(variant.join("variant.json")).ok()?)
+                    .ok()?;
+            let config = file
+                .config_dir
+                .as_deref()
+                .map(str::trim)
+                .filter(|raw| !raw.is_empty())
+                .map(|raw| match raw.strip_prefix("~/") {
+                    Some(rest) => home.join(rest),
+                    None if Path::new(raw).is_absolute() => PathBuf::from(raw),
+                    None => variant.join(raw),
+                })
+                .unwrap_or_else(|| variant.join("config"));
+            let projects = config.join("projects");
+            (projects.starts_with(&mirror) && projects.is_dir()).then_some(projects)
+        })
+        .collect()
+}
+
+// Constructor calls of `PrimaryRoots::for_home` on this thread (each one reads
+// the disk), so a test can show a call builds it once, not once per entry.
 #[cfg(test)]
 thread_local! {
-    static FOR_HOME_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub(crate) static FOR_HOME_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// The primary's scan roots under one home, read once. `collides` is the one
@@ -128,7 +167,7 @@ pub(crate) struct PrimaryRoots {
 impl PrimaryRoots {
     pub(crate) fn for_home(home: &Path) -> Self {
         #[cfg(test)]
-        FOR_HOME_READS.with(|reads| reads.set(reads.get() + 1));
+        FOR_HOME_CALLS.with(|reads| reads.set(reads.get() + 1));
         Self {
             claude: folded(&home.join(".claude")),
             roots: primary_scan_roots(home),
@@ -269,10 +308,12 @@ fn normalize(raw: &str) -> Result<String, Refusal> {
 /// Full-replace, not merge: `[]` clears every configured account (the Settings
 /// rollback path). Refusals follow `check`, against the process home.
 ///
-/// Existence is deliberately not probed. Whether a directory can be read right
-/// now says nothing about which account its Keychain item belongs to, and the
-/// answer would go stale the moment a volume mounts. It also keeps this setter
-/// off the `stat` path that made `extra_scan_paths` block its caller.
+/// Existence of the configured directories is deliberately not probed. Whether
+/// a directory can be read right now says nothing about which account its
+/// Keychain item belongs to, and the answer would go stale the moment a volume
+/// mounts. That does not make the setter disk-free: judging the entries reads
+/// the primary's scan roots (`primary_scan_roots`: `~/.cc-mirror` and each
+/// variant's `variant.json`) once, so call it off the main thread.
 pub(crate) fn set_from_json(raw: &str) -> Result<serde_json::Value, String> {
     set_from_json_with_home(raw, crate::user_home_dir().as_deref())
 }
@@ -364,13 +405,92 @@ mod tests {
             .collect()
     }
 
+    /// `cc_mirror_roots` is a copy of the engine's private decision, so it is
+    /// pinned against the engine's public `built_in_extra_scan_paths_for` (the
+    /// roots under `~/.cc-mirror`) on one fixture of every variant shape: no
+    /// `configDir`, an empty one, a relative one, `~/`, an absolute one under
+    /// and outside `~/.cc-mirror`, no `variant.json`, unparseable JSON, a wrong
+    /// field type, and a `projects` that is a file.
+    #[test]
+    fn cc_mirror_roots_match_the_engines_discovery() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        let mirror = home.join(".cc-mirror");
+        let outside = home.join("outside");
+        let inside = mirror.join("shared");
+        for dir in [&outside, &inside] {
+            std::fs::create_dir_all(dir.join("projects")).unwrap();
+        }
+        let variant = |name: &str, json: Option<String>, projects: bool| {
+            let dir = mirror.join(name);
+            std::fs::create_dir_all(dir.join("config")).unwrap();
+            if projects {
+                std::fs::create_dir_all(dir.join("config/projects")).unwrap();
+                std::fs::create_dir_all(dir.join("rel/projects")).unwrap();
+            }
+            if let Some(json) = json {
+                std::fs::write(dir.join("variant.json"), json).unwrap();
+            }
+        };
+        let with = |config: serde_json::Value| {
+            Some(serde_json::json!({ "configDir": config }).to_string())
+        };
+        variant("default", Some("{}".into()), true);
+        variant("empty", with("  ".into()), true);
+        variant("relative", with("rel".into()), true);
+        variant("tilde", with("~/outside".into()), true);
+        variant(
+            "absolute-outside",
+            with(outside.to_string_lossy().into()),
+            true,
+        );
+        variant(
+            "absolute-inside",
+            with(inside.to_string_lossy().into()),
+            true,
+        );
+        variant("no-json", None, true);
+        variant("bad-json", Some("not json".into()), true);
+        variant("wrong-type", with(serde_json::json!(5)), true);
+        variant("wrong-name-type", Some(r#"{"name": 5}"#.into()), true);
+        variant("no-projects", Some("{}".into()), false);
+        let file_variant = mirror.join("projects-is-a-file");
+        std::fs::create_dir_all(file_variant.join("config")).unwrap();
+        std::fs::write(file_variant.join("variant.json"), "{}").unwrap();
+        std::fs::write(file_variant.join("config/projects"), "x").unwrap();
+
+        let enabled = std::collections::HashSet::from([tokscale_core::ClientId::Claude]);
+        let mut engine: Vec<PathBuf> = tokscale_core::scanner::built_in_extra_scan_paths_for(
+            &home.to_string_lossy(),
+            &enabled,
+        )
+        .into_iter()
+        .map(|(_, path)| path)
+        .filter(|path| path.starts_with(&mirror))
+        .collect();
+        let mut ours = cc_mirror_roots(home);
+        engine.sort();
+        ours.sort();
+        assert!(!engine.is_empty(), "fixture: the engine found nothing");
+        assert_eq!(ours, engine);
+        // Control: the fixture really contains shapes the engine skips and
+        // roots it takes from outside `~/.cc-mirror`.
+        assert!(engine.len() < 11);
+        assert!(tokscale_core::scanner::built_in_extra_scan_paths_for(
+            &home.to_string_lossy(),
+            &enabled
+        )
+        .iter()
+        .any(|(_, path)| !path.starts_with(&mirror)));
+    }
+
     /// The primary's roots are read from the disk once per call, not once per
     /// entry: `check` over several entries reads once, over none reads not at
     /// all. Mutation: build the roots inside the loop.
     #[test]
     fn the_primary_roots_are_read_once_per_check() {
         let tmp = tempfile::tempdir().unwrap();
-        let reads = || FOR_HOME_READS.with(std::cell::Cell::get);
+        let reads = || FOR_HOME_CALLS.with(std::cell::Cell::get);
         let before = reads();
         let many: Vec<String> = (0..5).map(|i| format!("/x/account-{i}")).collect();
         check(&many, Some(tmp.path()));
