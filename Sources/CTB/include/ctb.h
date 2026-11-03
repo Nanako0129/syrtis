@@ -206,7 +206,8 @@ char *tb_set_antigravity_binding(const char *json);
 // where `key` = hex(SHA-256("antigravity-account\0" + Google sub)) and
 // `label` is the login's email (or "Antigravity account"). Nothing is written
 // unless Google's refresh response carries an id_token with the stored sub
-// (else account_mismatch). `err` is exactly one
+// (account_mismatch when it names another account, invalid_credential_format
+// when there is no usable id_token). `err` is exactly one
 // fixed code: agy_not_signed_in, agy_login_unreadable,
 // agy_login_missing_identity, oauth_client_not_found, oauth_client_rejected,
 // refresh_rejected, refresh_unreachable, account_mismatch,
@@ -281,7 +282,12 @@ char *tb_set_keychain_consent(const char *json);
 // left untouched, and the appDir in use until then is re-checked before it
 // is cleaned. Success data is `{"enabled","appDir":str|null,
 // "profiles":[{"id","dir"}],"cliTakeoverConfirmed","removedFiles":N,
-// "cleanupFailed":bool,"cleanupFailedProfiles":[id]}`; each id is `default`
+// "cleanupFailed":bool,"cleanupFailedProfiles":[id],
+// "rejectedProfiles":[{"index","reason"}]}`; a profile whose root is Cursor's
+// own folder (`cursor_default`) or repeats an earlier entry (`duplicate`;
+// same path or same directory) is left out and listed by its index in the
+// pushed list, while the default and the other profiles are registered.
+// Each id of `cleanupFailedProfiles` is `default`
 // or `<UUID>` (that profile's files could not all be deleted),
 // `cursor-profiles` (the parent folder of the added profiles could not be
 // read), or `appDir` (the appDir in use until this push now fails the
@@ -301,9 +307,12 @@ char *tb_set_cursor_sync(const char *json);
 // `{"state":"ok|partial|expired|notSignedIn|offline|error|disabled|cliPresent",
 // "events":N,"lastSuccessMs":ms|null,"reason"?:"<fixed code>","changed":bool,
 // "profiles":[{"id","state","events","lastSuccessMs","reason"?,
-// "duplicateOf"?}]}`. `changed`: some profile wrote its file (every
-// successful walk rewrites it; scan caches were invalidated, refresh views
-// whatever the headline state). A profile whose account an earlier profile
+// "duplicateOf"?}],"cleanupFailedProfiles":[id]}`. `changed`: a usage file's
+// bytes changed (written with new content, or a duplicate profile's old
+// account file removed); a walk whose bytes equal the file's only touches its
+// modified time and is not a change. Scan caches were invalidated; refresh
+// views whatever the headline state. `cleanupFailedProfiles`: profiles whose
+// stale usage file (a duplicate's old account) could not be deleted. A profile whose account an earlier profile
 // already covered this round is `duplicate` with `duplicateOf` = that
 // profile's id. Every walk failure covers its account except one specific to
 // that profile's session or to this machine: expired (local expiry, 401,
