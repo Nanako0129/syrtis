@@ -319,7 +319,6 @@
 "Sync usage from the Cursor app." = "同步 Cursor 应用的用量。";
 "Add" = "添加";
 "Folder not found. Kept in case the drive is disconnected or the path needs fixing." = "找不到这个目录。先保留，以防磁盘没有连接或路径需要修正。";
-"Syrtis doesn't use this folder." = "Syrtis 不会使用这个目录。";
 
 /* ===== 设置：说明文字 ===== */
 "Spins faster as the live token rate climbs (idle 2 fps, 1M tokens/min tops out at 40 fps)." = "实时 token 速率越高，转得越快（空闲时 2 fps；达到每分钟 100 万 token 时，上限为 40 fps）。";
@@ -339,7 +338,6 @@
 "You can also drag the bottom edge of the popover. Auto uses about 60% of your screen height." = "也可以直接拖动弹出窗口底部。“自动”约为屏幕高度的 60%。";
 "How often Syrtis rereads all logs in full. In between, new activity still shows up within 5 minutes." = "Syrtis 多久完整重读一次所有日志。两次之间，新的用量仍会在 5 分钟内出现。";
 "Syrtis started as a fork of tokcat by handlecusion. Log parsing and pricing come from tokscale by Junho Yeo, the menu bar design draws on CodexBar by Peter Steinberger, and the running cat comes from RunCat by Takuto Nakamura. MIT licensed." = "Syrtis 最初是从 handlecusion 的 tokcat 分支出来的。日志解析和计价来自 Junho Yeo 的 tokscale；菜单栏设计参考 Peter Steinberger 的 CodexBar；奔跑的猫来自 Takuto Nakamura 的 RunCat。采用 MIT 授权。";
-"For another Claude account, run Claude Code with CLAUDE_CONFIG_DIR set to its own folder and add that folder here. Its usage joins your totals; accounts aren't shown separately." = "另一个 Claude 账户：用 CLAUDE_CONFIG_DIR 指定它自己的目录来运行 Claude Code，再把该目录添加到这里。它的用量会计入总计，不会按账户分别显示。";
 "Directories of Pi session-format JSONL files. Usage-only exports from headless runners are counted, and full Pi sessions also work." = "Pi 会话格式 JSONL 文件的目录。无界面运行器写出的纯用量导出也会计入，完整的 Pi 会话同样适用。";
 "Only assistant usage contributes. Roots merge into the Pi total; there is no per-root breakdown." = "只有助手用量会计入。各根目录的用量会合并进 Pi 总计，不会分别显示。";
 "%lld of %lld folders can't be read right now; Syrtis will retry on the next scan." = "%2$lld 个目录中有 %1$lld 个暂时无法读取，下次扫描会再试。";
@@ -701,3 +699,18 @@
 "Percentage and reset time" = "百分比与重置倒计时";
 "Compact two-line" = "紧凑双行";
 "Resetting" = "重置中";
+"This folder can't be used: no folder was chosen." = "这个文件夹无法使用：没有选择文件夹。";
+"This folder can't be used: its path isn't a full path." = "这个文件夹无法使用：它的路径不是完整路径。";
+"This folder can't be used: it is the top-level folder (/)." = "这个文件夹无法使用：它是最顶层的文件夹 (/)。";
+"This folder can't be used: Syrtis couldn't find your home folder to check it." = "这个文件夹无法使用：Syrtis 找不到你的个人文件夹，无法检查它。";
+"This folder can't be used: it is your home folder." = "这个文件夹无法使用：它是你的个人文件夹。";
+"This folder can't be used: it is your home folder or contains it." = "这个文件夹无法使用：它是你的个人文件夹，或包含你的个人文件夹。";
+"This folder can't be used: it is, contains or sits inside folders Syrtis already reads for your main Claude account." = "这个文件夹无法使用：它就是、包含或位于 Syrtis 已为你的主要 Claude 账户读取的文件夹之内。";
+"This folder can't be used: it is already in the list." = "这个文件夹无法使用：它已经在列表中。";
+"This folder can't be used: it contains, or sits inside, another folder in the list." = "这个文件夹无法使用：它包含列表中的另一个文件夹，或位于其中。";
+"This folder can't be used: the list already has 8 folders." = "这个文件夹无法使用：列表已有 8 个文件夹。";
+"This folder can't be used: Syrtis couldn't check it." = "这个文件夹无法使用：Syrtis 无法检查它。";
+"For another Claude account, run Claude Code with CLAUDE_CONFIG_DIR set to its own folder and add that folder here. Each folder you add gets its own Claude card, and its usage also joins your totals." = "另一个 Claude 账户：用 CLAUDE_CONFIG_DIR 指定它自己的文件夹来运行 Claude Code，再把该文件夹添加到这里。你添加的每个文件夹都会有自己的 Claude 卡片，它的用量也会并入总计。";
+"To show a folder's limits, Syrtis reads the Keychain item Claude Code keeps for it, named Claude Code-credentials- followed by 8 characters derived from the folder's path. macOS may ask you to allow this. Syrtis doesn't log the sign-in." = "为了显示文件夹的额度，Syrtis 会读取 Claude Code 为它保存的钥匙串项目，名称是 Claude Code-credentials- 后面接 8 个由文件夹路径算出的字符。macOS 可能会请你允许这项访问。Syrtis 不会把登录信息写入日志。";
+"Syrtis sends the sign-in's access token to api.anthropic.com to ask for the usage. Once that token has expired, Syrtis sends the refresh token to platform.claude.com for a new one and writes the new sign-in back into the same Keychain item." = "Syrtis 会把登录的访问令牌发送到 api.anthropic.com 查询用量。令牌过期后，Syrtis 会把刷新令牌发送到 platform.claude.com 换取新的，并把新的登录写回同一个钥匙串项目。";
+"Some downloaded Cursor usage that is no longer needed couldn't be deleted. Syrtis tries again when it starts and when you change these settings." = "部分已不再需要的 Cursor 用量数据无法删除。Syrtis 会在启动时，以及你更改这些设置时再试一次。";

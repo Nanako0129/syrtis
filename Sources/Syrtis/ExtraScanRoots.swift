@@ -57,6 +57,19 @@ enum ExtraScanRoots {
                 || home.hasPrefix(standardized + "/")
         }
 
+        /// The refusal reason code for adding `path` after `existing`, or nil.
+        /// Path-only like `isRejectedRoot`. Codes share `AccountsCopy.refusalSentence`
+        /// with the Claude list: `empty_path`, `filesystem_root`, `duplicate`,
+        /// and `home_or_ancestor` for home or a folder containing it.
+        static func refusal(adding path: String, to existing: [String]) -> String? {
+            let standardized = standardizedPath(path)
+            if standardized.isEmpty { return "empty_path" }
+            if standardized == "/" { return "filesystem_root" }
+            if isRejectedRoot(path) { return "home_or_ancestor" }
+            if existing.map(standardizedPath).contains(standardized) { return "duplicate" }
+            return nil
+        }
+
         /// Probe paths off the main actor on the setter's serial queue. A probe
         /// issued right after a save can run before that save's install, which
         /// `apply` enqueues from a later main-actor task.
@@ -93,12 +106,34 @@ enum ExtraScanRoots {
         }
 
         static func isRejectedRoot(_ path: String) -> Bool { Pi.isRejectedRoot(path) }
+        static func refusal(adding path: String, to existing: [String]) -> String? {
+            Pi.refusal(adding: path, to: existing)
+        }
         static func missingRoots(
             in paths: [String],
             then completion: @escaping @Sendable @MainActor (Set<String>) -> Void
         ) {
             Pi.missingRoots(in: paths, then: completion)
         }
+    }
+
+    /// What an Add click on any of the three lists produces: the list, and the
+    /// fixed sentence to show under the button when the folder was refused.
+    /// Decided here, off the view, so a test can observe the sentence.
+    struct AddOutcome: Equatable {
+        let list: [String]
+        let refusalLine: String?
+    }
+
+    /// `refusal` is the list's own rule (`ClaudeExtraRoots.refusal(adding:to:)`,
+    /// `Pi.refusal`, `Dsh.refusal`); a refused folder is not added.
+    static func add(
+        _ path: String, to list: [String], refusal: (String, [String]) -> String?
+    ) -> AddOutcome {
+        if let code = refusal(path, list) {
+            return AddOutcome(list: list, refusalLine: AccountsCopy.refusalSentence(code))
+        }
+        return AddOutcome(list: list + [path], refusalLine: nil)
     }
 
     /// The complete payload for all clients.

@@ -21,6 +21,36 @@ private final class UncheckedBox<Value>: @unchecked Sendable {
     init(_ value: Value) { self.value = value }
 }
 
+/// The values of some standard-domain keys, put back later. Checks that reset
+/// or overwrite the Accounts page's preferences (`resetAppliedForTesting`
+/// removes the applied-roots key outright) would otherwise leave the
+/// developer's own defaults deleted after a run.
+struct DefaultsSnapshot {
+    private let defaults: UserDefaults
+    private let saved: [(key: String, value: Any?)]
+
+    init(keys: [String], defaults: UserDefaults = .standard) {
+        self.defaults = defaults
+        saved = keys.map { ($0, defaults.object(forKey: $0)) }
+    }
+
+    /// Set each key back to what it held, or remove it if it held nothing.
+    func restore() {
+        for (key, value) in saved {
+            if let value { defaults.set(value, forKey: key) } else { defaults.removeObject(forKey: key) }
+        }
+    }
+
+    /// The Accounts page's keys, every one a check there may delete.
+    @MainActor static let accountsKeys = [
+        ClaudeExtraRoots.storageKey, ClaudeExtraRoots.generationKey, ClaudeExtraRoots.appliedKey,
+        ClaudeExtraRoots.appliedConfigDirsKey, ExtraScanRoots.Pi.storageKey, ExtraScanRoots.Dsh.storageKey,
+        AntigravityAccounts.storageKey, AntigravityAccounts.removedKeysKey, AntigravityAutoCapture.enabledKey,
+        AntigravityAutoCapture.currentKey, CursorSync.enabledKey, CursorSync.noticeKey, CursorSync.takeoverKey,
+        CursorSync.profilesKey,
+    ]
+}
+
 @MainActor
 private final class ChartEventReceiver: NSResponder {
     var scrollEvent: NSEvent?
@@ -927,6 +957,8 @@ private struct DashboardModelTestObservation: Sendable {
 enum SelfTest {
     @MainActor static func run() -> Never {
         var failures = 0
+        // Put back at the end, whatever the checks below delete (MA-46).
+        let accountsDefaults = DefaultsSnapshot(keys: DefaultsSnapshot.accountsKeys)
         func expect(_ condition: @autoclosure () -> Bool, _ label: String) {
             if condition() {
                 print("ok   \(label)")
@@ -17495,7 +17527,7 @@ enum SelfTest {
                 .allSatisfy(agyDetails.contains)
                 && ["refresh token to Google's token service", "macOS may ask"]
                     .allSatisfy(AccountsCopy.confirmBody.contains)
-                && AccountsCopy.claudeDetails.contains("CLAUDE_CONFIG_DIR")
+                && AccountsCopy.claudeDetails.joined(separator: "\n").contains("CLAUDE_CONFIG_DIR")
                 && AccountsCopy.dsh == "DeepSeek Harness"
                 && AccountsCopy.dshDetails.contains("<DSH_HOME>/sessions")
                 && AccountsCopy.translated.contains(AccountsCopy.dshSummary)
@@ -17508,6 +17540,80 @@ enum SelfTest {
                 && AccountsCopy.autoToggleGroup(autoCaptureOn: false) == [AccountsCopy.autoOn, AccountsCopy.autoOff]
                 && AccountsCopy.page == SettingsPanel.Page.accounts.rawValue,
             "ACCOUNTS-PAGE Antigravity details keep the keychain / token-service / revoke facts and Claude details keep the CLAUDE_CONFIG_DIR instructions")
+
+        // Claude ⓘ (MA-25): the four questions a user asks of a credential
+        // read, and no claim that accounts aren't shown separately (each folder
+        // has its own window card).
+        let claudeInfo = AccountsCopy.claudeDetails.joined(separator: "\n")
+        expect(
+            ["Claude Code-credentials-", "macOS may ask", "doesn't log", "api.anthropic.com",
+             "platform.claude.com", "same Keychain item", "its own Claude card"].allSatisfy(claudeInfo.contains)
+                && !claudeInfo.contains("aren't shown separately"),
+            "ACCOUNTS-PAGE the Claude details name the Keychain item, that it is not logged, where the tokens go and the write-back, and drop 'accounts aren't shown separately'")
+
+        // MA-45: every string the Accounts page draws is in `translated`, found
+        // through the behavior that produces it where there is one.
+        let agyCodes = ["agy_not_signed_in", "agy_login_unreadable", "agy_login_missing_identity",
+                        "oauth_client_not_found", "oauth_client_rejected", "refresh_rejected",
+                        "refresh_unreachable", "account_mismatch", "invalid_credential_format",
+                        "keychain_write_failed", "keychain_delete_failed", "anything_else"]
+        let agyMessages = agyCodes.map { AntigravityAccounts.message(for: TBCoreError.bridge($0)) }
+            + [AntigravityAccounts.message(for: CocoaError(.fileNoSuchFile))]
+        let viewStrings = [AccountsCopy.folderMissing, AccountsCopy.addConfigDir, AccountsCopy.addFolder,
+                           AccountsCopy.addPrompt, AccountsCopy.removeHelp, AccountsCopy.unreadableFolders,
+                           AccountsCopy.rejectedPaths, AccountsCopy.capturing, AccountsCopy.captureCurrent,
+                           AccountsCopy.autoPaused, AccountsCopy.autoUnavailable, AccountsCopy.removeNamed,
+                           CursorSync.Copy.orphanCleanupFailed, CursorSync.Copy.cleanupFailed]
+        let outsideTranslated = (agyMessages + viewStrings + AccountsCopy.refusalCodes.map(AccountsCopy.refusalSentence))
+            .filter { !AccountsCopy.translated.contains($0) }
+        expect(outsideTranslated.isEmpty,
+               "ACCOUNTS-PAGE every Accounts string is in AccountsCopy.translated; outside: \(outsideTranslated)")
+
+        // MA-42/45: one fixed sentence per reason code, never a path. A refused
+        // add shows it and saves nothing; an accepted add shows none. Claude
+        // asks the core, Pi and DSH their own rule. Mutation: the line dropped
+        // from a refusal.
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        let sentence = AccountsCopy.refusalSentence
+        let addClaude = { (path: String, list: [String]) in
+            ExtraScanRoots.add(path, to: list, refusal: ClaudeExtraRoots.refusal(adding:to:))
+        }
+        let addPi = { (path: String, list: [String]) in
+            ExtraScanRoots.add(path, to: list, refusal: ExtraScanRoots.Pi.refusal(adding:to:))
+        }
+        let addDsh = { (path: String, list: [String]) in
+            ExtraScanRoots.add(path, to: list, refusal: ExtraScanRoots.Dsh.refusal(adding:to:))
+        }
+        let listed = ["/tmp/syrtis-selftest-accounts/a"]
+        let fresh = "/tmp/syrtis-selftest-accounts/b"
+        expect(
+            Set(AccountsCopy.refusalSentences).count == AccountsCopy.refusalCodes.count
+                && addClaude(home, listed) == .init(list: listed, refusalLine: sentence("home_directory"))
+                && addClaude(home + "/.claude", listed) == .init(list: listed, refusalLine: sentence("primary_scan_root"))
+                && addClaude(listed[0], listed) == .init(list: listed, refusalLine: sentence("duplicate"))
+                && addClaude(listed[0] + "/inner", listed) == .init(list: listed, refusalLine: sentence("overlap"))
+                && addClaude("relative/dir", listed) == .init(list: listed, refusalLine: sentence("not_absolute"))
+                && addClaude(fresh, listed) == .init(list: listed + [fresh], refusalLine: nil)
+                && addPi(home, listed) == .init(list: listed, refusalLine: sentence("home_or_ancestor"))
+                && addPi((home as NSString).deletingLastPathComponent, listed)
+                    == .init(list: listed, refusalLine: sentence("home_or_ancestor"))
+                && addPi("/", listed) == .init(list: listed, refusalLine: sentence("filesystem_root"))
+                && addPi(listed[0], listed) == .init(list: listed, refusalLine: sentence("duplicate"))
+                && addPi(fresh, listed) == .init(list: listed + [fresh], refusalLine: nil)
+                && addDsh(home, listed) == .init(list: listed, refusalLine: sentence("home_or_ancestor"))
+                && addDsh(listed[0], listed) == .init(list: listed, refusalLine: sentence("duplicate"))
+                && addDsh(fresh, listed) == .init(list: listed + [fresh], refusalLine: nil),
+            "ACCOUNTS-PAGE a refused add of a Claude, Pi or DSH folder shows its reason's fixed sentence and saves nothing; an accepted add shows none")
+
+        // MA-42: a Remove button is named by the row's whole label, so two rows
+        // sharing a last path component never share a name. Mutation: the last
+        // component only.
+        let sameName = [CursorSync.Profile(id: "A", root: "/Volumes/one/work"),
+                        CursorSync.Profile(id: "B", root: "/Volumes/two/work")]
+        let removeNames = sameName.map { AccountsCopy.removeName(CursorSync.rowLabel($0)) }
+        expect(Set(removeNames).count == 2 && removeNames.allSatisfy { $0.hasPrefix(AccountsCopy.removeName("")) }
+                   && removeNames[0].contains("/Volumes/one/work"),
+               "ACCOUNTS-PAGE Remove buttons are named 'Remove <whole row label>' so two rows never share a name; got \(removeNames)")
 
         // MARK: - M3: a Claude card is addressed by (clientId, accountKey)
 
@@ -18185,31 +18291,45 @@ enum SelfTest {
         expect(cursorOrder == ["on", "off"],
                "CURSOR-SYNC rapid on->off reaches the core in order, ending off; got \(String(describing: cursorOrder))")
 
+        // The core defines `changed` (a usage file's bytes changed); the app
+        // refreshes exactly on it. The same history synced again reports
+        // `changed:false` and must reload nothing. Mutation: refresh on every
+        // successful round.
         let cursorRefresh: [Bool]? = awaitMainActorValue {
             let suite = "tokenbar.selftest.cursorSyncRefresh"
             let defaults = UserDefaults(suiteName: suite)!
             defer { defaults.removePersistentDomain(forName: suite) }
             defaults.removePersistentDomain(forName: suite)
             defaults.set(true, forKey: CursorSync.noticeKey)
-            let ok = try? JSONDecoder().decode(
-                CursorSyncStatus.self, from: Data(#"{"state":"ok","events":7,"lastSuccessMs":1,"changed":true}"#.utf8))
-            let sync: @Sendable (Bool) -> CursorSyncStatus? = { _ in ok }
+            let status = { (changed: Bool) in
+                try? JSONDecoder().decode(
+                    CursorSyncStatus.self,
+                    from: Data(#"{"state":"ok","events":7,"lastSuccessMs":1,"changed":\#(changed)}"#.utf8))
+            }
+            let next = UncheckedBox<CursorSyncStatus?>(status(true))
+            let sync: @Sendable (Bool) -> CursorSyncStatus? = { _ in next.value }
             let generation = { UserDefaults.standard.integer(forKey: ClaudeExtraRoots.generationKey) }
             let controller = CursorSyncController()
             let g0 = generation()
             await controller.runSync(explicit: true, defaults: defaults, arguments: ["Syrtis"], sync: sync)
             let first = generation() != g0
+            // Same count, bytes changed: still a refresh.
             let g1 = generation()
             await controller.runSync(explicit: true, defaults: defaults, arguments: ["Syrtis"], sync: sync)
-            let sameAgain = generation() != g1
+            let sameCountChanged = generation() != g1
+            next.value = status(false)
+            let g2 = generation()
+            await controller.runSync(explicit: true, defaults: defaults, arguments: ["Syrtis"], sync: sync)
+            let identical = generation() != g2
             defaults.set(false, forKey: CursorSync.enabledKey)
             controller.reconfigure(refresh: false, defaults: defaults, arguments: ["Syrtis"], bundleID: "x.y",
                                    setConfig: { _ in false }, sync: sync)
             defaults.set(true, forKey: CursorSync.enabledKey)
-            let g2 = generation()
+            next.value = status(true)
+            let g3 = generation()
             await controller.runSync(explicit: true, defaults: defaults, arguments: ["Syrtis"], sync: sync)
-            let afterOffOn = generation() != g2
-            return [first, sameAgain, afterOffOn]
+            let afterOffOn = generation() != g3
+            return [first, sameCountChanged, identical, afterOffOn]
         }
         // A sync result that returns after sync was turned off is discarded.
         // Mutation: drop the generation/shouldSync check after the await.
@@ -18382,6 +18502,44 @@ enum SelfTest {
         }
         expect(cursorCleanup == [false, true, true, true, false, false],
                "CURSOR-SYNC a failed off cleanup is reported until an off cleanup succeeds; got \(String(describing: cursorCleanup))")
+        // MA-21: an accepted ON push whose orphan cleanup failed is shown
+        // (`orphanCleanupFailed`), cleared by the next accepted on push that
+        // succeeds, untouched by a rejected push, and reset when sync turns
+        // off. The line under the switch follows the switch. Mutations: drop
+        // the `run` assignment; show the off line while on.
+        let cursorOrphan: [Bool]? = awaitMainActorValue {
+            let suite = "tokenbar.selftest.cursorSyncOrphan"
+            let defaults = UserDefaults(suiteName: suite)!
+            defer { defaults.removePersistentDomain(forName: suite) }
+            defaults.removePersistentDomain(forName: suite)
+            defaults.set(true, forKey: CursorSync.noticeKey)
+            let none: @Sendable (Bool) -> CursorSyncStatus? = { _ in nil }
+            let controller = CursorSyncController()
+            var seen: [Bool] = []
+            let push: (Bool, Bool?) async -> Void = { on, result in
+                defaults.set(on, forKey: CursorSync.enabledKey)
+                let landed = UncheckedBox<Bool>(false)
+                controller.reconfigure(refresh: false, defaults: defaults, arguments: ["Syrtis"], bundleID: "x.y",
+                                       setConfig: { _ in landed.value = true; return result }, sync: none)
+                for _ in 0..<200 where !landed.value { try? await Task.sleep(nanoseconds: 10_000_000) }
+                try? await Task.sleep(nanoseconds: 50_000_000)
+            }
+            await push(true, true); seen.append(controller.orphanCleanupFailed)
+            await push(true, nil); seen.append(controller.orphanCleanupFailed)
+            await push(true, false); seen.append(controller.orphanCleanupFailed)
+            await push(true, true)
+            await push(false, false); seen.append(controller.orphanCleanupFailed)
+            return seen
+        }
+        expect(cursorOrphan == [true, true, false, false],
+               "CURSOR-SYNC an on-push orphan cleanup failure is shown until an on push succeeds; got \(String(describing: cursorOrphan))")
+        expect(CursorSync.cleanupLine(syncOn: true, cleanupFailed: false, orphanCleanupFailed: true)
+                   == CursorSync.Copy.orphanCleanupFailed.localized
+                && CursorSync.cleanupLine(syncOn: true, cleanupFailed: true, orphanCleanupFailed: false) == nil
+                && CursorSync.cleanupLine(syncOn: false, cleanupFailed: true, orphanCleanupFailed: true)
+                    == CursorSync.Copy.cleanupFailed.localized
+                && CursorSync.cleanupLine(syncOn: false, cleanupFailed: false, orphanCleanupFailed: true) == nil,
+               "CURSOR-SYNC the cleanup line under the switch follows the switch (on: orphan failure; off: off-push failure)")
         // The real FFI, so the Swift decode of `cleanupFailed` is exercised:
         // a read-only dir refuses the delete. Isolation (CMP-520 13b): a
         // SelfTest-only bundle id under a temporary HOME, so an off push can
@@ -18631,8 +18789,8 @@ enum SelfTest {
             }
             expect(missing.isEmpty, "CURSOR-PROFILES Accounts page Cursor section copy resolves in \(locale): missing \(missing)")
         }
-        expect(cursorRefresh == [true, true, true],
-               "CURSOR-SYNC every round that wrote refreshes, including two in a row with the same count, and after off->on; got \(String(describing: cursorRefresh))")
+        expect(cursorRefresh == [true, true, false, true],
+               "CURSOR-SYNC a round refreshes exactly when the core reports changed (including two in a row with the same count and after off->on) and an identical rewrite reloads nothing; got \(String(describing: cursorRefresh))")
         // CMP-520 FIX 1: one profile wrote while another failed — the
         // headline is `error`, but the core changed the data, so the
         // dashboard refreshes. Mutation: refresh only on `state == "ok"`.
@@ -21366,6 +21524,28 @@ enum SelfTest {
 
         // Bundle rename: pure decision only; never moves a real bundle.
         BundleRename.selfTest { expect($0, $1) }
+
+        // The restore itself, on a scratch suite: a present key comes back
+        // after a delete or a change, an absent one stays absent. Mutation:
+        // restore only keys that held a value.
+        do {
+            let suite = "tokenbar.selftest.defaultsSnapshot"
+            let scratch = UserDefaults(suiteName: suite)!
+            defer { scratch.removePersistentDomain(forName: suite) }
+            scratch.removePersistentDomain(forName: suite)
+            scratch.set("kept", forKey: "present-deleted")
+            scratch.set("old", forKey: "present-changed")
+            let snapshot = DefaultsSnapshot(keys: ["present-deleted", "present-changed", "absent"], defaults: scratch)
+            scratch.removeObject(forKey: "present-deleted")
+            scratch.set("new", forKey: "present-changed")
+            scratch.set("created", forKey: "absent")
+            snapshot.restore()
+            expect(scratch.string(forKey: "present-deleted") == "kept"
+                       && scratch.string(forKey: "present-changed") == "old"
+                       && scratch.object(forKey: "absent") == nil,
+                   "DEFAULTS-SNAPSHOT restore puts back deleted and changed keys and removes ones that did not exist")
+        }
+        accountsDefaults.restore()
 
         if failures > 0 {
             print("\(failures) selftest check(s) failed")

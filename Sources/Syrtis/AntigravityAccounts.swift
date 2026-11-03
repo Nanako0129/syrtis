@@ -113,31 +113,20 @@ enum AntigravityAccounts {
     /// fixed code naming no account; it is mapped here and never shown raw.
     static func message(for error: Error) -> String {
         guard case let TBCoreError.bridge(code) = error else {
-            return "Something went wrong. Try again."
+            return AccountsCopy.agyGenericError
         }
         switch code {
-        case "agy_not_signed_in":
-            return "Couldn't read agy's login. Check that agy is signed in, and allow access if macOS asks."
-        case "agy_login_unreadable":
-            return "agy's saved login is in a format Syrtis doesn't recognize."
-        case "agy_login_missing_identity":
-            return "agy's saved login doesn't say which Google account it is. Sign agy in again, then try again."
-        case "oauth_client_not_found":
-            return "Couldn't match this login to the installed Antigravity or agy."
-        case "oauth_client_rejected", "refresh_rejected":
-            return "Google didn't accept this login. Sign agy in again, then try again."
-        case "refresh_unreachable":
-            return "Google couldn't be reached right now. Try again later."
-        case "account_mismatch":
-            return "Google answered for a different account. Nothing was saved."
-        case "invalid_credential_format":
-            return "The login had an unexpected format. Nothing was saved."
-        case "keychain_write_failed":
-            return "Couldn't save to the login keychain."
-        case "keychain_delete_failed":
-            return "Couldn't delete the copy from the login keychain."
-        default:
-            return "Something went wrong. Try again."
+        case "agy_not_signed_in": return AccountsCopy.agyNotSignedIn
+        case "agy_login_unreadable": return AccountsCopy.agyLoginUnreadable
+        case "agy_login_missing_identity": return AccountsCopy.agyMissingIdentity
+        case "oauth_client_not_found": return AccountsCopy.agyClientNotFound
+        case "oauth_client_rejected", "refresh_rejected": return AccountsCopy.agyRejected
+        case "refresh_unreachable": return AccountsCopy.agyUnreachable
+        case "account_mismatch": return AccountsCopy.agyMismatch
+        case "invalid_credential_format": return AccountsCopy.agyBadFormat
+        case "keychain_write_failed": return AccountsCopy.agyWriteFailed
+        case "keychain_delete_failed": return AccountsCopy.agyDeleteFailed
+        default: return AccountsCopy.agyGenericError
         }
     }
 }

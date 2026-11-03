@@ -7,10 +7,10 @@ import TokenBarCore
 /// account — `<dir>/projects` and `<dir>/transcripts` (D2 in the extra-root
 /// plan) — and is pushed to the Rust registry via `TBCore.setExtraScanPaths`.
 ///
-/// Usage from these roots merges into the single reported total; there is no
-/// per-account breakdown. Settings must say so explicitly (see
-/// `SettingsPanel`'s hint copy) so a user adding a second account does not
-/// expect a split view that does not exist.
+/// Usage from these roots merges into the single reported total (token
+/// counts have no per-account breakdown), while each folder's quota window is
+/// its own card with its own account pill (`configDirsPayloadJSON`). The
+/// Settings copy (`AccountsCopy.claudeDetails`) says both.
 enum ClaudeExtraRoots {
     static let storageKey = "tokenbar.claude.extraConfigDirs"
     /// Incremented once the core has accepted a new root set. Views observe

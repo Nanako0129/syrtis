@@ -187,6 +187,11 @@ enum CursorSync {
         static let useSyrtis = "Use Syrtis Sync"
         static let keepCLI = "Keep tokscale CLI Data"
         static let cleanupFailed = "Cursor sync is off, but some downloaded usage couldn't be deleted. Restart Syrtis to retry."
+        /// PENDING APPROVAL (`multi-account-mac-copy-draft.md`, section 5). An
+        /// accepted on push that could not finish the orphan cleanup
+        /// (`cursor_sync::set_from_json`: `cleanupFailed`); the next accepted
+        /// push, at launch or on any of these settings, runs it again.
+        static let orphanCleanupFailed = "Some downloaded Cursor usage that is no longer needed couldn't be deleted. Syrtis tries again when it starts and when you change these settings."
         /// The core refused the settings (`tb_set_cursor_sync` error): nothing syncs.
         static let configRejected = "Cursor sync couldn't be set up, so nothing is being synced."
         /// Accounts page, profile list (CMP-520). The default profile's row.
@@ -215,13 +220,14 @@ enum CursorSync {
         static let cantAdd = "That folder can't be added."
         /// A row whose own reason is permanent (`permanentReasons`).
         static let cantRead = "Syrtis can't read this folder's Cursor sign-in."
-        /// Accessibility label of a row's Remove button; `%@` is the folder name.
-        static let removeFolder = "Remove %@"
+        /// Accessibility label of a row's Remove button; `%@` is the row's label
+        /// (`rowLabel`), the whole folder and not its last component.
+        static let removeFolder = AccountsCopy.removeNamed
 
         static var all: [String] {
             [title, toggle, privacy, `continue`, cancel, turnOff, lastSynced, partial, expired, notSignedIn,
              offline, error, cliPresent, syncNow, syncing, cliQuestion, useSyrtis, keepCLI, cleanupFailed,
-             configRejected, defaultProfile, addProfile, duplicate, profilesPrivacy, cantAdd, cantRead,
+             configRejected, orphanCleanupFailed, defaultProfile, addProfile, duplicate, profilesPrivacy, cantAdd, cantRead,
              removeFolder]
         }
     }
@@ -233,6 +239,21 @@ enum CursorSync {
     static let permanentReasons: Set<String> = [
         "db_symlink", "db_not_file", "db_foreign_owner",
     ]
+
+    /// The cleanup failure to show under the switch. While the switch shows
+    /// off, the off push's (its copy says sync is off); while on, the on
+    /// push's orphan cleanup.
+    static func cleanupLine(syncOn: Bool, cleanupFailed: Bool, orphanCleanupFailed: Bool) -> String? {
+        if syncOn { return orphanCleanupFailed ? Copy.orphanCleanupFailed.localized : nil }
+        return cleanupFailed ? Copy.cleanupFailed.localized : nil
+    }
+
+    /// A profile's row label in Settings: its folder with the home directory
+    /// abbreviated. Also the name of its Remove button, whole, so two profiles
+    /// never share one.
+    static func rowLabel(_ profile: Profile) -> String {
+        (profile.root as NSString).abbreviatingWithTildeInPath
+    }
 
     /// A profile row's line: the duplicate note, the permanent-failure line,
     /// or the status line for its state.
@@ -278,6 +299,11 @@ final class CursorSyncController: ObservableObject {
     /// reset when the next off push starts and set from its outcome. Not
     /// persisted: the launch push of an off preference runs the cleanup again.
     @Published private(set) var cleanupFailed = false
+    /// The last accepted ON push could not finish deleting profile dirs no
+    /// longer listed (a removed profile's, or an earlier appDir's). Set and
+    /// cleared by each accepted on push; reset when sync turns off, where
+    /// `cleanupFailed` speaks instead.
+    @Published private(set) var orphanCleanupFailed = false
     /// The Settings switch was turned on and its confirmation is open. It gates
     /// that switch only: `confirmEnable()` enables nothing unless this is set.
     /// The Overview notice answers through `answerNotice`, a separate path.
@@ -321,7 +347,7 @@ final class CursorSyncController: ObservableObject {
         loop?.cancel()
         generation &+= 1
         // An off push retries the cleanup: hide the last failure until it reports.
-        if !run { state = nil; lastSuccessMs = nil; cleanupFailed = false; profileStates = [:] }
+        if !run { state = nil; lastSuccessMs = nil; cleanupFailed = false; orphanCleanupFailed = false; profileStates = [:] }
         let previous = configPush
         let push = Task { [weak self] in
             await previous?.value
@@ -338,9 +364,13 @@ final class CursorSyncController: ObservableObject {
                     self.state = nil
                 }
             }
-            // Only an off push's outcome sets it (the copy says sync is off;
-            // an on push deletes only orphaned profile dirs).
-            if !run, let failed { self?.cleanupFailed = failed }
+            // An off push's outcome is `cleanupFailed` (the copy says sync is
+            // off); an accepted on push's, which deletes only orphaned profile
+            // dirs, is `orphanCleanupFailed`. A rejected push (nil) ran no
+            // cleanup and leaves both as they were.
+            if let failed {
+                if run { self?.orphanCleanupFailed = failed } else { self?.cleanupFailed = failed }
+            }
         }
         configPush = push
         loop = Task { [weak self] in
@@ -392,9 +422,10 @@ final class CursorSyncController: ObservableObject {
             // A round that wrote a file already invalidated the core's
             // caches; refresh the views on `changed`, not on the headline (one
             // profile can write while another fails) and not on the event
-            // count (another profile can write the same count). Every
-            // successful walk rewrites its file, so this reloads the views
-            // after each successful sync, at most every 30 minutes.
+            // count (another profile can write the same count). The core
+            // reports `changed` only when a usage file's bytes changed (or a
+            // duplicate profile's old file was removed), so an unchanged
+            // history reloads nothing.
             if result.changed { Self.refreshModel() }
         } while rerunPending && CursorSync.shouldSync(defaults: defaults, arguments: arguments)
     }
