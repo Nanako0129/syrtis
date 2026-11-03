@@ -383,8 +383,11 @@ fn serialize_agent_usage_payload(
     })
 }
 
-/// Workers in rayon's global pool, which serves user-initiated calls (popover
-/// load, manual Refresh). tokscale-core uses rayon for parallel log parsing (55+
+/// Workers in rayon's global pool. It serves user-initiated calls (popover
+/// load, manual Refresh) and every utility-priority call that is not in
+/// `BACKGROUND_SCAN_ENTRIES` (the tail tick, agent usage, cursor sync, usage
+/// trace, the setters), and listed entries too if `BACKGROUND_POOL` fails to
+/// build. tokscale-core uses rayon for parallel log parsing (55+
 /// par_iter sites); the default pool size is num_cpus, which is fine for a
 /// one-shot CLI but ruinous for a resident menu-bar daemon: each idle worker
 /// busy-waits before parking, and every poll wakes the whole pool. Two keep
@@ -415,12 +418,22 @@ static RAYON_INIT: LazyLock<()> = LazyLock::new(|| {
 /// workers against 50.8 s at one (59.4 s and 57.4 s wall), and the title graph's
 /// 10 s window peaked at 82% of a core against 39%. A build failure falls back
 /// to the global pool.
+///
+/// The worker's QoS is set to utility when it starts, so its class does not
+/// depend on which thread happened to build the pool.
 static BACKGROUND_POOL: LazyLock<Option<rayon::ThreadPool>> = LazyLock::new(|| {
-    rayon::ThreadPoolBuilder::new()
+    let builder = rayon::ThreadPoolBuilder::new()
         .num_threads(1)
-        .thread_name(|i| format!("tb-background-{i}"))
-        .build()
-        .ok()
+        .thread_name(|i| format!("tb-background-{i}"));
+    #[cfg(target_os = "macos")]
+    let builder = builder.start_handler(|_| {
+        extern "C" {
+            fn pthread_set_qos_class_self_np(qos_class: u32, relative_priority: i32) -> i32;
+        }
+        // QOS_CLASS_UTILITY from <sys/qos.h>.
+        unsafe { pthread_set_qos_class_self_np(0x11, 0) };
+    });
+    builder.build().ok()
 });
 
 /// Whether the calling thread runs at utility or background QoS. Swift's
@@ -461,7 +474,6 @@ const BACKGROUND_SCAN_ENTRIES: &[&str] = &[
     "tb_model_report",
     "tb_hourly_report",
     "tb_agents_report",
-    "tb_window_usage",
 ];
 
 /// Run an FFI body on the pool that matches its entry and its caller's priority:
@@ -1937,6 +1949,30 @@ mod tests {
             .unwrap()
         };
         assert_eq!(RAYON_THREADS, 2);
+        // The background worker reports utility QoS whichever thread built the
+        // pool: build it from a user-initiated thread, then read the worker's
+        // class from inside the pool.
+        std::thread::spawn(|| {
+            assert_eq!(unsafe { pthread_set_qos_class_self_np(QOS_CLASS_USER_INITIATED, 0) }, 0);
+            LazyLock::force(&BACKGROUND_POOL);
+        })
+        .join()
+        .unwrap();
+        extern "C" {
+            fn pthread_self() -> *mut std::ffi::c_void;
+            fn pthread_get_qos_class_np(
+                thread: *mut std::ffi::c_void,
+                qos_class: *mut u32,
+                relative_priority: *mut i32,
+            ) -> i32;
+        }
+        let worker_class = BACKGROUND_POOL.as_ref().expect("background pool").install(|| {
+            let (mut class, mut relative) = (0u32, 0i32);
+            let rc = unsafe { pthread_get_qos_class_np(pthread_self(), &mut class, &mut relative) };
+            assert_eq!(rc, 0);
+            class
+        });
+        assert_eq!(worker_class, QOS_CLASS_UTILITY, "background worker QoS");
         for entry in BACKGROUND_SCAN_ENTRIES {
             assert_eq!(width_for(entry, QOS_CLASS_UTILITY), 1, "{entry} at utility");
             assert_eq!(
