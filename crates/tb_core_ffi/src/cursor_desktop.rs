@@ -203,6 +203,78 @@ pub(crate) fn normalized_stored_string(value: &str) -> Option<String> {
     Some(value.to_string())
 }
 
+// ---------------------------------------------------------------------------
+// Sealed access tokens (plan CURSOR-SS-M, Design 1). Cursor 3.27+ may store
+// `cursorAuth/accessToken` as `cursor-safe-storage:v1:<STANDARD base64 of an
+// Electron safeStorage blob>`. Classified after `normalized_stored_string`
+// has unquoted the row (`query_login`), so every consumer of
+// `CursorLogin.access_token` sees the same form.
+
+const SEALED_PREFIX: &str = "cursor-safe-storage:";
+const SEALED_V1_PREFIX: &str = "cursor-safe-storage:v1:";
+
+/// The key that opens a sealed token. On macOS the Safe Storage key; other
+/// platforms have no key source (a sealed token is refused there before any
+/// consent lookup), so their placeholder is never constructed. Not compiled
+/// here: the Windows build is checked at the next Windows vendor sync.
+#[cfg(target_os = "macos")]
+pub(crate) use crate::macos_safe_storage::Key;
+#[cfg(not(target_os = "macos"))]
+#[allow(dead_code)]
+pub(crate) struct Key;
+#[cfg(not(target_os = "macos"))]
+impl Key {
+    pub(crate) fn decrypt(&self, _: &[u8]) -> Result<String, String> {
+        Err(String::new())
+    }
+}
+
+/// What a stored access token is. Every refusal is a fixed reason code.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum StoredToken {
+    /// No `cursor-safe-storage:` prefix: used as stored; no key is involved.
+    Plain,
+    /// `cursor-safe-storage:v1:`: the decoded Electron blob (`v10…`).
+    Sealed(Vec<u8>),
+    /// `token_sealed_unsupported` / `token_sealed_unreadable`.
+    Refused(&'static str),
+}
+
+pub(crate) fn stored_token(token: &str) -> StoredToken {
+    use base64::Engine as _;
+    if !token.starts_with(SEALED_PREFIX) {
+        return StoredToken::Plain;
+    }
+    let Some(encoded) = token.strip_prefix(SEALED_V1_PREFIX) else {
+        return StoredToken::Refused("token_sealed_unsupported");
+    };
+    if cfg!(not(target_os = "macos")) {
+        return StoredToken::Refused("token_sealed_unsupported");
+    }
+    // One reason for every decode failure (review T10).
+    match base64::engine::general_purpose::STANDARD.decode(encoded) {
+        Ok(blob) => StoredToken::Sealed(blob),
+        Err(_) => StoredToken::Refused("token_sealed_unreadable"),
+    }
+}
+
+/// Decrypt a sealed blob. Any failure (wrong key, padding, length, version,
+/// UTF-8) is `token_sealed_unreadable`; the decrypt error text (which names
+/// Grok Bot) is never passed through.
+pub(crate) fn unseal(blob: &[u8], key: &Key) -> Result<String, &'static str> {
+    key.decrypt(blob).map_err(|_| "token_sealed_unreadable")
+}
+
+/// The claims of a token that looks like a Cursor session JWT: only
+/// `[A-Za-z0-9._-]` (it goes into a cookie) and a decodable payload. The
+/// check the usage sync's `token_user` and Grok Bot's fallback share.
+pub(crate) fn jwt_claims(token: &str) -> Option<Value> {
+    token
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+        .then(|| crate::agent_usage::jwt_payload(token))?
+}
+
 /// Cursor user ids look like `user_...` (20+ alphanumerics). Scan for the
 /// first occurrence rather than depending on the surrounding JSON shape.
 pub(crate) fn extract_user_id(text: &str) -> Option<String> {

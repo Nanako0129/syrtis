@@ -631,15 +631,17 @@ public enum TBCore {
     /// `{"<public-client-id>": true|false}`; full-replace semantics — `{}`
     /// clears every grant. A wired client absent from the registry is not read
     /// from the Keychain, so macOS cannot raise its authorization dialog for
-    /// that client before the app has asked the user itself. `grok-bot` is the
-    /// only wired client; Claude reads its own Keychain items ungated, so this
-    /// is not a process-wide no-dialog guarantee.
+    /// that client before the app has asked the user itself. `grok-bot` and
+    /// `cursor` (the usage sync's sealed token) are the wired clients; Claude
+    /// reads its own Keychain items ungated, so this is not a process-wide
+    /// no-dialog guarantee. Full-replace, so both answers travel together
+    /// (`GrokBotKeychainConsent.composedPayload`).
     ///
     /// The core registry is in-memory and starts empty every launch, so the
     /// app owns re-applying the stored answer at startup and after each edit —
     /// see `GrokBotKeychainConsent`. Not calling this at all is the correct
-    /// behaviour for a user who has not agreed: the Grok Bot item is left
-    /// untouched.
+    /// behaviour for a user who has not agreed: neither Keychain item is
+    /// touched.
     public static func setKeychainConsent(json: String) throws -> KeychainConsentResult {
         try unwrap(json.withCString { tb_set_keychain_consent($0) })
     }
