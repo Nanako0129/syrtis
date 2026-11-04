@@ -854,6 +854,43 @@ private let agentUsageTransportLogCategories: Set<String> = [
     "connect", "request", "responseBody", "rateLimited", "serverError",
 ]
 
+/// The HTTP status worth showing for a category: only 429 for `rateLimited`
+/// and only 5xx for `serverError`; anything else is dropped.
+private func agentUsageTransportStatus(category: String, status: Int64?) -> Int? {
+    guard let value = status else { return nil }
+    switch category {
+    case "rateLimited":
+        return value == 429 ? Int(exactly: value) : nil
+    case "serverError":
+        return (500...599).contains(value) ? Int(exactly: value) : nil
+    default:
+        return nil
+    }
+}
+
+/// The card's error line with the core's fixed transport category (or the HTTP
+/// status for rateLimited/serverError) inserted, so a screenshot is
+/// diagnosable. `text` is already localized; the code is never translated and
+/// `osCode` is never shown. An unlisted category leaves `text` unchanged.
+package func agentUsageErrorLine(_ text: String, diagnostic: AgentUsageTransportDiagnostic?) -> String {
+    guard let category = diagnostic?.category,
+          agentUsageTransportLogCategories.contains(category) else { return text }
+    let code = agentUsageTransportStatus(category: category, status: diagnostic?.status)
+        .map(String.init) ?? category
+    let tail = ". Retrying automatically."
+    if text.hasSuffix(tail), let dot = text.range(of: ". ") {
+        return text.replacingCharacters(in: dot, with: " (\(code)). ")
+    }
+    return text + " (\(code))"
+}
+
+extension AgentUsageSnapshot {
+    /// The error as every surface shows it: localized, then coded.
+    package var errorLine: String? {
+        error.map { agentUsageErrorLine($0.localized, diagnostic: transportDiagnostic) }
+    }
+}
+
 package func agentUsageTransportLogEntries(
     _ payload: AgentUsagePayload
 ) -> [AgentUsageTransportLogEntry] {
@@ -864,16 +901,7 @@ package func agentUsageTransportLogEntries(
             ? snapshot.clientId : "unknown"
         let isKnownCategory = agentUsageTransportLogCategories.contains(rawCategory)
         let category = isKnownCategory ? rawCategory : "unknown"
-        let status = diagnostic.status.flatMap { value -> Int? in
-            switch rawCategory {
-            case "rateLimited":
-                return value == 429 ? Int(exactly: value) : nil
-            case "serverError":
-                return (500...599).contains(value) ? Int(exactly: value) : nil
-            default:
-                return nil
-            }
-        }
+        let status = agentUsageTransportStatus(category: rawCategory, status: diagnostic.status)
         let osCode = isKnownCategory && rawCategory != "rateLimited"
             && rawCategory != "serverError"
             ? diagnostic.osCode.flatMap { Int32(exactly: $0) }

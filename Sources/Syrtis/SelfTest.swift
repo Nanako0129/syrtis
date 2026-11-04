@@ -5667,6 +5667,42 @@ enum SelfTest {
                 && opencodeTransport?.first?.category == "rateLimited"
                 && opencodeTransport?.first?.status == 429,
             "opencode transport diagnostics keep their client id")
+        func errorLine(_ error: String, _ diagnostic: String?) -> String? {
+            transportPayload(
+                transportBase.replacingOccurrences(of: "codex", with: "claude")
+                    + #","error":"\#(error)""# + (diagnostic.map { #","transportDiagnostic":\#($0)"# } ?? ""))?
+                .agents.first?.errorLine
+        }
+        let claudeFailed = "Claude usage request failed. Retrying automatically."
+        expect(
+            errorLine(claudeFailed, #"{"category":"tls","osCode":-9806}"#)
+                == "Claude usage request failed (tls). Retrying automatically.",
+            "quota error line inserts the transport category before the retry sentence")
+        expect(
+            errorLine(claudeFailed, #"{"category":"rateLimited","status":429}"#)
+                == "Claude usage request failed (429). Retrying automatically."
+                && errorLine(claudeFailed, #"{"category":"serverError","status":503}"#)
+                == "Claude usage request failed (503). Retrying automatically.",
+            "quota error line shows the status for rateLimited and serverError")
+        expect(
+            errorLine(claudeFailed, #"{"category":"serverError","status":200}"#)
+                == "Claude usage request failed (serverError). Retrying automatically.",
+            "quota error line never shows an invalid status")
+        expect(
+            errorLine("Claude OAuth usage endpoint is rate limited. Retrying automatically in ~5s.", #"{"category":"dns"}"#)
+                == "Claude OAuth usage endpoint is rate limited. Retrying automatically in ~5s. (dns)",
+            "quota error line appends the category when the retry shape does not hold")
+        expect(
+            errorLine(claudeFailed, #"{"category":"futureCategory","status":200}"#) == claudeFailed
+                && errorLine(claudeFailed, nil) == claudeFailed,
+            "quota error line is unchanged for an unknown category or no diagnostic")
+        expect(
+            agentUsageErrorLine("Claude 用量請求失敗，將自動重試。",
+                                diagnostic: transportPayload(
+                                    transportBase + #","transportDiagnostic":{"category":"tls"}"#)?
+                                    .agents.first?.transportDiagnostic)
+                == "Claude 用量請求失敗，將自動重試。 (tls)",
+            "quota error line keeps the untranslated code on a translated sentence")
         let malformedTransportBodies = [
             transportBase + #","transportDiagnostic":"not-an-object""#,
             transportBase + #","transportDiagnostic":{"status":500}"#,
