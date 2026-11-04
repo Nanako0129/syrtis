@@ -125,18 +125,21 @@ enum Smoke {
         // Rust tests call `set_from_json` directly and the Swift selftest
         // injects a fake setter, so a field-name or decoder mismatch would pass
         // both and only surface here.
-        summarize("grok-bot-keychain-consent") {
-            let granted = GrokBotKeychainConsent.answer() == true
-            let result = try TBCore.setKeychainConsent(
-                json: granted ? GrokBotKeychainConsent.grantedPayload : "{}")
-            guard result.grantedCount == (granted ? 1 : 0), result.rejected.isEmpty else {
+        // Both wired clients go in one composed payload (the app's own
+        // `composedPayload`), and the count checked is the one the composer's
+        // answers imply, so a client id the core does not wire shows up here
+        // as a rejection.
+        summarize("keychain-consent") {
+            let grok = GrokBotKeychainConsent.answer() == true
+            let cursor = GrokBotKeychainConsent.cursorAnswer() == true
+            let expected = GrokBotKeychainConsent.grantedCount()
+            let result = try TBCore.setKeychainConsent(json: GrokBotKeychainConsent.composedPayload())
+            guard result.grantedCount == expected, result.rejected.isEmpty else {
                 throw TBCoreError.bridge(
-                    "stored answer granted=\(granted) but registered "
+                    "stored answers grok-bot=\(grok) cursor=\(cursor) but registered "
                         + "\(result.grantedCount) with \(result.rejected.count) rejected")
             }
-            return granted
-                ? "consent granted, Keychain read allowed"
-                : "no consent stored, Keychain not read"
+            return "grok-bot \(grok ? "granted" : "not granted"), cursor \(cursor ? "granted" : "not granted")"
         }
 
         summarize("trace") {

@@ -715,3 +715,10 @@
 "To show a folder's limits, Syrtis reads the Keychain item Claude Code keeps for it, named Claude Code-credentials- followed by 8 characters derived from the folder's path. macOS may ask you to allow this. Syrtis doesn't log the sign-in." = "为了显示文件夹的额度，Syrtis 会读取 Claude Code 为它保存的钥匙串项目，名称是 Claude Code-credentials- 后面接 8 个由文件夹路径算出的字符。macOS 可能会请你允许这项访问。Syrtis 不会把登录信息写入日志。";
 "Syrtis sends the sign-in's access token to api.anthropic.com to ask for the usage. Once that token has expired, Syrtis sends the refresh token to platform.claude.com for a new one and writes the new sign-in back into the same Keychain item." = "Syrtis 会把登录的访问令牌发送到 api.anthropic.com 查询用量。令牌过期后，Syrtis 会把刷新令牌发送到 platform.claude.com 换取新的，并把新的登录写回同一个钥匙串项目。";
 "Some downloaded Cursor usage that is no longer needed couldn't be deleted. Syrtis will try again." = "部分已不再需要的 Cursor 用量数据无法删除。Syrtis 会再试一次。";
+
+/* Cursor encrypted sign-in (plan CURSOR-SS-M; disclosure is a draft until the device check) */
+"Cursor stores its sign-in encrypted. Syrtis needs your permission to read it." = "Cursor 以加密方式存储登录信息，Syrtis 需要你的同意才能读取。";
+"macOS didn't let Syrtis read Cursor's encrypted sign-in." = "macOS 没有允许 Syrtis 读取 Cursor 加密的登录信息。";
+"Press Sync Now to read Cursor's encrypted sign-in." = "按“立即同步”以读取 Cursor 加密的登录信息。";
+"Allow Keychain access…" = "允许访问钥匙串…";
+"Cursor 3.27 and later can store its sign-in encrypted. To read it, Syrtis needs the \"Cursor Safe Storage\" key from your Keychain. That key can decrypt everything Cursor stores encrypted; Syrtis uses it only to read the Cursor sign-in of the profiles listed here, keeps it in memory while Syrtis runs, and never saves or logs it. The sign-in is still sent only to cursor.com. Turning on Cursor sync does not grant this; macOS will ask you to allow Syrtis. If Cursor stores its sign-in unencrypted, nothing is asked." = "Cursor 3.27 及以后的版本可以用加密方式存储登录信息。为了读取它，Syrtis 需要钥匙串中的“Cursor Safe Storage”密钥。这把密钥能解开 Cursor 所有加密存储的数据；Syrtis 只用它读取这里列出的配置的 Cursor 登录信息，只在 Syrtis 运行期间保留在内存中，不会存储或记录。登录信息仍然只会发送到 cursor.com。开启 Cursor 同步不等于同意这项访问；macOS 会请你允许 Syrtis。如果 Cursor 没有加密存储登录信息，就不会询问。";

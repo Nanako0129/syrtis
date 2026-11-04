@@ -98,16 +98,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Same split for the same reason: the Keychain consent registry is
         // also an in-memory RwLock that starts empty, so Swift re-applies the
-        // user's stored answer. Only a granted answer makes a call — an empty
-        // registry already denies, which is exactly right both for someone who
-        // has not been asked and for someone who said no.
-        GrokBotKeychainConsent.applyIfGranted()
-
-        // Cursor desktop sync: the core switch is in-memory and starts off, so
-        // the stored preference is re-applied here, and the 30-minute schedule
-        // starts if the one-time notice was acknowledged. `--demo` reaches
-        // this point too; `reconfigure` makes no core call in any test mode.
-        CursorSyncController.shared.reconfigure(refresh: false)
+        // user's stored answers (Grok Bot and Cursor, composed into one
+        // full-replace payload). Only a payload with a grant makes a call — an
+        // empty registry already denies, which is exactly right both for
+        // someone who has not been asked and for someone who said no.
+        //
+        // Then Cursor desktop sync: the core switch is in-memory and starts
+        // off, so the stored preference is re-applied, and the 30-minute
+        // schedule starts if the one-time notice was acknowledged. `launch`
+        // installs the consent synchronously first (plan CURSOR-SS-M, Design
+        // 7), because the first sync round of the process may read Cursor's
+        // Keychain key and must already see the grant. `--demo` reaches this
+        // point too; `reconfigure` makes no core call in any test mode.
+        CursorSyncController.shared.launch()
 
         // Captured Antigravity accounts: same in-memory registry story. The
         // label resolver goes first so no card can render a key as its label.

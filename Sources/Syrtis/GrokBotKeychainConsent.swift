@@ -22,14 +22,45 @@ import TokenBarCore
 /// `UserDefaults` read/write, both of which are safe anywhere, and the smoke
 /// path calls it off the main actor. Only the wake-up needs the main actor,
 /// and it hops there explicitly.
+///
+/// **One owner for both wired clients** (plan CURSOR-SS-M, Design 6). The core
+/// registry is full-replace, so the Grok Bot answer and the Cursor answer
+/// (Cursor sync reading its encrypted sign-in) always travel together in one
+/// `composedPayload`; installing either alone would clear the other.
 enum GrokBotKeychainConsent {
     static let storageKey = "tokenbar.grokBot.keychainConsent"
+    /// The user's answer for Cursor's "Cursor Safe Storage" key, the same
+    /// three states as Grok Bot's.
+    static let cursorStorageKey = "tokenbar.cursorSync.keychainConsent"
 
     /// `object(forKey:) as? Bool` rather than `bool(forKey:)`, which cannot
     /// tell "no" from "not asked" — it answers `false` for both, and those two
     /// need different copy.
     static func answer(defaults: UserDefaults = .standard) -> Bool? {
         defaults.object(forKey: storageKey) as? Bool
+    }
+
+    static func cursorAnswer(defaults: UserDefaults = .standard) -> Bool? {
+        defaults.object(forKey: cursorStorageKey) as? Bool
+    }
+
+    /// Both stored answers as the core payload, read from `defaults` (the
+    /// store every writer here uses). Never asked and declined both send
+    /// `false`: the core stores grants only.
+    static func composedPayload(defaults: UserDefaults = .standard) -> String {
+        composed(defaults: defaults).payload
+    }
+
+    /// How many grants `composedPayload` carries: the core's `grantedCount`
+    /// for it (Smoke checks the two agree).
+    static func grantedCount(defaults: UserDefaults = .standard) -> Int {
+        [answer(defaults: defaults), cursorAnswer(defaults: defaults)].filter { $0 == true }.count
+    }
+
+    private static func composed(defaults: UserDefaults) -> (payload: String, grants: Bool) {
+        let grok = answer(defaults: defaults) == true
+        let cursor = cursorAnswer(defaults: defaults) == true
+        return (#"{"grok-bot":\#(grok),"cursor":\#(cursor)}"#, grok || cursor)
     }
 
     /// Record the user's answer and make it take effect now — BOTH answers.
@@ -60,19 +91,34 @@ enum GrokBotKeychainConsent {
     ) {
         defaults.set(granted, forKey: storageKey)
         if let setConsent {
-            apply(granted: granted, setConsent: setConsent)
+            apply(defaults: defaults, setConsent: setConsent)
         } else {
-            apply(granted: granted)
+            apply(defaults: defaults)
         }
     }
 
-    /// Re-install a previously granted answer into the core registry. Called
-    /// at launch, where only the granted case does anything: the registry
-    /// starts empty, so denying it again would be a call and a wake that
-    /// change nothing.
-    static func applyIfGranted(defaults: UserDefaults = .standard) {
-        guard answer(defaults: defaults) == true else { return }
-        apply(granted: true)
+    /// Record the user's Cursor answer. The caller installs it (`installNow`
+    /// before the explicit sync the Allow button starts, Design 7).
+    static func setCursorAnswer(_ granted: Bool, defaults: UserDefaults = .standard) {
+        defaults.set(granted, forKey: cursorStorageKey)
+    }
+
+    /// Withdraw a Cursor grant that did not produce access: the sync reports
+    /// `keychain_denied` (the user pressed Deny in the macOS dialog) on the
+    /// headline or on any profile. The stored answer becomes `false` and the
+    /// composed payload is installed at once, so "cursor" leaves the core
+    /// registry before the next round, which then shows the consent line
+    /// instead of reading again. Grok Bot's answer is carried unchanged.
+    static func revokeCursorIfDenied(
+        _ status: CursorSyncStatus,
+        defaults: UserDefaults = .standard,
+        setConsent: @escaping @Sendable (String) -> Void = coreSetConsent
+    ) {
+        let denied = status.reason == "keychain_denied"
+            || (status.profiles ?? []).contains { $0.reason == "keychain_denied" }
+        guard denied, cursorAnswer(defaults: defaults) == true else { return }
+        setCursorAnswer(false, defaults: defaults)
+        installNow(defaults: defaults, setConsent: setConsent)
     }
 
     /// Withdraw a grant that did not produce access.
@@ -103,15 +149,15 @@ enum GrokBotKeychainConsent {
         answer(false, defaults: defaults)
     }
 
-    /// Payloads for the one wired client. Exposed for the selftest, which
-    /// asserts the exact JSON rather than that "a call happened" — the core
-    /// rejects an unknown client id, so a typo here would produce a grant that
-    /// is never honoured and a card that never fills.
-    static let grantedPayload = #"{"grok-bot":true}"#
-    /// Full-replace with nothing, which is how the core spells "revoked".
-    static let deniedPayload = "{}"
+    /// The real setter. The selftest asserts the exact JSON `composedPayload`
+    /// produces rather than that "a call happened" — the core rejects an
+    /// unknown client id, so a typo would produce a grant that is never
+    /// honoured and a card that never fills.
+    static let coreSetConsent: @Sendable (String) -> Void = {
+        _ = try? TBCore.setKeychainConsent(json: $0)
+    }
 
-    /// Install the answer and make the quota cards notice.
+    /// Install both stored answers and make the quota cards notice.
     ///
     /// The setter is a parameter with the real one as its default, the same
     /// seam `ClaudeExtraRoots.install(setConfigDirs:setScanPaths:)` uses: the
@@ -122,37 +168,51 @@ enum GrokBotKeychainConsent {
     /// from a button on the MainActor and the queue hop costs nothing; sharing
     /// the shape with its sibling is worth more than saving it.
     static func apply(
-        granted: Bool = true,
-        setConsent: @escaping @Sendable (String) -> Void = {
-            _ = try? TBCore.setKeychainConsent(json: $0)
-        }
+        defaults: UserDefaults = .standard,
+        setConsent: @escaping @Sendable (String) -> Void = coreSetConsent
     ) {
-        let payload = granted ? grantedPayload : deniedPayload
-        applyQueue.async {
-            // Compared on the queue, not before it, or two fast clicks both
-            // read the same stale value and the later one is dropped. The
-            // registry starts empty every launch, so the initial `nil` means
-            // "denied" and a decline from a process that never granted
-            // correctly does nothing at all — no FFI call, no wake.
-            guard lastInstalledPayload != payload else { return }
-            let hadInstalled = lastInstalledPayload != nil
-            lastInstalledPayload = payload
-            guard granted || hadInstalled else { return }
-            setConsent(payload)
-            Task { @MainActor in
-                // Invalidate BEFORE signalling, the same order and for the
-                // same reason as `ClaudeExtraRoots.install`: a poll woken
-                // while the throttle still holds a payload is answered from
-                // the one built before consent existed, and the user watches
-                // the card sit unchanged for up to the throttle floor after
-                // clicking Allow.
-                await AgentUsageThrottle.shared.invalidate()
-                // Wakes both poll loops now rather than at the next 60s/5min
-                // tick. Each captured the epoch before fetching, so a fetch
-                // already in flight discards its own payload and refetches
-                // instead of publishing one built without the grant.
-                ClaudeExtraRoots.RegistryChange.signal()
-            }
+        applyQueue.async { install(defaults: defaults, setConsent: setConsent) }
+    }
+
+    /// `apply`, but returns only once the install is done (or found nothing
+    /// to do: no grant, the same payload as last time, a setter failure). The
+    /// launch path and the Cursor Allow button call this so the grant is in
+    /// the core before the sync that needs it starts (Design 7).
+    static func installNow(
+        defaults: UserDefaults = .standard,
+        setConsent: @escaping @Sendable (String) -> Void = coreSetConsent
+    ) {
+        applyQueue.sync { install(defaults: defaults, setConsent: setConsent) }
+    }
+
+    /// Runs on `applyQueue` only.
+    private static func install(
+        defaults: UserDefaults, setConsent: @escaping @Sendable (String) -> Void
+    ) {
+        // Composed on the queue, not before it, or two fast clicks both read
+        // the same stale answers and the later one is dropped. The registry
+        // starts empty every launch, so the initial `nil` means "nothing
+        // granted" and a payload without a grant from a process that never
+        // installed one does nothing at all — no FFI call, no wake.
+        let (payload, grants) = composed(defaults: defaults)
+        guard lastInstalledPayload != payload else { return }
+        let hadInstalled = lastInstalledPayload != nil
+        lastInstalledPayload = payload
+        guard grants || hadInstalled else { return }
+        setConsent(payload)
+        Task { @MainActor in
+            // Invalidate BEFORE signalling, the same order and for the
+            // same reason as `ClaudeExtraRoots.install`: a poll woken
+            // while the throttle still holds a payload is answered from
+            // the one built before consent existed, and the user watches
+            // the card sit unchanged for up to the throttle floor after
+            // clicking Allow.
+            await AgentUsageThrottle.shared.invalidate()
+            // Wakes both poll loops now rather than at the next 60s/5min
+            // tick. Each captured the epoch before fetching, so a fetch
+            // already in flight discards its own payload and refetches
+            // instead of publishing one built without the grant.
+            ClaudeExtraRoots.RegistryChange.signal()
         }
     }
 
