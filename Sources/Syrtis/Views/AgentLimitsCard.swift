@@ -814,7 +814,7 @@ struct AgentLimitsCard: View {
                         .font(.caption2)
                         .foregroundStyle(snapshot?.error != nil ? .red : .secondary)
                         .lineLimit(2)
-                        .help(snapshot?.errorLine ?? detail)
+                        .help(detail)
                 }
                 VStack(spacing: 8) {
                     if !uniqueWindows.isEmpty {

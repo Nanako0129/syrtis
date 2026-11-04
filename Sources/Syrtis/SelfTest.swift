@@ -5696,13 +5696,18 @@ enum SelfTest {
             errorLine(claudeFailed, #"{"category":"futureCategory","status":200}"#) == claudeFailed
                 && errorLine(claudeFailed, nil) == claudeFailed,
             "quota error line is unchanged for an unknown category or no diagnostic")
-        expect(
-            agentUsageErrorLine("Claude 用量請求失敗，將自動重試。",
-                                diagnostic: transportPayload(
-                                    transportBase + #","transportDiagnostic":{"category":"tls"}"#)?
-                                    .agents.first?.transportDiagnostic)
-                == "Claude 用量請求失敗，將自動重試。 (tls)",
-            "quota error line keeps the untranslated code on a translated sentence")
+        // The production surfaces, not only the helper: the time-window card's
+        // blocked reason comes from `WindowCardLoader.quotaHalf`.
+        var windowCardCoded = false
+        if let coded = transportPayload(
+            transportBase.replacingOccurrences(of: "codex", with: "claude")
+                + #","error":"Claude usage request failed. Retrying automatically.","transportDiagnostic":{"category":"tls"}"#),
+           case let .blocked(_, reason) = WindowCardLoader.quotaHalf(
+               payload: coded, clientId: "claude", accountKey: coded.agents.first?.accountKey,
+               attempted: true, curve: { _, _, _, _ in nil }, nowMs: 0) {
+            windowCardCoded = reason == "Claude usage request failed (tls). Retrying automatically."
+        }
+        expect(windowCardCoded, "the time-window card's blocked reason carries the transport code")
         let malformedTransportBodies = [
             transportBase + #","transportDiagnostic":"not-an-object""#,
             transportBase + #","transportDiagnostic":{"status":500}"#,

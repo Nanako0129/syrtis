@@ -849,6 +849,9 @@ private let agentUsageTransportLogClientIds: Set<String> = {
     return ids
 }()
 
+/// The transport categories Syrtis recognises. Two consumers: the os_log entries
+/// (`agentUsageTransportLogEntries`) and the code shown on a failed card
+/// (`agentUsageErrorLine`). Removing a category here removes it from both.
 private let agentUsageTransportLogCategories: Set<String> = [
     "timeout", "dns", "tls", "connectionRefused", "connectionReset",
     "connect", "request", "responseBody", "rateLimited", "serverError",
@@ -880,8 +883,8 @@ package func agentUsageErrorLine(_ text: String, diagnostic: AgentUsageTransport
     let code = agentUsageTransportStatus(category: category, status: diagnostic?.status)
         .map(String.init) ?? category
     let tail = ". Retrying automatically."
-    if text.hasSuffix(tail), let dot = text.range(of: tail, options: .backwards) {
-        return text.replacingCharacters(in: dot, with: " (\(code))" + tail)
+    if text.hasSuffix(tail) {
+        return String(text.dropLast(tail.count)) + " (\(code))" + tail
     }
     return text + " (\(code))"
 }

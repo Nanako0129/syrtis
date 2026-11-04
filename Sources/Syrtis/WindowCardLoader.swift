@@ -171,7 +171,7 @@ enum WindowCardLoader {
                            reason: "Not in the latest quota report.".localized)
                 : .loading
         }
-        if let error = agent.error {
+        if let error = agent.errorLine {
             return .blocked(clientId: clientId, reason: error)
         }
         // The third copy of the same rule, and the one the wording above was
