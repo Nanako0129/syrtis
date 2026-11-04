@@ -622,6 +622,14 @@ fn load_credentials_from(db_path: &Path) -> Result<Option<CursorCredentials>, St
     let Some(login) = crate::cursor_desktop::read_login(db_path)? else {
         return Ok(None);
     };
+    // Only a token that looks like the session JWT the usage sync accepts
+    // (`cursor_desktop::jwt_claims`) is sent as a cookie; anything else is
+    // treated as no Cursor login. That includes a sealed token (Cursor 3.27+,
+    // `cursor-safe-storage:v1:…`, whose `:` fails the charset): it is never
+    // decrypted here (plan CURSOR-SS-M, U4) and its envelope is never sent.
+    if crate::cursor_desktop::jwt_claims(&login.access_token).is_none() {
+        return Ok(None);
+    }
     let Some(user_id) = login.stored_user_id().map(str::to_string) else {
         return Ok(None);
     };
@@ -792,14 +800,14 @@ mod tests {
         let (default_dir, default_db) = temp_state_db(
             "cmp_default",
             &[
-                ("cursorAuth/accessToken", "DEFAULTPROFILETOKEN"),
+                ("cursorAuth/accessToken", &ide_jwt("DEFAULTPROFILETOKEN")),
                 ("glass.lastSignedInAuthId", default_user),
             ],
         );
         let (added_dir, added_db) = temp_state_db(
             "cmp_added",
             &[
-                ("cursorAuth/accessToken", "ADDEDPROFILETOKEN"),
+                ("cursorAuth/accessToken", &ide_jwt("ADDEDPROFILETOKEN")),
                 ("glass.lastSignedInAuthId", "user_ADDEDprofile01234567890"),
             ],
         );
@@ -833,10 +841,49 @@ mod tests {
         let _ = std::fs::remove_dir_all(&added_dir);
         match loaded {
             Ok(Some(GrokBotCredentials::Cursor(credentials))) => {
-                assert_eq!(credentials.access_token, "DEFAULTPROFILETOKEN");
+                assert_eq!(credentials.access_token, ide_jwt("DEFAULTPROFILETOKEN"));
                 assert_eq!(credentials.user_id, default_user);
             }
             _ => panic!("expected the default profile's Cursor credentials"),
+        }
+    }
+
+    /// A plaintext Cursor login token in the session-JWT shape the fallback
+    /// requires (`cursor_desktop::jwt_claims`); `tag` is its signature.
+    fn ide_jwt(tag: &str) -> String {
+        let encode = |v: &str| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(v);
+        format!(
+            "{}.{}.{tag}",
+            encode(r#"{"alg":"HS256"}"#),
+            encode(r#"{"sub":"auth0|user_abcDEF1234567890xyzAB"}"#)
+        )
+    }
+
+    /// CURSOR-SS-M Acceptance 1 test 8 (U4, review T1): the fallback never
+    /// decrypts and never sends a sealed token or a non-JWT one; both are
+    /// "no Cursor login". Control: the JWT twin loads.
+    #[test]
+    fn the_cursor_fallback_sends_only_a_plaintext_session_jwt() {
+        let id = "user_abcDEF1234567890xyzAB";
+        let sealed = format!(
+            "cursor-safe-storage:v1:{}",
+            base64::engine::general_purpose::STANDARD.encode(b"v10 sealed blob")
+        );
+        for (tag, token, loads) in [
+            ("sealed", format!("\"{sealed}\""), false),
+            ("nonjwt", "tok-123".to_string(), false),
+            ("jwt", format!("\"{}\"", ide_jwt("tok-123")), true),
+        ] {
+            let (dir, path) = temp_state_db(
+                tag,
+                &[
+                    ("cursorAuth/accessToken", &token),
+                    ("glass.lastSignedInAuthId", &format!("glass-{id}")),
+                ],
+            );
+            let loaded = load_credentials_from(&path).unwrap();
+            std::fs::remove_dir_all(&dir).ok();
+            assert_eq!(loaded.is_some(), loads, "{tag}");
         }
     }
 
@@ -886,14 +933,14 @@ mod tests {
         let (dir, path) = temp_state_db(
             "ok",
             &[
-                ("cursorAuth/accessToken", "\"tok-123\""),
+                ("cursorAuth/accessToken", &format!("\"{}\"", ide_jwt("tok-123"))),
                 ("glass.lastSignedInAuthId", &format!("glass-{id}")),
             ],
         );
         let creds = load_credentials_from(&path)
             .unwrap()
             .expect("credentials load");
-        assert_eq!(creds.access_token, "tok-123");
+        assert_eq!(creds.access_token, ide_jwt("tok-123"));
         assert_eq!(creds.user_id, id);
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -904,7 +951,7 @@ mod tests {
         let (dir, path) = temp_state_db(
             "profile",
             &[
-                ("cursorAuth/accessToken", "tok-plain"),
+                ("cursorAuth/accessToken", &ide_jwt("tok-plain")),
                 (
                     "cursorAuth/cachedScopedProfile",
                     &format!("{{\"userId\":\"{id}\"}}"),
@@ -920,7 +967,7 @@ mod tests {
 
     #[test]
     fn token_without_user_id_yields_no_credentials() {
-        let (dir, path) = temp_state_db("noid", &[("cursorAuth/accessToken", "tok-123")]);
+        let (dir, path) = temp_state_db("noid", &[("cursorAuth/accessToken", &ide_jwt("tok-123"))]);
         assert!(load_credentials_from(&path).unwrap().is_none());
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -979,7 +1026,7 @@ mod tests {
         let (dir, cursor_path) = temp_state_db(
             "desktop_priority",
             &[
-                ("cursorAuth/accessToken", "ide-token"),
+                ("cursorAuth/accessToken", &ide_jwt("ide-token")),
                 ("glass.lastSignedInAuthId", "user_abcDEF1234567890xyzAB"),
             ],
         );
@@ -1017,7 +1064,7 @@ mod tests {
         let (dir, cursor_path) = temp_state_db(
             "fallback",
             &[
-                ("cursorAuth/accessToken", "ide-token"),
+                ("cursorAuth/accessToken", &ide_jwt("ide-token")),
                 ("glass.lastSignedInAuthId", "user_abcDEF1234567890xyzAB"),
             ],
         );
@@ -1159,7 +1206,7 @@ mod tests {
         let (dir, desktop_path, cursor_path) = temp_encrypted_desktop_login(
             "no_consent_no_fallback",
             &[
-                ("cursorAuth/accessToken", "ide-token"),
+                ("cursorAuth/accessToken", &ide_jwt("ide-token")),
                 ("glass.lastSignedInAuthId", "user_abcDEF1234567890xyzAB"),
             ],
         );
@@ -1262,7 +1309,7 @@ mod tests {
         let (dir, cursor_path) = temp_state_db(
             "cursor_only_no_consent",
             &[
-                ("cursorAuth/accessToken", "ide-token"),
+                ("cursorAuth/accessToken", &ide_jwt("ide-token")),
                 ("glass.lastSignedInAuthId", "user_abcDEF1234567890xyzAB"),
             ],
         );

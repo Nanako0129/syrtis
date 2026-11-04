@@ -257,16 +257,50 @@ enum CursorSync {
         /// (`rowLabel`), the whole folder and not its last component.
         static let removeFolder = AccountsCopy.removeNamed
 
+        /// Cursor 3.27+ encrypted sign-in (plan CURSOR-SS-M, Design 8-9). Draft
+        /// copy: the disclosure is final only after the device check shows what
+        /// the macOS dialog asks (plan Acceptance 4c).
+        /// `keychain_consent`: a sealed sign-in and no "cursor" consent yet.
+        static let keychainConsent = "Cursor stores its sign-in encrypted. Syrtis needs your permission to read it."
+        /// `keychain_denied`: macOS refused (Deny in its dialog).
+        static let keychainDenied = "macOS didn't let Syrtis read Cursor's encrypted sign-in."
+        /// `keychain_unlock`: no key in memory, and only a round the user starts reads the Keychain.
+        static let keychainUnlock = "Press Sync Now to read Cursor's encrypted sign-in."
+        static let keychainAllowAccess = "Allow Keychain access…"
+        static let keychainDisclosure = "Cursor 3.27 and later can store its sign-in encrypted. To read it, Syrtis needs the \"Cursor Safe Storage\" key from your Keychain. That key can decrypt everything Cursor stores encrypted; Syrtis uses it only to read the Cursor sign-in of the profiles listed here, keeps it in memory while Syrtis runs, and never saves or logs it. The sign-in is still sent only to cursor.com. Turning on Cursor sync does not grant this; macOS will ask you to allow Syrtis. If Cursor stores its sign-in unencrypted, nothing is asked."
+        /// The semantic button key the Grok Bot consent already uses (English
+        /// "Allow"; the bare "Allow" key is the badge, a different part of speech).
+        static let allow = "consent.action.allow"
+
         static var all: [String] {
             [title, toggle, privacy, `continue`, cancel, turnOff, lastSynced, partial, expired, notSignedIn,
              offline, error, errorWithReason, cliPresent, syncNow, syncing, cliQuestion, useSyrtis, keepCLI, cleanupFailed,
              configRejected, staleCleanupFailed, defaultProfile, addProfile, duplicate, profilesPrivacy, cantAdd, cantRead,
-             removeFolder]
+             removeFolder, keychainConsent, keychainDenied, keychainUnlock, keychainAllowAccess, keychainDisclosure, allow]
         }
     }
 
     /// Swift-side state: the last on push was refused by the core.
     static let configRejectedState = "configRejected"
+
+    /// Reasons answered by the "Allow Keychain access…" button: no consent
+    /// yet, or macOS refused (the stored answer was withdrawn).
+    static let keychainAllowReasons: Set<String> = ["keychain_consent", "keychain_denied"]
+
+    /// The headline or any profile asks for Keychain consent.
+    static func needsKeychainAllow(reason: String?, profiles: [String: CursorSyncStatus.Profile]) -> Bool {
+        anyReason(in: keychainAllowReasons, headline: reason, profiles: Array(profiles.values))
+    }
+
+    /// One of `codes` on the headline or on any profile. Shared by the Allow
+    /// button and the Cursor Keychain revert, so both read a round the same way.
+    static func anyReason(
+        in codes: Set<String>, headline: String?, profiles: [CursorSyncStatus.Profile]
+    ) -> Bool {
+        ([headline] + profiles.map(\.reason)).contains { code in
+            code.map { codes.contains($0) } ?? false
+        }
+    }
 
     /// Per-profile reasons a retry will not fix.
     static let permanentReasons: Set<String> = [
@@ -347,6 +381,12 @@ enum CursorSync {
         case "notSignedIn": return Copy.notSignedIn.localized
         case "offline": return Copy.offline.localized
         case "error":
+            switch reason {
+            case "keychain_consent"?: return Copy.keychainConsent.localized
+            case "keychain_denied"?: return Copy.keychainDenied.localized
+            case "keychain_unlock"?: return Copy.keychainUnlock.localized
+            default: break
+            }
             if let reason, (1...40).contains(reason.utf8.count),
                reason.utf8.allSatisfy({ $0 == UInt8(ascii: "_") || (UInt8(ascii: "a")...UInt8(ascii: "z")).contains($0) }) {
                 return Copy.errorWithReason.localized(reason)
@@ -407,6 +447,12 @@ final class CursorSyncController: ObservableObject {
     private var generation = 0
     /// Set when a sync's result was discarded as stale; the sync reruns.
     private var rerunPending = false
+    /// An explicit sync was asked for while a round ran (e.g. Allow during a
+    /// background round): it runs as soon as that round ends.
+    private var explicitPending = false
+    /// The "Allow Keychain access…" confirmation is open. `allowKeychainAccess`
+    /// grants nothing unless this is set.
+    @Published private(set) var keychainConfirmPending = false
 
     /// Push the stored preferences into the core, then (re)start the schedule
     /// if sync is allowed. Called at launch and after every preference change.
@@ -418,7 +464,8 @@ final class CursorSyncController: ObservableObject {
         arguments: [String] = CommandLine.arguments,
         bundleID: String? = Bundle.main.bundleIdentifier,
         setConfig: @escaping CursorSync.SetConfig = CursorSync.coreSetConfig,
-        sync: @escaping CursorSync.Sync = CursorSync.coreSync
+        sync: @escaping CursorSync.Sync = CursorSync.coreSync,
+        setConsent: @escaping @Sendable (String) -> Void = GrokBotKeychainConsent.coreSetConsent
     ) {
         // Test modes make no core call at all: turning off deletes files, and
         // `--demo` runs with the real bundle id. No bundle id (bare `swift
@@ -481,27 +528,78 @@ final class CursorSyncController: ObservableObject {
             if refresh { Self.refreshModel() }
             guard run, self?.state != CursorSync.configRejectedState else { return }
             while !Task.isCancelled {
-                await self?.runSync(explicit: false, defaults: defaults, arguments: arguments, sync: sync)
+                await self?.runSync(
+                    explicit: false, defaults: defaults, arguments: arguments, sync: sync, setConsent: setConsent)
                 try? await Task.sleep(for: .seconds(CursorSync.interval))
             }
         }
     }
 
+    /// Launch (Design 7): install both stored Keychain answers synchronously
+    /// (returns whether or not anything was granted), then push the Cursor
+    /// config and start the schedule, so a first round that may read the
+    /// Keychain already sees the grant.
+    func launch(
+        defaults: UserDefaults = .standard,
+        arguments: [String] = CommandLine.arguments,
+        bundleID: String? = Bundle.main.bundleIdentifier,
+        setConsent: @escaping @Sendable (String) -> Void = GrokBotKeychainConsent.coreSetConsent,
+        setConfig: @escaping CursorSync.SetConfig = CursorSync.coreSetConfig,
+        sync: @escaping CursorSync.Sync = CursorSync.coreSync
+    ) {
+        GrokBotKeychainConsent.installNow(defaults: defaults, setConsent: setConsent)
+        reconfigure(refresh: false, defaults: defaults, arguments: arguments, bundleID: bundleID,
+                    setConfig: setConfig, sync: sync, setConsent: setConsent)
+    }
+
+    /// "Allow Keychain access…": opens the confirmation with the disclosure.
+    func askKeychainAccess() { keychainConfirmPending = true }
+
+    /// Cancel, Escape, clicking away: grants nothing.
+    func cancelKeychainAccess() { keychainConfirmPending = false }
+
+    /// Allow in the confirmation (Design 7): store the Cursor answer, install
+    /// the composed payload, then run an explicit sync, the one round kind
+    /// (besides the first) that may read the Keychain. Does nothing unless the
+    /// confirmation asked first.
+    func allowKeychainAccess(
+        defaults: UserDefaults = .standard,
+        arguments: [String] = CommandLine.arguments,
+        setConsent: @escaping @Sendable (String) -> Void = GrokBotKeychainConsent.coreSetConsent,
+        sync: @escaping CursorSync.Sync = CursorSync.coreSync
+    ) async {
+        guard keychainConfirmPending else { return }
+        keychainConfirmPending = false
+        GrokBotKeychainConsent.setCursorAnswer(true, defaults: defaults)
+        GrokBotKeychainConsent.installNow(defaults: defaults, setConsent: setConsent)
+        await runSync(explicit: true, defaults: defaults, arguments: arguments, sync: sync, setConsent: setConsent)
+    }
+
     /// One sync, off the main thread. Single-flight here as well as in the core:
-    /// a request while a sync runs is dropped, since that sync's result is
-    /// current. A reconfigure during a sync makes its result stale; that result
-    /// is discarded and the sync reruns, so the new settings get a fresh result.
+    /// a background request while a sync runs is dropped, since that sync's
+    /// result is current; an explicit one runs right after it (it may read the
+    /// Keychain, which the background round may not). A reconfigure during a
+    /// sync makes its result stale; that result is discarded and the sync
+    /// reruns, so the new settings get a fresh result. A result reporting
+    /// `keychain_denied` withdraws the Cursor Keychain answer
+    /// (`revokeCursorIfDenied`, through `setConsent`).
     func runSync(
         explicit: Bool, defaults: UserDefaults = .standard,
         arguments: [String] = CommandLine.arguments,
-        sync: @escaping CursorSync.Sync = CursorSync.coreSync
+        sync: @escaping CursorSync.Sync = CursorSync.coreSync,
+        setConsent: @escaping @Sendable (String) -> Void = GrokBotKeychainConsent.coreSetConsent
     ) async {
         guard CursorSync.shouldSync(defaults: defaults, arguments: arguments) else { return }
-        if syncing { return }
+        if syncing {
+            if explicit { explicitPending = true }
+            return
+        }
         syncing = true
         defer { syncing = false }
+        var explicit = explicit
         repeat {
             rerunPending = false
+            if explicitPending { explicit = true; explicitPending = false }
             // Read the generation BEFORE waiting: a settings change during the
             // wait makes this pass stale (discarded and rerun below).
             let started = generation
@@ -512,12 +610,14 @@ final class CursorSyncController: ObservableObject {
             else { rerunPending = true; continue }
             // The core refused the newest settings: there is nothing to sync.
             if state == CursorSync.configRejectedState { break }
-            let result = await Task.detached(priority: .utility) { sync(explicit) }.value
+            let thisExplicit = explicit
+            let result = await Task.detached(priority: .utility) { sync(thisExplicit) }.value
             // A reconfigure (e.g. turning sync off) happened while this ran:
             // its result describes a configuration that no longer applies.
             guard started == generation, CursorSync.shouldSync(defaults: defaults, arguments: arguments)
             else { rerunPending = true; continue }
             guard let result else { state = "error"; reason = nil; profileStates = [:]; continue }
+            GrokBotKeychainConsent.revokeCursorIfDenied(result, defaults: defaults, setConsent: setConsent)
             state = result.state
             reason = result.reason
             lastSuccessMs = result.lastSuccessMs
@@ -532,7 +632,8 @@ final class CursorSyncController: ObservableObject {
             // duplicate profile's old file was removed), so an unchanged
             // history reloads nothing.
             if result.changed { Self.refreshModel() }
-        } while rerunPending && CursorSync.shouldSync(defaults: defaults, arguments: arguments)
+        } while (rerunPending || explicitPending) && CursorSync.shouldSync(defaults: defaults, arguments: arguments)
+        explicitPending = false
     }
 
     /// The model's normal refresh: drop Swift scan caches and bump the

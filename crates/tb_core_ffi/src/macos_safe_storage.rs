@@ -94,7 +94,7 @@ impl Key {
         key
     }
 
-    fn from_password(password: &[u8]) -> Result<Self, String> {
+    pub(crate) fn from_password(password: &[u8]) -> Result<Self, String> {
         let mut key = Self([0; 16]);
         let salt = b"saltysalt";
         // SAFETY: all pointers refer to live slices with their exact lengths;
@@ -161,6 +161,70 @@ impl Key {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Cursor's Safe Storage key (plan CURSOR-SS-M, Design 2). Read in this
+// process through Security.framework, so the macOS dialog names Syrtis (U2).
+
+/// Why the Keychain gave no Cursor key. Each consumer maps it to its own fixed
+/// reason; nothing from the Keychain reaches a message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum KeychainError {
+    NotFound,
+    Denied,
+    Other,
+}
+
+/// The OSStatus table: errSecItemNotFound (-25300) is NotFound;
+/// errSecUserCanceled (-128) and errSecAuthFailed (-25293) are Denied;
+/// everything else, errSecInteractionNotAllowed (-25308) included, is Other.
+pub(crate) fn keychain_error(status: i32) -> KeychainError {
+    match status {
+        -25300 => KeychainError::NotFound,
+        -128 | -25293 => KeychainError::Denied,
+        _ => KeychainError::Other,
+    }
+}
+
+const CURSOR_SERVICE: &str = "Cursor Safe Storage";
+/// Current Electron names the account `<app> Key` (electron#35864); older
+/// builds used the bare app name. The legacy name is tried only when the
+/// current one does not exist, never after a denial (that would be a second
+/// dialog).
+const CURSOR_ACCOUNTS: [&str; 2] = ["Cursor Key", "Cursor"];
+
+/// The production per-account fetch: one `SecItemCopyMatching` for
+/// `Cursor Safe Storage` / `account`, returning the password bytes or the
+/// OSStatus. Blocks while macOS shows its dialog (no timeout exists there).
+/// Never called by tests: they inject their own fetch.
+pub(crate) fn cursor_keychain_fetch(account: &str) -> Result<Vec<u8>, i32> {
+    use security_framework::passwords::{generic_password, PasswordOptions};
+    generic_password(PasswordOptions::new_generic_password(
+        CURSOR_SERVICE,
+        account,
+    ))
+    .map_err(|error| error.code())
+}
+
+/// Read Cursor's Safe Storage password through `fetch` (`Cursor Key`, then
+/// `Cursor` only on NotFound) and derive the key. Our copy of the password is
+/// erased after derivation; Security.framework's internal CFData copy is
+/// released by the framework and is outside our control.
+pub(crate) fn read_cursor_key(
+    fetch: &dyn Fn(&str) -> Result<Vec<u8>, i32>,
+) -> Result<Key, KeychainError> {
+    let mut found = Err(KeychainError::NotFound);
+    for account in CURSOR_ACCOUNTS {
+        found = fetch(account).map_err(keychain_error);
+        if !matches!(found, Err(KeychainError::NotFound)) {
+            break;
+        }
+    }
+    let mut password = found?;
+    let key = Key::from_password(&password).map_err(|_| KeychainError::Other);
+    erase(&mut password);
+    key
+}
+
 fn erase(bytes: &mut [u8]) {
     for byte in bytes {
         // SAFETY: each pointer is an exclusively borrowed live byte. Volatile
@@ -197,5 +261,21 @@ mod tests {
             .is_err());
         assert!(key.decrypt(b"v11unsupported").is_err());
         assert!(key.decrypt(b"v10truncated").is_err());
+    }
+
+    /// Acceptance 1 test 5, the status table (the fallback order is tested
+    /// through a whole sync round in `cursor_sync::tests`).
+    #[test]
+    fn keychain_statuses_map_to_three_outcomes() {
+        for (status, expected) in [
+            (-25300, KeychainError::NotFound),
+            (-128, KeychainError::Denied),
+            (-25293, KeychainError::Denied),
+            (-25308, KeychainError::Other),
+            (-25291, KeychainError::Other),
+            (1, KeychainError::Other),
+        ] {
+            assert_eq!(keychain_error(status), expected, "{status}");
+        }
     }
 }

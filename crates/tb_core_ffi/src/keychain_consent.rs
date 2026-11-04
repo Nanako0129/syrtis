@@ -9,10 +9,15 @@
 //! all until the answer is yes. The app owns the explanation and the "Allow"
 //! button; this registry is only how that answer crosses the FFI boundary.
 //!
-//! The one consumer today is `agent_grokbot::decode_desktop_secret`, which
-//! checks it immediately before its `decrypt` call — at the decrypt and not at
-//! "a desktop login exists", because a `plaintext:v1:` secret needs no key and
-//! there is nothing to ask about.
+//! Two consumers, each gated on its own id. `grok-bot`:
+//! `agent_grokbot::decode_desktop_secret`, which checks it immediately before
+//! its `decrypt` call — at the decrypt and not at "a desktop login exists",
+//! because a `plaintext:v1:` secret needs no key and there is nothing to ask
+//! about. `cursor`: `cursor_sync::SealedRound::open`, checked only for a
+//! sealed (`cursor-safe-storage:`) token, before the cached key is used or the
+//! Keychain is read; a plaintext Cursor token never consults it. A payload
+//! that does not grant `cursor` also drops the Cursor key the sync keeps in
+//! memory (`cursor_sync::drop_sealed_key`).
 //!
 //! **Deliberately two-valued.** "Never asked" and "declined" are the same
 //! thing to an adapter — in both cases it must not touch the Keychain — so
@@ -29,7 +34,7 @@
 //! The registry starts empty every launch — it is in-memory, not persisted —
 //! so Swift owns re-applying the user's stored answer at startup. The empty
 //! default is the correct behaviour for a process that never calls the setter:
-//! no Grok Bot Keychain contact, no dialog for it.
+//! no Grok Bot or Cursor Keychain contact, no dialog for either.
 //!
 //! **This is not a process-wide no-Keychain guarantee.** `agent_usage` reads
 //! `Claude Code-credentials` and `tokenbar-claude-oauth-token` through
@@ -47,7 +52,7 @@ use std::sync::{LazyLock, RwLock};
 /// this list is refused rather than stored, so a typo in the payload cannot
 /// register a grant that nothing will ever read — and cannot be mistaken for
 /// one that is being honoured.
-const CONSENTABLE_CLIENTS: &[&str] = &["grok-bot"];
+const CONSENTABLE_CLIENTS: &[&str] = &["grok-bot", "cursor"];
 
 static KEYCHAIN_CONSENT: LazyLock<RwLock<BTreeSet<String>>> =
     LazyLock::new(|| RwLock::new(BTreeSet::new()));
@@ -71,8 +76,8 @@ pub(crate) fn allowed(client_id: &str) -> bool {
 /// sends the user's stored answer verbatim, and "no" is a legitimate answer.
 /// Only an unrecognised client id is rejected.
 pub(crate) fn set_from_json(raw: &str) -> Result<serde_json::Value, String> {
-    let input: std::collections::BTreeMap<String, bool> = serde_json::from_str(raw)
-        .map_err(|e| format!("invalid Keychain consent JSON: {}", e))?;
+    let input: std::collections::BTreeMap<String, bool> =
+        serde_json::from_str(raw).map_err(|e| format!("invalid Keychain consent JSON: {}", e))?;
 
     let mut granted: BTreeSet<String> = BTreeSet::new();
     let mut rejected: Vec<serde_json::Value> = Vec::new();
@@ -90,9 +95,15 @@ pub(crate) fn set_from_json(raw: &str) -> Result<serde_json::Value, String> {
     }
 
     let granted_count = granted.len();
+    let cursor_granted = granted.contains("cursor");
     *KEYCHAIN_CONSENT
         .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner()) = granted;
+    // After the write lock is released (a round holds the key cache while it
+    // reads consent): no grant, no key in memory (U3, Design 4).
+    if !cursor_granted {
+        crate::cursor_sync::drop_sealed_key();
+    }
 
     Ok(serde_json::json!({
         "grantedCount": granted_count,

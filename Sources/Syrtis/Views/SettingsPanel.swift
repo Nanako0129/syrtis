@@ -1331,6 +1331,39 @@ struct SettingsPanel: View {
                         .foregroundStyle(cursorSync.state == "ok" ? Color.secondary : Color.orange)
                         .fixedSize(horizontal: false, vertical: true)
                 }
+                // Cursor 3.27+ encrypted sign-in (plan CURSOR-SS-M, Design 8):
+                // shown when the headline or any profile needs Keychain
+                // consent. Allow opens nothing by itself: the confirmation
+                // carries the disclosure, and only its Allow stores the answer
+                // and starts the explicit sync that raises the macOS dialog.
+                if CursorSync.needsKeychainAllow(reason: cursorSync.reason, profiles: cursorSync.profileStates) {
+                    Button(CursorSync.Copy.keychainAllowAccess.localized) { cursorSync.askKeychainAccess() }
+                        .controlSize(.small)
+                        .padding(.horizontal, 10)
+                        .popover(
+                            isPresented: Binding(
+                                get: { cursorSync.keychainConfirmPending },
+                                set: { if !$0 { cursorSync.cancelKeychainAccess() } }),
+                            arrowEdge: .bottom
+                        ) {
+                            VStack(alignment: .leading, spacing: 10) {
+                                hint(CursorSync.Copy.keychainDisclosure)
+                                HStack {
+                                    Spacer()
+                                    Button(CursorSync.Copy.cancel.localized) { cursorSync.cancelKeychainAccess() }
+                                        .keyboardShortcut(.cancelAction)
+                                    // No default-action shortcut: Return must not consent.
+                                    Button(CursorSync.Copy.allow.localized) {
+                                        Task { await cursorSync.allowKeychainAccess() }
+                                    }
+                                }
+                                .controlSize(.small)
+                            }
+                            .frame(width: 280, alignment: .leading)
+                            .padding(12)
+                        }
+                        .onDisappear { cursorSync.cancelKeychainAccess() }
+                }
                 if cursorSync.state == "cliPresent", !cursorTakeover {
                     hint(CursorSync.Copy.cliQuestion)
                     Button(CursorSync.Copy.useSyrtis.localized) {

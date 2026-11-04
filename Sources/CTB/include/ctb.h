@@ -262,12 +262,14 @@ char *tb_antigravity_auto_capture(const char *removed_keys_json);
 // consumer does not wire Keychain consent for is rejected and never stored,
 // while `false` is an ordinary answer rather than a rejection.
 //
-// Scope: this registry governs ONLY the clients it wires, and "grok-bot" is
-// the only id this build accepts. Its Keychain item is not read while that id
-// is absent, so macOS cannot raise its authorization dialog for the Grok Bot
-// login before the app has asked the user itself; the gate sits immediately
-// before the decrypt of the desktop login rather than at "a login exists", so
-// a plaintext-stored secret keeps working ungated.
+// Scope: this registry governs ONLY the clients it wires: "grok-bot" and
+// "cursor" are the ids this build accepts. A wired client's Keychain item is
+// not read while its id is absent, so macOS cannot raise its authorization
+// dialog before the app has asked the user itself. Each gate sits immediately
+// before the decrypt rather than at "a login exists", so a plaintext-stored
+// secret keeps working ungated: Grok Bot's desktop login, and for "cursor" the
+// usage sync's sealed (`cursor-safe-storage:`) access token. A payload that
+// does not grant "cursor" also drops the Cursor key the sync keeps in memory.
 //
 // It is NOT a process-wide no-Keychain guarantee. The Claude provider reads
 // `Claude Code-credentials` and `tokenbar-claude-oauth-token` through
@@ -277,7 +279,8 @@ char *tb_antigravity_auto_capture(const char *removed_keys_json);
 //
 // The registry is in-memory and starts empty every launch, so the caller owns
 // re-applying the user's stored answer at startup; a process that never calls
-// this reads no Grok Bot Keychain item.
+// this reads neither the Grok Bot nor the Cursor Keychain item. The payload is
+// full-replace, so send every client's answer together.
 char *tb_set_keychain_consent(const char *json);
 
 // Configure Cursor desktop sync. `json` is
@@ -340,7 +343,14 @@ char *tb_set_cursor_sync(const char *json);
 // registered from it.
 // `cliPresent` = a walk completed but tokscale CLI Cursor files exist and the
 // takeover is not confirmed; it carries no `reason`. `reason` codes name no
-// account and never carry the token.
+// account and never carry the token. A sealed access token (Cursor 3.27+,
+// `cursor-safe-storage:v1:`) adds these `error` reasons: `keychain_consent`
+// (no "cursor" consent: nothing read), `keychain_denied` (macOS refused:
+// withdraw the consent), `keychain_unlock` (no key in memory and this round
+// may not read: only a `user_initiated` call or the process's first call
+// reads the Keychain, at most once per call, and that read waits for the
+// macOS dialog), `keychain_missing`, `keychain_unavailable`,
+// `token_sealed_unreadable` and `token_sealed_unsupported`.
 char *tb_cursor_sync(int32_t user_initiated);
 
 // Release a string returned by any tb_* entry point.

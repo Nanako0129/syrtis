@@ -200,6 +200,12 @@ fn limits() -> Limits {
     }
 }
 
+/// Plaintext tests: no Cursor Keychain consent (a sealed token would stop at
+/// `keychain_consent` or, with no key source, `token_sealed_unsupported`).
+fn no_consent() -> bool {
+    false
+}
+
 fn stem(user: &str) -> Option<String> {
     crate::agent_account_scope::keyed_digest_hex(&KEY, FILE_NAME_DOMAIN, user.as_bytes()).ok()
 }
@@ -220,15 +226,22 @@ fn run_with(
         url,
         https_only: false,
         file_stem: &stem,
+        key_fetch: None,
+        consent: &no_consent,
+    };
+    let slot = Slot {
+        id: DEFAULT_PROFILE_ID.to_string(),
+        root: None,
+        dir: dir.to_path_buf(),
+        db: db.to_path_buf(),
     };
     crate::RUNTIME.block_on(run(
         &target,
-        db,
-        dir,
+        &slot,
         limits,
         enabled,
         &mut |_, _| None,
-        false,
+        &mut SealedRound::new(false, &|| true),
     ))
 }
 
@@ -823,6 +836,8 @@ fn sync_status(f: &Fixture, url: &str, registry: &RwLock<Config>) -> serde_json:
         url,
         https_only: false,
         file_stem: &stem,
+        key_fetch: None,
+        consent: &no_consent,
     };
     let source = || registry.read().unwrap().clone();
     sync_with(true, None, &target, &source, Some(limits())).0
@@ -2027,6 +2042,8 @@ fn sync_round_in(
         url,
         https_only: false,
         file_stem: &stem,
+        key_fetch: None,
+        consent: &no_consent,
     };
     let source = || registry.read().unwrap().clone();
     sync_with(true, home, &target, &source, Some(limits)).0
@@ -2597,6 +2614,8 @@ fn target<'a>(db: &'a Path, url: &'a str) -> Target<'a> {
         url,
         https_only: false,
         file_stem: &stem,
+        key_fetch: None,
+        consent: &no_consent,
     }
 }
 
@@ -3060,4 +3079,700 @@ fn a_previous_app_dir_that_could_not_be_cleaned_is_retried_until_clean() {
     assert!(!cache.join(hex_name('a')).exists());
     assert_eq!(push("com.example.second")["cleanupFailed"], false);
     set_for_test(Config::default());
+}
+
+// --- sealed tokens (plan CURSOR-SS-M, Acceptance 1) ---------------------------
+//
+// Hermetic: the Keychain is a closure (`Target::key_fetch`), consent a closure
+// (or the in-memory registry for test 16); never the real Keychain, never
+// Security.framework.
+//
+// Fixture: a synthetic session JWT for `USER` (exp 4102444800 = 2100-01-01),
+// sealed the way Electron's macOS safeStorage does, generated independently
+// of this code with Python hashlib + OpenSSL (as the `macos_safe_storage`
+// fixture), never from a real Keychain or a real Cursor database:
+//
+//   key=$(python3 -c 'import hashlib,sys;print(hashlib.pbkdf2_hmac("sha1",
+//         sys.argv[1].encode(),b"saltysalt",1003,16).hex())' "$PASSWORD")
+//   { printf 'v10'; printf '%s' "$SEALED_JWT" |
+//     openssl enc -aes-128-cbc -K "$key" -iv 20202020202020202020202020202020; } | base64
+//
+// (OpenSSL 4.1.0, PKCS7 padding by default.) `SEALED_B64` uses
+// `SAFE_STORAGE_PASSWORD`, `OTHER_SEALED_B64` uses `OTHER_PASSWORD`; both
+// contain `+` and `/`, so a URL_SAFE decode fails on them.
+
+const SEALED_JWT: &str = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJhdXRoMHx1c2VyX0NBTkFSWXVzZXIwMTIzNDU2Nzg5QUIiLCJ0eXBlIjoic2Vzc2lvbiIsImV4cCI6NDEwMjQ0NDgwMH0.CANARYsignatureXYZ";
+const SAFE_STORAGE_PASSWORD: &str = "test-cursor-safe-storage-password";
+const OTHER_PASSWORD: &str = "test-other-profile-password";
+const SEALED_B64: &str = "djEw8+TB1Z9KP2LSnhnAOkoG/rZDMNM60WA8aBrDF0Lq8b14ETjZU4oAM+GymBTJs96k6GThmCKnEb/p0ZUgRWybj9Rib1g/ETjaK1eV89hF9gFgNu5njPzKseH2vAwHut3sNkaXvPaj8914JEU6bGWqafewhtl0WpfESqAMUcBhkpx/K8NnNPDYgsoK1K2uDDwX";
+const OTHER_SEALED_B64: &str = "djEwQvaqV+D/2m6qRhxCu/YxXFYbILo+sCU/IN/wqAabT85DoYAIQYMGxpsw8Yp6ftdjD+Cet4SZ46hB5AJlpLV+8ZMfNFrDv9RixDfWZBSfh71ZspdCFBm1irpRFIcpzvZc2GbKSOfDK1hfsEVKeVIA0nl7hx55Cny7YFe+uq//rEdUijB1HfmPf4W/kZ/7rOgG";
+
+fn sealed(b64: &str) -> String {
+    format!("cursor-safe-storage:v1:{b64}")
+}
+
+/// Both registries' test locks (the consent registry drops the cached key),
+/// then a clean sealed-token state.
+fn sealed_lock() -> (
+    std::sync::MutexGuard<'static, ()>,
+    std::sync::MutexGuard<'static, ()>,
+) {
+    let guards = (
+        lock(),
+        crate::keychain_consent::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()),
+    );
+    crate::keychain_consent::reset_for_test();
+    reset_sealed_for_test();
+    guards
+}
+
+/// A Keychain stand-in: records every account asked, answers with `answer`.
+fn keychain<'a>(
+    calls: &'a std::cell::RefCell<Vec<String>>,
+    answer: impl Fn(&str) -> Result<Vec<u8>, i32> + 'a,
+) -> impl Fn(&str) -> Result<Vec<u8>, i32> + 'a {
+    move |account| {
+        calls.borrow_mut().push(account.to_string());
+        answer(account)
+    }
+}
+
+fn password(_: &str) -> Result<Vec<u8>, i32> {
+    Ok(SAFE_STORAGE_PASSWORD.as_bytes().to_vec())
+}
+
+fn granted() -> bool {
+    true
+}
+
+fn sealed_round(
+    explicit: bool,
+    default_db: &Path,
+    url: &str,
+    registry: &RwLock<Config>,
+    key_fetch: Option<&KeyFetch<'_>>,
+    consent: &dyn Fn() -> bool,
+) -> serde_json::Value {
+    let target = Target {
+        db_path: default_db,
+        url,
+        https_only: false,
+        file_stem: &stem,
+        key_fetch,
+        consent,
+    };
+    let source = || registry.read().unwrap().clone();
+    sync_with(explicit, None, &target, &source, Some(limits())).0
+}
+
+/// One sealed default profile (`token` stored JSON-quoted, as Cursor does).
+struct SealedFixture {
+    tmp: tempfile::TempDir,
+    db: PathBuf,
+    registry: RwLock<Config>,
+}
+
+fn sealed_fixture(token: &str) -> SealedFixture {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = login_db(&tmp.path().join("default"), token, USER);
+    let registry = RwLock::new(multi(&tmp.path().join("home"), true, Vec::new()));
+    SealedFixture { tmp, db, registry }
+}
+
+fn cookie_of(seen: &Arc<Mutex<Vec<Seen>>>) -> Option<String> {
+    header(&seen.lock().unwrap().first()?.head, "cookie")
+}
+
+/// 1: a sealed token, with consent and the key, sends exactly what its
+/// plaintext twin sends (same user, same token, so the same exp).
+#[test]
+fn sealed_token_with_consent_syncs_like_its_plaintext_twin() {
+    let _guard = sealed_lock();
+    let calls = std::cell::RefCell::new(Vec::new());
+    let fetch = keychain(&calls, password);
+    let twin = sealed_fixture(SEALED_JWT);
+    let (url, plain_seen) = serve(vec![json_ok(&page(1, &["a"]))]);
+    let plain = sealed_round(true, &twin.db, &url, &twin.registry, Some(&fetch), &granted);
+    assert_eq!(plain["state"], "ok", "{plain}");
+    assert!(
+        calls.borrow().is_empty(),
+        "a plaintext token read the Keychain"
+    );
+
+    let f = sealed_fixture(&sealed(SEALED_B64));
+    let (url, sealed_seen) = serve(vec![json_ok(&page(1, &["a"]))]);
+    let status = sealed_round(true, &f.db, &url, &f.registry, Some(&fetch), &granted);
+    assert_eq!(status["state"], "ok", "{status}");
+    assert_eq!(*calls.borrow(), ["Cursor Key"]);
+    let (plain_cookie, sealed_cookie) = (cookie_of(&plain_seen), cookie_of(&sealed_seen));
+    assert!(plain_cookie
+        .as_deref()
+        .is_some_and(|c| c.contains(SEALED_JWT)));
+    assert_eq!(sealed_cookie, plain_cookie);
+    let user = token_user(&CursorLogin {
+        access_token: SEALED_JWT.to_string(),
+        glass_user_id: None,
+        profile_user_id: None,
+    })
+    .unwrap();
+    assert_eq!(user, (USER.to_string(), 4102444800.0));
+}
+
+/// 2: a plaintext token without consent syncs and never reaches the key
+/// source.
+#[test]
+fn plaintext_token_needs_no_consent_and_no_keychain() {
+    let _guard = sealed_lock();
+    let calls = std::cell::RefCell::new(Vec::new());
+    let fetch = keychain(&calls, password);
+    let asked = std::cell::Cell::new(0);
+    let consent = || {
+        asked.set(asked.get() + 1);
+        false
+    };
+    let f = sealed_fixture(&valid_token());
+    let (url, seen) = serve(vec![json_ok(&page(1, &["a"]))]);
+    let status = sealed_round(true, &f.db, &url, &f.registry, Some(&fetch), &consent);
+    assert_eq!(status["state"], "ok", "{status}");
+    assert_eq!(seen.lock().unwrap().len(), 1);
+    assert!(calls.borrow().is_empty(), "plaintext reached the Keychain");
+    assert_eq!(asked.get(), 0, "plaintext consulted the consent");
+}
+
+/// 3: a sealed token without consent stops at `keychain_consent`, with no
+/// Keychain call and nothing sent.
+#[test]
+fn sealed_token_without_consent_reads_nothing() {
+    let _guard = sealed_lock();
+    let calls = std::cell::RefCell::new(Vec::new());
+    let fetch = keychain(&calls, password);
+    let f = sealed_fixture(&sealed(SEALED_B64));
+    let (url, seen) = serve(vec![json_ok(&page(1, &["a"]))]);
+    let status = sealed_round(true, &f.db, &url, &f.registry, Some(&fetch), &no_consent);
+    assert_eq!(states(&status), ["error:keychain_consent"]);
+    assert_eq!(status["reason"], "keychain_consent");
+    assert!(calls.borrow().is_empty());
+    assert!(seen.lock().unwrap().is_empty());
+}
+
+/// Two sealed profiles: the default (`default_b64`) and one added profile
+/// (`added_b64`), same account.
+fn two_sealed(default_b64: &str, added_b64: &str) -> SealedFixture {
+    let f = sealed_fixture(&sealed(default_b64));
+    let root = profile_root(f.tmp.path(), "b", &sealed(added_b64), USER);
+    *f.registry.write().unwrap() = multi(
+        &f.tmp.path().join("home"),
+        true,
+        vec![profile(PROFILE_A, &root)],
+    );
+    f
+}
+
+/// 4: Deny is `keychain_denied`, the legacy account is not tried after it,
+/// and a second sealed profile of the same round reuses the result (one
+/// dialog per round).
+#[test]
+fn a_denied_read_is_not_retried_in_the_round() {
+    let _guard = sealed_lock();
+    let calls = std::cell::RefCell::new(Vec::new());
+    let fetch = keychain(&calls, |_| Err(-128));
+    let f = two_sealed(SEALED_B64, SEALED_B64);
+    let (url, seen) = serve(vec![json_ok(&page(1, &["a"]))]);
+    let status = sealed_round(true, &f.db, &url, &f.registry, Some(&fetch), &granted);
+    assert_eq!(
+        states(&status),
+        ["error:keychain_denied", "error:keychain_denied"]
+    );
+    assert_eq!(*calls.borrow(), ["Cursor Key"], "a second dialog");
+    assert!(seen.lock().unwrap().is_empty());
+}
+
+/// 5: NotFound on `Cursor Key` falls back to `Cursor`, in that order; other
+/// statuses stop at the first account (table in `macos_safe_storage`).
+#[test]
+fn the_legacy_account_is_tried_only_when_the_current_one_is_missing() {
+    let _guard = sealed_lock();
+    let cases: [(&KeyFetch<'_>, &str, &[&str]); 4] = [
+        (
+            &|account| match account {
+                "Cursor Key" => Err(-25300),
+                _ => password(account),
+            },
+            "ok",
+            &["Cursor Key", "Cursor"],
+        ),
+        (
+            &|_| Err(-25300),
+            "error:keychain_missing",
+            &["Cursor Key", "Cursor"],
+        ),
+        (
+            &|_| Err(-25308),
+            "error:keychain_unavailable",
+            &["Cursor Key"],
+        ),
+        (&|_| Err(-25293), "error:keychain_denied", &["Cursor Key"]),
+    ];
+    for (answer, expected, accounts) in cases {
+        reset_sealed_for_test();
+        let calls = std::cell::RefCell::new(Vec::new());
+        let fetch = keychain(&calls, answer);
+        let f = sealed_fixture(&sealed(SEALED_B64));
+        let (url, _) = serve(vec![json_ok(&page(1, &["a"]))]);
+        let status = sealed_round(true, &f.db, &url, &f.registry, Some(&fetch), &granted);
+        assert_eq!(states(&status), [expected], "{accounts:?}");
+        assert_eq!(*calls.borrow(), accounts);
+    }
+}
+
+/// 6: one read serves both profiles; a later background round uses the
+/// cached key with no read; removing the grant, or turning sync off, empties
+/// the cache at once (no round in between).
+#[test]
+fn the_key_is_read_once_kept_and_dropped_with_the_grant_or_the_switch() {
+    let _guard = sealed_lock();
+    let calls = std::cell::RefCell::new(Vec::new());
+    let fetch = keychain(&calls, password);
+    let f = two_sealed(SEALED_B64, SEALED_B64);
+    let replies = (0..4).map(|_| json_ok(&page(1, &["a"]))).collect();
+    let (url, _) = serve(replies);
+    let round = |explicit| sealed_round(explicit, &f.db, &url, &f.registry, Some(&fetch), &granted);
+    assert_eq!(states(&round(true)), ["ok", "duplicate"]);
+    assert_eq!(calls.borrow().len(), 1, "one read per round");
+    assert_eq!(states(&round(false)), ["ok", "duplicate"]);
+    assert_eq!(calls.borrow().len(), 1, "a background round read again");
+    assert!(sealed_key_cached_for_test());
+
+    // A payload that does not grant "cursor" drops the key immediately.
+    crate::keychain_consent::set_from_json(r#"{"grok-bot":true}"#).unwrap();
+    assert!(!sealed_key_cached_for_test(), "consent removed, key kept");
+    // Control: a payload that grants "cursor" keeps it.
+    assert_eq!(states(&round(true)), ["ok", "duplicate"]);
+    crate::keychain_consent::set_from_json(r#"{"cursor":true}"#).unwrap();
+    assert!(sealed_key_cached_for_test());
+
+    // Turning sync off drops it immediately too.
+    set_for_test(Config::default());
+    set_from_json(r#"{"enabled":false,"bundleId":"com.example.off"}"#, None).unwrap();
+    assert!(!sealed_key_cached_for_test(), "sync off, key kept");
+    set_for_test(Config::default());
+    crate::keychain_consent::reset_for_test();
+}
+
+/// 7: every malformed sealed token is a fixed reason, and no fixture secret
+/// reaches any output; a decrypt failure with the cached key empties the
+/// cache.
+#[test]
+fn malformed_sealed_tokens_are_fixed_reasons_without_secrets() {
+    let _guard = sealed_lock();
+    let blob = base64::engine::general_purpose::STANDARD
+        .decode(SEALED_B64)
+        .unwrap();
+    let encode = |bytes: &[u8]| base64::engine::general_purpose::STANDARD.encode(bytes);
+    let mut v11 = blob.clone();
+    v11[2] = b'1';
+    let cases = [
+        (sealed(OTHER_SEALED_B64), "token_sealed_unreadable"),
+        (sealed(&encode(&blob[..11])), "token_sealed_unreadable"),
+        (sealed(&encode(&v11)), "token_sealed_unreadable"),
+        (sealed("not*base64"), "token_sealed_unreadable"),
+        (
+            format!("cursor-safe-storage:v2:{SEALED_B64}"),
+            "token_sealed_unsupported",
+        ),
+    ];
+    let mut outputs = Vec::new();
+    for (token, reason) in &cases {
+        reset_sealed_for_test();
+        let calls = std::cell::RefCell::new(Vec::new());
+        let fetch = keychain(&calls, password);
+        let f = sealed_fixture(token);
+        let (url, seen) = serve(vec![json_ok(&page(1, &["a"]))]);
+        let status = sealed_round(true, &f.db, &url, &f.registry, Some(&fetch), &granted);
+        assert_eq!(states(&status), [format!("error:{reason}")], "{status}");
+        assert!(seen.lock().unwrap().is_empty());
+        outputs.push(status.to_string());
+        for entry in walkdir(f.tmp.path()) {
+            outputs.push(entry);
+        }
+    }
+    let all = outputs.join("\n");
+    for canary in [
+        SEALED_JWT,
+        SIGNATURE,
+        SAFE_STORAGE_PASSWORD,
+        OTHER_PASSWORD,
+        &SEALED_B64[4..24],
+        &OTHER_SEALED_B64[4..24],
+    ] {
+        assert!(!all.contains(canary), "a fixture secret reached an output");
+    }
+
+    // A decrypt failure with a cached key empties the cache.
+    reset_sealed_for_test();
+    let calls = std::cell::RefCell::new(Vec::new());
+    let fetch = keychain(&calls, password);
+    let f = sealed_fixture(&sealed(SEALED_B64));
+    let (url, _) = serve(vec![json_ok(&page(1, &["a"]))]);
+    let round = |explicit| sealed_round(explicit, &f.db, &url, &f.registry, Some(&fetch), &granted);
+    assert_eq!(states(&round(true)), ["ok"]);
+    assert!(sealed_key_cached_for_test());
+    // The stored token now needs another key (a rotated Safe Storage key).
+    let rotated = login_db(
+        &f.tmp.path().join("rotated"),
+        &sealed(OTHER_SEALED_B64),
+        USER,
+    );
+    std::fs::copy(rotated, &f.db).unwrap();
+    assert_eq!(states(&round(false)), ["error:token_sealed_unreadable"]);
+    assert!(
+        !sealed_key_cached_for_test(),
+        "a key that opens nothing was kept"
+    );
+    assert_eq!(calls.borrow().len(), 1);
+    assert_eq!(states(&round(false)), ["error:keychain_unlock"]);
+}
+
+/// Names and contents of every file under `dir`.
+fn walkdir(dir: &Path) -> Vec<String> {
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        let path = entry.path();
+        out.push(entry.file_name().to_string_lossy().into_owned());
+        if path.is_dir() {
+            out.extend(walkdir(&path));
+        } else if path.extension().is_some_and(|e| e == "json") {
+            out.push(std::fs::read_to_string(&path).unwrap_or_default());
+        }
+    }
+    out
+}
+
+/// 9: the opened token goes through the same checks as a plaintext one: a
+/// stored account that differs is `account_mismatch`, a non-JWT plaintext
+/// is `token_unreadable`.
+#[test]
+fn an_opened_token_is_checked_like_a_plaintext_one() {
+    let _guard = sealed_lock();
+    let calls = std::cell::RefCell::new(Vec::new());
+    let fetch = keychain(&calls, password);
+    let tmp = tempfile::tempdir().unwrap();
+    let db = login_db(&tmp.path().join("other"), &sealed(SEALED_B64), OTHER_USER);
+    let registry = RwLock::new(multi(&tmp.path().join("home"), true, Vec::new()));
+    let (url, seen) = serve(vec![json_ok(&page(1, &["a"]))]);
+    let status = sealed_round(true, &db, &url, &registry, Some(&fetch), &granted);
+    assert_eq!(states(&status), ["error:account_mismatch"]);
+    // Synthetic non-JWT plaintext from the `macos_safe_storage` fixture
+    // (Python hashlib + OpenSSL, password `test-keychain-password`).
+    reset_sealed_for_test();
+    let calls = std::cell::RefCell::new(Vec::new());
+    let fetch = keychain(&calls, |_| Ok(b"test-keychain-password".to_vec()));
+    let f = sealed_fixture(&sealed("djEwAO+8/FAQYBswbLPYv43X0Q=="));
+    let status = sealed_round(true, &f.db, &url, &f.registry, Some(&fetch), &granted);
+    assert_eq!(states(&status), ["error:token_unreadable"]);
+    assert_eq!(calls.borrow().len(), 1, "the fixture never reached the key");
+    assert!(seen.lock().unwrap().is_empty());
+}
+
+/// 11: only the first round of the process, or a round the user started,
+/// may read. A first round with a plaintext token (or none) still counts.
+#[test]
+fn only_the_first_or_an_explicit_round_reads_the_keychain() {
+    let _guard = sealed_lock();
+    let calls = std::cell::RefCell::new(Vec::new());
+    let fetch = keychain(&calls, password);
+    let f = sealed_fixture(&valid_token());
+    let (url, _) = serve((0..3).map(|_| json_ok(&page(1, &["a"]))).collect());
+    let round = |explicit| sealed_round(explicit, &f.db, &url, &f.registry, Some(&fetch), &granted);
+    assert_eq!(states(&round(false)), ["ok"], "first round, plaintext");
+    // Cursor now stores the token sealed.
+    let resealed = login_db(&f.tmp.path().join("resealed"), &sealed(SEALED_B64), USER);
+    std::fs::copy(resealed, &f.db).unwrap();
+    assert_eq!(states(&round(false)), ["error:keychain_unlock"]);
+    assert!(
+        calls.borrow().is_empty(),
+        "a background round read the Keychain"
+    );
+    assert_eq!(states(&round(true)), ["ok"]);
+    assert_eq!(calls.borrow().len(), 1);
+
+    // No token at all in the first round counts as well.
+    reset_sealed_for_test();
+    let tmp = tempfile::tempdir().unwrap();
+    let absent = tmp.path().join("absent.vscdb");
+    let registry = RwLock::new(multi(&tmp.path().join("home"), true, Vec::new()));
+    let status = sealed_round(false, &absent, &url, &registry, Some(&fetch), &granted);
+    assert_eq!(states(&status), ["notSignedIn"]);
+    assert_eq!(states(&round(false)), ["error:keychain_unlock"]);
+    assert_eq!(
+        calls.borrow().len(),
+        1,
+        "a background round read the Keychain"
+    );
+    // Control: in a fresh process the first background round does read.
+    reset_sealed_for_test();
+    assert_eq!(states(&round(false)), ["ok"]);
+    assert_eq!(calls.borrow().len(), 2);
+}
+
+/// 12: a key whose read was overtaken (consent removed, sync turned off, a
+/// drop) while the dialog was up is not kept, and the next round needs
+/// consent again.
+#[test]
+fn a_key_read_overtaken_by_a_change_is_not_kept() {
+    let _guard = sealed_lock();
+    let f = sealed_fixture(&sealed(SEALED_B64));
+    let (url, seen) = serve(vec![json_ok(&page(1, &["a"]))]);
+
+    // Consent removed while the dialog is up.
+    let consent = std::sync::atomic::AtomicBool::new(true);
+    let calls = std::cell::RefCell::new(Vec::new());
+    let fetch = keychain(&calls, |account| {
+        consent.store(false, Ordering::SeqCst);
+        password(account)
+    });
+    let live = || consent.load(Ordering::SeqCst);
+    let status = sealed_round(true, &f.db, &url, &f.registry, Some(&fetch), &live);
+    assert_eq!(states(&status), ["error:keychain_consent"]);
+    assert!(!sealed_key_cached_for_test());
+    let status = sealed_round(false, &f.db, &url, &f.registry, Some(&fetch), &live);
+    assert_eq!(states(&status), ["error:keychain_consent"]);
+    assert_eq!(calls.borrow().len(), 1);
+
+    // Sync turned off while the dialog is up.
+    reset_sealed_for_test();
+    let calls = std::cell::RefCell::new(Vec::new());
+    let fetch = keychain(&calls, |account| {
+        f.registry.write().unwrap().enabled = false;
+        password(account)
+    });
+    let status = sealed_round(true, &f.db, &url, &f.registry, Some(&fetch), &granted);
+    assert_eq!(states(&status), ["disabled"]);
+    assert!(!sealed_key_cached_for_test());
+    f.registry.write().unwrap().enabled = true;
+
+    // A drop (here: a consent payload without "cursor", while the injected
+    // consent still says yes) between the read and the store.
+    reset_sealed_for_test();
+    let calls = std::cell::RefCell::new(Vec::new());
+    let fetch = keychain(&calls, |account| {
+        crate::keychain_consent::set_from_json(r#"{"grok-bot":true}"#).unwrap();
+        password(account)
+    });
+    let status = sealed_round(true, &f.db, &url, &f.registry, Some(&fetch), &granted);
+    assert_eq!(states(&status), ["error:keychain_consent"]);
+    assert!(!sealed_key_cached_for_test());
+    assert!(seen.lock().unwrap().is_empty(), "an overtaken key was used");
+    // Control: the same read with nothing changing is kept and used.
+    reset_sealed_for_test();
+    let fetch = keychain(&calls, password);
+    let status = sealed_round(true, &f.db, &url, &f.registry, Some(&fetch), &granted);
+    assert_eq!(states(&status), ["ok"]);
+    assert!(sealed_key_cached_for_test());
+    crate::keychain_consent::reset_for_test();
+}
+
+/// 13: with no key source (the non-macOS build), a sealed token is
+/// `token_sealed_unsupported` before any consent lookup.
+#[test]
+fn no_key_source_means_unsupported_before_consent() {
+    let _guard = sealed_lock();
+    let asked = std::cell::Cell::new(0);
+    let consent = || {
+        asked.set(asked.get() + 1);
+        true
+    };
+    let f = sealed_fixture(&sealed(SEALED_B64));
+    let (url, seen) = serve(vec![json_ok(&page(1, &["a"]))]);
+    let status = sealed_round(true, &f.db, &url, &f.registry, None, &consent);
+    assert_eq!(states(&status), ["error:token_sealed_unsupported"]);
+    assert_eq!(asked.get(), 0);
+    assert!(seen.lock().unwrap().is_empty());
+}
+
+/// 15: an added profile sealed with another key fails on its own; the key
+/// that opened the default profile is kept for the next background round.
+/// Only when no profile opens is it dropped.
+#[test]
+fn one_profile_failing_to_open_keeps_the_key_for_the_others() {
+    let _guard = sealed_lock();
+    let calls = std::cell::RefCell::new(Vec::new());
+    let fetch = keychain(&calls, password);
+    let f = two_sealed(SEALED_B64, OTHER_SEALED_B64);
+    let (url, seen) = serve((0..2).map(|_| json_ok(&page(1, &["a"]))).collect());
+    let round = |explicit| sealed_round(explicit, &f.db, &url, &f.registry, Some(&fetch), &granted);
+    assert_eq!(
+        states(&round(true)),
+        ["ok", "error:token_sealed_unreadable"]
+    );
+    assert_eq!(calls.borrow().len(), 1);
+    assert_eq!(
+        states(&round(false)),
+        ["ok", "error:token_sealed_unreadable"]
+    );
+    assert_eq!(calls.borrow().len(), 1, "the key was dropped");
+    assert_eq!(seen.lock().unwrap().len(), 2, "the default did not sync");
+
+    // Every profile failing: the key goes.
+    let g = two_sealed(OTHER_SEALED_B64, OTHER_SEALED_B64);
+    let status = sealed_round(false, &g.db, &url, &g.registry, Some(&fetch), &granted);
+    assert_eq!(
+        states(&status),
+        [
+            "error:token_sealed_unreadable",
+            "error:token_sealed_unreadable"
+        ]
+    );
+    assert!(!sealed_key_cached_for_test());
+}
+
+/// 16: the production consent check reads the registry: a payload with
+/// `"cursor":false` stops an explicit round at `keychain_consent`.
+#[test]
+fn the_registry_decides_cursor_consent() {
+    let _guard = sealed_lock();
+    let calls = std::cell::RefCell::new(Vec::new());
+    let fetch = keychain(&calls, password);
+    let consent = || crate::keychain_consent::allowed("cursor");
+    let f = sealed_fixture(&sealed(SEALED_B64));
+    let (url, _) = serve(vec![json_ok(&page(1, &["a"]))]);
+    let result =
+        crate::keychain_consent::set_from_json(r#"{"grok-bot":true,"cursor":false}"#).unwrap();
+    assert!(result["rejected"].as_array().unwrap().is_empty());
+    let status = sealed_round(true, &f.db, &url, &f.registry, Some(&fetch), &consent);
+    assert_eq!(states(&status), ["error:keychain_consent"]);
+    assert!(calls.borrow().is_empty());
+    // Control: granting "cursor" lets the same round read.
+    crate::keychain_consent::set_from_json(r#"{"grok-bot":true,"cursor":true}"#).unwrap();
+    let status = sealed_round(true, &f.db, &url, &f.registry, Some(&fetch), &consent);
+    assert_eq!(states(&status), ["ok"]);
+    assert_eq!(calls.borrow().len(), 1);
+    crate::keychain_consent::reset_for_test();
+}
+
+// --- review round 1 ---------------------------------------------------------
+
+/// R1: the consent answer a cached key is used under is read while the
+/// key-cache lock is held, so a revoke (registry write, then a drop under
+/// that lock) cannot slip between the check and the decrypt. A withdrawn
+/// answer there is `keychain_consent` with nothing sent.
+#[test]
+fn consent_is_read_under_the_key_cache_lock() {
+    let _guard = sealed_lock();
+    let calls = std::cell::RefCell::new(Vec::new());
+    let fetch = keychain(&calls, password);
+    let f = sealed_fixture(&sealed(SEALED_B64));
+    let (url, seen) = serve((0..2).map(|_| json_ok(&page(1, &["a"]))).collect());
+    assert_eq!(
+        states(&sealed_round(
+            true,
+            &f.db,
+            &url,
+            &f.registry,
+            Some(&fetch),
+            &granted
+        )),
+        ["ok"]
+    );
+    assert!(sealed_key_cached_for_test());
+    // `try_lock` from the thread that holds the lock fails without blocking.
+    let held = std::cell::RefCell::new(Vec::new());
+    let answer = std::cell::Cell::new(true);
+    let consent = || {
+        held.borrow_mut().push(SEALED_KEY.try_lock().is_err());
+        answer.get()
+    };
+    let status = sealed_round(false, &f.db, &url, &f.registry, Some(&fetch), &consent);
+    assert_eq!(states(&status), ["ok"]);
+    assert_eq!(
+        *held.borrow(),
+        [true],
+        "consent read outside the key-cache lock"
+    );
+    answer.set(false);
+    let status = sealed_round(false, &f.db, &url, &f.registry, Some(&fetch), &consent);
+    assert_eq!(states(&status), ["error:keychain_consent"]);
+    assert_eq!(
+        seen.lock().unwrap().len(),
+        2,
+        "a withdrawn grant opened the token"
+    );
+    assert_eq!(calls.borrow().len(), 1);
+}
+
+/// R3: time spent waiting on the Keychain dialog comes off the round's
+/// budget; the walk does not get a fresh one.
+#[test]
+fn the_keychain_wait_counts_against_the_round_budget() {
+    let _guard = sealed_lock();
+    let calls = std::cell::RefCell::new(Vec::new());
+    let fetch = keychain(&calls, |account| {
+        std::thread::sleep(Duration::from_millis(1200));
+        password(account)
+    });
+    let f = sealed_fixture(&sealed(SEALED_B64));
+    let (url, seen) = serve(vec![json_ok(&page(1, &["a"]))]);
+    let target = Target {
+        db_path: &f.db,
+        url: &url,
+        https_only: false,
+        file_stem: &stem,
+        key_fetch: Some(&fetch),
+        consent: &granted,
+    };
+    let source = || f.registry.read().unwrap().clone();
+    let short = Limits {
+        budget: Duration::from_secs(1),
+        ..limits()
+    };
+    let status = sync_with(true, None, &target, &source, Some(short)).0;
+    assert_eq!(states(&status), ["partial:budget_exhausted"]);
+    assert!(
+        seen.lock().unwrap().is_empty(),
+        "the walk ran past the budget"
+    );
+    // Control: with time left after the wait, the same round syncs.
+    reset_sealed_for_test();
+    let roomy = Limits {
+        budget: Duration::from_secs(10),
+        ..limits()
+    };
+    let status = sync_with(true, None, &target, &source, Some(roomy)).0;
+    assert_eq!(states(&status), ["ok"]);
+}
+
+/// R4: a profile removed while the dialog was up skips itself, but the key
+/// the user just allowed is kept for the round's other profiles.
+#[test]
+fn a_profile_removed_during_the_dialog_keeps_the_key_for_the_others() {
+    let _guard = sealed_lock();
+    let f = sealed_fixture(&valid_token());
+    let home = f.tmp.path().join("home");
+    let a = profile_root(f.tmp.path(), "a", &sealed(SEALED_B64), USER);
+    let b = profile_root(f.tmp.path(), "b", &sealed(SEALED_B64), USER);
+    *f.registry.write().unwrap() = multi(
+        &home,
+        true,
+        vec![profile(PROFILE_A, &a), profile(PROFILE_B, &b)],
+    );
+    let calls = std::cell::RefCell::new(Vec::new());
+    let fetch = keychain(&calls, |account| {
+        // Profile A is removed while macOS shows its dialog.
+        f.registry
+            .write()
+            .unwrap()
+            .profiles
+            .retain(|p| p.id != PROFILE_A);
+        password(account)
+    });
+    let (url, _) = serve(vec![json_ok(&page(1, &["a"]))]);
+    let status = sealed_round(true, &f.db, &url, &f.registry, Some(&fetch), &granted);
+    assert_eq!(states(&status), ["ok", "disabled", "duplicate"]);
+    assert_eq!(calls.borrow().len(), 1);
+    assert!(
+        sealed_key_cached_for_test(),
+        "the allowed key was thrown away"
+    );
 }

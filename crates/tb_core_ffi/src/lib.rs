@@ -1648,10 +1648,13 @@ pub unsafe extern "C" fn tb_antigravity_remove(key: *const c_char) -> *mut c_cha
 ///
 /// A WIRED client whose id is absent from the registry is never read from the
 /// Keychain, so the OS authorization dialog cannot appear for it before the
-/// app has asked the user. The one wired client is `grok-bot`, whose gate sits
+/// app has asked the user. Two clients are wired: `grok-bot`, whose gate sits
 /// in `agent_grokbot::decode_desktop_secret` immediately before the decrypt —
 /// not at "a desktop login exists", so a plaintext-stored secret keeps working
-/// ungated.
+/// ungated — and `cursor`, checked by the usage sync only for a sealed
+/// (`cursor-safe-storage:`) access token (`cursor_sync::SealedRound`). A
+/// payload that does not grant `cursor` also drops the Cursor key the sync
+/// keeps in memory. Full-replace: the caller sends both answers together.
 ///
 /// This is not a process-wide no-Keychain guarantee: `agent_usage` reads the
 /// Claude credentials through `/usr/bin/security` without consulting this
@@ -1660,7 +1663,7 @@ pub unsafe extern "C" fn tb_antigravity_remove(key: *const c_char) -> *mut c_cha
 ///
 /// The registry is in-memory and starts empty every launch: the caller owns
 /// re-applying the user's stored answer, and a process that never calls this
-/// reads no Grok Bot Keychain item.
+/// reads neither the Grok Bot nor the Cursor Keychain item.
 ///
 /// # Safety
 /// `json` must be NULL or a valid NUL-terminated UTF-8 string.
@@ -1888,6 +1891,12 @@ unsafe fn set_cursor_sync_from_c(json: *const c_char) -> Result<serde_json::Valu
 /// another synced); `events` sums this call's writes, `lastSuccessMs` is the
 /// newest complete file's mtime. `cliPresent` = a walk completed but CLI Cursor files
 /// exist and the user has not confirmed the takeover; it carries no `reason`.
+/// A sealed access token adds the `error` reasons `keychain_consent`,
+/// `keychain_denied`, `keychain_unlock` (only a `user_initiated` call or the
+/// process's first call reads the Keychain, once, waiting on the macOS
+/// dialog), `keychain_missing`, `keychain_unavailable`,
+/// `token_sealed_unreadable`, `token_sealed_unsupported` (`cursor_sync`
+/// module doc).
 #[no_mangle]
 pub extern "C" fn tb_cursor_sync(user_initiated: i32) -> *mut c_char {
     guarded("tb_cursor_sync", || {

@@ -29,6 +29,16 @@
 //! - Every round re-checks the appDir first; one that no longer passes
 //!   (`check_app_dir`) gets no read, lock, write or takeover file
 //!   (`app_dir_rejected`).
+//! - A sealed token (`cursor-safe-storage:v1:`, Cursor 3.27+) is opened with
+//!   Cursor's Safe Storage key only while the user's "cursor" Keychain
+//!   consent stands; a plaintext token never consults consent or the
+//!   Keychain. The Keychain is read at most once per round, and only by a
+//!   round the user started or the process's first round; the derived key
+//!   stays in memory until the grant is removed or sync is turned off
+//!   (plan CURSOR-SS-M, `SealedRound`). Every outcome is a fixed reason:
+//!   `keychain_consent`, `keychain_denied`, `keychain_missing`,
+//!   `keychain_unavailable`, `keychain_unlock`, `token_sealed_unreadable`,
+//!   `token_sealed_unsupported`.
 //! - Swift passes a bundle id and `(uuid, root)` pairs, never a directory or a
 //!   database path; Rust derives both (CMP-520 B2). `sub` never crosses the
 //!   FFI: a profile whose account an earlier profile already covered this
@@ -44,7 +54,7 @@ use fs2::FileExt as _;
 use serde::{Deserialize, Serialize};
 use std::io::Write as _;
 use std::path::{Component, Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -430,6 +440,10 @@ pub(crate) fn set_from_json(raw: &str, home: Option<&Path>) -> Result<serde_json
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         std::mem::replace(&mut *guard, new.clone())
     };
+    // Sync turned off: the cached Cursor key goes with it (U3, Design 4).
+    if !new.enabled {
+        drop_sealed_key();
+    }
     let mut cleanup = Cleanup::default();
     // The appDir in use until now (files may be left there) is cleaned only
     // if it still passes the checks; otherwise it is reported. A refused new
@@ -1114,6 +1128,177 @@ struct Target<'a> {
     url: &'a str,
     https_only: bool,
     file_stem: &'a dyn Fn(&str) -> Option<String>,
+    /// The per-account fetch of Cursor's Safe Storage password (production:
+    /// `macos_safe_storage::cursor_keychain_fetch`), or `None` where there is
+    /// no key source: a sealed token is then `token_sealed_unsupported`.
+    key_fetch: Option<&'a KeyFetch<'a>>,
+    /// The user's Cursor Keychain consent (production:
+    /// `keychain_consent::allowed("cursor")`), re-read at every use.
+    consent: &'a dyn Fn() -> bool,
+}
+
+/// Account name → password bytes, or the Keychain's OSStatus.
+type KeyFetch<'a> = dyn Fn(&str) -> Result<Vec<u8>, i32> + 'a;
+
+// ---------------------------------------------------------------------------
+// Sealed tokens (plan CURSOR-SS-M, Design 3-4, U3).
+//
+// The derived key stays in memory while Syrtis runs (U3), dropped (erased by
+// `Key`'s Drop) when the "cursor" grant is removed or sync is turned off. The
+// Keychain is read at most once per round, and only by a round the user
+// started (`explicit`) or the process's first round: a later background round
+// never raises the dialog.
+
+struct KeyCache {
+    key: Option<cursor_desktop::Key>,
+    /// Bumped by every drop. A read stores its key only if no drop happened
+    /// while it waited on the dialog.
+    generation: u64,
+}
+
+static SEALED_KEY: Mutex<KeyCache> = Mutex::new(KeyCache {
+    key: None,
+    generation: 0,
+});
+
+/// Set when the first `sync_with` round of the process ends, whatever it
+/// found (plaintext, no token, a refusal), so only that round may read
+/// without the user asking.
+static FIRST_ROUND_DONE: AtomicBool = AtomicBool::new(false);
+
+fn sealed_key() -> std::sync::MutexGuard<'static, KeyCache> {
+    SEALED_KEY
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Drop the cached key, if any, and invalidate a read in flight. Called with
+/// no other registry lock held (`keychain_consent::set_from_json`,
+/// `set_from_json` here, a round in which the key opened no token).
+pub(crate) fn drop_sealed_key() {
+    let mut cache = sealed_key();
+    cache.key = None;
+    cache.generation = cache.generation.wrapping_add(1);
+}
+
+fn read_key(fetch: &KeyFetch<'_>) -> Result<cursor_desktop::Key, &'static str> {
+    #[cfg(target_os = "macos")]
+    {
+        use crate::macos_safe_storage::{read_cursor_key, KeychainError};
+        read_cursor_key(fetch).map_err(|error| match error {
+            KeychainError::Denied => "keychain_denied",
+            KeychainError::NotFound => "keychain_missing",
+            KeychainError::Other => "keychain_unavailable",
+        })
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = fetch;
+        Err("token_sealed_unsupported")
+    }
+}
+
+/// One round's sealed-token state.
+struct SealedRound<'a> {
+    /// The round may still read the Keychain: explicit or the process's
+    /// first round, and no read yet this round.
+    may_read: bool,
+    /// The global sync switch (the round's live config), as opposed to one
+    /// profile's `enabled`: a key read is kept only while it is on.
+    switch_on: &'a dyn Fn() -> bool,
+    /// The round's one read failed; later profiles reuse the reason (never a
+    /// second dialog).
+    failed: Option<&'static str>,
+    /// Some profile tried the key; some profile's token opened with it.
+    tried: bool,
+    opened: bool,
+}
+
+impl<'a> SealedRound<'a> {
+    fn new(may_read: bool, switch_on: &'a dyn Fn() -> bool) -> Self {
+        Self {
+            may_read,
+            switch_on,
+            failed: None,
+            tried: false,
+            opened: false,
+        }
+    }
+
+    /// The plaintext of one profile's sealed token, or the fixed refusal.
+    /// `enabled`: the profile's live switch (still configured as when the
+    /// round started).
+    fn open(
+        &mut self,
+        blob: &[u8],
+        target: &Target<'_>,
+        enabled: &dyn Fn() -> bool,
+    ) -> Result<String, Stop> {
+        let refuse = |reason| Err(Stop::error(reason));
+        let Some(fetch) = target.key_fetch else {
+            return refuse("token_sealed_unsupported");
+        };
+        let mut cache = sealed_key();
+        // Checked under the key-cache lock, never before it: a revoke writes
+        // the registry first and then drops the key under this lock, so the
+        // answer read here holds until the decrypt below is done.
+        if !(target.consent)() {
+            return refuse("keychain_consent");
+        }
+        if cache.key.is_none() {
+            if let Some(reason) = self.failed {
+                return refuse(reason);
+            }
+            if !self.may_read {
+                return refuse("keychain_unlock");
+            }
+            self.may_read = false;
+            let generation = cache.generation;
+            // Not held across the read: it blocks until the dialog is
+            // answered, and a drop must not wait for that.
+            drop(cache);
+            let key = match read_key(fetch) {
+                Ok(key) => key,
+                Err(reason) => {
+                    self.failed = Some(reason);
+                    return refuse(reason);
+                }
+            };
+            cache = sealed_key();
+            // Stored only if no drop happened while the dialog was up (an off
+            // push or a consent payload without "cursor" bumps the
+            // generation), consent stands and sync is still on; otherwise
+            // `key` is dropped (erased) here.
+            if !(self.switch_on)() {
+                return Err(Stop::new(State::Disabled, None));
+            }
+            if cache.generation != generation || !(target.consent)() {
+                return refuse("keychain_consent");
+            }
+            cache.key = Some(key);
+            // A profile removed while the dialog was up only skips itself:
+            // the key the user just allowed stays for the other profiles.
+            if !enabled() {
+                return Err(Stop::new(State::Disabled, None));
+            }
+        }
+        let Some(key) = cache.key.as_ref() else {
+            return refuse("keychain_unlock");
+        };
+        self.tried = true;
+        let token = cursor_desktop::unseal(blob, key).map_err(Stop::error)?;
+        self.opened = true;
+        Ok(token)
+    }
+
+    /// A key no profile of the round could open its token with is dropped
+    /// (a rotated Safe Storage key: the next Sync Now reads again). One bad
+    /// profile beside a good one keeps it.
+    fn finish(self) {
+        if self.tried && !self.opened {
+            drop_sealed_key();
+        }
+    }
 }
 
 fn now_secs() -> f64 {
@@ -1127,14 +1312,7 @@ fn now_secs() -> f64 {
 /// Refuses (S-1) when a stored glass/profile id exists and differs.
 fn token_user(login: &CursorLogin) -> Result<(String, f64), Stop> {
     let unreadable = Stop::error("token_unreadable");
-    if !login
-        .access_token
-        .bytes()
-        .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
-    {
-        return Err(unreadable);
-    }
-    let claims = crate::agent_usage::jwt_payload(&login.access_token).ok_or(unreadable)?;
+    let claims = cursor_desktop::jwt_claims(&login.access_token).ok_or(unreadable)?;
     let sub = claims
         .get("sub")
         .and_then(serde_json::Value::as_str)
@@ -1309,34 +1487,50 @@ fn covers_account(stop: Stop) -> bool {
 /// started"). `claim(stem, false)` returns the index of an earlier profile
 /// that already covered the same account this round; `claim(stem, true)`
 /// records this one: after its file is committed, or after a walk failure
-/// that is not this session's own (see the module doc). `checked`: an added
-/// profile, read with `read_login_checked` (a symlinked database refused);
-/// the default profile follows a symlinked `state.vscdb`, as every release
-/// did, and opens the resolved file the checked way without an owner check
-/// (`read_login_resolved`).
+/// that is not this session's own (see the module doc). An added profile
+/// (`slot.root` set) is read with `read_login_checked` (a symlinked database
+/// refused); the default profile follows a symlinked `state.vscdb`, as every
+/// release did, and opens the resolved file the checked way without an owner
+/// check (`read_login_resolved`). `sealed`: the round's sealed-token state.
 async fn run(
     target: &Target<'_>,
-    db_path: &Path,
-    dir: &Path,
+    slot: &Slot,
     limits: Limits,
     enabled: &dyn Fn() -> bool,
     claim: &mut dyn FnMut(&str, bool) -> Option<usize>,
-    checked: bool,
+    sealed: &mut SealedRound<'_>,
 ) -> Outcome {
     let stopped = Outcome::stopped;
+    // `limits.budget` is what was left of the round's budget when this
+    // profile started; time spent waiting on the Keychain dialog comes off it.
+    let started = Instant::now();
+    let dir = slot.dir.as_path();
     if !enabled() {
         return stopped(Stop::new(State::Disabled, None));
     }
-    let read = if checked {
-        cursor_desktop::read_login_checked(db_path)
+    let read = if slot.root.is_some() {
+        cursor_desktop::read_login_checked(&slot.db)
     } else {
-        cursor_desktop::read_login_resolved(db_path)
+        cursor_desktop::read_login_resolved(&slot.db)
     };
-    let login = match read {
+    let mut login = match read {
         Ok(Some(login)) => login,
         Ok(None) => return stopped(Stop::new(State::NotSignedIn, None)),
         Err(reason) => return Outcome::refused(Stop::error(reason)),
     };
+    // A sealed token is opened before anything reads it; a plaintext one is
+    // used as stored, with no consent lookup and no key (Design 1, 3).
+    match cursor_desktop::stored_token(&login.access_token) {
+        cursor_desktop::StoredToken::Plain => {}
+        cursor_desktop::StoredToken::Sealed(blob) => match sealed.open(&blob, target, enabled) {
+            Ok(token) => login.access_token = token,
+            Err(stop) if stop.state == State::Disabled => return stopped(stop),
+            Err(stop) => return Outcome::refused(stop),
+        },
+        cursor_desktop::StoredToken::Refused(reason) => {
+            return Outcome::refused(Stop::error(reason))
+        }
+    }
     let (user, exp) = match token_user(&login) {
         Ok(found) => found,
         Err(stop) => return Outcome::refused(stop),
@@ -1379,6 +1573,10 @@ async fn run(
     };
     cookie.set_sensitive(true);
     drop(login);
+    let limits = Limits {
+        budget: limits.budget.saturating_sub(started.elapsed()),
+        ..limits
+    };
     let events = match walk(target, &cookie, limits, enabled).await {
         Ok(events) => events,
         Err(stop) => {
@@ -1458,6 +1656,10 @@ pub(crate) fn sync_now(explicit: bool, home: Option<&Path>) -> (serde_json::Valu
         crate::agent_account_scope::installation_digest_hex(FILE_NAME_DOMAIN, user.as_bytes()).ok()
     };
     let db_path = cursor_desktop::state_db_path();
+    #[cfg(target_os = "macos")]
+    let key_fetch: Option<&KeyFetch<'_>> = Some(&crate::macos_safe_storage::cursor_keychain_fetch);
+    #[cfg(not(target_os = "macos"))]
+    let key_fetch: Option<&KeyFetch<'_>> = None;
     sync_with(
         explicit,
         home,
@@ -1466,6 +1668,8 @@ pub(crate) fn sync_now(explicit: bool, home: Option<&Path>) -> (serde_json::Valu
             url: USAGE_EVENTS_URL,
             https_only: true,
             file_stem: &stem,
+            key_fetch,
+            consent: &|| crate::keychain_consent::allowed("cursor"),
         },
         &config,
         None,
@@ -1526,6 +1730,11 @@ fn sync_with(
     let deadline = Instant::now() + limits.budget;
     let mut walked: Vec<(String, usize)> = Vec::new();
     let mut outcomes: Vec<Outcome> = Vec::with_capacity(profiles.len());
+    let switch_on = || config().enabled;
+    let mut sealed = SealedRound::new(
+        explicit || !FIRST_ROUND_DONE.load(Ordering::SeqCst),
+        &switch_on,
+    );
     for (index, profile) in profiles.iter().enumerate() {
         let remaining = deadline.saturating_duration_since(Instant::now());
         let outcome = if app_dir_rejected {
@@ -1546,19 +1755,20 @@ fn sync_with(
             };
             crate::RUNTIME.block_on(run(
                 target,
-                &profile.db,
-                &profile.dir,
+                profile,
                 Limits {
                     budget: remaining,
                     ..limits
                 },
                 &still_wanted,
                 &mut claim,
-                profile.root.is_some(),
+                &mut sealed,
             ))
         };
         outcomes.push(outcome);
     }
+    sealed.finish();
+    FIRST_ROUND_DONE.store(true, Ordering::SeqCst);
     let changed = outcomes.iter().any(|o| o.changed);
     let head = if profiles.is_empty() {
         Stop::new(State::Disabled, None)
@@ -1643,6 +1853,19 @@ thread_local! {
 #[cfg(test)]
 pub(crate) fn set_thread_config_for_test(config: Option<Config>) {
     THREAD_CONFIG.with(|c| *c.borrow_mut() = config);
+}
+
+/// Test reset seam for the sealed-token state (the cached key, its
+/// generation, `FIRST_ROUND_DONE`). Callers hold `TEST_LOCK`.
+#[cfg(test)]
+pub(crate) fn reset_sealed_for_test() {
+    drop_sealed_key();
+    FIRST_ROUND_DONE.store(false, Ordering::SeqCst);
+}
+
+#[cfg(test)]
+pub(crate) fn sealed_key_cached_for_test() -> bool {
+    sealed_key().key.is_some()
 }
 
 #[cfg(test)]

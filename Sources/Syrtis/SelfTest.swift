@@ -19249,22 +19249,27 @@ enum SelfTest {
         // matters is that the FFI call and the wake both occur, and a real
         // setter would put a genuine Keychain grant into this process.
         let consentWake: (installed: String?, woke: Bool)? = awaitMainActorValue {
+            let suite = "tokenbar.selftest.keychainWake"
+            let defaults = UserDefaults(suiteName: suite)!
+            defaults.removePersistentDomain(forName: suite)
+            defaults.set(true, forKey: GrokBotKeychainConsent.storageKey)
             GrokBotKeychainConsent.resetInstalledPayloadForTesting()
             let before = ClaudeExtraRoots.RegistryChange.epoch
             let installed = UncheckedBox<String?>(nil)
-            GrokBotKeychainConsent.apply(setConsent: { installed.value = $0 })
+            GrokBotKeychainConsent.apply(defaults: defaults, setConsent: { installed.value = $0 })
             var woke = false
             for _ in 0..<200 where !woke {
                 try? await Task.sleep(nanoseconds: 10_000_000)
                 woke = ClaudeExtraRoots.RegistryChange.epoch != before
             }
+            defaults.removePersistentDomain(forName: suite)
             return (installed.value, woke)
         }
         expect(
-            consentWake?.installed == #"{"grok-bot":true}"#,
-            "granting sends exactly {\"grok-bot\":true} — the core refuses any "
-                + "other client id, so a wrong payload grants nothing and the "
-                + "card never fills")
+            consentWake?.installed == #"{"grok-bot":true,"cursor":false}"#,
+            "granting sends exactly {\"grok-bot\":true,\"cursor\":false} — the core "
+                + "refuses any other client id, so a wrong payload grants nothing and "
+                + "the card never fills; got \(String(describing: consentWake?.installed))")
         expect(
             consentWake?.woke == true,
             "granting did not wake the poll loops, so the card sits unchanged "
@@ -19327,10 +19332,10 @@ enum SelfTest {
             return (installed.value, woke)
         }
         expect(
-            revoke?.installed == [#"{"grok-bot":true}"#, "{}"],
-            "declining after a grant must full-replace the registry with {} — "
+            revoke?.installed == [#"{"grok-bot":true,"cursor":false}"#, #"{"grok-bot":false,"cursor":false}"#],
+            "declining after a grant must full-replace the registry with no grant — "
                 + "otherwise this process keeps reading the Keychain until the "
-                + "next launch despite the user's refusal")
+                + "next launch despite the user's refusal; got \(String(describing: revoke?.installed))")
         expect(
             revoke?.woke == true,
             "revoking did not wake the poll loops, so the card keeps showing "
@@ -19393,6 +19398,189 @@ enum SelfTest {
             ] == ["Set up", "Allow", "Allow", nil],
             "every placeholder source must name its own badge, and a working "
                 + "card must name none")
+
+        // CURSOR-SS-M Acceptance 2 test 10: one composed payload carries BOTH
+        // answers, because the core registry is full-replace and either client
+        // installing alone would clear the other's grant. Never asked and
+        // declined both send false. `grantedCount` is the count Smoke checks
+        // the core's `grantedCount` against. Mutation a: drop the cursor answer
+        // from `composedPayload` (Cursor's grant never reaches the core).
+        let composedPayloads: [String]? = awaitMainActorValue {
+            let suite = "tokenbar.selftest.keychainComposed"
+            let defaults = UserDefaults(suiteName: suite)!
+            defer { defaults.removePersistentDomain(forName: suite) }
+            var out: [String] = []
+            for (grok, cursor) in [(nil, nil), (true, nil), (nil, true), (false, true), (true, true)] as [(Bool?, Bool?)] {
+                defaults.removePersistentDomain(forName: suite)
+                if let grok { defaults.set(grok, forKey: GrokBotKeychainConsent.storageKey) }
+                if let cursor { defaults.set(cursor, forKey: GrokBotKeychainConsent.cursorStorageKey) }
+                out.append("\(GrokBotKeychainConsent.composedPayload(defaults: defaults))#\(GrokBotKeychainConsent.grantedCount(defaults: defaults))")
+            }
+            return out
+        }
+        expect(
+            composedPayloads == [
+                #"{"grok-bot":false,"cursor":false}#0"#, #"{"grok-bot":true,"cursor":false}#1"#,
+                #"{"grok-bot":false,"cursor":true}#1"#, #"{"grok-bot":false,"cursor":true}#1"#,
+                #"{"grok-bot":true,"cursor":true}#2"#,
+            ],
+            "CURSOR-SS composed Keychain payload keeps both answers (nil and false send false) and Smoke's count matches; got \(String(describing: composedPayloads))")
+
+        // CURSOR-SS-M Acceptance 2 test 10, the Cursor revert: a round
+        // reporting `keychain_denied`, on the headline or on any one profile,
+        // withdraws the Cursor answer AND installs the composed payload at
+        // once, so "cursor" leaves the core registry before the next round
+        // (which then shows the consent line instead of reopening the macOS
+        // dialog). Grok Bot's grant rides along unchanged. Driven through
+        // `runSync`, the production call site. Control: `keychain_consent`
+        // (no grant yet) changes nothing. Mutation c: revert the stored answer
+        // without installing (`revokeCursorIfDenied` without `installNow`).
+        let cursorRevert: [String]? = awaitMainActorValue {
+            let suite = "tokenbar.selftest.cursorKeychainDenied"
+            let defaults = UserDefaults(suiteName: suite)!
+            defer { defaults.removePersistentDomain(forName: suite) }
+            func status(_ json: String) -> CursorSyncStatus? {
+                try? JSONDecoder().decode(CursorSyncStatus.self, from: Data(json.utf8))
+            }
+            let cases: [(String, String)] = [
+                ("headline", #"{"state":"error","reason":"keychain_denied","events":0,"lastSuccessMs":null,"changed":false,"profiles":[{"id":"default","state":"error","reason":"keychain_denied","lastSuccessMs":null}]}"#),
+                ("profile", #"{"state":"ok","events":1,"lastSuccessMs":1,"changed":false,"profiles":[{"id":"default","state":"ok","lastSuccessMs":1},{"id":"0A1B2C3D-0000-4000-8000-00000000000A","state":"error","reason":"keychain_denied","lastSuccessMs":null}]}"#),
+                ("control", #"{"state":"error","reason":"keychain_consent","events":0,"lastSuccessMs":null,"changed":false}"#),
+            ]
+            var out: [String] = []
+            for (tag, json) in cases {
+                defaults.removePersistentDomain(forName: suite)
+                defaults.set(true, forKey: CursorSync.noticeKey)
+                defaults.set(true, forKey: GrokBotKeychainConsent.storageKey)
+                defaults.set(true, forKey: GrokBotKeychainConsent.cursorStorageKey)
+                GrokBotKeychainConsent.resetInstalledPayloadForTesting()
+                let installed = UncheckedBox<[String]>([])
+                let spy: @Sendable (String) -> Void = { installed.value.append($0) }
+                GrokBotKeychainConsent.installNow(defaults: defaults, setConsent: spy)
+                let result = status(json)
+                let controller = CursorSyncController()
+                await controller.runSync(
+                    explicit: true, defaults: defaults, arguments: ["Syrtis"],
+                    sync: { _ in result }, setConsent: spy)
+                let answer = GrokBotKeychainConsent.cursorAnswer(defaults: defaults).map { "\($0)" } ?? "nil"
+                out.append("\(tag):\(answer):\(installed.value.last ?? "none"):\(installed.value.count)")
+            }
+            return out
+        }
+        expect(
+            cursorRevert == [
+                #"headline:false:{"grok-bot":true,"cursor":false}:2"#,
+                #"profile:false:{"grok-bot":true,"cursor":false}:2"#,
+                #"control:true:{"grok-bot":true,"cursor":true}:1"#,
+            ],
+            "CURSOR-SS keychain_denied (headline or one profile) withdraws the Cursor answer and installs it at once, Grok Bot unchanged; got \(String(describing: cursorRevert))")
+
+        // CURSOR-SS-M Design 8: the fixed lines and the Allow button's trigger.
+        let keychainLines = ["keychain_consent", "keychain_denied", "keychain_unlock", "keychain_missing"].map {
+            CursorSync.statusLine(state: "error", lastSuccessMs: nil, reason: $0)
+        }
+        let profileNeedingConsent = try? JSONDecoder().decode(
+            CursorSyncStatus.Profile.self, from: Data(#"{"id":"x","state":"error","reason":"keychain_consent","lastSuccessMs":null}"#.utf8))
+        let profileUnlock = try? JSONDecoder().decode(
+            CursorSyncStatus.Profile.self, from: Data(#"{"id":"x","state":"error","reason":"keychain_unlock","lastSuccessMs":null}"#.utf8))
+        expect(
+            keychainLines == [
+                CursorSync.Copy.keychainConsent.localized, CursorSync.Copy.keychainDenied.localized,
+                CursorSync.Copy.keychainUnlock.localized, CursorSync.Copy.errorWithReason.localized("keychain_missing"),
+            ]
+                && CursorSync.needsKeychainAllow(reason: "keychain_denied", profiles: [:])
+                && CursorSync.needsKeychainAllow(reason: "ok", profiles: ["x": profileNeedingConsent!])
+                && !CursorSync.needsKeychainAllow(reason: "keychain_unlock", profiles: ["x": profileUnlock!])
+                && !CursorSync.needsKeychainAllow(reason: nil, profiles: [:]),
+            "CURSOR-SS consent/denied/unlock have fixed lines (others the coded line), and Allow shows for consent or denied on the headline or any profile; got \(keychainLines)")
+
+        // CURSOR-SS-M Acceptance 2 test 14, the order without completions
+        // (Design 7). Launch: the composed consent is installed before the
+        // first Cursor round (which may read the Keychain); with no grant the
+        // setter is not called and sync starts as before. Allow: answer, then
+        // install, then the explicit sync. Allow while a background round
+        // runs: the explicit round runs right after it instead of being
+        // dropped. Mutations b: `launch` using the async `apply` instead of
+        // `installNow` (or the Allow path installing after `runSync`); the
+        // explicit request dropped while syncing (old behaviour); `launch` not
+        // passing `setConsent` to `reconfigure` (the revert uses the real one).
+        let cursorOrdering: [String]? = awaitMainActorValue {
+            let suite = "tokenbar.selftest.cursorKeychainOrder"
+            let defaults = UserDefaults(suiteName: suite)!
+            defer { defaults.removePersistentDomain(forName: suite) }
+            let ok = try? JSONDecoder().decode(
+                CursorSyncStatus.self, from: Data(#"{"state":"ok","events":1,"lastSuccessMs":1,"changed":false}"#.utf8))
+            let log = UncheckedBox<[String]>([])
+            // The setter is slow on purpose: an install that does not finish
+            // before the sync starts lets the sync log first.
+            let setter: @Sendable (String) -> Void = { _ in Thread.sleep(forTimeInterval: 0.2); log.value.append("setter") }
+            // The third launch's first round reports `keychain_denied`: the
+            // revert it triggers must go through the injected setter too, so
+            // `launch` threads `setConsent` into the schedule's `runSync`.
+            let denied = try? JSONDecoder().decode(
+                CursorSyncStatus.self,
+                from: Data(#"{"state":"error","reason":"keychain_denied","events":0,"lastSuccessMs":null,"changed":false}"#.utf8))
+            var out: [String] = []
+            for (tag, grok, cursor, result) in [
+                ("launch", false, false, ok), ("launch+grant", true, false, ok), ("launch+denied", false, true, denied),
+            ] {
+                defaults.removePersistentDomain(forName: suite)
+                defaults.set(true, forKey: CursorSync.noticeKey)
+                if grok { defaults.set(true, forKey: GrokBotKeychainConsent.storageKey) }
+                if cursor { defaults.set(true, forKey: GrokBotKeychainConsent.cursorStorageKey) }
+                GrokBotKeychainConsent.resetInstalledPayloadForTesting()
+                log.value = []
+                let controller = CursorSyncController()
+                controller.launch(defaults: defaults, arguments: ["Syrtis"], bundleID: "x.y", setConsent: setter,
+                                  setConfig: { _ in .clean }, sync: { _ in log.value.append("sync"); return result })
+                for _ in 0..<300 where !log.value.contains("sync") {
+                    try? await Task.sleep(nanoseconds: 10_000_000)
+                }
+                try? await Task.sleep(nanoseconds: 500_000_000)
+                out.append("\(tag):" + log.value.joined(separator: ","))
+                // Stop the loop.
+                defaults.set(false, forKey: CursorSync.enabledKey)
+                controller.reconfigure(refresh: false, defaults: defaults, arguments: ["Syrtis"], bundleID: "x.y",
+                                       setConfig: { _ in .clean }, sync: { _ in nil })
+            }
+            // Allow from idle.
+            defaults.removePersistentDomain(forName: suite)
+            defaults.set(true, forKey: CursorSync.noticeKey)
+            GrokBotKeychainConsent.resetInstalledPayloadForTesting()
+            log.value = []
+            let tagged: @Sendable (Bool) -> CursorSyncStatus? = { explicit in log.value.append("sync:\(explicit)"); return ok }
+            let idle = CursorSyncController()
+            await idle.allowKeychainAccess(defaults: defaults, arguments: ["Syrtis"], setConsent: setter, sync: tagged)
+            let unasked = log.value.joined(separator: ",")
+            idle.askKeychainAccess()
+            await idle.allowKeychainAccess(defaults: defaults, arguments: ["Syrtis"], setConsent: setter, sync: tagged)
+            out.append("allow-unasked:\(unasked)")
+            out.append("allow:" + log.value.joined(separator: ","))
+            // Allow while a background round runs.
+            defaults.removePersistentDomain(forName: suite)
+            defaults.set(true, forKey: CursorSync.noticeKey)
+            GrokBotKeychainConsent.resetInstalledPayloadForTesting()
+            log.value = []
+            let slow: @Sendable (Bool) -> CursorSyncStatus? = { explicit in
+                log.value.append("sync:\(explicit)"); Thread.sleep(forTimeInterval: 0.3); return ok
+            }
+            let busy = CursorSyncController()
+            let running = Task { @MainActor in
+                await busy.runSync(explicit: false, defaults: defaults, arguments: ["Syrtis"], sync: slow, setConsent: setter)
+            }
+            for _ in 0..<200 where !busy.syncing { try? await Task.sleep(nanoseconds: 5_000_000) }
+            busy.askKeychainAccess()
+            await busy.allowKeychainAccess(defaults: defaults, arguments: ["Syrtis"], setConsent: setter, sync: slow)
+            await running.value
+            out.append("allow-busy:" + log.value.joined(separator: ","))
+            return out
+        }
+        expect(
+            cursorOrdering == [
+                "launch:sync", "launch+grant:setter,sync", "launch+denied:setter,sync,setter", "allow-unasked:",
+                "allow:setter,sync:true", "allow-busy:sync:false,setter,sync:true",
+            ],
+            "CURSOR-SS launch installs the consent before the first round (no grant: no setter), Allow installs before its explicit sync, and Allow during a round runs the explicit round after it; got \(String(describing: cursorOrdering))")
 
         // M3-p. A payload fetched under the previous registry must not be
         // applied, only dropped.
