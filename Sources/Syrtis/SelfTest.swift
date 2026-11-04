@@ -19071,8 +19071,8 @@ enum SelfTest {
             ok["rows filled"] = controller.profileStates.count == 4
             ok["permanent reason line"] = controller.profileStates["A"].flatMap(CursorSync.rowLine)
                 == CursorSync.Copy.cantRead.localized
-            ok["transient reason keeps the retry line"] = controller.profileStates["C"].flatMap(CursorSync.rowLine)
-                == CursorSync.Copy.error.localized
+            ok["transient reason keeps the retry line, with its code"] = controller.profileStates["C"].flatMap(CursorSync.rowLine)
+                == CursorSync.Copy.errorWithReason.localized("login_unreadable")
             ok["duplicate line"] = controller.profileStates["B"].flatMap(CursorSync.rowLine)
                 == CursorSync.Copy.duplicate.localized
             controller.reconfigure(refresh: false, defaults: defaults, arguments: user, bundleID: "x.y",
@@ -19125,6 +19125,9 @@ enum SelfTest {
             let before = generation()
             await controller.runSync(explicit: true, defaults: defaults, arguments: ["Syrtis"], sync: sync)
             return mixed != nil && generation() != before && controller.state == "error"
+                && controller.reason == "account_mismatch"
+                && CursorSync.statusLine(state: controller.state, lastSuccessMs: controller.lastSuccessMs,
+                                         reason: controller.reason)?.contains("account_mismatch") == true
         }
         expect(cursorPartialRefresh == true,
                "CURSOR-SYNC a round where one profile wrote and another failed still refreshes the dashboard; got \(String(describing: cursorPartialRefresh))")
@@ -19142,6 +19145,18 @@ enum SelfTest {
                 expect(CursorSync.statusLine(state: state, lastSuccessMs: nil, now: now) == copy?.localized,
                        "CURSOR-SYNC status \(state) maps to its approved line")
             }
+            let withCode = CursorSync.statusLine(state: "error", lastSuccessMs: nil, reason: "http_status", now: now)
+            expect(withCode == CursorSync.Copy.errorWithReason.localized("http_status")
+                       && withCode?.contains("http_status") == true,
+                   "CURSOR-SYNC error with a reason code shows the code: \(withCode ?? "nil")")
+            let badCodes: [String?] = [nil, "Bad Code!", "", String(repeating: "a", count: 41)]
+            expect(badCodes.allSatisfy {
+                CursorSync.statusLine(state: "error", lastSuccessMs: nil, reason: $0, now: now)
+                    == CursorSync.Copy.error.localized
+            }, "CURSOR-SYNC error without a valid reason code keeps the generic line")
+            expect(CursorSync.statusLine(state: "offline", lastSuccessMs: nil, reason: "http_status", now: now)
+                       == CursorSync.Copy.offline.localized,
+                   "CURSOR-SYNC a reason does not change a non-error state's line")
             let ok = CursorSync.statusLine(state: "ok", lastSuccessMs: ms, now: now)
             expect(ok?.hasPrefix("Last synced ") == true && ok?.contains("1 hour ago") == true,
                    "CURSOR-SYNC status ok shows the relative time: \(ok ?? "nil")")
