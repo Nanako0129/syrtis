@@ -199,6 +199,8 @@ enum CursorSync {
         static let notSignedIn = "Sign in to the Cursor app to sync your usage."
         static let offline = "Can't reach Cursor. Syrtis will try again."
         static let error = "Cursor usage couldn't be synced. Syrtis will try again later."
+        /// `error` plus the core's fixed reason code (`%@`), so a screenshot can be diagnosed.
+        static let errorWithReason = "Cursor usage couldn't be synced (%@). Syrtis will try again later."
         static let cliPresent = "Showing Cursor usage from tokscale CLI."
         static let syncNow = "Sync Now"
         static let syncing = "Syncing…"
@@ -257,7 +259,7 @@ enum CursorSync {
 
         static var all: [String] {
             [title, toggle, privacy, `continue`, cancel, turnOff, lastSynced, partial, expired, notSignedIn,
-             offline, error, cliPresent, syncNow, syncing, cliQuestion, useSyrtis, keepCLI, cleanupFailed,
+             offline, error, errorWithReason, cliPresent, syncNow, syncing, cliQuestion, useSyrtis, keepCLI, cleanupFailed,
              configRejected, staleCleanupFailed, defaultProfile, addProfile, duplicate, profilesPrivacy, cantAdd, cantRead,
              removeFolder]
         }
@@ -321,12 +323,16 @@ enum CursorSync {
     static func rowLine(_ status: CursorSyncStatus.Profile) -> String? {
         if status.state == "duplicate" { return Copy.duplicate.localized }
         if let reason = status.reason, permanentReasons.contains(reason) { return Copy.cantRead.localized }
-        return statusLine(state: status.state, lastSuccessMs: status.lastSuccessMs)
+        return statusLine(state: status.state, lastSuccessMs: status.lastSuccessMs, reason: status.reason)
     }
 
     /// Status line for a core state. nil where there is nothing to say
     /// (`disabled`, not yet synced, or `ok` with no recorded time).
-    static func statusLine(state: String?, lastSuccessMs: Int64?, now: Date = Date()) -> String? {
+    /// For `error`, `reason` is shown only if it looks like one of the core's
+    /// fixed codes (`^[a-z_]{1,40}$`), so the line never carries free text.
+    static func statusLine(
+        state: String?, lastSuccessMs: Int64?, reason: String? = nil, now: Date = Date()
+    ) -> String? {
         switch state {
         case "ok":
             guard let lastSuccessMs else { return nil }
@@ -340,7 +346,11 @@ enum CursorSync {
         case "expired": return Copy.expired.localized
         case "notSignedIn": return Copy.notSignedIn.localized
         case "offline": return Copy.offline.localized
-        case "error": return Copy.error.localized
+        case "error":
+            if let reason, reason.range(of: "\\A[a-z_]{1,40}\\z", options: .regularExpression) != nil {
+                return Copy.errorWithReason.localized(reason)
+            }
+            return Copy.error.localized
         case "cliPresent": return Copy.cliPresent.localized
         case configRejectedState: return Copy.configRejected.localized
         default: return nil
@@ -354,6 +364,8 @@ final class CursorSyncController: ObservableObject {
 
     @Published private(set) var state: String?
     @Published private(set) var lastSuccessMs: Int64?
+    /// The core's fixed reason code for `state` (nil when none).
+    @Published private(set) var reason: String?
     @Published private(set) var syncing = false
     /// The last off push could not delete every downloaded file. Kept while
     /// sync is on (the copy says sync is off, so Settings hides it then);
@@ -419,7 +431,7 @@ final class CursorSyncController: ObservableObject {
         let mine = generation
         // An off push retries the cleanup: hide the last failure until it reports.
         if !run {
-            state = nil; lastSuccessMs = nil; cleanupFailed = false; orphanCleanupFailed = false
+            state = nil; lastSuccessMs = nil; reason = nil; cleanupFailed = false; orphanCleanupFailed = false
             staleProfiles = []; refusedProfiles = [:]; profileStates = [:]
         }
         let previous = configPush
@@ -502,8 +514,9 @@ final class CursorSyncController: ObservableObject {
             // its result describes a configuration that no longer applies.
             guard started == generation, CursorSync.shouldSync(defaults: defaults, arguments: arguments)
             else { rerunPending = true; continue }
-            guard let result else { state = "error"; profileStates = [:]; continue }
+            guard let result else { state = "error"; reason = nil; profileStates = [:]; continue }
             state = result.state
+            reason = result.reason
             lastSuccessMs = result.lastSuccessMs
             staleProfiles = CursorSync.staleAfter(staleProfiles, status: result)
             profileStates = Dictionary(

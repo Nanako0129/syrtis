@@ -667,6 +667,7 @@
 "Sign in to the Cursor app to sync your usage." = "在 Cursor 应用登录后就能同步用量。";
 "Can't reach Cursor. Syrtis will try again." = "连不上 Cursor，Syrtis 会再试一次。";
 "Cursor usage couldn't be synced. Syrtis will try again later." = "无法同步 Cursor 用量，Syrtis 稍后会再试。";
+"Cursor usage couldn't be synced (%@). Syrtis will try again later." = "无法同步 Cursor 用量（%@），Syrtis 稍后会再试。";
 "Showing Cursor usage from tokscale CLI." = "目前显示的是 tokscale CLI 的 Cursor 用量。";
 "Sync Now" = "立即同步";
 "Syncing…" = "同步中…";

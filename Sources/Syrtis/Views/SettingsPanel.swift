@@ -1323,7 +1323,8 @@ struct SettingsPanel: View {
                 .onDisappear { cursorSync.cancelEnable() }
             if CursorSync.toggleShowsOn(enabled: cursorSyncOn, acknowledged: cursorNoticeAck) {
                 if let line = CursorSync.statusLine(
-                    state: cursorSync.state, lastSuccessMs: cursorSync.lastSuccessMs)
+                    state: cursorSync.state, lastSuccessMs: cursorSync.lastSuccessMs,
+                    reason: cursorSync.reason)
                 {
                     Text(line)
                         .font(.caption2)
