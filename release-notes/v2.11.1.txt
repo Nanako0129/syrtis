@@ -1,0 +1,5 @@
+Fixes:
+- Cursor usage sync can read a sign-in that Cursor 3.27 and later stores encrypted, once you allow it: Settings -> Accounts -> Cursor shows "Allow Keychain access…", and macOS then asks for permission to use the "Cursor Safe Storage" key. The key stays in memory while Syrtis runs and is never saved or logged; the sign-in is still sent only to cursor.com, and a plaintext sign-in never asks. The encrypted path has not been tried on a real encrypted Cursor (Cursor 3.28.7 on the maintainer's Mac kept a plaintext sign-in). Thanks @ohari5336.
+- Antigravity CLI (agy) logins that store no account identity, as agy 1.4.12 does, are captured again, which fixes the known issue in v2.11.0. An account you removed is not written back.
+- After Syrtis has been idle, the popover no longer opens with "Checking agent limits…" in the quota area: it shows the last quota already fetched and updates it as before.
+- A failed Cursor sync and a quota card that fails to connect now show a reason code, for example "(http_status)" or "(connectionRefused)".
