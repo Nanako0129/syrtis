@@ -114,8 +114,8 @@ enum GrokBotKeychainConsent {
         defaults: UserDefaults = .standard,
         setConsent: @escaping @Sendable (String) -> Void = coreSetConsent
     ) {
-        let denied = status.reason == "keychain_denied"
-            || (status.profiles ?? []).contains { $0.reason == "keychain_denied" }
+        let denied = CursorSync.anyReason(
+            in: ["keychain_denied"], headline: status.reason, profiles: status.profiles ?? [])
         guard denied, cursorAnswer(defaults: defaults) == true else { return }
         setCursorAnswer(false, defaults: defaults)
         installNow(defaults: defaults, setConsent: setConsent)

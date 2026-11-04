@@ -1199,10 +1199,13 @@ fn read_key(fetch: &KeyFetch<'_>) -> Result<cursor_desktop::Key, &'static str> {
 }
 
 /// One round's sealed-token state.
-struct SealedRound {
+struct SealedRound<'a> {
     /// The round may still read the Keychain: explicit or the process's
     /// first round, and no read yet this round.
     may_read: bool,
+    /// The global sync switch (the round's live config), as opposed to one
+    /// profile's `enabled`: a key read is kept only while it is on.
+    switch_on: &'a dyn Fn() -> bool,
     /// The round's one read failed; later profiles reuse the reason (never a
     /// second dialog).
     failed: Option<&'static str>,
@@ -1211,10 +1214,11 @@ struct SealedRound {
     opened: bool,
 }
 
-impl SealedRound {
-    fn new(may_read: bool) -> Self {
+impl<'a> SealedRound<'a> {
+    fn new(may_read: bool, switch_on: &'a dyn Fn() -> bool) -> Self {
         Self {
             may_read,
+            switch_on,
             failed: None,
             tried: false,
             opened: false,
@@ -1222,7 +1226,8 @@ impl SealedRound {
     }
 
     /// The plaintext of one profile's sealed token, or the fixed refusal.
-    /// `enabled`: the profile's live switch.
+    /// `enabled`: the profile's live switch (still configured as when the
+    /// round started).
     fn open(
         &mut self,
         blob: &[u8],
@@ -1233,10 +1238,13 @@ impl SealedRound {
         let Some(fetch) = target.key_fetch else {
             return refuse("token_sealed_unsupported");
         };
+        let mut cache = sealed_key();
+        // Checked under the key-cache lock, never before it: a revoke writes
+        // the registry first and then drops the key under this lock, so the
+        // answer read here holds until the decrypt below is done.
         if !(target.consent)() {
             return refuse("keychain_consent");
         }
-        let mut cache = sealed_key();
         if cache.key.is_none() {
             if let Some(reason) = self.failed {
                 return refuse(reason);
@@ -1257,15 +1265,22 @@ impl SealedRound {
                 }
             };
             cache = sealed_key();
-            // Stored only if nothing changed while the dialog was up;
-            // otherwise `key` is dropped (erased) here.
-            if !enabled() {
+            // Stored only if no drop happened while the dialog was up (an off
+            // push or a consent payload without "cursor" bumps the
+            // generation), consent stands and sync is still on; otherwise
+            // `key` is dropped (erased) here.
+            if !(self.switch_on)() {
                 return Err(Stop::new(State::Disabled, None));
             }
             if cache.generation != generation || !(target.consent)() {
                 return refuse("keychain_consent");
             }
             cache.key = Some(key);
+            // A profile removed while the dialog was up only skips itself:
+            // the key the user just allowed stays for the other profiles.
+            if !enabled() {
+                return Err(Stop::new(State::Disabled, None));
+            }
         }
         let Some(key) = cache.key.as_ref() else {
             return refuse("keychain_unlock");
@@ -1483,9 +1498,12 @@ async fn run(
     limits: Limits,
     enabled: &dyn Fn() -> bool,
     claim: &mut dyn FnMut(&str, bool) -> Option<usize>,
-    sealed: &mut SealedRound,
+    sealed: &mut SealedRound<'_>,
 ) -> Outcome {
     let stopped = Outcome::stopped;
+    // `limits.budget` is what was left of the round's budget when this
+    // profile started; time spent waiting on the Keychain dialog comes off it.
+    let started = Instant::now();
     let dir = slot.dir.as_path();
     if !enabled() {
         return stopped(Stop::new(State::Disabled, None));
@@ -1555,6 +1573,10 @@ async fn run(
     };
     cookie.set_sensitive(true);
     drop(login);
+    let limits = Limits {
+        budget: limits.budget.saturating_sub(started.elapsed()),
+        ..limits
+    };
     let events = match walk(target, &cookie, limits, enabled).await {
         Ok(events) => events,
         Err(stop) => {
@@ -1708,7 +1730,11 @@ fn sync_with(
     let deadline = Instant::now() + limits.budget;
     let mut walked: Vec<(String, usize)> = Vec::new();
     let mut outcomes: Vec<Outcome> = Vec::with_capacity(profiles.len());
-    let mut sealed = SealedRound::new(explicit || !FIRST_ROUND_DONE.load(Ordering::SeqCst));
+    let switch_on = || config().enabled;
+    let mut sealed = SealedRound::new(
+        explicit || !FIRST_ROUND_DONE.load(Ordering::SeqCst),
+        &switch_on,
+    );
     for (index, profile) in profiles.iter().enumerate() {
         let remaining = deadline.saturating_duration_since(Instant::now());
         let outcome = if app_dir_rejected {

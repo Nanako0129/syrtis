@@ -19461,7 +19461,8 @@ enum SelfTest {
         // runs: the explicit round runs right after it instead of being
         // dropped. Mutations b: `launch` using the async `apply` instead of
         // `installNow` (or the Allow path installing after `runSync`); the
-        // explicit request dropped while syncing (old behaviour).
+        // explicit request dropped while syncing (old behaviour); `launch` not
+        // passing `setConsent` to `reconfigure` (the revert uses the real one).
         let cursorOrdering: [String]? = awaitMainActorValue {
             let suite = "tokenbar.selftest.cursorKeychainOrder"
             let defaults = UserDefaults(suiteName: suite)!
@@ -19472,21 +19473,30 @@ enum SelfTest {
             // The setter is slow on purpose: an install that does not finish
             // before the sync starts lets the sync log first.
             let setter: @Sendable (String) -> Void = { _ in Thread.sleep(forTimeInterval: 0.2); log.value.append("setter") }
+            // The third launch's first round reports `keychain_denied`: the
+            // revert it triggers must go through the injected setter too, so
+            // `launch` threads `setConsent` into the schedule's `runSync`.
+            let denied = try? JSONDecoder().decode(
+                CursorSyncStatus.self,
+                from: Data(#"{"state":"error","reason":"keychain_denied","events":0,"lastSuccessMs":null,"changed":false}"#.utf8))
             var out: [String] = []
-            for granted in [false, true] {
+            for (tag, grok, cursor, result) in [
+                ("launch", false, false, ok), ("launch+grant", true, false, ok), ("launch+denied", false, true, denied),
+            ] {
                 defaults.removePersistentDomain(forName: suite)
                 defaults.set(true, forKey: CursorSync.noticeKey)
-                if granted { defaults.set(true, forKey: GrokBotKeychainConsent.storageKey) }
+                if grok { defaults.set(true, forKey: GrokBotKeychainConsent.storageKey) }
+                if cursor { defaults.set(true, forKey: GrokBotKeychainConsent.cursorStorageKey) }
                 GrokBotKeychainConsent.resetInstalledPayloadForTesting()
                 log.value = []
                 let controller = CursorSyncController()
                 controller.launch(defaults: defaults, arguments: ["Syrtis"], bundleID: "x.y", setConsent: setter,
-                                  setConfig: { _ in .clean }, sync: { _ in log.value.append("sync"); return ok })
+                                  setConfig: { _ in .clean }, sync: { _ in log.value.append("sync"); return result })
                 for _ in 0..<300 where !log.value.contains("sync") {
                     try? await Task.sleep(nanoseconds: 10_000_000)
                 }
-                try? await Task.sleep(nanoseconds: 300_000_000)
-                out.append("launch\(granted ? "+grant" : ""):" + log.value.joined(separator: ","))
+                try? await Task.sleep(nanoseconds: 500_000_000)
+                out.append("\(tag):" + log.value.joined(separator: ","))
                 // Stop the loop.
                 defaults.set(false, forKey: CursorSync.enabledKey)
                 controller.reconfigure(refresh: false, defaults: defaults, arguments: ["Syrtis"], bundleID: "x.y",
@@ -19526,7 +19536,7 @@ enum SelfTest {
         }
         expect(
             cursorOrdering == [
-                "launch:sync", "launch+grant:setter,sync", "allow-unasked:",
+                "launch:sync", "launch+grant:setter,sync", "launch+denied:setter,sync,setter", "allow-unasked:",
                 "allow:setter,sync:true", "allow-busy:sync:false,setter,sync:true",
             ],
             "CURSOR-SS launch installs the consent before the first round (no grant: no setter), Allow installs before its explicit sync, and Allow during a round runs the explicit round after it; got \(String(describing: cursorOrdering))")

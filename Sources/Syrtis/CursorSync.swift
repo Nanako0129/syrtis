@@ -289,8 +289,16 @@ enum CursorSync {
 
     /// The headline or any profile asks for Keychain consent.
     static func needsKeychainAllow(reason: String?, profiles: [String: CursorSyncStatus.Profile]) -> Bool {
-        ([reason] + profiles.values.map(\.reason)).contains { code in
-            code.map { keychainAllowReasons.contains($0) } ?? false
+        anyReason(in: keychainAllowReasons, headline: reason, profiles: Array(profiles.values))
+    }
+
+    /// One of `codes` on the headline or on any profile. Shared by the Allow
+    /// button and the Cursor Keychain revert, so both read a round the same way.
+    static func anyReason(
+        in codes: Set<String>, headline: String?, profiles: [CursorSyncStatus.Profile]
+    ) -> Bool {
+        ([headline] + profiles.map(\.reason)).contains { code in
+            code.map { codes.contains($0) } ?? false
         }
     }
 
@@ -456,7 +464,8 @@ final class CursorSyncController: ObservableObject {
         arguments: [String] = CommandLine.arguments,
         bundleID: String? = Bundle.main.bundleIdentifier,
         setConfig: @escaping CursorSync.SetConfig = CursorSync.coreSetConfig,
-        sync: @escaping CursorSync.Sync = CursorSync.coreSync
+        sync: @escaping CursorSync.Sync = CursorSync.coreSync,
+        setConsent: @escaping @Sendable (String) -> Void = GrokBotKeychainConsent.coreSetConsent
     ) {
         // Test modes make no core call at all: turning off deletes files, and
         // `--demo` runs with the real bundle id. No bundle id (bare `swift
@@ -519,7 +528,8 @@ final class CursorSyncController: ObservableObject {
             if refresh { Self.refreshModel() }
             guard run, self?.state != CursorSync.configRejectedState else { return }
             while !Task.isCancelled {
-                await self?.runSync(explicit: false, defaults: defaults, arguments: arguments, sync: sync)
+                await self?.runSync(
+                    explicit: false, defaults: defaults, arguments: arguments, sync: sync, setConsent: setConsent)
                 try? await Task.sleep(for: .seconds(CursorSync.interval))
             }
         }
@@ -539,7 +549,7 @@ final class CursorSyncController: ObservableObject {
     ) {
         GrokBotKeychainConsent.installNow(defaults: defaults, setConsent: setConsent)
         reconfigure(refresh: false, defaults: defaults, arguments: arguments, bundleID: bundleID,
-                    setConfig: setConfig, sync: sync)
+                    setConfig: setConfig, sync: sync, setConsent: setConsent)
     }
 
     /// "Allow Keychain access…": opens the confirmation with the disclosure.

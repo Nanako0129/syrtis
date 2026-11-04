@@ -241,7 +241,7 @@ fn run_with(
         limits,
         enabled,
         &mut |_, _| None,
-        &mut SealedRound::new(false),
+        &mut SealedRound::new(false, &|| true),
     ))
 }
 
@@ -3650,4 +3650,129 @@ fn the_registry_decides_cursor_consent() {
     assert_eq!(states(&status), ["ok"]);
     assert_eq!(calls.borrow().len(), 1);
     crate::keychain_consent::reset_for_test();
+}
+
+// --- review round 1 ---------------------------------------------------------
+
+/// R1: the consent answer a cached key is used under is read while the
+/// key-cache lock is held, so a revoke (registry write, then a drop under
+/// that lock) cannot slip between the check and the decrypt. A withdrawn
+/// answer there is `keychain_consent` with nothing sent.
+#[test]
+fn consent_is_read_under_the_key_cache_lock() {
+    let _guard = sealed_lock();
+    let calls = std::cell::RefCell::new(Vec::new());
+    let fetch = keychain(&calls, password);
+    let f = sealed_fixture(&sealed(SEALED_B64));
+    let (url, seen) = serve((0..2).map(|_| json_ok(&page(1, &["a"]))).collect());
+    assert_eq!(
+        states(&sealed_round(
+            true,
+            &f.db,
+            &url,
+            &f.registry,
+            Some(&fetch),
+            &granted
+        )),
+        ["ok"]
+    );
+    assert!(sealed_key_cached_for_test());
+    // `try_lock` from the thread that holds the lock fails without blocking.
+    let held = std::cell::RefCell::new(Vec::new());
+    let answer = std::cell::Cell::new(true);
+    let consent = || {
+        held.borrow_mut().push(SEALED_KEY.try_lock().is_err());
+        answer.get()
+    };
+    let status = sealed_round(false, &f.db, &url, &f.registry, Some(&fetch), &consent);
+    assert_eq!(states(&status), ["ok"]);
+    assert_eq!(
+        *held.borrow(),
+        [true],
+        "consent read outside the key-cache lock"
+    );
+    answer.set(false);
+    let status = sealed_round(false, &f.db, &url, &f.registry, Some(&fetch), &consent);
+    assert_eq!(states(&status), ["error:keychain_consent"]);
+    assert_eq!(
+        seen.lock().unwrap().len(),
+        2,
+        "a withdrawn grant opened the token"
+    );
+    assert_eq!(calls.borrow().len(), 1);
+}
+
+/// R3: time spent waiting on the Keychain dialog comes off the round's
+/// budget; the walk does not get a fresh one.
+#[test]
+fn the_keychain_wait_counts_against_the_round_budget() {
+    let _guard = sealed_lock();
+    let calls = std::cell::RefCell::new(Vec::new());
+    let fetch = keychain(&calls, |account| {
+        std::thread::sleep(Duration::from_millis(1200));
+        password(account)
+    });
+    let f = sealed_fixture(&sealed(SEALED_B64));
+    let (url, seen) = serve(vec![json_ok(&page(1, &["a"]))]);
+    let target = Target {
+        db_path: &f.db,
+        url: &url,
+        https_only: false,
+        file_stem: &stem,
+        key_fetch: Some(&fetch),
+        consent: &granted,
+    };
+    let source = || f.registry.read().unwrap().clone();
+    let short = Limits {
+        budget: Duration::from_secs(1),
+        ..limits()
+    };
+    let status = sync_with(true, None, &target, &source, Some(short)).0;
+    assert_eq!(states(&status), ["partial:budget_exhausted"]);
+    assert!(
+        seen.lock().unwrap().is_empty(),
+        "the walk ran past the budget"
+    );
+    // Control: with time left after the wait, the same round syncs.
+    reset_sealed_for_test();
+    let roomy = Limits {
+        budget: Duration::from_secs(10),
+        ..limits()
+    };
+    let status = sync_with(true, None, &target, &source, Some(roomy)).0;
+    assert_eq!(states(&status), ["ok"]);
+}
+
+/// R4: a profile removed while the dialog was up skips itself, but the key
+/// the user just allowed is kept for the round's other profiles.
+#[test]
+fn a_profile_removed_during_the_dialog_keeps_the_key_for_the_others() {
+    let _guard = sealed_lock();
+    let f = sealed_fixture(&valid_token());
+    let home = f.tmp.path().join("home");
+    let a = profile_root(f.tmp.path(), "a", &sealed(SEALED_B64), USER);
+    let b = profile_root(f.tmp.path(), "b", &sealed(SEALED_B64), USER);
+    *f.registry.write().unwrap() = multi(
+        &home,
+        true,
+        vec![profile(PROFILE_A, &a), profile(PROFILE_B, &b)],
+    );
+    let calls = std::cell::RefCell::new(Vec::new());
+    let fetch = keychain(&calls, |account| {
+        // Profile A is removed while macOS shows its dialog.
+        f.registry
+            .write()
+            .unwrap()
+            .profiles
+            .retain(|p| p.id != PROFILE_A);
+        password(account)
+    });
+    let (url, _) = serve(vec![json_ok(&page(1, &["a"]))]);
+    let status = sealed_round(true, &f.db, &url, &f.registry, Some(&fetch), &granted);
+    assert_eq!(states(&status), ["ok", "disabled", "duplicate"]);
+    assert_eq!(calls.borrow().len(), 1);
+    assert!(
+        sealed_key_cached_for_test(),
+        "the allowed key was thrown away"
+    );
 }
