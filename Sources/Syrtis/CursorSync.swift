@@ -347,7 +347,8 @@ enum CursorSync {
         case "notSignedIn": return Copy.notSignedIn.localized
         case "offline": return Copy.offline.localized
         case "error":
-            if let reason, reason.range(of: "\\A[a-z_]{1,40}\\z", options: .regularExpression) != nil {
+            if let reason, (1...40).contains(reason.utf8.count),
+               reason.utf8.allSatisfy({ $0 == UInt8(ascii: "_") || (UInt8(ascii: "a")...UInt8(ascii: "z")).contains($0) }) {
                 return Copy.errorWithReason.localized(reason)
             }
             return Copy.error.localized
@@ -449,9 +450,11 @@ final class CursorSyncController: ObservableObject {
             if run {
                 if pushed == nil {
                     self.state = CursorSync.configRejectedState
+                    self.reason = nil
                     self.profileStates = [:]
                 } else if self.state == CursorSync.configRejectedState {
                     self.state = nil
+                    self.reason = nil
                 }
             }
             // An off push's outcome is `cleanupFailed` (the copy says sync is

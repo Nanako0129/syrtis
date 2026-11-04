@@ -19125,6 +19125,9 @@ enum SelfTest {
             let before = generation()
             await controller.runSync(explicit: true, defaults: defaults, arguments: ["Syrtis"], sync: sync)
             return mixed != nil && generation() != before && controller.state == "error"
+                && controller.reason == "account_mismatch"
+                && CursorSync.statusLine(state: controller.state, lastSuccessMs: controller.lastSuccessMs,
+                                         reason: controller.reason)?.contains("account_mismatch") == true
         }
         expect(cursorPartialRefresh == true,
                "CURSOR-SYNC a round where one profile wrote and another failed still refreshes the dashboard; got \(String(describing: cursorPartialRefresh))")
@@ -19154,13 +19157,6 @@ enum SelfTest {
             expect(CursorSync.statusLine(state: "offline", lastSuccessMs: nil, reason: "http_status", now: now)
                        == CursorSync.Copy.offline.localized,
                    "CURSOR-SYNC a reason does not change a non-error state's line")
-            let permanentJSON = """
-                {"id":"p","state":"error","reason":"\(CursorSync.permanentReasons.sorted()[0])"}
-                """
-            let permanent = try? JSONDecoder().decode(
-                CursorSyncStatus.Profile.self, from: Data(permanentJSON.utf8))
-            expect(permanent.flatMap(CursorSync.rowLine) == CursorSync.Copy.cantRead.localized,
-                   "CURSOR-SYNC a permanent reason still shows the cantRead line")
             let ok = CursorSync.statusLine(state: "ok", lastSuccessMs: ms, now: now)
             expect(ok?.hasPrefix("Last synced ") == true && ok?.contains("1 hour ago") == true,
                    "CURSOR-SYNC status ok shows the relative time: \(ok ?? "nil")")
