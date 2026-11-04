@@ -1567,7 +1567,7 @@ pub extern "C" fn tb_antigravity_login_marker() -> *mut c_char {
 /// `{"status":"captured"|"unchanged","key":"<64 hex>","label":"..."}` or
 /// `{"status":"skipped_removed"}`. `unchanged` means a Syrtis item already
 /// holds this refresh token (its own key's item, or, for agy 1.4.x, any
-/// registered account's): nothing was scanned, requested or written.
+/// registered account's not in the removed keys): nothing was scanned, requested or written.
 /// `captured` requires Google's refresh response to pass the checks of
 /// `tb_antigravity_capture` (`account_mismatch` for another account or
 /// client, `invalid_credential_format` when there is no usable `id_token`).

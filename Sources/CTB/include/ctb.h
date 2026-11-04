@@ -246,7 +246,8 @@ char *tb_antigravity_login_marker(void);
 // write). Success data is
 // `{"status":"captured"|"unchanged","key":"...","label":"..."}` or
 // `{"status":"skipped_removed"}`; `unchanged` = a Syrtis item (its own key's,
-// or for agy 1.4.x any registered account's) already holds this refresh
+// or for agy 1.4.x any registered account's not in removed_keys) already
+// holds this refresh
 // token (nothing scanned, requested or written). `captured` requires Google's
 // response id_token to pass tb_antigravity_capture's checks. `err` is one
 // fixed code: the tb_antigravity_capture codes, plus not_signed_in, paused
