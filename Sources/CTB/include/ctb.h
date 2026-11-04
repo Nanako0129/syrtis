@@ -211,10 +211,14 @@ char *tb_set_antigravity_binding(const char *json);
 // own item is read once and never written. Blocking (keychain + network):
 // call off the main thread. Success data is `{"key":"<64 hex>","label":"..."}`
 // where `key` = hex(SHA-256("antigravity-account\0" + Google sub)) and
-// `label` is the login's email (or "Antigravity account"). Nothing is written
-// unless Google's refresh response carries an id_token with the stored sub
-// (account_mismatch when it names another account, invalid_credential_format
-// when there is no usable id_token). `err` is exactly one
+// `label` is Google's email, else agy's local one (or "Antigravity account").
+// Nothing is written unless Google's refresh response carries an id_token
+// whose aud is the client used and that names agy's account: the sub in
+// agy's stored id_token, or, for agy 1.4.x's item (no id_token), an email
+// equal to its id_token_email ignoring ASCII case (account_mismatch
+// otherwise, invalid_credential_format when there is no usable id_token).
+// Without a stored id_token, each client found in agy's files is tried.
+// `err` is exactly one
 // fixed code: agy_not_signed_in, agy_login_unreadable,
 // agy_login_missing_identity, oauth_client_not_found, oauth_client_rejected,
 // refresh_rejected, refresh_unreachable, account_mismatch,
@@ -236,11 +240,15 @@ char *tb_antigravity_remove(const char *key);
 char *tb_antigravity_login_marker(void);
 // One automatic capture of agy's current login, run once per marker change
 // while automatic capture is on. `removed_keys_json` is `["<64 hex>", ...]`,
-// the keys the user removed; a listed account is skipped before any request.
-// Success data is `{"status":"captured"|"unchanged","key":"...","label":"..."}`
-// or `{"status":"skipped_removed"}`; `unchanged` = Syrtis's item already holds
-// this refresh token (nothing scanned, requested or written). `captured`
-// requires Google's response id_token to carry the stored sub. `err` is one
+// the keys the user removed; a listed account is never written (with agy's
+// stored id_token it is skipped before any request; agy 1.4.x's item names
+// its account only in Google's answer, so after the refresh, before the
+// write). Success data is
+// `{"status":"captured"|"unchanged","key":"...","label":"..."}` or
+// `{"status":"skipped_removed"}`; `unchanged` = a Syrtis item (its own key's,
+// or for agy 1.4.x any registered account's) already holds this refresh
+// token (nothing scanned, requested or written). `captured` requires Google's
+// response id_token to pass tb_antigravity_capture's checks. `err` is one
 // fixed code: the tb_antigravity_capture codes, plus not_signed_in, paused
 // (agy's item read ended other than exit 0/44, e.g. a cancelled dialog) and
 // invalid_removed_keys. Blocking (keychain + network). Does not register.
