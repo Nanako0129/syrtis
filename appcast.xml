@@ -3,6 +3,24 @@
     <channel>
         <title>TokenBar updates</title>
         <item>
+            <title>2.11.1</title>
+            <pubDate>Wed, 04 Nov 2026 11:11:07 +0000</pubDate>
+            <link>https://github.com/Nanako0129/syrtis/releases/tag/v2.11.1</link>
+            <sparkle:version>1785</sparkle:version>
+            <sparkle:shortVersionString>2.11.1</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
+            <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
+            <description><![CDATA[<b>Fixes:</b>
+<ul>
+<li>Cursor usage sync can read a sign-in that Cursor 3.27 and later stores encrypted, once you allow it: Settings -&gt; Accounts -&gt; Cursor shows "Allow Keychain access…", and macOS then asks for permission to use the "Cursor Safe Storage" key. The key stays in memory while Syrtis runs and is never saved or logged; the sign-in is still sent only to cursor.com, and a plaintext sign-in never asks. The encrypted path has not been tried on a real encrypted Cursor (Cursor 3.28.7 on the maintainer's Mac kept a plaintext sign-in). Thanks @ohari5336.</li>
+<li>Antigravity CLI (agy) logins that store no account identity, as agy 1.4.12 does, are captured again, which fixes the known issue in v2.11.0. An account you removed is not written back.</li>
+<li>After Syrtis has been idle, the popover no longer opens with "Checking agent limits…" in the quota area: it shows the last quota already fetched and updates it as before.</li>
+<li>A failed Cursor sync and a quota card that fails to connect now show a reason code, for example "(http_status)" or "(connectionRefused)".</li>
+</ul>
+]]></description>
+            <enclosure url="https://github.com/Nanako0129/syrtis/releases/download/v2.11.1/Syrtis.app.tar.gz" length="14901267" type="application/octet-stream" sparkle:edSignature="2nlpR/0p1MYJf/bwHi9wLv0pZbG5gSMz2petlv+8zs/lAgUVvm8WtIJcwQhh6T3NJsJGZ31ODwML4fPKsZJ+Aw=="/>
+        </item>
+        <item>
             <title>2.11.0</title>
             <pubDate>Tue, 03 Nov 2026 12:46:38 +0000</pubDate>
             <link>https://github.com/Nanako0129/syrtis/releases/tag/v2.11.0</link>
@@ -98,26 +116,6 @@
 </ul>
 ]]></description>
             <enclosure url="https://github.com/Nanako0129/syrtis/releases/download/v2.9.0/Syrtis.app.tar.gz" length="14117728" type="application/octet-stream" sparkle:edSignature="22vbKDLyjqL7ptXfAII6s/dFTPn+3kDopFuMzn1eteQhkXowQzfsCdX4BpjJRIC8b+DCed8k3le6cmsphMdrAw=="/>
-        </item>
-        <item>
-            <title>2.8.0</title>
-            <pubDate>Fri, 16 Oct 2026 16:58:27 +0000</pubDate>
-            <link>https://github.com/Nanako0129/syrtis/releases/tag/v2.8.0</link>
-            <sparkle:version>1583</sparkle:version>
-            <sparkle:shortVersionString>2.8.0</sparkle:shortVersionString>
-            <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
-            <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
-            <description><![CDATA[<b>Features:</b>
-<ul>
-<li>DeepSeek Harness (DSH) usage now appears on its own tab, read from DSH's session logs. Thanks @kizaki-R.</li>
-</ul>
-<b>Fixes:</b>
-<ul>
-<li>The refresh indicator now keeps spinning until the window card has finished reading local usage.</li>
-<li>If the window card's reading falls more than two minutes behind, intervals it hasn't read yet say "Reading local usage…" instead of showing 0 tokens.</li>
-</ul>
-]]></description>
-            <enclosure url="https://github.com/Nanako0129/syrtis/releases/download/v2.8.0/Syrtis.app.tar.gz" length="14110799" type="application/octet-stream" sparkle:edSignature="fy+RIdXFbtctl+3wbxRYUqq4iRvp8Tw7vAl0sqIBmxjrGZWLOax/B9JN6xqgCvGGQ9mOg7eahBuC89A4AhHsBQ=="/>
         </item>
         <item>
             <title>1.1.1</title>
