@@ -21549,6 +21549,13 @@ enum SelfTest {
                    && WindowUsageCard.shortLabel("Session") == "Session"
                    && WindowUsageCard.shortLabel("Codex Spark · 5h") == "Codex Spark · 5h",
                "WCP-label grouped Antigravity window names are shortened; other labels are unchanged")
+        // AGY-QSUM-M: the Argon group repeats its own name in the bucket
+        // ("Gemini 4 Argon Weekly Limit", agy /usage 2026-11-04).
+        expect(WindowUsageCard.shortLabel("Gemini 4 Argon · Gemini 4 Argon Weekly Limit") == "Gemini 4 Argon · Weekly"
+                   && WindowUsageCard.shortLabel("Gemini 4 Argon · Gemini 4 Argon Five Hour Limit") == "Gemini 4 Argon · 5h"
+                   && WindowUsageCard.shortLabel("Gemini 4 Argon · Other Weekly Limit") == "Gemini 4 Argon · Other Weekly Limit"
+                   && WindowUsageCard.shortLabel("Gemini 4 Argon · Gemini 4 Argon Limit") == "Gemini 4 Argon · Gemini 4 Argon Limit",
+               "WCP-label the Argon \"<group> <window> Limit\" bucket is shortened; a bucket naming another group is not")
 
         // WCP-golden-unreadable (verifier F1). A one-account client whose curve
         // read throws: base showed "Quota history could not be read" (cycles
