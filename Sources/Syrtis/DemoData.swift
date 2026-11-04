@@ -722,10 +722,15 @@ enum DemoData {
                 sum += rate(stamp) * (0.6 + 0.8 * unit(Int(stamp / step)))
                 cumulative.append(sum)
             }
-            for (stamp, c) in zip(stamps, cumulative) {
+            for (index, (stamp, c)) in zip(stamps, cumulative).enumerated() {
+                // The last reading of a cycle is its total exactly: `total * c / sum`
+                // with c == sum can land on 43.4999… and round down, so the running
+                // cycle's newest point disagreed with its card (43 vs 44) whenever the
+                // local-time rhythm made that division inexact (seen with TZ=UTC).
+                let value = index == stamps.count - 1 ? total : total * c / max(sum, 1e-9)
                 points.append([
                     "sampledAt": stamp,
-                    "usedPercent": min(100, (total * c / max(sum, 1e-9)).rounded()),
+                    "usedPercent": min(100, value.rounded()),
                     "resetAt": resetAt,
                     "durationSeconds": duration,
                     "durationSource": "contract",

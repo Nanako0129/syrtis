@@ -849,10 +849,52 @@ private let agentUsageTransportLogClientIds: Set<String> = {
     return ids
 }()
 
+/// The transport categories Syrtis recognises. Two consumers: the os_log entries
+/// (`agentUsageTransportLogEntries`) and the code shown on a failed card
+/// (`agentUsageErrorLine`). Removing a category here removes it from both.
 private let agentUsageTransportLogCategories: Set<String> = [
     "timeout", "dns", "tls", "connectionRefused", "connectionReset",
     "connect", "request", "responseBody", "rateLimited", "serverError",
 ]
+
+/// The HTTP status worth showing for a category: only 429 for `rateLimited`
+/// and only 5xx for `serverError`; anything else is dropped.
+private func agentUsageTransportStatus(category: String, status: Int64?) -> Int? {
+    guard let value = status else { return nil }
+    switch category {
+    case "rateLimited":
+        return value == 429 ? Int(exactly: value) : nil
+    case "serverError":
+        return (500...599).contains(value) ? Int(exactly: value) : nil
+    default:
+        return nil
+    }
+}
+
+/// The card's error line with the core's fixed transport category (or the HTTP
+/// status for rateLimited/serverError) inserted, so a screenshot is
+/// diagnosable. The code is never translated and `osCode` is never shown. An
+/// unlisted category leaves `text` unchanged. "X. Retrying automatically."
+/// becomes "X (code). Retrying automatically."; any other shape gets the code
+/// appended.
+package func agentUsageErrorLine(_ text: String, diagnostic: AgentUsageTransportDiagnostic?) -> String {
+    guard let category = diagnostic?.category,
+          agentUsageTransportLogCategories.contains(category) else { return text }
+    let code = agentUsageTransportStatus(category: category, status: diagnostic?.status)
+        .map(String.init) ?? category
+    let tail = ". Retrying automatically."
+    if text.hasSuffix(tail) {
+        return String(text.dropLast(tail.count)) + " (\(code))" + tail
+    }
+    return text + " (\(code))"
+}
+
+extension AgentUsageSnapshot {
+    /// The error as every surface shows it (the core's text, as before), coded.
+    package var errorLine: String? {
+        error.map { agentUsageErrorLine($0, diagnostic: transportDiagnostic) }
+    }
+}
 
 package func agentUsageTransportLogEntries(
     _ payload: AgentUsagePayload
@@ -864,16 +906,7 @@ package func agentUsageTransportLogEntries(
             ? snapshot.clientId : "unknown"
         let isKnownCategory = agentUsageTransportLogCategories.contains(rawCategory)
         let category = isKnownCategory ? rawCategory : "unknown"
-        let status = diagnostic.status.flatMap { value -> Int? in
-            switch rawCategory {
-            case "rateLimited":
-                return value == 429 ? Int(exactly: value) : nil
-            case "serverError":
-                return (500...599).contains(value) ? Int(exactly: value) : nil
-            default:
-                return nil
-            }
-        }
+        let status = agentUsageTransportStatus(category: rawCategory, status: diagnostic.status)
         let osCode = isKnownCategory && rawCategory != "rateLimited"
             && rawCategory != "serverError"
             ? diagnostic.osCode.flatMap { Int32(exactly: $0) }
