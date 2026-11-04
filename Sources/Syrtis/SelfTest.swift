@@ -19071,8 +19071,8 @@ enum SelfTest {
             ok["rows filled"] = controller.profileStates.count == 4
             ok["permanent reason line"] = controller.profileStates["A"].flatMap(CursorSync.rowLine)
                 == CursorSync.Copy.cantRead.localized
-            ok["transient reason keeps the retry line"] = controller.profileStates["C"].flatMap(CursorSync.rowLine)
-                == CursorSync.Copy.error.localized
+            ok["transient reason keeps the retry line, with its code"] = controller.profileStates["C"].flatMap(CursorSync.rowLine)
+                == CursorSync.Copy.errorWithReason.localized("login_unreadable")
             ok["duplicate line"] = controller.profileStates["B"].flatMap(CursorSync.rowLine)
                 == CursorSync.Copy.duplicate.localized
             controller.reconfigure(refresh: false, defaults: defaults, arguments: user, bundleID: "x.y",
