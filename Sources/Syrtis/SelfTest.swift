@@ -4626,17 +4626,31 @@ enum SelfTest {
             AgentUsagePayload.self, from: Data(legacyPublicationJSON.utf8))
 
         var stalePublicationState = AgentUsagePublicationState()
-        _ = stalePublicationState.resolve(publicationB)
-        let staleResult = stalePublicationState.resolve(publicationA)
+        _ = stalePublicationState.resolve(publicationB, accountSet: "")
+        let staleResult = stalePublicationState.resolve(publicationA, accountSet: "")
         expect(
             staleResult.publicationGeneration == 2 &&
                 staleResult.agents.first?.error == "terminal B" &&
                 staleResult.agents.first?.windows.isEmpty == true,
             "stale generation resolves to newer terminal payload content")
 
+        // IDLE-QUOTA: the account set is stamped only on a strictly newer
+        // generation, so an equal re-accept after a registry change cannot give
+        // an old payload the new set (and the seed then refuses it).
+        var stampState = AgentUsagePublicationState()
+        _ = stampState.resolve(publicationA, accountSet: "set-A")
+        _ = stampState.resolve(publicationA, accountSet: "set-B")
+        let stampKeptA = stampState.latest(forAccountSet: "set-A")?.publicationGeneration == 1
+        let stampRefusesB = stampState.latest(forAccountSet: "set-B") == nil
+        _ = stampState.resolve(publicationB, accountSet: "set-B")
+        let stampNewerTakesB = stampState.latest(forAccountSet: "set-B")?.publicationGeneration == 2
+            && stampState.latest(forAccountSet: "set-A") == nil
+        expect(stampKeptA && stampRefusesB && stampNewerTakesB,
+               "IDLE-QUOTA an equal-generation re-accept keeps the first account set; a newer generation restamps it")
+
         var orderedPublicationState = AgentUsagePublicationState()
-        let firstResult = orderedPublicationState.resolve(publicationA)
-        let secondResult = orderedPublicationState.resolve(publicationB)
+        let firstResult = orderedPublicationState.resolve(publicationA, accountSet: "")
+        let secondResult = orderedPublicationState.resolve(publicationB, accountSet: "")
         expect(
             firstResult.publicationGeneration == 1 &&
                 firstResult.agents.first?.windows.first?.usedPercent == 12,
@@ -4646,12 +4660,12 @@ enum SelfTest {
                 secondResult.agents.first?.error == "terminal B",
             "generation 2 terminal replaces generation 1")
 
-        let legacyResult = stalePublicationState.resolve(legacyPublication)
+        let legacyResult = stalePublicationState.resolve(legacyPublication, accountSet: "")
         expect(
             legacyResult.publicationGeneration == nil &&
                 legacyResult.agents.first?.error == "legacy payload",
             "legacy payload passes through without touching generation state")
-        let afterLegacy = stalePublicationState.resolve(publicationA)
+        let afterLegacy = stalePublicationState.resolve(publicationA, accountSet: "")
         expect(
             afterLegacy.publicationGeneration == 2 &&
                 afterLegacy.agents.first?.error == "terminal B",
@@ -13006,6 +13020,98 @@ enum SelfTest {
         expect(
             lp3GateChecks["gateFailureIssuedNoScan"] == true,
             "LP3: a restored model whose first-ever graph fetch fails issues zero model calls")
+
+        // --- IDLE-QUOTA: a popover built without a quota snapshot is seeded ---
+        // --- from the process-wide publication, under the same account set. ---
+
+        let iqSeed: [String: Bool]? = awaitMainActorValue { () async -> [String: Bool] in
+            let oldDirs = ClaudeExtraRoots.appliedConfigDirsProvider
+            AgentUsagePublicationCoordinator.resetForTesting()
+            DashboardModel.invalidateScanDerivedCaches()
+            defer {
+                ClaudeExtraRoots.appliedConfigDirsProvider = oldDirs
+                // Also puts the Antigravity registry seam back.
+                AgentUsagePublicationCoordinator.resetForTesting()
+                DashboardModel.invalidateScanDerivedCaches()
+            }
+            var out: [String: Bool] = [:]
+
+            // Publish under account set A, let `mutate` move the set, drop the
+            // in-memory snapshot the way a Cursor sync does, then build the
+            // popover model from a valid disk envelope (no quota in it).
+            @MainActor func reopen(mutate: () -> Void) -> DashboardModel {
+                AgentUsagePublicationCoordinator.resetForTesting()
+                DashboardModel.invalidateScanDerivedCaches()
+                ClaudeExtraRoots.appliedConfigDirsProvider = { "iq-dirs-A" }
+                AgentUsagePublicationCoordinator.antigravityRegistryProvider = { "iq-agy-A,iq-agy-B" }
+                _ = AgentUsagePublicationCoordinator.resolve(DemoData.publishedAgentUsage)
+                mutate()
+                DashboardModel.invalidateScanDerivedCaches()
+                let dir = lp3TempDir("idle-quota")
+                defer { try? FileManager.default.removeItem(at: dir) }
+                _ = SnapshotStore.write(lp3Encode(lp3Envelope(year: nil)), in: dir)
+                return DashboardModel(
+                    cachesSnapshot: true, source: ControlledTurnUsageDataSource(),
+                    initialYear: nil, buildIdentity: lp3Identity, snapshotDirectory: dir)
+            }
+            let generation = DemoData.publishedAgentUsage.publicationGeneration
+            out["control: the fixture payload is generated"] = generation != nil
+
+            // (a) Mutation: remove the seed in DashboardModel.init.
+            let a = reopen {}
+            var aReady = false
+            if case .ready = a.phase { aReady = true }
+            out["(a) the disk restore opens ready"] = aReady
+            out["(a) quota is shown before any poll"] =
+                a.agentUsage?.publicationGeneration == generation
+
+            // (b1) Mutation: drop the config-dir comparison from the fingerprint.
+            let b1 = reopen { ClaudeExtraRoots.appliedConfigDirsProvider = { "iq-dirs-B" } }
+            var b1Ready = false
+            if case .ready = b1.phase { b1Ready = true }
+            out["(b1) control: still opens ready"] = b1Ready
+            out["(b1) a changed config-dir set refuses the seed"] = b1.agentUsage == nil
+
+            // (b2) Mutation: drop the Antigravity comparison from the fingerprint.
+            let b2 = reopen {
+                AgentUsagePublicationCoordinator.antigravityRegistryProvider = { "iq-agy-A" }
+            }
+            var b2Ready = false
+            if case .ready = b2.phase { b2Ready = true }
+            out["(b2) control: still opens ready"] = b2Ready
+            out["(b2) a removed Antigravity account refuses the seed"] = b2.agentUsage == nil
+
+            // (c) An in-memory snapshot whose quota has NO generation passes
+            // `resolve` through; the coordinator then holds a different,
+            // generated payload. Mutation: seed after the restore chain
+            // without the nil check.
+            AgentUsagePublicationCoordinator.resetForTesting()
+            DashboardModel.invalidateScanDerivedCaches()
+            let cSource = WindowScanCountingSource(payload: DemoData.agentUsage)
+            let cSeed = DashboardModel(cachesSnapshot: true, source: cSource, initialYear: nil)
+            await cSeed.load()
+            let cPoll = Task { await cSeed.pollAgentUsage() }
+            var spins = 0
+            while cSeed.agentUsage == nil, spins < 2_000 {
+                try? await Task.sleep(nanoseconds: 1_000_000)
+                spins += 1
+            }
+            cPoll.cancel()
+            _ = await cPoll.value
+            _ = AgentUsagePublicationCoordinator.resolve(DemoData.publishedAgentUsage)
+            let cReopened = DashboardModel(cachesSnapshot: true, source: cSource, initialYear: nil)
+            out["(c) control: the snapshot carried an ungenerated quota"] =
+                cSeed.agentUsage != nil && cSeed.agentUsage?.publicationGeneration == nil
+            out["(c) control: the coordinator holds a generated payload"] =
+                AgentUsagePublicationCoordinator.latestPayload?.publicationGeneration == generation
+            out["(c) the restored snapshot's quota is kept, not replaced by the seed"] =
+                cReopened.agentUsage != nil && cReopened.agentUsage?.publicationGeneration == nil
+            return out
+        }
+        expect(iqSeed != nil, "IDLE-QUOTA fixture completes")
+        for (label, passed) in (iqSeed ?? [:]).sorted(by: { $0.key < $1.key }) {
+            expect(passed, "IDLE-QUOTA \(label)")
+        }
 
         // --- Header indicator ownership: only the owning token clears ---
         // --- `backgroundRefresh`, so an overtaken fetch's completion  ---
@@ -21619,6 +21725,9 @@ enum SelfTest {
             var o: [String: Bool] = [:]
             // A fresh seeding model that writes the shared reopen cache.
             DashboardModel.invalidateScanDerivedCaches()
+            // The body's model polled once already; with its payload still in
+            // the coordinator the seed would satisfy the wait below unpolled.
+            AgentUsagePublicationCoordinator.resetForTesting()
             let seed = DashboardModel(cachesSnapshot: true, source: src, initialYear: nil)
             await seed.load()
             let poll = Task { await seed.pollAgentUsage() }

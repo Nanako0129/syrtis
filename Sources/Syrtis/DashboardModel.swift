@@ -54,13 +54,27 @@ enum AppView: String, CaseIterable {
 struct AgentUsagePublicationState {
     private var latestGeneration: UInt64?
     private var latestPayload: AgentUsagePayload?
+    /// The account set (Claude config dirs + Antigravity registry) in force
+    /// when `latestPayload`'s generation was first accepted. Stamped only on a
+    /// strictly newer generation: an equal re-accept in the window between a
+    /// registry change and its invalidation must not give an old payload the
+    /// new set.
+    private var latestAccountSet: String?
 
     var latest: AgentUsagePayload? { latestPayload }
 
-    mutating func resolve(_ candidate: AgentUsagePayload) -> AgentUsagePayload {
+    /// The latest payload, only when it was accepted under `accountSet`.
+    func latest(forAccountSet accountSet: String) -> AgentUsagePayload? {
+        latestAccountSet == accountSet ? latestPayload : nil
+    }
+
+    mutating func resolve(_ candidate: AgentUsagePayload, accountSet: String) -> AgentUsagePayload {
         guard let generation = candidate.publicationGeneration else { return candidate }
         if let latestGeneration, generation < latestGeneration {
             return latestPayload ?? candidate
+        }
+        if latestGeneration.map({ generation > $0 }) ?? true {
+            latestAccountSet = accountSet
         }
         latestGeneration = generation
         latestPayload = candidate
@@ -89,8 +103,27 @@ enum AgentUsagePublicationCoordinator {
     /// `currentAgyKey` at the moment of reading, not at publication.
     static var latestPayload: AgentUsagePayload? { state.latest.map(antigravityDedup) }
 
+    /// Seed for a freshly built popover model: the last published payload, but
+    /// only if the Claude config-dir set and the Antigravity registry are the
+    /// ones it was accepted under (a removed account must not reappear).
+    static func latestPayload(forAccountSet accountSet: String) -> AgentUsagePayload? {
+        state.latest(forAccountSet: accountSet).map(antigravityDedup)
+    }
+
+    /// Test seam: the Antigravity registry as the account-set fingerprint
+    /// reads it. Put back by `resetForTesting()`.
+    static var antigravityRegistryProvider: () -> String = defaultAntigravityRegistry
+
+    private static let defaultAntigravityRegistry: () -> String = {
+        AntigravityAccounts.payloadJSON(AntigravityAccounts.load())
+    }
+
+    static var accountSet: String {
+        ClaudeExtraRoots.appliedConfigDirsJSON + "\n" + antigravityRegistryProvider()
+    }
+
     static func resolve(_ candidate: AgentUsagePayload) -> AgentUsagePayload {
-        let resolved = state.resolve(candidate)
+        let resolved = state.resolve(candidate, accountSet: accountSet)
         GrokBotKeychainConsent.revokeIfAccessWasDenied(resolved)
         return antigravityDedup(resolved)
     }
@@ -113,6 +146,7 @@ enum AgentUsagePublicationCoordinator {
     /// lines further down, by doing so.
     static func resetForTesting() {
         state = AgentUsagePublicationState()
+        antigravityRegistryProvider = defaultAntigravityRegistry
     }
 }
 
@@ -508,6 +542,16 @@ private struct DashboardSnapshot {
             phase = .loading
         }
         if cachesSnapshot {
+            // A restore with no quota (disk branch, or an in-memory snapshot
+            // dropped by `invalidateScanDerivedCaches`) would open the quota
+            // area empty until a full provider round. The tray keeps the
+            // process-wide publication fresh, so show that while the poll
+            // refreshes it. Only when nothing was restored, and only under the
+            // account set the payload was accepted with.
+            if agentUsage == nil {
+                agentUsage = AgentUsagePublicationCoordinator.latestPayload(
+                    forAccountSet: AgentUsagePublicationCoordinator.accountSet)
+            }
             Self.lastSnapshotOwner = ObjectIdentifier(self)
         }
     }
