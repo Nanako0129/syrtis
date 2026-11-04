@@ -4634,6 +4634,20 @@ enum SelfTest {
                 staleResult.agents.first?.windows.isEmpty == true,
             "stale generation resolves to newer terminal payload content")
 
+        // IDLE-QUOTA: the account set is stamped only on a strictly newer
+        // generation, so an equal re-accept after a registry change cannot give
+        // an old payload the new set (and the seed then refuses it).
+        var stampState = AgentUsagePublicationState()
+        _ = stampState.resolve(publicationA, accountSet: "set-A")
+        _ = stampState.resolve(publicationA, accountSet: "set-B")
+        let stampKeptA = stampState.latest(forAccountSet: "set-A")?.publicationGeneration == 1
+        let stampRefusesB = stampState.latest(forAccountSet: "set-B") == nil
+        _ = stampState.resolve(publicationB, accountSet: "set-B")
+        let stampNewerTakesB = stampState.latest(forAccountSet: "set-B")?.publicationGeneration == 2
+            && stampState.latest(forAccountSet: "set-A") == nil
+        expect(stampKeptA && stampRefusesB && stampNewerTakesB,
+               "IDLE-QUOTA an equal-generation re-accept keeps the first account set; a newer generation restamps it")
+
         var orderedPublicationState = AgentUsagePublicationState()
         let firstResult = orderedPublicationState.resolve(publicationA, accountSet: "")
         let secondResult = orderedPublicationState.resolve(publicationB, accountSet: "")
