@@ -148,7 +148,9 @@ enum AntigravityAccounts {
 
 extension AntigravityAccounts {
     /// Keys (hashes only) the user removed while automatic capture was on.
-    /// Automatic capture skips them before any request; only a manual
+    /// Automatic capture never writes them back: an agy login that stores an
+    /// id_token is skipped before any request, one without (agy 1.4.x) after
+    /// the refresh that names its account and before any write. Only a manual
     /// Capture of that account takes a key off this list.
     static let removedKeysKey = "tokenbar.antigravity.removedKeys"
 
