@@ -870,24 +870,26 @@ private func agentUsageTransportStatus(category: String, status: Int64?) -> Int?
 
 /// The card's error line with the core's fixed transport category (or the HTTP
 /// status for rateLimited/serverError) inserted, so a screenshot is
-/// diagnosable. `text` is already localized; the code is never translated and
-/// `osCode` is never shown. An unlisted category leaves `text` unchanged.
+/// diagnosable. The code is never translated and `osCode` is never shown. An
+/// unlisted category leaves `text` unchanged. "X. Retrying automatically."
+/// becomes "X (code). Retrying automatically."; any other shape gets the code
+/// appended.
 package func agentUsageErrorLine(_ text: String, diagnostic: AgentUsageTransportDiagnostic?) -> String {
     guard let category = diagnostic?.category,
           agentUsageTransportLogCategories.contains(category) else { return text }
     let code = agentUsageTransportStatus(category: category, status: diagnostic?.status)
         .map(String.init) ?? category
     let tail = ". Retrying automatically."
-    if text.hasSuffix(tail), let dot = text.range(of: ". ") {
-        return text.replacingCharacters(in: dot, with: " (\(code)). ")
+    if text.hasSuffix(tail), let dot = text.range(of: tail, options: .backwards) {
+        return text.replacingCharacters(in: dot, with: " (\(code))" + tail)
     }
     return text + " (\(code))"
 }
 
 extension AgentUsageSnapshot {
-    /// The error as every surface shows it: localized, then coded.
+    /// The error as every surface shows it (the core's text, as before), coded.
     package var errorLine: String? {
-        error.map { agentUsageErrorLine($0.localized, diagnostic: transportDiagnostic) }
+        error.map { agentUsageErrorLine($0, diagnostic: transportDiagnostic) }
     }
 }
 
