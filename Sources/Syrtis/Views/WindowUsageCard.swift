@@ -27,11 +27,20 @@ struct WindowUsageCard: View {
     /// grouped buckets arrive as "Gemini Models · Weekly Limit Remaining",
     /// which overflowed the pill row (maintainer, 2026-10-03). Shortens only
     /// the "<group> · <bucket>" shape: "Gemini · Weekly", "Claude/GPT · 5h"
-    /// (localized). Any other label is returned localized and unchanged, and
-    /// the Agent-limits card keeps the full name.
+    /// (localized). A bucket that repeats its group's name, "Gemini 4 Argon ·
+    /// Gemini 4 Argon Weekly Limit" (measured 2026-11-04), shortens the same
+    /// way: "Gemini 4 Argon · Weekly". Any other label is returned localized
+    /// and unchanged, and the Agent-limits card keeps the full name.
     static func shortLabel(_ label: String) -> String {
         let parts = label.components(separatedBy: " · ")
-        guard parts.count == 2, parts[1].hasSuffix(" Limit Remaining") else {
+        guard parts.count == 2 else { return label.localized }
+        let bucket: String
+        if parts[1].hasSuffix(" Limit Remaining") {
+            bucket = String(parts[1].dropLast(" Limit Remaining".count))
+        } else if parts[1].hasPrefix(parts[0] + " "), parts[1].hasSuffix(" Limit"),
+                  parts[1].count > parts[0].count + 1 + " Limit".count {
+            bucket = String(parts[1].dropFirst(parts[0].count + 1).dropLast(" Limit".count))
+        } else {
             return label.localized
         }
         var group = parts[0]
@@ -39,7 +48,6 @@ struct WindowUsageCard: View {
             group = String(group.dropLast(suffix.count))
         }
         group = group.replacingOccurrences(of: " and ", with: "/")
-        let bucket = String(parts[1].dropLast(" Limit Remaining".count))
         let window = switch bucket {
         case "Weekly": "Weekly".localized
         case "Five Hour": "5h".localized
