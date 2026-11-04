@@ -814,7 +814,7 @@ struct AgentLimitsCard: View {
                         .font(.caption2)
                         .foregroundStyle(snapshot?.error != nil ? .red : .secondary)
                         .lineLimit(2)
-                        .help(snapshot?.error ?? detail)
+                        .help(detail)
                 }
                 VStack(spacing: 8) {
                     if !uniqueWindows.isEmpty {
@@ -1034,7 +1034,7 @@ struct AgentLimitsCard: View {
 
     private func detailText(_ snapshot: AgentUsageSnapshot?) -> String? {
         guard let snapshot else { return nil }
-        if let error = snapshot.error { return error }
+        if let line = snapshot.errorLine { return line }
         let parts = [snapshot.identity?.email, snapshot.identity?.plan].compactMap(\.self)
         return parts.isEmpty ? nil : parts.joined(separator: " · ")
     }

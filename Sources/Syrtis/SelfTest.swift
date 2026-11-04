@@ -5667,6 +5667,47 @@ enum SelfTest {
                 && opencodeTransport?.first?.category == "rateLimited"
                 && opencodeTransport?.first?.status == 429,
             "opencode transport diagnostics keep their client id")
+        func errorLine(_ error: String, _ diagnostic: String?) -> String? {
+            transportPayload(
+                transportBase.replacingOccurrences(of: "codex", with: "claude")
+                    + #","error":"\#(error)""# + (diagnostic.map { #","transportDiagnostic":\#($0)"# } ?? ""))?
+                .agents.first?.errorLine
+        }
+        let claudeFailed = "Claude usage request failed. Retrying automatically."
+        expect(
+            errorLine(claudeFailed, #"{"category":"tls","osCode":-9806}"#)
+                == "Claude usage request failed (tls). Retrying automatically.",
+            "quota error line inserts the transport category before the retry sentence")
+        expect(
+            errorLine(claudeFailed, #"{"category":"rateLimited","status":429}"#)
+                == "Claude usage request failed (429). Retrying automatically."
+                && errorLine(claudeFailed, #"{"category":"serverError","status":503}"#)
+                == "Claude usage request failed (503). Retrying automatically.",
+            "quota error line shows the status for rateLimited and serverError")
+        expect(
+            errorLine(claudeFailed, #"{"category":"serverError","status":200}"#)
+                == "Claude usage request failed (serverError). Retrying automatically.",
+            "quota error line never shows an invalid status")
+        expect(
+            errorLine("Claude OAuth usage endpoint is rate limited. Retrying automatically in ~5s.", #"{"category":"dns"}"#)
+                == "Claude OAuth usage endpoint is rate limited. Retrying automatically in ~5s. (dns)",
+            "quota error line appends the category when the retry shape does not hold")
+        expect(
+            errorLine(claudeFailed, #"{"category":"futureCategory","status":200}"#) == claudeFailed
+                && errorLine(claudeFailed, nil) == claudeFailed,
+            "quota error line is unchanged for an unknown category or no diagnostic")
+        // The production surfaces, not only the helper: the time-window card's
+        // blocked reason comes from `WindowCardLoader.quotaHalf`.
+        var windowCardCoded = false
+        if let coded = transportPayload(
+            transportBase.replacingOccurrences(of: "codex", with: "claude")
+                + #","error":"Claude usage request failed. Retrying automatically.","transportDiagnostic":{"category":"tls"}"#),
+           case let .blocked(_, reason) = WindowCardLoader.quotaHalf(
+               payload: coded, clientId: "claude", accountKey: coded.agents.first?.accountKey,
+               attempted: true, curve: { _, _, _, _ in nil }, nowMs: 0) {
+            windowCardCoded = reason == "Claude usage request failed (tls). Retrying automatically."
+        }
+        expect(windowCardCoded, "the time-window card's blocked reason carries the transport code")
         let malformedTransportBodies = [
             transportBase + #","transportDiagnostic":"not-an-object""#,
             transportBase + #","transportDiagnostic":{"status":500}"#,
