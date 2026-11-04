@@ -717,7 +717,7 @@
 "Syrtis sends the sign-in's access token to api.anthropic.com to ask for the usage. Once that token has expired, Syrtis sends the refresh token to platform.claude.com for a new one and writes the new sign-in back into the same Keychain item." = "Syrtis 會把登入的存取權杖送到 api.anthropic.com 查詢用量。權杖過期後，Syrtis 會把重新整理權杖送到 platform.claude.com 換取新的，並把新的登入寫回同一個鑰匙圈項目。";
 "Some downloaded Cursor usage that is no longer needed couldn't be deleted. Syrtis will try again." = "部分已不再需要的 Cursor 用量資料無法刪除。Syrtis 會再試一次。";
 
-/* Cursor encrypted sign-in (plan CURSOR-SS-M; disclosure is a draft until the device check) */
+/* Cursor encrypted sign-in (plan CURSOR-SS-M; disclosure approved by the maintainer 2026-11-04) */
 "Cursor stores its sign-in encrypted. Syrtis needs your permission to read it." = "Cursor 以加密方式儲存登入資訊，Syrtis 需要你的同意才能讀取。";
 "macOS didn't let Syrtis read Cursor's encrypted sign-in." = "macOS 沒有允許 Syrtis 讀取 Cursor 加密的登入資訊。";
 "Press Sync Now to read Cursor's encrypted sign-in." = "按「立即同步」以讀取 Cursor 加密的登入資訊。";
