@@ -3826,7 +3826,14 @@ fn month_start_ms(back: i32) -> i64 {
     use chrono::TimeZone as _;
     let month = cursor_billing_v2::month_index(now_ms_i64()).unwrap() - back;
     chrono::Utc
-        .with_ymd_and_hms(month.div_euclid(12), month.rem_euclid(12) as u32 + 1, 1, 0, 0, 0)
+        .with_ymd_and_hms(
+            month.div_euclid(12),
+            month.rem_euclid(12) as u32 + 1,
+            1,
+            0,
+            0,
+            0,
+        )
         .unwrap()
         .timestamp_millis()
 }
@@ -3908,7 +3915,10 @@ fn run_v2(f: &Fixture, replies: Vec<Reply>, limits: Limits) -> (Outcome, Vec<See
 
 fn v2_requests(seen: &[Seen]) -> Vec<Seen> {
     seen.iter()
-        .filter(|s| s.head.starts_with("GET /api/dashboard/v2/query-billing-items?"))
+        .filter(|s| {
+            s.head
+                .starts_with("GET /api/dashboard/v2/query-billing-items?")
+        })
         .cloned()
         .collect()
 }
@@ -3941,10 +3951,15 @@ fn row_ms(row: &serde_json::Value) -> i64 {
 }
 
 fn row_tokens(row: &serde_json::Value) -> f64 {
-    ["inputTokens", "outputTokens", "cacheReadTokens", "cacheWriteTokens"]
-        .iter()
-        .map(|key| row["tokenUsage"][key].as_f64().unwrap_or(0.0))
-        .sum()
+    [
+        "inputTokens",
+        "outputTokens",
+        "cacheReadTokens",
+        "cacheWriteTokens",
+    ]
+    .iter()
+    .map(|key| row["tokenUsage"][key].as_f64().unwrap_or(0.0))
+    .sum()
 }
 
 fn tokens_in_month(dir: &Path, back: i32) -> f64 {
@@ -4042,7 +4057,11 @@ fn a_refused_switch_freezes_nothing_and_old_success_writes_only_its_rows() {
     assert!(!sidecar_path(&f.dir).exists(), "frozen at the switch");
     assert_eq!(std::fs::read(expected_file(&f.dir)).unwrap(), before);
 
-    let rows = [old_row("a", t), old_row("b", t + 1000), old_row("c", t + 2000)];
+    let rows = [
+        old_row("a", t),
+        old_row("b", t + 1000),
+        old_row("c", t + 2000),
+    ];
     let (outcome, _) = run_v2(&f, vec![old_page(&rows)], v2_limits(false));
     assert_eq!(outcome, ok(3));
     assert!(!sidecar_path(&f.dir).exists());
@@ -4090,7 +4109,10 @@ fn the_first_v2_commit_keeps_old_rows_and_adds_only_rows_after_the_cutover() {
 fn a_second_v2_commit_keeps_the_sidecar_and_its_cutover() {
     let f = fixture();
     assert_eq!(first_v2_round(&f).stop.state, State::Ok);
-    assert!(sidecar_path(&f.dir).exists(), "the first commit dropped its sidecar");
+    assert!(
+        sidecar_path(&f.dir).exists(),
+        "the first commit dropped its sidecar"
+    );
     let first = sidecar_json(&f.dir);
     let cutover = v2_cutover();
     let new_ms = (now_ms_i64() - 60_000).max(month_start_ms(0) + 1);
@@ -4099,10 +4121,7 @@ fn a_second_v2_commit_keeps_the_sidecar_and_its_cutover() {
         vec![
             old_migrated(),
             v2_page(
-                &[
-                    item("v-current", month_start_ms(0)),
-                    item("v-new", new_ms),
-                ],
+                &[item("v-current", month_start_ms(0)), item("v-new", new_ms)],
                 None,
             ),
             v2_page(&[item("v-after", cutover + HOUR)], None),
@@ -4112,7 +4131,10 @@ fn a_second_v2_commit_keeps_the_sidecar_and_its_cutover() {
     assert_eq!(outcome.stop.state, State::Ok);
     assert!(sidecar_path(&f.dir).exists(), "the sidecar was dropped");
     let second = sidecar_json(&f.dir);
-    assert_eq!(second["cutoverMs"].to_string(), first["cutoverMs"].to_string());
+    assert_eq!(
+        second["cutoverMs"].to_string(),
+        first["cutoverMs"].to_string()
+    );
     assert_eq!(second["frozen"].to_string(), first["frozen"].to_string());
     let rows = live_rows(&f.dir);
     assert_eq!(rows.len(), 5);
@@ -4148,7 +4170,11 @@ fn a_background_round_keeps_the_months_it_did_not_re_read() {
         v2_limits(false),
     );
     assert_eq!(outcome.stop.state, State::Ok);
-    assert_eq!(v2_requests(&seen).len(), 3, "a background round reads M-2..M");
+    assert_eq!(
+        v2_requests(&seen).len(),
+        3,
+        "a background round reads M-2..M"
+    );
     assert_eq!(tokens_in_month(&f.dir, 5), ITEM_TOKENS, "month M-5 changed");
     assert_eq!(live_rows(&f.dir).len(), 12);
 }
@@ -4167,10 +4193,7 @@ fn a_month_answering_empty_keeps_its_rows() {
         vec![
             old_migrated(),
             v2_page(
-                &[
-                    item("v-current", month_start_ms(0)),
-                    item("v-new", new_ms),
-                ],
+                &[item("v-current", month_start_ms(0)), item("v-new", new_ms)],
                 None,
             ),
             v2_empty(),
@@ -4179,7 +4202,10 @@ fn a_month_answering_empty_keeps_its_rows() {
     );
     assert_eq!(outcome.stop.state, State::Ok);
     let times: Vec<i64> = live_rows(&f.dir).iter().map(row_ms).collect();
-    assert!(times.contains(&(cutover + HOUR)), "M-1's row was dropped on {{}}");
+    assert!(
+        times.contains(&(cutover + HOUR)),
+        "M-1's row was dropped on {{}}"
+    );
     assert!(times.contains(&new_ms), "the file was not updated");
     assert_eq!(times.len(), 5);
 }
@@ -4237,10 +4263,7 @@ fn refusals_leave_the_file_and_sidecar_unchanged() {
             1,
         ),
         (
-            vec![
-                v2_page(&[current()], Some("c1")),
-                v2_page(&[], Some("c1")),
-            ],
+            vec![v2_page(&[current()], Some("c1")), v2_page(&[], Some("c1"))],
             stop(State::Partial, Some("too_many_pages")),
             2,
         ),
@@ -4436,7 +4459,11 @@ fn cleanup_deletes_sidecars_and_ignores_another_stems() {
     seed_by_old_walk(&f, &[old_row("a", month_start_ms(1) + HOUR)]);
     assert_eq!(
         names_in(&f.dir),
-        [expected_file(&f.dir).file_name().unwrap().to_string_lossy().into_owned()]
+        [expected_file(&f.dir)
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned()]
     );
 
     // Another stem's sidecar is never read by a V2 commit, and goes.
@@ -4458,7 +4485,10 @@ fn cleanup_deletes_sidecars_and_ignores_another_stems() {
     assert_eq!(outcome, ok(1));
     assert!(!f.dir.join(sidecar_of('c')).exists());
     assert_eq!(live_rows(&f.dir).len(), 1);
-    assert!(sidecar_json(&f.dir)["frozen"].as_array().unwrap().is_empty());
+    assert!(sidecar_json(&f.dir)["frozen"]
+        .as_array()
+        .unwrap()
+        .is_empty());
 }
 
 /// S5/S7: `userEmail`, `principal.id`, `billingItemId`, the token and the
@@ -4510,7 +4540,14 @@ fn v2_canaries_stay_out_and_another_principal_writes_nothing() {
     }
 
     let all = outputs.join("\n");
-    for canary in [EMAIL_CANARY, USER, OTHER_USER, ITEM_ID_CANARY, SIGNATURE, f.token.as_str()] {
+    for canary in [
+        EMAIL_CANARY,
+        USER,
+        OTHER_USER,
+        ITEM_ID_CANARY,
+        SIGNATURE,
+        f.token.as_str(),
+    ] {
         assert!(!all.contains(canary), "canary leaked");
     }
     // Control: the outputs searched hold the written row and the refusal.
@@ -4597,7 +4634,10 @@ fn v2_items_map_to_engine_rows() {
     assert_eq!(included["timestamp"], t.to_string());
     assert_eq!(included["model"], "composer-2.5");
     assert!(included.get("conversationId").is_none());
-    assert!(included.get("chargedCents").is_none(), "D2: included row priced");
+    assert!(
+        included.get("chargedCents").is_none(),
+        "D2: included row priced"
+    );
     assert_eq!(paid["chargedCents"], 1.25);
     let usage = &included["tokenUsage"];
     assert_eq!(usage["inputTokens"], 1263.0);
@@ -4629,6 +4669,9 @@ fn an_old_success_after_v2_deletes_the_sidecar() {
     let (outcome, seen) = run_v2(&f, vec![old_page(&rows)], v2_limits(false));
     assert_eq!(outcome, ok(1));
     assert!(v2_requests(&seen).is_empty());
-    assert!(!sidecar_path(&f.dir).exists(), "the sidecar outlived an old success");
+    assert!(
+        !sidecar_path(&f.dir).exists(),
+        "the sidecar outlived an old success"
+    );
     assert_eq!(live_rows(&f.dir).len(), 1);
 }

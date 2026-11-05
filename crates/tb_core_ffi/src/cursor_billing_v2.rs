@@ -261,9 +261,10 @@ pub(crate) async fn walk(
             }
             let items = page.data.unwrap_or_default();
             // S7: every item, written or not, must be the cookie's own user.
-            if items.iter().any(|item| {
-                item.principal.as_ref().and_then(|p| p.id.as_deref()) != Some(user)
-            }) {
+            if items
+                .iter()
+                .any(|item| item.principal.as_ref().and_then(|p| p.id.as_deref()) != Some(user))
+            {
                 return Err(Stop::error("billing_v2_principal_mismatch"));
             }
             for item in items {
