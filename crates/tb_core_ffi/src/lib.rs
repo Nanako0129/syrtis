@@ -27,6 +27,7 @@ mod agent_quota_history;
 mod agent_usage;
 mod agents_report;
 mod claude_config_dirs;
+mod cursor_billing_v2;
 mod cursor_desktop;
 mod cursor_sync;
 mod extra_scan_paths;

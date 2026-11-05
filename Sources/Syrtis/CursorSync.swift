@@ -272,11 +272,24 @@ enum CursorSync {
         /// "Allow"; the bare "Allow" key is the badge, a different part of speech).
         static let allow = "consent.action.allow"
 
+        /// Cursor Billing V2 (plan CURSOR-BV2-M, design 7). Each keeps the
+        /// core's code (`%@`) on the #547 line so a screenshot can be
+        /// diagnosed. Draft copy, shown to the maintainer before merge.
+        /// `billing_v2_team_required`: V2 answered `missing_team_id`.
+        static let billingV2TeamRequired = "Cursor's new billing asks for a team for this account, which Syrtis can't read yet (%@)."
+        /// `billing_v2_unavailable`: V2 answered another `availability`.
+        static let billingV2Unavailable = "Cursor's new billing didn't provide this account's usage (%@). Syrtis will try again later."
+        /// `billing_v2_no_items`: no earlier usage and V2 returned none.
+        static let billingV2NoItems = "Cursor's new billing has no usage for this account yet (%@). Syrtis will try again later."
+        /// `billing_v2_principal_mismatch`: V2 returned another account's rows; nothing saved.
+        static let billingV2PrincipalMismatch = "Cursor returned usage of another account, so Syrtis saved nothing (%@)."
+
         static var all: [String] {
             [title, toggle, privacy, `continue`, cancel, turnOff, lastSynced, partial, expired, notSignedIn,
              offline, error, errorWithReason, cliPresent, syncNow, syncing, cliQuestion, useSyrtis, keepCLI, cleanupFailed,
              configRejected, staleCleanupFailed, defaultProfile, addProfile, duplicate, profilesPrivacy, cantAdd, cantRead,
-             removeFolder, keychainConsent, keychainDenied, keychainUnlock, keychainAllowAccess, keychainDisclosure, allow]
+             removeFolder, keychainConsent, keychainDenied, keychainUnlock, keychainAllowAccess, keychainDisclosure, allow,
+             billingV2TeamRequired, billingV2Unavailable, billingV2NoItems, billingV2PrincipalMismatch]
         }
     }
 
@@ -385,6 +398,11 @@ enum CursorSync {
             case "keychain_consent"?: return Copy.keychainConsent.localized
             case "keychain_denied"?: return Copy.keychainDenied.localized
             case "keychain_unlock"?: return Copy.keychainUnlock.localized
+            case "billing_v2_team_required"?: return Copy.billingV2TeamRequired.localized("billing_v2_team_required")
+            case "billing_v2_unavailable"?: return Copy.billingV2Unavailable.localized("billing_v2_unavailable")
+            case "billing_v2_no_items"?: return Copy.billingV2NoItems.localized("billing_v2_no_items")
+            case "billing_v2_principal_mismatch"?:
+                return Copy.billingV2PrincipalMismatch.localized("billing_v2_principal_mismatch")
             default: break
             }
             if let reason, (1...40).contains(reason.utf8.count),
