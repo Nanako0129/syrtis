@@ -19600,6 +19600,24 @@ enum SelfTest {
                 && !CursorSync.needsKeychainAllow(reason: nil, profiles: [:]),
             "CURSOR-SS consent/denied/unlock have fixed lines (others the coded line), and Allow shows for consent or denied on the headline or any profile; got \(keychainLines)")
 
+        // CURSOR-BV2-M design 7: each Billing V2 reason has its own line that
+        // still carries the code, and none is the generic coded line.
+        let billingCodes = ["billing_v2_team_required", "billing_v2_unavailable", "billing_v2_no_items", "billing_v2_principal_mismatch"]
+        let billingLines: [String?] = billingCodes.map {
+            CursorSync.statusLine(state: "error", lastSuccessMs: nil, reason: $0)
+        }
+        let billingCopy = [
+            CursorSync.Copy.billingV2TeamRequired, CursorSync.Copy.billingV2Unavailable,
+            CursorSync.Copy.billingV2NoItems, CursorSync.Copy.billingV2PrincipalMismatch,
+        ]
+        let billingExpected: [String?] = zip(billingCopy, billingCodes).map { copy, code in copy.localized(code) }
+        let billingCarryCode = zip(billingLines, billingCodes).allSatisfy { line, code in
+            line?.contains(code) == true && line != CursorSync.Copy.errorWithReason.localized(code)
+        }
+        expect(
+            billingLines == billingExpected && billingCarryCode && Set(billingLines).count == 4,
+            "CURSOR-BV2 each Billing V2 reason has its own line carrying its code; got \(billingLines)")
+
         // CURSOR-SS-M Acceptance 2 test 14, the order without completions
         // (Design 7). Launch: the composed consent is installed before the
         // first Cursor round (which may read the Keychain); with no grant the

@@ -723,3 +723,9 @@
 "Press Sync Now to read Cursor's encrypted sign-in." = "按「立即同步」以讀取 Cursor 加密的登入資訊。";
 "Allow Keychain access…" = "允許存取鑰匙圈…";
 "Cursor 3.27 and later can store its sign-in encrypted. To read it, Syrtis needs the \"Cursor Safe Storage\" key from your Keychain. That key can decrypt everything Cursor stores encrypted; Syrtis uses it only to read the Cursor sign-in of the profiles listed here, keeps it in memory while Syrtis runs, and never saves or logs it. The sign-in is still sent only to cursor.com. Turning on Cursor sync does not grant this; macOS will ask you to allow Syrtis. If Cursor stores its sign-in unencrypted, nothing is asked." = "Cursor 3.27 以後的版本可以用加密方式儲存登入資訊。為了讀取它，Syrtis 需要鑰匙圈裡的「Cursor Safe Storage」金鑰。這把金鑰能解開 Cursor 所有加密儲存的資料；Syrtis 只用它讀取這裡列出的設定檔的 Cursor 登入資訊，只在 Syrtis 執行期間保留在記憶體中，不會儲存或記錄。登入資訊仍然只會送到 cursor.com。開啟 Cursor 同步不等於同意這項存取；macOS 會請你允許 Syrtis。如果 Cursor 沒有加密儲存登入資訊，就不會詢問。";
+
+/* Cursor Billing V2 reasons (plan CURSOR-BV2-M; draft, shown to the maintainer before merge) */
+"Cursor's new billing asks for a team for this account, which Syrtis can't read yet (%@)." = "Cursor 新版計費要求這個帳號指定團隊，Syrtis 目前還無法讀取（%@）。";
+"Cursor's new billing didn't provide this account's usage (%@). Syrtis will try again later." = "Cursor 新版計費沒有提供這個帳號的用量（%@），Syrtis 稍後會再試。";
+"Cursor's new billing has no usage for this account yet (%@). Syrtis will try again later." = "Cursor 新版計費目前還沒有這個帳號的用量（%@），Syrtis 稍後會再試。";
+"Cursor returned usage of another account, so Syrtis saved nothing (%@)." = "Cursor 回傳的是其他帳號的用量，因此 Syrtis 沒有儲存任何資料（%@）。";

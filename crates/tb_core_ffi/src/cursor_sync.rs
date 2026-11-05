@@ -48,7 +48,21 @@
 //!   profile's session or to this machine — expired (local expiry, 401,
 //!   redirect, 403 JSON), disabled (removed mid-walk), client_unavailable,
 //!   write_failed — which leaves the account to the next profile on it.
+//!
+//! Billing V2 (plan CURSOR-BV2-M r4): the old walk runs first every round and
+//! keeps every result it has today. Only when its page 1 is a 2xx JSON object
+//! without `usageEventsDisplay` does that profile's round read
+//! `query-billing-items` (`cursor_billing_v2`) with the same client and
+//! cookie. The live `usage.<stem>.json` stays the one file the engine reads;
+//! beside it, the dot-prefixed sidecar `.cursor-sync.history.<stem>.json`
+//! (never scanned) keeps the old rows frozen at the first V2 commit, the
+//! cutover, and the months V2 has read (`History`). A V2 commit writes
+//! frozen rows ∪ V2 rows after the cutover; an old-walk commit deletes the
+//! sidecar (the full old history is back). Fixed reasons:
+//! `billing_v2_team_required`, `billing_v2_unavailable`,
+//! `billing_v2_no_items`, `billing_v2_principal_mismatch`.
 
+use crate::cursor_billing_v2::{self, Fetched};
 use crate::cursor_desktop::{self, CursorLogin};
 use fs2::FileExt as _;
 use serde::{Deserialize, Serialize};
@@ -64,6 +78,10 @@ const LOCK_FILE_NAME: &str = ".cursor-sync.lock";
 /// Starts with a dot so it can never match the engine's `usage*` patterns: a
 /// half-written temp file must not be scanned.
 const TEMP_FILE_PREFIX: &str = ".cursor-sync.tmp-";
+/// The Billing V2 history sidecar, `.cursor-sync.history.<stem>.json`: dot
+/// prefixed (never one of the engine's `usage.*` files) and not the temp
+/// prefix (which every commit deletes).
+const SIDECAR_PREFIX: &str = ".cursor-sync.history.";
 
 const PAGE_SIZE: u32 = 500;
 /// Upstream's per-page timeout (`CURSOR_HTTP_TIMEOUT`), clamped to the budget.
@@ -700,9 +718,10 @@ fn complete_file(dir: &Path) -> Option<(PathBuf, SystemTime)> {
 // ---------------------------------------------------------------------------
 // Files.
 
-/// What a delete pass did: `removed` counts every file of ours (usage files
-/// and temp leftovers), `usage` only the usage files, which are what the
-/// engine reads (a temp file never changes what is counted).
+/// What a delete pass did: `removed` counts every file of ours (usage files,
+/// temp leftovers, history sidecars), `usage` only the usage files, which are
+/// what the engine reads (a temp file or a sidecar never changes what is
+/// counted).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct Removal {
     removed: usize,
@@ -710,10 +729,11 @@ struct Removal {
     failed: bool,
 }
 
-/// Delete Syrtis usage files (and temp leftovers) in `dir` except `keep`.
-/// Never touches anything else. Caller holds the dir lock. `failed`: any of
-/// ours could not be deleted, or the dir could not be read.
-fn remove_usage_files(dir: &Path, keep: Option<&str>) -> Removal {
+/// Delete Syrtis usage files (and temp leftovers and history sidecars) in
+/// `dir` except the names in `keep`. Never touches anything else. Caller
+/// holds the dir lock. `failed`: any of ours could not be deleted, or the dir
+/// could not be read.
+fn remove_usage_files(dir: &Path, keep: &[&str]) -> Removal {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Removal {
             failed: true,
@@ -728,7 +748,7 @@ fn remove_usage_files(dir: &Path, keep: Option<&str>) -> Removal {
         };
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        if !is_ours(&name) || Some(name.as_ref()) == keep {
+        if !is_ours(&name) || keep.contains(&name.as_ref()) {
             continue;
         }
         match std::fs::remove_file(entry.path()) {
@@ -743,9 +763,24 @@ fn remove_usage_files(dir: &Path, keep: Option<&str>) -> Removal {
     result
 }
 
-/// B2: exactly our file names, `usage.<64 hex>.json` and our temp prefix.
+/// B2: exactly our file names, `usage.<64 hex>.json`, our temp prefix and
+/// `.cursor-sync.history.<64 hex>.json` (a sidecar of any stem).
 fn is_ours(name: &str) -> bool {
-    is_sync_file_name(name) || name.starts_with(TEMP_FILE_PREFIX)
+    is_sync_file_name(name) || name.starts_with(TEMP_FILE_PREFIX) || is_sidecar_name(name)
+}
+
+fn is_sidecar_name(name: &str) -> bool {
+    name.strip_prefix(SIDECAR_PREFIX)
+        .and_then(|rest| rest.strip_suffix(".json"))
+        .is_some_and(|hex| hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
+fn live_name(stem: &str) -> String {
+    format!("usage.{stem}.json")
+}
+
+fn sidecar_name(stem: &str) -> String {
+    format!("{SIDECAR_PREFIX}{stem}.json")
 }
 
 /// `(removed, failed)`. A missing dir, or one that is not a real directory,
@@ -755,13 +790,13 @@ fn is_ours(name: &str) -> bool {
 /// lock file and `rmdir` it, which succeeds only if nothing else is left
 /// (never `remove_dir_all`).
 fn remove_usage_files_locked(dir: &Path, remove_dir: bool) -> (usize, bool) {
-    let result = locked_removal(dir, None, remove_dir);
+    let result = locked_removal(dir, &[], remove_dir);
     (result.removed, result.failed)
 }
 
-/// `remove_usage_files_locked` that spares `keep` (a usage file name) and
-/// reports the usage files separately.
-fn locked_removal(dir: &Path, keep: Option<&str>, remove_dir: bool) -> Removal {
+/// `remove_usage_files_locked` that spares `keep` (file names) and reports
+/// the usage files separately.
+fn locked_removal(dir: &Path, keep: &[&str], remove_dir: bool) -> Removal {
     let nothing = Removal::default();
     // Only a real directory: never follow a symlink to delete elsewhere.
     match std::fs::symlink_metadata(dir) {
@@ -866,6 +901,34 @@ fn commit_file(
     still_wanted: &dyn Fn() -> bool,
 ) -> Result<Committed, Stop> {
     let failed = || Stop::error("write_failed");
+    let _lock = lock_dir(dir, still_wanted)?;
+    // An old walk brings the full old history back, so this stem's Billing
+    // V2 sidecar goes, and before the live file is replaced: a live file an
+    // old walk wrote never sits beside a sidecar (`commit_v2` relies on it).
+    match std::fs::remove_file(dir.join(sidecar_name(stem))) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return Err(failed()),
+    }
+    let payload = serde_json::to_vec(&UsageFile {
+        total_usage_events_count: events.len(),
+        usage_events_display: events,
+    })
+    .map_err(|_| failed())?;
+    let final_name = live_name(stem);
+    let changed = write_atomic(dir, &final_name, &payload)?;
+    let removal = remove_usage_files(dir, &[&final_name]);
+    Ok(Committed {
+        changed: changed || removal.usage > 0,
+        cleanup_failed: removal.failed,
+    })
+}
+
+/// `dir` as a real directory, locked exclusively (released when the returned
+/// file drops); `still_wanted` checked before anything is created and again
+/// under the lock (see `commit_file`).
+fn lock_dir(dir: &Path, still_wanted: &dyn Fn() -> bool) -> Result<std::fs::File, Stop> {
+    let failed = || Stop::error("write_failed");
     if !still_wanted() {
         return Err(Stop::new(State::Disabled, None));
     }
@@ -882,41 +945,241 @@ fn commit_file(
     if !still_wanted() {
         return Err(Stop::new(State::Disabled, None));
     }
+    Ok(lock)
+}
+
+/// `dir/name` holds `payload` afterwards: unchanged bytes only get a new
+/// mtime (`refresh_if_same`); otherwise temp 0600, fsync, atomic rename, dir
+/// fsync. Returns whether the bytes changed. Caller holds the dir lock.
+fn write_atomic(dir: &Path, name: &str, payload: &[u8]) -> Result<bool, Stop> {
+    if refresh_if_same(&dir.join(name), payload) {
+        return Ok(false);
+    }
+    let temp_path = dir.join(temp_file_name());
+    let written = (|| {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&temp_path)?;
+        file.write_all(payload)?;
+        file.sync_all()?;
+        drop(file);
+        tokscale_core::fs_atomic::replace_file(&temp_path, &dir.join(name))
+    })();
+    if written.is_err() {
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(Stop::error("write_failed"));
+    }
+    // The rename is the commit point; a failed dir fsync cannot undo it.
+    let _ = crate::agent_quota_history::sync_directory(dir);
+    Ok(true)
+}
+
+// ---------------------------------------------------------------------------
+// Billing V2 history (plan CURSOR-BV2-M r4, design 3-5b, D5, D6).
+
+/// The sidecar `.cursor-sync.history.<stem>.json`. Created only by the first
+/// V2 commit for a stem (no same-stem sidecar yet), from that stem's live
+/// file; after that `frozen` and `cutover_ms` never change, only `fetched`.
+/// Every V2 commit writes the live file as `frozen` followed by its V2 rows,
+/// so the live file's V2 rows are the ones after the first `frozen.len()`
+/// (an old-walk commit deletes the sidecar before it replaces the live file).
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct History {
+    /// The old endpoint's rows as they were at the first V2 commit.
+    frozen: Vec<Event>,
+    /// V2 rows at or before it are never written. None: no old rows.
+    cutover_ms: Option<i64>,
+    /// UTC month index (`cursor_billing_v2::month_index`) -> rows written
+    /// for that month when V2 last read it with rows (0: read, never had any).
+    fetched: std::collections::BTreeMap<i32, u64>,
+}
+
+/// The stem's sidecar: None when there is none; Err when one is there but is
+/// not a regular file we can read and parse (fail closed: no V2 commit).
+fn read_history(dir: &Path, stem: &str) -> Result<Option<History>, ()> {
+    let path = dir.join(sidecar_name(stem));
+    match std::fs::symlink_metadata(&path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Ok(meta) if meta.is_file() => {
+            let bytes = std::fs::read(&path).map_err(|_| ())?;
+            serde_json::from_slice(&bytes).map(Some).map_err(|_| ())
+        }
+        _ => Err(()),
+    }
+}
+
+/// The stem's live file's rows; none when it is absent or not a regular file
+/// (never followed, as in `refresh_if_same`); Err when it cannot be parsed.
+fn read_live(dir: &Path, stem: &str) -> Result<Vec<Event>, ()> {
+    let path = dir.join(live_name(stem));
+    if !std::fs::symlink_metadata(&path).is_ok_and(|meta| meta.is_file()) {
+        return Ok(Vec::new());
+    }
+    let bytes = std::fs::read(&path).map_err(|_| ())?;
+    serde_json::from_slice::<Page>(&bytes)
+        .map(|page| page.usage_events_display)
+        .map_err(|_| ())
+}
+
+/// Unix ms from a timestamp the engine accepts: base-10 ms, else RFC 3339
+/// (engine `parse_ms_timestamp`).
+pub(crate) fn timestamp_ms(text: &str) -> Option<i64> {
+    let text = text.trim();
+    text.parse::<i64>().ok().or_else(|| {
+        chrono::DateTime::parse_from_rfc3339(text)
+            .ok()
+            .map(|time| time.timestamp_millis())
+    })
+}
+
+fn event_ms(event: &Event) -> Option<i64> {
+    match event.timestamp.as_ref()? {
+        Timestamp::Text(text) => timestamp_ms(text),
+        Timestamp::Number(number) => number
+            .as_i64()
+            .or_else(|| number.as_f64().map(|ms| ms as i64)),
+    }
+}
+
+/// D5: the newest frozen time, clamped to now (S8: a future timestamp must
+/// not hold V2 rows back); now when no frozen time can be read; None without
+/// frozen rows.
+fn cutover_of(frozen: &[Event], now_ms: i64) -> Option<i64> {
+    if frozen.is_empty() {
+        return None;
+    }
+    Some(
+        frozen
+            .iter()
+            .filter_map(event_ms)
+            .max()
+            .map_or(now_ms, |newest| newest.min(now_ms)),
+    )
+}
+
+/// Design 5/6: the months this V2 round reads, newest first, and whether it
+/// stops after 3 empty windows in a row (no cutover). Range: the cutover's
+/// month (or 11 months back, whichever is later) to now. An explicit round
+/// reads all of it; a background one the last three months (not before the
+/// range) plus any month V2 never read. Read without the lock: the commit
+/// re-reads both files under it.
+fn v2_windows(dir: &Path, stem: &str, explicit: bool, now_ms: i64) -> (Vec<i32>, bool) {
+    let (cutover, fetched) = match read_history(dir, stem) {
+        Ok(Some(history)) => (history.cutover_ms, history.fetched),
+        _ => (
+            read_live(dir, stem)
+                .ok()
+                .and_then(|rows| cutover_of(&rows, now_ms)),
+            std::collections::BTreeMap::new(),
+        ),
+    };
+    let Some(current) = cursor_billing_v2::month_index(now_ms) else {
+        return (Vec::new(), true);
+    };
+    let floor = current - 11;
+    let first = cutover
+        .and_then(cursor_billing_v2::month_index)
+        .map_or(floor, |month| month.max(floor));
+    let recent = first.max(current - 2);
+    let windows = (first..=current)
+        .rev()
+        .filter(|month| explicit || *month >= recent || !fetched.contains_key(month))
+        .collect();
+    (windows, cutover.is_none())
+}
+
+/// Design 4/5b, D6: under the dir lock, the live file becomes frozen rows ∪
+/// the live file's V2 rows in months this walk did not re-read with rows ∪
+/// this walk's rows after the cutover; the sidecar is created on the first
+/// V2 commit (from the same stem's live file) and afterwards only its
+/// `fetched` list changes. A month re-read with no rows keeps its rows.
+/// Nothing at all to write (no old rows, no V2 rows): `billing_v2_no_items`,
+/// nothing written. Returns the commit and the live file's row count.
+fn commit_v2(
+    dir: &Path,
+    stem: &str,
+    fetched: Fetched,
+    now_ms: i64,
+    still_wanted: &dyn Fn() -> bool,
+) -> Result<(Committed, usize), Stop> {
+    let failed = || Stop::error("write_failed");
+    let _lock = lock_dir(dir, still_wanted)?;
+    let live = read_live(dir, stem).map_err(|_| failed())?;
+    let (mut history, live_v2) = match read_history(dir, stem).map_err(|_| failed())? {
+        Some(history) => {
+            let v2: Vec<Event> = live.into_iter().skip(history.frozen.len()).collect();
+            (history, v2)
+        }
+        None => (
+            History {
+                cutover_ms: cutover_of(&live, now_ms),
+                frozen: live,
+                fetched: std::collections::BTreeMap::new(),
+            },
+            Vec::new(),
+        ),
+    };
+    let cutover = history.cutover_ms;
+    let fresh: Vec<_> = fetched
+        .rows
+        .into_iter()
+        .filter(|row| cutover.is_none_or(|cutover| row.ms > cutover))
+        .collect();
+    let mut with_rows: std::collections::BTreeMap<i32, u64> = std::collections::BTreeMap::new();
+    for row in &fresh {
+        *with_rows.entry(row.month).or_default() += 1;
+    }
+    let months = fetched.months;
+    for month in &months {
+        match with_rows.get(month) {
+            Some(count) => {
+                history.fetched.insert(*month, *count);
+            }
+            None => {
+                history.fetched.entry(*month).or_insert(0);
+            }
+        }
+    }
+    let replaced = |event: &Event| {
+        event_ms(event)
+            .and_then(cursor_billing_v2::month_index)
+            .is_some_and(|month| with_rows.contains_key(&month))
+    };
+    let sidecar = serde_json::to_vec(&history).map_err(|_| failed())?;
+    let mut events = history.frozen;
+    events.extend(live_v2.into_iter().filter(|event| !replaced(event)));
+    events.extend(fresh.into_iter().map(|row| row.event));
+    if events.is_empty() {
+        return Err(Stop::error("billing_v2_no_items"));
+    }
     let payload = serde_json::to_vec(&UsageFile {
         total_usage_events_count: events.len(),
-        usage_events_display: events,
+        usage_events_display: &events,
     })
     .map_err(|_| failed())?;
-    let final_name = format!("usage.{stem}.json");
-    let same = refresh_if_same(&dir.join(&final_name), &payload);
-    if !same {
-        let temp_path = dir.join(temp_file_name());
-        let written = (|| {
-            let mut options = std::fs::OpenOptions::new();
-            options.write(true).create_new(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt as _;
-                options.mode(0o600);
-            }
-            let mut file = options.open(&temp_path)?;
-            file.write_all(&payload)?;
-            file.sync_all()?;
-            drop(file);
-            tokscale_core::fs_atomic::replace_file(&temp_path, &dir.join(&final_name))
-        })();
-        if written.is_err() {
-            let _ = std::fs::remove_file(&temp_path);
-            return Err(failed());
-        }
-        // The rename is the commit point; a failed dir fsync cannot undo it.
-        let _ = crate::agent_quota_history::sync_directory(dir);
-    }
-    let removal = remove_usage_files(dir, Some(&final_name));
-    Ok(Committed {
-        changed: !same || removal.usage > 0,
-        cleanup_failed: removal.failed,
-    })
+    let sidecar_name = sidecar_name(stem);
+    let final_name = live_name(stem);
+    // The live file first. Should the sidecar write then fail, a first
+    // commit leaves no sidecar (the next one freezes this live file whole,
+    // cutover at its newest row: nothing counted twice), and a later one
+    // keeps the previous sidecar (same frozen rows; only `fetched` is stale,
+    // which makes a later round re-read more months, never fewer).
+    let changed = write_atomic(dir, &final_name, &payload)?;
+    write_atomic(dir, &sidecar_name, &sidecar)?;
+    let removal = remove_usage_files(dir, &[&final_name, &sidecar_name]);
+    Ok((
+        Committed {
+            changed: changed || removal.usage > 0,
+            cleanup_failed: removal.failed,
+        },
+        events.len(),
+    ))
 }
 
 /// What a commit left: whether a usage file's bytes changed, and whether
@@ -946,7 +1209,7 @@ struct Page {
 /// engine accepts both.
 #[derive(Deserialize, Serialize)]
 #[serde(untagged)]
-enum Timestamp {
+pub(crate) enum Timestamp {
     Text(String),
     Number(serde_json::Number),
 }
@@ -957,7 +1220,7 @@ enum Timestamp {
 /// the file. Written back as a JSON number.
 #[derive(Serialize)]
 #[serde(transparent)]
-struct Num(serde_json::Number);
+pub(crate) struct Num(pub(crate) serde_json::Number);
 
 impl<'de> Deserialize<'de> for Num {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
@@ -978,33 +1241,33 @@ impl<'de> Deserialize<'de> for Num {
 
 #[derive(Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct TokenUsage {
+pub(crate) struct TokenUsage {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    input_tokens: Option<Num>,
+    pub(crate) input_tokens: Option<Num>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    output_tokens: Option<Num>,
+    pub(crate) output_tokens: Option<Num>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    cache_read_tokens: Option<Num>,
+    pub(crate) cache_read_tokens: Option<Num>,
     /// Read by the engine (`cache_write`), though absent on many events.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    cache_write_tokens: Option<Num>,
+    pub(crate) cache_write_tokens: Option<Num>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    total_cents: Option<Num>,
+    pub(crate) total_cents: Option<Num>,
 }
 
 #[derive(Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct Event {
+pub(crate) struct Event {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    conversation_id: Option<String>,
+    pub(crate) conversation_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    timestamp: Option<Timestamp>,
+    pub(crate) timestamp: Option<Timestamp>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    model: Option<String>,
+    pub(crate) model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    charged_cents: Option<Num>,
+    pub(crate) charged_cents: Option<Num>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    token_usage: Option<TokenUsage>,
+    pub(crate) token_usage: Option<TokenUsage>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1028,16 +1291,16 @@ pub(crate) enum State {
 /// Every `reason` is a fixed literal: nothing from the token, the account,
 /// the response or the filesystem can reach a status string.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Stop {
+pub(crate) struct Stop {
     state: State,
     reason: Option<&'static str>,
 }
 
 impl Stop {
-    fn new(state: State, reason: Option<&'static str>) -> Self {
+    pub(crate) fn new(state: State, reason: Option<&'static str>) -> Self {
         Self { state, reason }
     }
-    fn error(reason: &'static str) -> Self {
+    pub(crate) fn error(reason: &'static str) -> Self {
         Self::new(State::Error, Some(reason))
     }
 }
@@ -1100,12 +1363,17 @@ fn writes_no_file(outcome: &Outcome) -> bool {
 // The walk.
 
 #[derive(Clone, Copy)]
-struct Limits {
-    budget: Duration,
-    page_timeout: Duration,
+pub(crate) struct Limits {
+    pub(crate) budget: Duration,
+    pub(crate) page_timeout: Duration,
     page_size: u32,
-    max_pages: u32,
-    max_body_bytes: usize,
+    /// Per walk: the old walk's pages, or the V2 walk's pages over all its
+    /// windows (S4). The byte cap likewise.
+    pub(crate) max_pages: u32,
+    pub(crate) max_body_bytes: usize,
+    /// The round was started by the user: a V2 walk re-reads every month in
+    /// its range (design 6), not only the recent and never-read ones.
+    explicit: bool,
 }
 
 impl Limits {
@@ -1116,6 +1384,7 @@ impl Limits {
             page_size: PAGE_SIZE,
             max_pages: MAX_PAGES,
             max_body_bytes: MAX_BODY_BYTES,
+            explicit: false,
         }
     }
 }
@@ -1126,6 +1395,8 @@ struct Target<'a> {
     /// The default profile's database; added profiles derive their own.
     db_path: &'a Path,
     url: &'a str,
+    /// Billing V2's base URL (production: `cursor_billing_v2::BILLING_ITEMS_URL`).
+    billing_url: &'a str,
     https_only: bool,
     file_stem: &'a dyn Fn(&str) -> Option<String>,
     /// The per-account fetch of Cursor's Safe Storage password (production:
@@ -1338,13 +1609,16 @@ fn token_user(login: &CursorLogin) -> Result<(String, f64), Stop> {
     Ok((user.to_string(), exp))
 }
 
-enum BodyError {
+pub(crate) enum BodyError {
     TooLarge,
     Timeout,
     Transport,
 }
 
-async fn read_capped(response: &mut reqwest::Response, cap: usize) -> Result<Vec<u8>, BodyError> {
+pub(crate) async fn read_capped(
+    response: &mut reqwest::Response,
+    cap: usize,
+) -> Result<Vec<u8>, BodyError> {
     if response
         .content_length()
         .is_some_and(|length| length > cap as u64)
@@ -1367,18 +1641,83 @@ async fn read_capped(response: &mut reqwest::Response, cap: usize) -> Result<Vec
     }
 }
 
+/// A send that failed: a timeout is `partial`, anything else `offline`.
+pub(crate) fn send_stop(error: &reqwest::Error) -> Stop {
+    if error.is_timeout() {
+        Stop::new(State::Partial, Some("timeout"))
+    } else {
+        Stop::new(State::Offline, Some("unreachable"))
+    }
+}
+
+pub(crate) fn body_stop(error: BodyError) -> Stop {
+    match error {
+        BodyError::TooLarge => Stop::error("body_too_large"),
+        BodyError::Timeout => Stop::new(State::Partial, Some("timeout")),
+        BodyError::Transport => Stop::new(State::Offline, Some("unreachable")),
+    }
+}
+
+/// The stop for a response that is not a 2xx, or None for a 2xx. Shared by
+/// both walks, so V2 answers each status the way the old walk does.
+pub(crate) async fn refusal(response: &mut reqwest::Response) -> Option<Stop> {
+    let status = response.status();
+    if status.is_redirection() || status.as_u16() == 401 {
+        return Some(Stop::new(State::Expired, None));
+    }
+    if status.as_u16() == 403 {
+        // P3-4: an auth refusal is JSON; an HTML wall (bot check, outage
+        // page) is not a sign-in problem and must not tell the user to
+        // sign in again.
+        let json = read_capped(response, MAX_ERROR_BODY_BYTES)
+            .await
+            .ok()
+            .is_some_and(|b| serde_json::from_slice::<serde_json::Value>(&b).is_ok());
+        return Some(if json {
+            Stop::new(State::Expired, None)
+        } else {
+            Stop::error("forbidden_non_json")
+        });
+    }
+    if status.as_u16() == 429 {
+        // A maintainer stop condition (plan C2 stops), distinct on purpose.
+        return Some(Stop::error("rate_limited"));
+    }
+    if status.is_server_error() {
+        return Some(Stop::error("server_error"));
+    }
+    if !status.is_success() {
+        return Some(Stop::error("http_status"));
+    }
+    None
+}
+
+/// D1a: a JSON object with no `usageEventsDisplay` key (only the key names
+/// are kept, in memory). Anything else, a malformed array included, is not.
+fn lacks_usage_events(body: &[u8]) -> bool {
+    serde_json::from_slice::<std::collections::BTreeMap<String, serde::de::IgnoredAny>>(body)
+        .is_ok_and(|keys| !keys.contains_key("usageEventsDisplay"))
+}
+
+/// The client both walks use: no redirects, https only in production.
+fn client(target: &Target<'_>) -> Result<reqwest::Client, Stop> {
+    crate::agent_usage::provider_http_client_builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .https_only(target.https_only)
+        .build()
+        .map_err(|_| Stop::error("client_unavailable"))
+}
+
+/// The old endpoint's complete history, or None when its page 1 is a 2xx
+/// JSON object without `usageEventsDisplay` (a Billing V2 account, D1a).
 async fn walk(
+    client: &reqwest::Client,
     target: &Target<'_>,
     cookie: &reqwest::header::HeaderValue,
     limits: Limits,
     enabled: &dyn Fn() -> bool,
-) -> Result<Vec<Event>, Stop> {
+) -> Result<Option<Vec<Event>>, Stop> {
     use reqwest::header;
-    let client = crate::agent_usage::provider_http_client_builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .https_only(target.https_only)
-        .build()
-        .map_err(|_| Stop::error("client_unavailable"))?;
     let end_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis())
@@ -1413,51 +1752,16 @@ async fn walk(
             .timeout(limits.page_timeout.min(remaining))
             .send()
             .await;
-        let mut response = match sent {
-            Ok(response) => response,
-            Err(error) if error.is_timeout() => {
-                return Err(Stop::new(State::Partial, Some("timeout")))
-            }
-            Err(_) => return Err(Stop::new(State::Offline, Some("unreachable"))),
-        };
-        let status = response.status();
-        if status.is_redirection() || status.as_u16() == 401 {
-            return Err(Stop::new(State::Expired, None));
-        }
-        if status.as_u16() == 403 {
-            // P3-4: an auth refusal is JSON; an HTML wall (bot check, outage
-            // page) is not a sign-in problem and must not tell the user to
-            // sign in again.
-            let json = read_capped(&mut response, MAX_ERROR_BODY_BYTES)
-                .await
-                .ok()
-                .is_some_and(|b| serde_json::from_slice::<serde_json::Value>(&b).is_ok());
-            return Err(if json {
-                Stop::new(State::Expired, None)
-            } else {
-                Stop::error("forbidden_non_json")
-            });
-        }
-        if status.as_u16() == 429 {
-            // A maintainer stop condition (plan C2 stops), distinct on purpose.
-            return Err(Stop::error("rate_limited"));
-        }
-        if status.is_server_error() {
-            return Err(Stop::error("server_error"));
-        }
-        if !status.is_success() {
-            return Err(Stop::error("http_status"));
+        let mut response = sent.map_err(|error| send_stop(&error))?;
+        if let Some(stop) = refusal(&mut response).await {
+            return Err(stop);
         }
         let cap = limits.max_body_bytes.saturating_sub(bytes_read);
-        let body = match read_capped(&mut response, cap).await {
-            Ok(body) => body,
-            Err(BodyError::TooLarge) => return Err(Stop::error("body_too_large")),
-            Err(BodyError::Timeout) => return Err(Stop::new(State::Partial, Some("timeout"))),
-            Err(BodyError::Transport) => {
-                return Err(Stop::new(State::Offline, Some("unreachable")))
-            }
-        };
+        let body = read_capped(&mut response, cap).await.map_err(body_stop)?;
         bytes_read += body.len();
+        if page == 1 && lacks_usage_events(&body) {
+            return Ok(None);
+        }
         let page: Page =
             serde_json::from_slice(&body).map_err(|_| Stop::error("unexpected_response"))?;
         let received = page.usage_events_display.len();
@@ -1466,7 +1770,7 @@ async fn walk(
             .total_usage_events_count
             .is_some_and(|total| events.len() as u64 >= total);
         if received < limits.page_size as usize || reached_total {
-            return Ok(events);
+            return Ok(Some(events));
         }
     }
     Err(Stop::error("too_many_pages"))
@@ -1557,7 +1861,7 @@ async fn run(
         if !enabled() {
             return stopped(Stop::new(State::Disabled, None));
         }
-        let cleaned = locked_removal(dir, Some(&format!("usage.{stem}.json")), false);
+        let cleaned = locked_removal(dir, &[&live_name(&stem)], false);
         return Outcome {
             duplicate_of: Some(first),
             changed: cleaned.usage > 0,
@@ -1577,8 +1881,39 @@ async fn run(
         budget: limits.budget.saturating_sub(started.elapsed()),
         ..limits
     };
-    let events = match walk(target, &cookie, limits, enabled).await {
-        Ok(events) => events,
+    let client = match client(target) {
+        Ok(client) => client,
+        Err(stop) => return stopped(stop),
+    };
+    let walk_started = Instant::now();
+    let events = match walk(&client, target, &cookie, limits, enabled).await {
+        Ok(Some(events)) => events,
+        Ok(None) => {
+            let limits = Limits {
+                budget: limits.budget.saturating_sub(walk_started.elapsed()),
+                ..limits
+            };
+            let synced =
+                billing_v2(&client, target, dir, &stem, &user, &cookie, limits, enabled).await;
+            drop(cookie);
+            return match synced {
+                Ok((committed, events)) => {
+                    claim(&stem, true);
+                    Outcome {
+                        events,
+                        changed: committed.changed,
+                        cleanup_failed: committed.cleanup_failed,
+                        ..stopped(Stop::new(State::Ok, None))
+                    }
+                }
+                Err(stop) => {
+                    if covers_account(stop) {
+                        claim(&stem, true);
+                    }
+                    stopped(stop)
+                }
+            };
+        }
         Err(stop) => {
             if covers_account(stop) {
                 claim(&stem, true);
@@ -1599,6 +1934,41 @@ async fn run(
         }
         Err(stop) => stopped(stop),
     }
+}
+
+/// D1a's other half: the V2 walk over this round's months, then the V2
+/// commit. A refusal or partial walk returns before the commit, so the live
+/// file and the sidecar stay as they were. Any failure here covers the
+/// account like a walk failure (`covers_account`): write_failed and
+/// disabled do not.
+#[allow(clippy::too_many_arguments)]
+async fn billing_v2(
+    client: &reqwest::Client,
+    target: &Target<'_>,
+    dir: &Path,
+    stem: &str,
+    user: &str,
+    cookie: &reqwest::header::HeaderValue,
+    limits: Limits,
+    enabled: &dyn Fn() -> bool,
+) -> Result<(Committed, usize), Stop> {
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as i64);
+    let (windows, stop_after_empty) = v2_windows(dir, stem, limits.explicit, now_ms);
+    let fetched = cursor_billing_v2::walk(
+        client,
+        target.billing_url,
+        cookie,
+        user,
+        limits,
+        enabled,
+        &windows,
+        stop_after_empty,
+        now_ms,
+    )
+    .await?;
+    commit_v2(dir, stem, fetched, now_ms, enabled)
 }
 
 // ---------------------------------------------------------------------------
@@ -1666,6 +2036,7 @@ pub(crate) fn sync_now(explicit: bool, home: Option<&Path>) -> (serde_json::Valu
         &Target {
             db_path: &db_path,
             url: USAGE_EVENTS_URL,
+            billing_url: cursor_billing_v2::BILLING_ITEMS_URL,
             https_only: true,
             file_stem: &stem,
             key_fetch,
@@ -1758,6 +2129,7 @@ fn sync_with(
                 profile,
                 Limits {
                     budget: remaining,
+                    explicit,
                     ..limits
                 },
                 &still_wanted,

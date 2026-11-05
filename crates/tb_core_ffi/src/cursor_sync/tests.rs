@@ -88,6 +88,12 @@ fn json_ok(body: &str) -> Reply {
     http("200 OK", "application/json", body)
 }
 
+/// The Billing V2 URL on the same loopback server (which answers in order,
+/// whatever the path), so a test can tell the two endpoints apart.
+fn v2_url(url: &str) -> String {
+    url.replace("/api/usage", "/api/dashboard/v2/query-billing-items")
+}
+
 fn read_request(stream: &mut TcpStream) -> Seen {
     let mut buf = Vec::new();
     let mut chunk = [0u8; 4096];
@@ -197,6 +203,7 @@ fn limits() -> Limits {
         page_size: 2,
         max_pages: 10,
         max_body_bytes: 1024 * 1024,
+        explicit: false,
     }
 }
 
@@ -221,9 +228,11 @@ fn run_with(
     limits: Limits,
     enabled: &dyn Fn() -> bool,
 ) -> Outcome {
+    let billing = v2_url(url);
     let target = Target {
         db_path: db,
         url,
+        billing_url: &billing,
         https_only: false,
         file_stem: &stem,
         key_fetch: None,
@@ -467,7 +476,11 @@ fn http_statuses_map_to_states() {
             stop(State::Error, Some("server_error")),
         ),
         (
-            json_ok(r#"{"totalUsageEventsCount":1}"#),
+            json_ok(r#"{"totalUsageEventsCount":1,"usageEventsDisplay":"x"}"#),
+            stop(State::Error, Some("unexpected_response")),
+        ),
+        (
+            json_ok("[]"),
             stop(State::Error, Some("unexpected_response")),
         ),
         (
@@ -831,9 +844,11 @@ fn registry(enabled: bool, dir: &Path) -> RwLock<Config> {
 }
 
 fn sync_status(f: &Fixture, url: &str, registry: &RwLock<Config>) -> serde_json::Value {
+    let billing = v2_url(url);
     let target = Target {
         db_path: &f.db,
         url,
+        billing_url: &billing,
         https_only: false,
         file_stem: &stem,
         key_fetch: None,
@@ -907,7 +922,9 @@ fn canaries_never_reach_the_file_names_status_or_errors() {
         vec![http("401 Unauthorized", "application/json", "{}")],
         vec![http("403 Forbidden", "text/html", "<html>blocked</html>")],
         vec![http("429 Too Many Requests", "application/json", "{}")],
-        vec![json_ok(&format!(r#"{{"owningUser":"{OWNING_CANARY}"}}"#))],
+        vec![json_ok(&format!(
+            r#"{{"usageEventsDisplay":{{"owningUser":"{OWNING_CANARY}"}}}}"#
+        ))],
         vec![json_ok(&page(4, &["a", "b"])), Reply::Hang],
     ];
     let mut outputs = Vec::new();
@@ -2037,9 +2054,11 @@ fn sync_round_in(
     limits: Limits,
     home: Option<&Path>,
 ) -> serde_json::Value {
+    let billing = v2_url(url);
     let target = Target {
         db_path: default_db,
         url,
+        billing_url: &billing,
         https_only: false,
         file_stem: &stem,
         key_fetch: None,
@@ -2612,6 +2631,7 @@ fn target<'a>(db: &'a Path, url: &'a str) -> Target<'a> {
     Target {
         db_path: db,
         url,
+        billing_url: url,
         https_only: false,
         file_stem: &stem,
         key_fetch: None,
@@ -3158,6 +3178,7 @@ fn sealed_round(
     let target = Target {
         db_path: default_db,
         url,
+        billing_url: url,
         https_only: false,
         file_stem: &stem,
         key_fetch,
@@ -3717,6 +3738,7 @@ fn the_keychain_wait_counts_against_the_round_budget() {
     let target = Target {
         db_path: &f.db,
         url: &url,
+        billing_url: &url,
         https_only: false,
         file_stem: &stem,
         key_fetch: Some(&fetch),
@@ -3775,4 +3797,838 @@ fn a_profile_removed_during_the_dialog_keeps_the_key_for_the_others() {
         sealed_key_cached_for_test(),
         "the allowed key was thrown away"
     );
+}
+
+// --- Billing V2 (plan CURSOR-BV2-M r4, Acceptance 1) ---------------------------
+//
+// Fixtures: the discovery's §1 third-party shapes (t3code #28511's redacted
+// item, `{}`, `{"data":[]}`, cursor pagination) and G1's observed
+// `{"availability":"missing_team_id"}`. Months are relative to the real UTC
+// now, so the windows the walk asks for are the ones these replies answer.
+
+const EMAIL_CANARY: &str = "EMAILCANARY@example.invalid";
+const ITEM_ID_CANARY: &str = "BILLINGITEMIDCANARY";
+const HOUR: i64 = 3_600_000;
+/// The four meters of `item`: 1263 + 46400 + 0 + 312.
+const ITEM_TOKENS: f64 = 47975.0;
+/// `event`'s four token counts: 10 + 5 + 2 + 9.
+const OLD_ROW_TOKENS: f64 = 26.0;
+
+fn now_ms_i64() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64
+}
+
+/// Start (Unix ms) of the UTC month `back` months before the current one.
+fn month_start_ms(back: i32) -> i64 {
+    use chrono::TimeZone as _;
+    let month = cursor_billing_v2::month_index(now_ms_i64()).unwrap() - back;
+    chrono::Utc
+        .with_ymd_and_hms(month.div_euclid(12), month.rem_euclid(12) as u32 + 1, 1, 0, 0, 0)
+        .unwrap()
+        .timestamp_millis()
+}
+
+fn iso(ms: i64) -> String {
+    use chrono::TimeZone as _;
+    chrono::Utc
+        .timestamp_millis_opt(ms)
+        .unwrap()
+        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+}
+
+/// A V2 billing item shaped like t3code #28511's redacted live sample.
+fn item(id: &str, ms: i64) -> serde_json::Value {
+    serde_json::json!({
+        "billingItemId": id,
+        "eventTime": iso(ms),
+        "product": "cursor",
+        "chargeCategory": "usage",
+        "usageType": "included",
+        "principal": {"type": "user", "id": USER},
+        "usage": {"prompt-text-tokens": "1263", "cached-prompt-text-tokens": "46400",
+                  "cache-write-text-tokens": "0", "completion-text-tokens": "312"},
+        "totalTokens": "47975",
+        "hasTokenMeters": true,
+        "pricing": {"currency": "USD", "contracted": "0.0000000000"},
+        "displayExtras": {"model": "composer-2.5", "userEmail": EMAIL_CANARY,
+                          "displayLabel": "Composer 2.5"},
+    })
+}
+
+fn v2_page(items: &[serde_json::Value], next: Option<&str>) -> Reply {
+    let pagination = match next {
+        Some(next) => serde_json::json!({"nextCursor": next, "hasMore": true}),
+        None => serde_json::json!({}),
+    };
+    json_ok(&serde_json::json!({"data": items, "pagination": pagination}).to_string())
+}
+
+/// `{}`: t3code reads it as an idle slice (discovery §2).
+fn v2_empty() -> Reply {
+    json_ok("{}")
+}
+
+/// The old endpoint's page 1 for a migrated account (#520): an object
+/// without `usageEventsDisplay`.
+fn old_migrated() -> Reply {
+    json_ok("{}")
+}
+
+fn old_page(rows: &[serde_json::Value]) -> Reply {
+    json_ok(
+        &serde_json::json!({"totalUsageEventsCount": rows.len(), "usageEventsDisplay": rows})
+            .to_string(),
+    )
+}
+
+/// An old-endpoint row at `ms`.
+fn old_row(id: &str, ms: i64) -> serde_json::Value {
+    let mut row = event(id);
+    row["timestamp"] = ms.to_string().into();
+    row
+}
+
+fn v2_limits(explicit: bool) -> Limits {
+    Limits {
+        max_pages: 64,
+        explicit,
+        ..limits()
+    }
+}
+
+fn run_v2(f: &Fixture, replies: Vec<Reply>, limits: Limits) -> (Outcome, Vec<Seen>) {
+    let (url, seen) = serve(replies);
+    let outcome = run_with(&f.db, &f.dir, &url, limits, &|| true);
+    let seen = seen.lock().unwrap().clone();
+    (outcome, seen)
+}
+
+fn v2_requests(seen: &[Seen]) -> Vec<Seen> {
+    seen.iter()
+        .filter(|s| s.head.starts_with("GET /api/dashboard/v2/query-billing-items?"))
+        .cloned()
+        .collect()
+}
+
+fn query(seen: &Seen) -> std::collections::BTreeMap<String, String> {
+    let target = seen.head.split(' ').nth(1).unwrap();
+    reqwest::Url::parse(&format!("http://h{target}"))
+        .unwrap()
+        .query_pairs()
+        .into_owned()
+        .collect()
+}
+
+fn sidecar_path(dir: &Path) -> PathBuf {
+    dir.join(sidecar_name(&stem(USER).unwrap()))
+}
+
+fn sidecar_json(dir: &Path) -> serde_json::Value {
+    serde_json::from_slice(&std::fs::read(sidecar_path(dir)).unwrap()).unwrap()
+}
+
+fn live_rows(dir: &Path) -> Vec<serde_json::Value> {
+    let file: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(expected_file(dir)).unwrap()).unwrap();
+    file["usageEventsDisplay"].as_array().unwrap().clone()
+}
+
+fn row_ms(row: &serde_json::Value) -> i64 {
+    timestamp_ms(row["timestamp"].as_str().unwrap()).unwrap()
+}
+
+fn row_tokens(row: &serde_json::Value) -> f64 {
+    ["inputTokens", "outputTokens", "cacheReadTokens", "cacheWriteTokens"]
+        .iter()
+        .map(|key| row["tokenUsage"][key].as_f64().unwrap_or(0.0))
+        .sum()
+}
+
+fn tokens_in_month(dir: &Path, back: i32) -> f64 {
+    let (start, end) = (month_start_ms(back), month_start_ms(back - 1));
+    live_rows(dir)
+        .iter()
+        .filter(|row| (start..end).contains(&row_ms(row)))
+        .map(row_tokens)
+        .sum()
+}
+
+/// The live file as the old walk writes it, from `rows`.
+fn seed_by_old_walk(f: &Fixture, rows: &[serde_json::Value]) {
+    let (outcome, _) = run_v2(f, vec![old_page(rows)], v2_limits(false));
+    assert_eq!(outcome.stop.state, State::Ok);
+}
+
+/// The cutover the first V2 round below leaves: the newest old row.
+fn v2_cutover() -> i64 {
+    month_start_ms(1) + 2 * HOUR
+}
+
+/// Two old rows in M-1 (the newer one is the cutover), then a first V2
+/// round (windows M, M-1): `v-current` in M; in M-1 one item before the
+/// cutover, one at it, `v-after` after it.
+fn first_v2_round(f: &Fixture) -> Outcome {
+    let cutover = v2_cutover();
+    seed_by_old_walk(
+        f,
+        &[
+            old_row("a", month_start_ms(1) + HOUR),
+            old_row("b", cutover),
+        ],
+    );
+    let (outcome, seen) = run_v2(
+        f,
+        vec![
+            old_migrated(),
+            v2_page(&[item("v-current", month_start_ms(0))], None),
+            v2_page(
+                &[
+                    item("v-before", cutover - HOUR / 2),
+                    item("v-at", cutover),
+                    item("v-after", cutover + HOUR),
+                ],
+                None,
+            ),
+        ],
+        v2_limits(false),
+    );
+    assert_eq!(
+        v2_requests(&seen).len(),
+        2,
+        "range: the cutover's month to now"
+    );
+    outcome
+}
+
+/// D1a control: an account the old endpoint still answers never reaches V2.
+/// Mutation: `if page == 1 && lacks_usage_events(&body)` -> `if page == 1`.
+#[test]
+fn unmigrated_account_never_calls_billing_v2() {
+    let f = fixture();
+    let (outcome, seen) = run_v2(&f, vec![json_ok(&page(1, &["a"]))], v2_limits(true));
+    assert_eq!(outcome, ok(1));
+    assert_eq!(seen.len(), 1);
+    assert!(seen[0].head.starts_with("POST /api/usage "));
+    assert!(!sidecar_path(&f.dir).exists());
+}
+
+/// Nothing is frozen at the switch: a refused V2 round leaves the old file
+/// alone and creates no sidecar, and a later old success writes only its
+/// own rows. Mutation: in `billing_v2`, after `let (windows,
+/// stop_after_empty) = …;` add `let _ = commit_v2(dir, stem, Fetched { rows:
+/// Vec::new(), months: Vec::new() }, now_ms, enabled);` (freeze at switch).
+#[test]
+fn a_refused_switch_freezes_nothing_and_old_success_writes_only_its_rows() {
+    let f = fixture();
+    let t = month_start_ms(1) + HOUR;
+    seed_by_old_walk(&f, &[old_row("a", t), old_row("b", t + 1000)]);
+    let before = std::fs::read(expected_file(&f.dir)).unwrap();
+    let (outcome, seen) = run_v2(
+        &f,
+        vec![
+            old_migrated(),
+            json_ok(r#"{"availability":"missing_team_id"}"#),
+        ],
+        v2_limits(false),
+    );
+    assert_eq!(
+        outcome,
+        stop(State::Error, Some("billing_v2_team_required"))
+    );
+    assert_eq!(v2_requests(&seen).len(), 1);
+    assert!(!sidecar_path(&f.dir).exists(), "frozen at the switch");
+    assert_eq!(std::fs::read(expected_file(&f.dir)).unwrap(), before);
+
+    let rows = [old_row("a", t), old_row("b", t + 1000), old_row("c", t + 2000)];
+    let (outcome, _) = run_v2(&f, vec![old_page(&rows)], v2_limits(false));
+    assert_eq!(outcome, ok(3));
+    assert!(!sidecar_path(&f.dir).exists());
+    assert_eq!(live_rows(&f.dir).len(), 3);
+    let total: f64 = live_rows(&f.dir).iter().map(row_tokens).sum();
+    assert_eq!(total, 3.0 * OLD_ROW_TOKENS);
+}
+
+/// D5: the first V2 commit keeps the old rows (pre-cutover total unchanged)
+/// and adds only V2 rows after the cutover. Mutations: (plain replace)
+/// `let mut events = history.frozen;` -> `let mut events: Vec<Event> =
+/// Vec::new();`; (no cutover filter) `.filter(|row| cutover.is_none_or(|cutover|
+/// row.ms > cutover))` -> `.filter(|_| true)`.
+#[test]
+fn the_first_v2_commit_keeps_old_rows_and_adds_only_rows_after_the_cutover() {
+    let f = fixture();
+    let outcome = first_v2_round(&f);
+    assert_eq!(outcome, ok(4));
+    let cutover = v2_cutover();
+    let rows = live_rows(&f.dir);
+    assert_eq!(rows.len(), 4);
+    let pre: f64 = rows
+        .iter()
+        .filter(|row| row_ms(row) <= cutover)
+        .map(row_tokens)
+        .sum();
+    assert_eq!(pre, 2.0 * OLD_ROW_TOKENS, "pre-cutover total changed");
+    let after: Vec<i64> = rows
+        .iter()
+        .filter(|row| row_ms(row) > cutover)
+        .map(row_ms)
+        .collect();
+    assert_eq!(after.len(), 2);
+    assert!(after.contains(&(cutover + HOUR)) && after.contains(&month_start_ms(0)));
+    let history = sidecar_json(&f.dir);
+    assert_eq!(history["cutoverMs"], cutover);
+    assert_eq!(history["frozen"].as_array().unwrap().len(), 2);
+}
+
+/// Design 4: a second V2 commit keeps the sidecar, its cutover and frozen
+/// rows byte for byte, and writes an item first seen in round 2.
+/// Mutation: `remove_usage_files(dir, &[&final_name, &sidecar_name])` ->
+/// `remove_usage_files(dir, &[&final_name])`.
+#[test]
+fn a_second_v2_commit_keeps_the_sidecar_and_its_cutover() {
+    let f = fixture();
+    assert_eq!(first_v2_round(&f).stop.state, State::Ok);
+    assert!(sidecar_path(&f.dir).exists(), "the first commit dropped its sidecar");
+    let first = sidecar_json(&f.dir);
+    let cutover = v2_cutover();
+    let new_ms = (now_ms_i64() - 60_000).max(month_start_ms(0) + 1);
+    let (outcome, _) = run_v2(
+        &f,
+        vec![
+            old_migrated(),
+            v2_page(
+                &[
+                    item("v-current", month_start_ms(0)),
+                    item("v-new", new_ms),
+                ],
+                None,
+            ),
+            v2_page(&[item("v-after", cutover + HOUR)], None),
+        ],
+        v2_limits(false),
+    );
+    assert_eq!(outcome.stop.state, State::Ok);
+    assert!(sidecar_path(&f.dir).exists(), "the sidecar was dropped");
+    let second = sidecar_json(&f.dir);
+    assert_eq!(second["cutoverMs"].to_string(), first["cutoverMs"].to_string());
+    assert_eq!(second["frozen"].to_string(), first["frozen"].to_string());
+    let rows = live_rows(&f.dir);
+    assert_eq!(rows.len(), 5);
+    assert!(rows.iter().any(|row| row_ms(row) == new_ms));
+}
+
+/// Design 5b: a background round reads only M-2..M; month M-5's V2 rows
+/// stay, and an item dated M-5 inside window M (a month this round did not
+/// read) is not written. Mutations: (A) delete `events.extend(live_v2
+/// .into_iter().filter(|event| !replaced(event)));`; (B) delete
+/// `rows.retain(|row| months.contains(&row.month));`.
+#[test]
+fn a_background_round_keeps_the_months_it_did_not_re_read() {
+    let f = fixture();
+    let at = |back: i32| month_start_ms(back) + if back == 0 { 0 } else { HOUR };
+    let mut replies = vec![old_migrated()];
+    replies.extend((0..12).map(|back| v2_page(&[item(&format!("m{back}"), at(back))], None)));
+    let (outcome, seen) = run_v2(&f, replies, v2_limits(true));
+    assert_eq!(outcome, ok(12));
+    assert_eq!(v2_requests(&seen).len(), 12);
+    assert_eq!(tokens_in_month(&f.dir, 5), ITEM_TOKENS);
+
+    let mut leak = item("leak", at(5) + HOUR);
+    leak["usage"]["prompt-text-tokens"] = "999999".into();
+    let (outcome, seen) = run_v2(
+        &f,
+        vec![
+            old_migrated(),
+            v2_page(&[item("m0", at(0)), leak], None),
+            v2_empty(),
+            v2_empty(),
+        ],
+        v2_limits(false),
+    );
+    assert_eq!(outcome.stop.state, State::Ok);
+    assert_eq!(v2_requests(&seen).len(), 3, "a background round reads M-2..M");
+    assert_eq!(tokens_in_month(&f.dir, 5), ITEM_TOKENS, "month M-5 changed");
+    assert_eq!(live_rows(&f.dir).len(), 12);
+}
+
+/// Design 6: a month that had rows and now answers `{}` keeps them; the
+/// rest of the file is updated. Mutation: in `replaced`,
+/// `with_rows.contains_key(&month)` -> `months.contains(&month)`.
+#[test]
+fn a_month_answering_empty_keeps_its_rows() {
+    let f = fixture();
+    assert_eq!(first_v2_round(&f).stop.state, State::Ok);
+    let cutover = v2_cutover();
+    let new_ms = (now_ms_i64() - 60_000).max(month_start_ms(0) + 1);
+    let (outcome, _) = run_v2(
+        &f,
+        vec![
+            old_migrated(),
+            v2_page(
+                &[
+                    item("v-current", month_start_ms(0)),
+                    item("v-new", new_ms),
+                ],
+                None,
+            ),
+            v2_empty(),
+        ],
+        v2_limits(true),
+    );
+    assert_eq!(outcome.stop.state, State::Ok);
+    let times: Vec<i64> = live_rows(&f.dir).iter().map(row_ms).collect();
+    assert!(times.contains(&(cutover + HOUR)), "M-1's row was dropped on {{}}");
+    assert!(times.contains(&new_ms), "the file was not updated");
+    assert_eq!(times.len(), 5);
+}
+
+/// An item on the M-1/M boundary that both windows return is written once.
+/// Mutation: `if ids.insert(id) { rows.push(row); }` -> `ids.insert(id);
+/// rows.push(row);`.
+#[test]
+fn an_item_on_a_window_boundary_is_written_once() {
+    let f = fixture();
+    let boundary = item(ITEM_ID_CANARY, month_start_ms(0) - 500);
+    let (outcome, _) = run_v2(
+        &f,
+        vec![
+            old_migrated(),
+            v2_page(&[boundary.clone(), item("c", month_start_ms(0))], None),
+            v2_page(&[boundary], None),
+            v2_empty(),
+            v2_empty(),
+            v2_empty(),
+        ],
+        v2_limits(true),
+    );
+    assert_eq!(outcome.stop.state, State::Ok);
+    let at_boundary = live_rows(&f.dir)
+        .iter()
+        .filter(|row| row_ms(row) == month_start_ms(0) - 500)
+        .count();
+    assert_eq!(at_boundary, 1);
+}
+
+/// Refusals and partial walks leave the live file and the sidecar as they
+/// were, with fixed reasons; a 429 stops the whole walk. Mutations: swap
+/// the `Some("missing_team_id")` arm's reason with the `Some(_)` arm's;
+/// delete `|| !cursors.insert(next.clone())`; delete `next.len() >
+/// MAX_CURSOR_BYTES ||`; delete the `if status.as_u16() == 429 {…}` block
+/// in `refusal`.
+#[test]
+fn refusals_leave_the_file_and_sidecar_unchanged() {
+    let f = fixture();
+    assert_eq!(first_v2_round(&f).stop.state, State::Ok);
+    let live = std::fs::read(expected_file(&f.dir)).unwrap();
+    let side = std::fs::read(sidecar_path(&f.dir)).unwrap();
+    let current = || item("v-current", month_start_ms(0));
+    let long = "c".repeat(4097);
+    let cases: Vec<(Vec<Reply>, Outcome, usize)> = vec![
+        (
+            vec![json_ok(r#"{"availability":"missing_team_id"}"#)],
+            stop(State::Error, Some("billing_v2_team_required")),
+            1,
+        ),
+        (
+            vec![json_ok(r#"{"availability":"not_enabled"}"#)],
+            stop(State::Error, Some("billing_v2_unavailable")),
+            1,
+        ),
+        (
+            vec![
+                v2_page(&[current()], Some("c1")),
+                v2_page(&[], Some("c1")),
+            ],
+            stop(State::Partial, Some("too_many_pages")),
+            2,
+        ),
+        (
+            vec![v2_page(&[current()], Some(&long))],
+            stop(State::Partial, Some("too_many_pages")),
+            1,
+        ),
+        (
+            vec![
+                v2_page(&[current()], None),
+                http("429 Too Many Requests", "application/json", "{}"),
+            ],
+            stop(State::Error, Some("rate_limited")),
+            2,
+        ),
+        (
+            vec![http("401 Unauthorized", "application/json", "{}")],
+            stop(State::Expired, None),
+            1,
+        ),
+        (
+            vec![http("403 Forbidden", "text/html", "<html>blocked</html>")],
+            stop(State::Error, Some("forbidden_non_json")),
+            1,
+        ),
+        (
+            vec![http("500 Internal Server Error", "text/plain", "x")],
+            stop(State::Error, Some("server_error")),
+            1,
+        ),
+        (
+            vec![json_ok("[]")],
+            stop(State::Error, Some("unexpected_response")),
+            1,
+        ),
+        (
+            vec![json_ok("<html>")],
+            stop(State::Error, Some("unexpected_response")),
+            1,
+        ),
+    ];
+    for (replies, expected, requests) in cases {
+        let mut all = vec![old_migrated()];
+        all.extend(replies);
+        let (outcome, seen) = run_v2(&f, all, v2_limits(false));
+        assert_eq!(outcome, expected);
+        let v2 = v2_requests(&seen);
+        assert_eq!(v2.len(), requests, "{expected:?}");
+        if requests == 2 && expected.stop.reason == Some("too_many_pages") {
+            assert_eq!(query(&v2[1]).get("cursor").map(String::as_str), Some("c1"));
+        }
+        assert_eq!(std::fs::read(expected_file(&f.dir)).unwrap(), live);
+        assert_eq!(std::fs::read(sidecar_path(&f.dir)).unwrap(), side);
+    }
+}
+
+/// Design 5: no old file and rows only in the current month: the first
+/// (full-budget) round reads M (two pages), M-1, M-2, M-3 and commits. The
+/// request is the GET the plan names. Mutation: delete `if stop_after_empty
+/// && empty_run >= EMPTY_WINDOWS_STOP { break; }`.
+#[test]
+fn no_old_file_and_rows_only_this_month_commit_after_four_windows() {
+    let _guard = lock();
+    let f = fixture();
+    let (url, seen) = serve(vec![
+        old_migrated(),
+        v2_page(&[item("x1", month_start_ms(0))], Some("n1")),
+        v2_page(&[item("x2", month_start_ms(0) + 1)], None),
+        v2_empty(),
+        json_ok(r#"{"data":[]}"#),
+        json_ok(r#"{"data":[],"pagination":{}}"#),
+    ]);
+    let status = sync_status(&f, &url, &registry(true, &f.dir));
+    assert_eq!(status["state"], "ok", "{status}");
+    assert_eq!(status["events"], 2);
+    assert_eq!(ROUND_BUDGET.with(|b| b.get()), Some(FULL_BUDGET));
+    let seen = seen.lock().unwrap().clone();
+    assert_eq!(seen.len(), 6);
+    let v2 = v2_requests(&seen);
+    assert_eq!(v2.len(), 5);
+    let first = query(&v2[0]);
+    assert_eq!(first.get("scope").map(String::as_str), Some("user"));
+    assert_eq!(first.get("pageSize").map(String::as_str), Some("100"));
+    assert_eq!(
+        first.get("startTime"),
+        Some(&iso(month_start_ms(0)).replace(".000Z", "Z"))
+    );
+    assert!(first.get("endTime").unwrap().ends_with('Z'));
+    assert!(!first.contains_key("cursor"));
+    assert_eq!(query(&v2[1]).get("cursor").map(String::as_str), Some("n1"));
+    assert_eq!(
+        query(&v2[2]).get("endTime"),
+        Some(&iso(month_start_ms(0) - 1000).replace(".000Z", "Z"))
+    );
+    for request in &v2 {
+        assert_eq!(
+            header(&request.head, "cookie").as_deref(),
+            Some(format!("WorkosCursorSessionToken={USER}%3A%3A{}", f.token).as_str())
+        );
+        let head = request.head.to_ascii_lowercase();
+        assert!(head.contains("origin: https://cursor.com\r\n"));
+        assert!(head.contains("accept: application/json\r\n"));
+    }
+    assert_eq!(sidecar_json(&f.dir)["cutoverMs"], serde_json::Value::Null);
+}
+
+/// D6: no old file and no rows anywhere: nothing is written. Mutation:
+/// delete `if events.is_empty() { return Err(Stop::error("billing_v2_no_items")); }`.
+#[test]
+fn no_old_file_and_no_rows_writes_nothing() {
+    let f = fixture();
+    let mut grok = item("g", month_start_ms(1) + HOUR);
+    grok["product"] = "grok-bot".into();
+    let (outcome, seen) = run_v2(
+        &f,
+        vec![
+            old_migrated(),
+            v2_empty(),
+            v2_page(&[grok], None),
+            json_ok(r#"{"data":[]}"#),
+        ],
+        v2_limits(true),
+    );
+    assert_eq!(outcome, stop(State::Error, Some("billing_v2_no_items")));
+    assert_eq!(v2_requests(&seen).len(), 3);
+    assert!(!expected_file(&f.dir).exists());
+    assert!(!sidecar_path(&f.dir).exists());
+}
+
+/// S4: the page cap counts every window of one walk. Mutation: move `let
+/// mut pages = 0u32;` into the `for &month in windows` loop (per window).
+#[test]
+fn the_page_cap_counts_across_windows() {
+    let f = fixture();
+    let mut replies = vec![old_migrated()];
+    replies.extend(
+        (0..12).map(|back| v2_page(&[item(&format!("p{back}"), month_start_ms(back) + 1)], None)),
+    );
+    let (outcome, seen) = run_v2(
+        &f,
+        replies,
+        Limits {
+            max_pages: 3,
+            ..v2_limits(true)
+        },
+    );
+    assert_eq!(outcome, stop(State::Partial, Some("too_many_pages")));
+    assert_eq!(v2_requests(&seen).len(), 3);
+    assert!(!expected_file(&f.dir).exists());
+}
+
+/// Disable, profile removal and an account switch delete live files and
+/// sidecars; a sidecar of another stem is never read and is cleaned by a V2
+/// commit. Mutation: `|| is_sidecar_name(name)` deleted from `is_ours`.
+#[test]
+fn cleanup_deletes_sidecars_and_ignores_another_stems() {
+    let sidecar_of = |c: char| format!("{SIDECAR_PREFIX}{}.json", c.to_string().repeat(64));
+    {
+        let _guard = lock();
+        set_for_test(Config::default());
+        let home = tempfile::tempdir().unwrap();
+        let app = app_dir_in(home.path());
+        let off = serde_json::json!({"enabled": false, "bundleId": BUNDLE});
+        set_in(home.path(), off.clone()).unwrap();
+        // Profile removal: A is not configured, so an on push removes it.
+        // (Nothing complete-shaped sits in a configured dir while sync is
+        // on, so no other test's takeover sees it.)
+        let orphan = app.join("cursor-profiles").join(PROFILE_A);
+        std::fs::create_dir_all(&orphan).unwrap();
+        std::fs::write(orphan.join(hex_name('a')), "x").unwrap();
+        std::fs::write(orphan.join(sidecar_of('a')), "x").unwrap();
+        let on = serde_json::json!({"enabled": true, "bundleId": BUNDLE, "profiles": []});
+        set_in(home.path(), on).unwrap();
+        assert!(!orphan.exists(), "the orphan's sidecar was left");
+        // Disable.
+        set_in(home.path(), off.clone()).unwrap();
+        let default = app.join("cursor-cache");
+        std::fs::create_dir_all(&default).unwrap();
+        std::fs::write(default.join(hex_name('a')), "x").unwrap();
+        std::fs::write(default.join(sidecar_of('a')), "x").unwrap();
+        set_in(home.path(), off).unwrap();
+        assert!(names_in(&default).is_empty(), "{:?}", names_in(&default));
+        set_for_test(Config::default());
+    }
+
+    // Account switch: another account's live file and sidecar go with the
+    // next commit for this account.
+    let f = fixture();
+    std::fs::create_dir_all(&f.dir).unwrap();
+    std::fs::write(f.dir.join(hex_name('b')), "x").unwrap();
+    std::fs::write(f.dir.join(sidecar_of('b')), "x").unwrap();
+    seed_by_old_walk(&f, &[old_row("a", month_start_ms(1) + HOUR)]);
+    assert_eq!(
+        names_in(&f.dir),
+        [expected_file(&f.dir).file_name().unwrap().to_string_lossy().into_owned()]
+    );
+
+    // Another stem's sidecar is never read by a V2 commit, and goes.
+    let f = fixture();
+    std::fs::create_dir_all(&f.dir).unwrap();
+    let foreign = serde_json::json!({"frozen": [old_row("x", 1)], "cutoverMs": 1, "fetched": {}});
+    std::fs::write(f.dir.join(sidecar_of('c')), foreign.to_string()).unwrap();
+    let (outcome, _) = run_v2(
+        &f,
+        vec![
+            old_migrated(),
+            v2_page(&[item("only", month_start_ms(0))], None),
+            v2_empty(),
+            v2_empty(),
+            v2_empty(),
+        ],
+        v2_limits(true),
+    );
+    assert_eq!(outcome, ok(1));
+    assert!(!f.dir.join(sidecar_of('c')).exists());
+    assert_eq!(live_rows(&f.dir).len(), 1);
+    assert!(sidecar_json(&f.dir)["frozen"].as_array().unwrap().is_empty());
+}
+
+/// S5/S7: `userEmail`, `principal.id`, `billingItemId`, the token and the
+/// cookie never reach a file or the status; another principal stops the
+/// walk with nothing written. Mutations: in `struct Extras`, put
+/// `#[serde(rename = "userEmail")]` on `model`; replace the principal
+/// check's condition with `false`.
+#[test]
+fn v2_canaries_stay_out_and_another_principal_writes_nothing() {
+    let _guard = lock();
+    let mut outputs = Vec::new();
+    let mut collect = |f: &Fixture, status: serde_json::Value| {
+        outputs.push(status.to_string());
+        for entry in std::fs::read_dir(&f.dir).into_iter().flatten().flatten() {
+            outputs.push(entry.file_name().to_string_lossy().into_owned());
+            if entry.file_type().unwrap().is_file() {
+                outputs.push(std::fs::read_to_string(entry.path()).unwrap());
+            }
+        }
+    };
+    let f = fixture();
+    let (url, _) = serve(vec![
+        old_migrated(),
+        v2_page(&[item(ITEM_ID_CANARY, month_start_ms(0))], None),
+        v2_empty(),
+        v2_empty(),
+        v2_empty(),
+    ]);
+    let status = sync_status(&f, &url, &registry(true, &f.dir));
+    assert_eq!(status["state"], "ok", "{status}");
+    collect(&f, status);
+
+    let mut other = item("o", month_start_ms(0));
+    other["principal"]["id"] = OTHER_USER.into();
+    let mut missing = item("m", month_start_ms(0));
+    missing.as_object_mut().unwrap().remove("principal");
+    for bad in [other, missing] {
+        let f = fixture();
+        let (url, _) = serve(vec![
+            old_migrated(),
+            v2_page(&[item("fine", month_start_ms(0)), bad], None),
+        ]);
+        let status = sync_status(&f, &url, &registry(true, &f.dir));
+        assert_eq!(status["state"], "error");
+        assert_eq!(status["reason"], "billing_v2_principal_mismatch");
+        assert!(!expected_file(&f.dir).exists());
+        assert!(!sidecar_path(&f.dir).exists());
+        collect(&f, status);
+    }
+
+    let all = outputs.join("\n");
+    for canary in [EMAIL_CANARY, USER, OTHER_USER, ITEM_ID_CANARY, SIGNATURE, f.token.as_str()] {
+        assert!(!all.contains(canary), "canary leaked");
+    }
+    // Control: the outputs searched hold the written row and the refusal.
+    assert!(all.contains("composer-2.5") && all.contains("billing_v2_principal_mismatch"));
+}
+
+/// S8: an unparseable `eventTime` is dropped; a future newest old row
+/// clamps the cutover to now. Mutations: (drop) `let ms =
+/// timestamp_ms(&item.event_time?)?;` -> `let ms =
+/// timestamp_ms(&item.event_time?).unwrap_or(0);` together with deleting
+/// `rows.retain(|row| months.contains(&row.month));`; (clamp)
+/// `.map_or(now_ms, |newest| newest.min(now_ms))` -> `.map_or(now_ms,
+/// |newest| newest)`.
+#[test]
+fn bad_event_times_are_dropped_and_a_future_cutover_is_clamped() {
+    let f = fixture();
+    let mut bad = item("bad", month_start_ms(0));
+    bad["eventTime"] = "yesterday".into();
+    let (outcome, _) = run_v2(
+        &f,
+        vec![
+            old_migrated(),
+            v2_page(&[bad, item("good", month_start_ms(0))], None),
+            v2_empty(),
+            v2_empty(),
+            v2_empty(),
+        ],
+        v2_limits(true),
+    );
+    assert_eq!(outcome, ok(1));
+
+    let f = fixture();
+    let future = 4_102_444_800_000; // 2100-01-01
+    seed_by_old_walk(&f, &[old_row("a", month_start_ms(1)), old_row("z", future)]);
+    let before = now_ms_i64();
+    let (outcome, _) = run_v2(
+        &f,
+        vec![
+            old_migrated(),
+            v2_page(&[item("v", month_start_ms(0))], None),
+        ],
+        v2_limits(true),
+    );
+    let after = now_ms_i64();
+    assert_eq!(outcome.stop.state, State::Ok);
+    let cutover = sidecar_json(&f.dir)["cutoverMs"].as_i64().unwrap();
+    assert!((before..=after).contains(&cutover), "cutover {cutover}");
+}
+
+/// Discovery §4 mapping: meters, model, timestamp, no conversation id; D2
+/// (contracted 0 -> no chargedCents, > 0 -> cents); D3 (only `cursor`
+/// rows); `hasTokenMeters:false` skipped; only the engine's fields written.
+/// Mutations: delete `.filter(|usd| *usd > 0.0)`; delete `if
+/// item.product.as_deref() != Some("cursor") { return None; }`; delete `if
+/// item.has_token_meters == Some(false) { return None; }`; swap
+/// `usage.prompt` and `usage.cached` in `TokenUsage { … }`.
+#[test]
+fn v2_items_map_to_engine_rows() {
+    let f = fixture();
+    let t = month_start_ms(0);
+    let included = item("included", t);
+    let mut paid = item("paid", t + 1);
+    paid["pricing"]["contracted"] = "0.0125000000".into();
+    let mut grok = item("grok", t + 2);
+    grok["product"] = "grok-bot".into();
+    let mut meterless = item("meterless", t + 3);
+    meterless["hasTokenMeters"] = false.into();
+    let (outcome, _) = run_v2(
+        &f,
+        vec![
+            old_migrated(),
+            v2_page(&[included, paid, grok, meterless], None),
+            v2_empty(),
+            v2_empty(),
+            v2_empty(),
+        ],
+        v2_limits(true),
+    );
+    assert_eq!(outcome, ok(2));
+    let rows = live_rows(&f.dir);
+    assert_eq!(rows.len(), 2);
+    let included = rows.iter().find(|r| row_ms(r) == t).unwrap();
+    let paid = rows.iter().find(|r| row_ms(r) == t + 1).unwrap();
+    assert_eq!(included["timestamp"], t.to_string());
+    assert_eq!(included["model"], "composer-2.5");
+    assert!(included.get("conversationId").is_none());
+    assert!(included.get("chargedCents").is_none(), "D2: included row priced");
+    assert_eq!(paid["chargedCents"], 1.25);
+    let usage = &included["tokenUsage"];
+    assert_eq!(usage["inputTokens"], 1263.0);
+    assert_eq!(usage["cacheReadTokens"], 46400.0);
+    assert_eq!(usage["cacheWriteTokens"], 0.0);
+    assert_eq!(usage["outputTokens"], 312.0);
+    assert!(usage.get("totalCents").is_none());
+    for row in &rows {
+        for key in row.as_object().unwrap().keys() {
+            assert!(ALLOWED_EVENT_FIELDS.contains(&key.as_str()), "{key}");
+        }
+        for key in row["tokenUsage"].as_object().unwrap().keys() {
+            assert!(ALLOWED_TOKEN_FIELDS.contains(&key.as_str()), "{key}");
+        }
+    }
+}
+
+/// Design 4: a successful old walk after V2 commits brings the full old
+/// history back: the sidecar goes and the live file is the old rows alone.
+/// Mutation (both, since either deletion alone suffices): delete the
+/// `match std::fs::remove_file(dir.join(sidecar_name(stem))) {…}` block in
+/// `commit_file`, and delete `|| is_sidecar_name(name)` from `is_ours`.
+#[test]
+fn an_old_success_after_v2_deletes_the_sidecar() {
+    let f = fixture();
+    assert_eq!(first_v2_round(&f).stop.state, State::Ok);
+    assert!(sidecar_path(&f.dir).exists());
+    let rows = [old_row("a", month_start_ms(1) + HOUR)];
+    let (outcome, seen) = run_v2(&f, vec![old_page(&rows)], v2_limits(false));
+    assert_eq!(outcome, ok(1));
+    assert!(v2_requests(&seen).is_empty());
+    assert!(!sidecar_path(&f.dir).exists(), "the sidecar outlived an old success");
+    assert_eq!(live_rows(&f.dir).len(), 1);
 }
