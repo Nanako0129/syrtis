@@ -88,6 +88,11 @@ const PAGE_SIZE: u32 = 500;
 const PAGE_TIMEOUT: Duration = Duration::from_secs(15);
 /// 256 pages × 500 = 128k events. The byte cap below normally binds first.
 const MAX_PAGES: u32 = 256;
+/// Billing V2 pages hold 100 items (`cursor_billing_v2::PAGE_SIZE`), a fifth
+/// of the old 500: 1280 pages keep the old walk's ceiling of 128k events,
+/// counted over every window of one walk (S4). Unmeasured: no V2 history of
+/// that size has been seen; at ~1 s/page the round's budget binds first.
+const MAX_V2_PAGES: u32 = 1280;
 /// Cumulative over the walk. C0.5 measured ≈ 553 bytes/event (33173 bytes for
 /// 60 events), so 64 MiB is ≈ 120k events, far above the largest history
 /// seen (3542 events ≈ 2 MB).
@@ -751,6 +756,12 @@ fn remove_usage_files(dir: &Path, keep: &[&str]) -> Removal {
         if !is_ours(&name) || keep.contains(&name.as_ref()) {
             continue;
         }
+        // Syrtis only ever writes a sidecar as a file: a directory with that
+        // name is not ours to delete, and must not turn an old walk's
+        // otherwise unchanged commit into a cleanup failure.
+        if is_sidecar_name(&name) && entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            continue;
+        }
         match std::fs::remove_file(entry.path()) {
             Ok(()) => {
                 result.removed += 1;
@@ -903,13 +914,11 @@ fn commit_file(
     let failed = || Stop::error("write_failed");
     let _lock = lock_dir(dir, still_wanted)?;
     // An old walk brings the full old history back, so this stem's Billing
-    // V2 sidecar goes, and before the live file is replaced: a live file an
-    // old walk wrote never sits beside a sidecar (`commit_v2` relies on it).
-    match std::fs::remove_file(dir.join(sidecar_name(stem))) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(_) => return Err(failed()),
-    }
+    // V2 sidecar goes, before the live file is replaced. Best effort: the old
+    // walk's commit never fails on it (a non-file at that name stays), and a
+    // sidecar that outlives this commit no longer matches the live file's
+    // fingerprint, so `commit_v2` takes no V2 rows from this file.
+    let _ = std::fs::remove_file(dir.join(sidecar_name(stem)));
     let payload = serde_json::to_vec(&UsageFile {
         total_usage_events_count: events.len(),
         usage_events_display: events,
@@ -984,10 +993,12 @@ fn write_atomic(dir: &Path, name: &str, payload: &[u8]) -> Result<bool, Stop> {
 
 /// The sidecar `.cursor-sync.history.<stem>.json`. Created only by the first
 /// V2 commit for a stem (no same-stem sidecar yet), from that stem's live
-/// file; after that `frozen` and `cutover_ms` never change, only `fetched`.
-/// Every V2 commit writes the live file as `frozen` followed by its V2 rows,
-/// so the live file's V2 rows are the ones after the first `frozen.len()`
-/// (an old-walk commit deletes the sidecar before it replaces the live file).
+/// file; after that `frozen` and `cutover_ms` never change, only `fetched`
+/// and `live`. Every V2 commit writes the live file as `frozen` followed by
+/// its V2 rows, so the live file's V2 rows are the ones after the first
+/// `frozen.len()`: trusted only while the live file is still the one the
+/// last V2 commit wrote (`live`), never taken from a file another writer
+/// replaced (an older build's old walk, a failed sidecar delete).
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct History {
@@ -995,13 +1006,40 @@ struct History {
     frozen: Vec<Event>,
     /// V2 rows at or before it are never written. None: no old rows.
     cutover_ms: Option<i64>,
-    /// UTC month index (`cursor_billing_v2::month_index`) -> rows written
-    /// for that month when V2 last read it with rows (0: read, never had any).
-    fetched: std::collections::BTreeMap<i32, u64>,
+    /// UTC months (`cursor_billing_v2::month_index`) V2 has read to their
+    /// last page.
+    fetched: std::collections::BTreeSet<i32>,
+    /// The live file the last V2 commit wrote.
+    #[serde(default)]
+    live: Option<Fingerprint>,
+}
+
+#[derive(Serialize, Deserialize, PartialEq, Eq)]
+struct Fingerprint {
+    sha256: String,
+    rows: usize,
+}
+
+fn fingerprint(bytes: &[u8], rows: usize) -> Fingerprint {
+    use sha2::Digest as _;
+    Fingerprint {
+        sha256: sha2::Sha256::digest(bytes)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect(),
+        rows,
+    }
+}
+
+impl History {
+    /// The live file is the one this sidecar's last V2 commit wrote.
+    fn trusts(&self, live: Option<&Fingerprint>) -> bool {
+        self.live.is_some() && self.live.as_ref() == live
+    }
 }
 
 /// The stem's sidecar: None when there is none; Err when one is there but is
-/// not a regular file we can read and parse (fail closed: no V2 commit).
+/// not a regular file we can read and parse (fail closed: no V2 round).
 fn read_history(dir: &Path, stem: &str) -> Result<Option<History>, ()> {
     let path = dir.join(sidecar_name(stem));
     match std::fs::symlink_metadata(&path) {
@@ -1014,17 +1052,20 @@ fn read_history(dir: &Path, stem: &str) -> Result<Option<History>, ()> {
     }
 }
 
-/// The stem's live file's rows; none when it is absent or not a regular file
-/// (never followed, as in `refresh_if_same`); Err when it cannot be parsed.
-fn read_live(dir: &Path, stem: &str) -> Result<Vec<Event>, ()> {
+/// The stem's live file's rows and fingerprint; none when it is absent or
+/// not a regular file (never followed, as in `refresh_if_same`); Err when it
+/// cannot be parsed.
+fn read_live(dir: &Path, stem: &str) -> Result<(Vec<Event>, Option<Fingerprint>), ()> {
     let path = dir.join(live_name(stem));
     if !std::fs::symlink_metadata(&path).is_ok_and(|meta| meta.is_file()) {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), None));
     }
     let bytes = std::fs::read(&path).map_err(|_| ())?;
-    serde_json::from_slice::<Page>(&bytes)
+    let rows = serde_json::from_slice::<Page>(&bytes)
         .map(|page| page.usage_events_display)
-        .map_err(|_| ())
+        .map_err(|_| ())?;
+    let print = fingerprint(&bytes, rows.len());
+    Ok((rows, Some(print)))
 }
 
 /// Unix ms from a timestamp the engine accepts: base-10 ms, else RFC 3339
@@ -1064,23 +1105,31 @@ fn cutover_of(frozen: &[Event], now_ms: i64) -> Option<i64> {
 }
 
 /// Design 5/6: the months this V2 round reads, newest first, and whether it
-/// stops after 3 empty windows in a row (no cutover). Range: the cutover's
-/// month (or 11 months back, whichever is later) to now. An explicit round
-/// reads all of it; a background one the last three months (not before the
-/// range) plus any month V2 never read. Read without the lock: the commit
-/// re-reads both files under it.
-fn v2_windows(dir: &Path, stem: &str, explicit: bool, now_ms: i64) -> (Vec<i32>, bool) {
-    let (cutover, fetched) = match read_history(dir, stem) {
-        Ok(Some(history)) => (history.cutover_ms, history.fetched),
-        _ => (
-            read_live(dir, stem)
-                .ok()
-                .and_then(|rows| cutover_of(&rows, now_ms)),
-            std::collections::BTreeMap::new(),
+/// stops after 3 empty calendar months in a row. Range: the cutover's month
+/// (or 11 months back, whichever is later) to now. An explicit round reads
+/// all of it, with no early stop; a background one the last three months
+/// (not before the range) plus any month V2 never read (every month, when
+/// the live file is not the one the sidecar's last commit wrote), and with
+/// no cutover stops after 3 empty months. `history` and `live` are read
+/// without the lock; the commit re-reads both under it.
+fn v2_windows(
+    history: Option<&History>,
+    live: &(Vec<Event>, Option<Fingerprint>),
+    explicit: bool,
+    now_ms: i64,
+) -> (Vec<i32>, bool) {
+    let (cutover, fetched) = match history {
+        Some(history) => (
+            history.cutover_ms,
+            history
+                .trusts(live.1.as_ref())
+                .then_some(&history.fetched),
         ),
+        None => (cutover_of(&live.0, now_ms), None),
     };
+    let stop_after_empty = cutover.is_none() && !explicit;
     let Some(current) = cursor_billing_v2::month_index(now_ms) else {
-        return (Vec::new(), true);
+        return (Vec::new(), stop_after_empty);
     };
     let floor = current - 11;
     let first = cutover
@@ -1089,18 +1138,22 @@ fn v2_windows(dir: &Path, stem: &str, explicit: bool, now_ms: i64) -> (Vec<i32>,
     let recent = first.max(current - 2);
     let windows = (first..=current)
         .rev()
-        .filter(|month| explicit || *month >= recent || !fetched.contains_key(month))
+        .filter(|month| {
+            explicit || *month >= recent || !fetched.is_some_and(|read| read.contains(month))
+        })
         .collect();
-    (windows, cutover.is_none())
+    (windows, stop_after_empty)
 }
 
 /// Design 4/5b, D6: under the dir lock, the live file becomes frozen rows ∪
 /// the live file's V2 rows in months this walk did not re-read with rows ∪
 /// this walk's rows after the cutover; the sidecar is created on the first
 /// V2 commit (from the same stem's live file) and afterwards only its
-/// `fetched` list changes. A month re-read with no rows keeps its rows.
-/// Nothing at all to write (no old rows, no V2 rows): `billing_v2_no_items`,
-/// nothing written. Returns the commit and the live file's row count.
+/// `fetched` and `live` change. A month re-read with no rows keeps its rows.
+/// A live file the sidecar's last commit did not write has no V2 rows (and
+/// every month counts as never read again). Nothing at all to write (no old
+/// rows, no V2 rows): `billing_v2_no_items`, nothing written. Returns the
+/// commit and the live file's row count.
 fn commit_v2(
     dir: &Path,
     stem: &str,
@@ -1110,17 +1163,26 @@ fn commit_v2(
 ) -> Result<(Committed, usize), Stop> {
     let failed = || Stop::error("write_failed");
     let _lock = lock_dir(dir, still_wanted)?;
-    let live = read_live(dir, stem).map_err(|_| failed())?;
+    let (live, live_print) = read_live(dir, stem).map_err(|_| failed())?;
     let (mut history, live_v2) = match read_history(dir, stem).map_err(|_| failed())? {
-        Some(history) => {
-            let v2: Vec<Event> = live.into_iter().skip(history.frozen.len()).collect();
-            (history, v2)
+        Some(mut history) => {
+            if history.trusts(live_print.as_ref()) {
+                let v2: Vec<Event> = live.into_iter().skip(history.frozen.len()).collect();
+                (history, v2)
+            } else {
+                // Another writer replaced the live file: none of its rows
+                // are taken by position, and the months V2 had read are
+                // read again.
+                history.fetched.clear();
+                (history, Vec::new())
+            }
         }
         None => (
             History {
                 cutover_ms: cutover_of(&live, now_ms),
                 frozen: live,
-                fetched: std::collections::BTreeMap::new(),
+                fetched: std::collections::BTreeSet::new(),
+                live: None,
             },
             Vec::new(),
         ),
@@ -1131,28 +1193,15 @@ fn commit_v2(
         .into_iter()
         .filter(|row| cutover.is_none_or(|cutover| row.ms > cutover))
         .collect();
-    let mut with_rows: std::collections::BTreeMap<i32, u64> = std::collections::BTreeMap::new();
-    for row in &fresh {
-        *with_rows.entry(row.month).or_default() += 1;
-    }
+    let with_rows: std::collections::BTreeSet<i32> = fresh.iter().map(|row| row.month).collect();
     let months = fetched.months;
-    for month in &months {
-        match with_rows.get(month) {
-            Some(count) => {
-                history.fetched.insert(*month, *count);
-            }
-            None => {
-                history.fetched.entry(*month).or_insert(0);
-            }
-        }
-    }
+    history.fetched.extend(months.iter().copied());
     let replaced = |event: &Event| {
         event_ms(event)
             .and_then(cursor_billing_v2::month_index)
-            .is_some_and(|month| with_rows.contains_key(&month))
+            .is_some_and(|month| with_rows.contains(&month))
     };
-    let sidecar = serde_json::to_vec(&history).map_err(|_| failed())?;
-    let mut events = history.frozen;
+    let mut events = history.frozen.clone();
     events.extend(live_v2.into_iter().filter(|event| !replaced(event)));
     events.extend(fresh.into_iter().map(|row| row.event));
     if events.is_empty() {
@@ -1163,13 +1212,15 @@ fn commit_v2(
         usage_events_display: &events,
     })
     .map_err(|_| failed())?;
+    history.live = Some(fingerprint(&payload, events.len()));
+    let sidecar = serde_json::to_vec(&history).map_err(|_| failed())?;
     let sidecar_name = sidecar_name(stem);
     let final_name = live_name(stem);
     // The live file first. Should the sidecar write then fail, a first
     // commit leaves no sidecar (the next one freezes this live file whole,
     // cutover at its newest row: nothing counted twice), and a later one
-    // keeps the previous sidecar (same frozen rows; only `fetched` is stale,
-    // which makes a later round re-read more months, never fewer).
+    // keeps the previous sidecar, whose fingerprint no longer matches: the
+    // next commit takes no V2 rows by position and reads every month again.
     let changed = write_atomic(dir, &final_name, &payload)?;
     write_atomic(dir, &sidecar_name, &sidecar)?;
     let removal = remove_usage_files(dir, &[&final_name, &sidecar_name]);
@@ -1207,7 +1258,7 @@ struct Page {
 
 /// The event timestamp: Unix ms as a string (observed) or a number; the
 /// engine accepts both.
-#[derive(Deserialize, Serialize)]
+#[derive(Deserialize, Serialize, Clone)]
 #[serde(untagged)]
 pub(crate) enum Timestamp {
     Text(String),
@@ -1218,7 +1269,7 @@ pub(crate) enum Timestamp {
 /// (`de_opt_*_lenient`), so both are accepted here; anything else (an object,
 /// a non-numeric string) fails the page rather than carrying free text into
 /// the file. Written back as a JSON number.
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 #[serde(transparent)]
 pub(crate) struct Num(pub(crate) serde_json::Number);
 
@@ -1239,7 +1290,7 @@ impl<'de> Deserialize<'de> for Num {
     }
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Deserialize, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct TokenUsage {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1255,7 +1306,7 @@ pub(crate) struct TokenUsage {
     pub(crate) total_cents: Option<Num>,
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Deserialize, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Event {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1325,6 +1376,9 @@ struct Outcome {
     /// its account, no installation key, a cookie that cannot be built, an
     /// appDir that fails its checks (so no storage to write to).
     refused: bool,
+    /// Billing V2 rows of this account left out for an unreadable
+    /// `eventTime` or no model (reported as `droppedRows`; never a row).
+    dropped: usize,
 }
 
 impl Outcome {
@@ -1336,6 +1390,7 @@ impl Outcome {
             changed: false,
             cleanup_failed: false,
             refused: false,
+            dropped: 0,
         }
     }
 
@@ -1370,6 +1425,8 @@ pub(crate) struct Limits {
     /// Per walk: the old walk's pages, or the V2 walk's pages over all its
     /// windows (S4). The byte cap likewise.
     pub(crate) max_pages: u32,
+    /// The V2 walk's own page cap (`MAX_V2_PAGES`), over all its windows.
+    pub(crate) max_v2_pages: u32,
     pub(crate) max_body_bytes: usize,
     /// The round was started by the user: a V2 walk re-reads every month in
     /// its range (design 6), not only the recent and never-read ones.
@@ -1383,6 +1440,7 @@ impl Limits {
             page_timeout: PAGE_TIMEOUT,
             page_size: PAGE_SIZE,
             max_pages: MAX_PAGES,
+            max_v2_pages: MAX_V2_PAGES,
             max_body_bytes: MAX_BODY_BYTES,
             explicit: false,
         }
@@ -1861,7 +1919,8 @@ async fn run(
         if !enabled() {
             return stopped(Stop::new(State::Disabled, None));
         }
-        let cleaned = locked_removal(dir, &[&live_name(&stem)], false);
+        // The account's own Billing V2 sidecar stays with its live file.
+        let cleaned = locked_removal(dir, &[&live_name(&stem), &sidecar_name(&stem)], false);
         return Outcome {
             duplicate_of: Some(first),
             changed: cleaned.usage > 0,
@@ -1893,7 +1952,7 @@ async fn run(
                 budget: limits.budget.saturating_sub(walk_started.elapsed()),
                 ..limits
             };
-            let synced =
+            let (synced, dropped) =
                 billing_v2(&client, target, dir, &stem, &user, &cookie, limits, enabled).await;
             drop(cookie);
             return match synced {
@@ -1903,6 +1962,7 @@ async fn run(
                         events,
                         changed: committed.changed,
                         cleanup_failed: committed.cleanup_failed,
+                        dropped,
                         ..stopped(Stop::new(State::Ok, None))
                     }
                 }
@@ -1910,7 +1970,10 @@ async fn run(
                     if covers_account(stop) {
                         claim(&stem, true);
                     }
-                    stopped(stop)
+                    Outcome {
+                        dropped,
+                        ..stopped(stop)
+                    }
                 }
             };
         }
@@ -1937,10 +2000,10 @@ async fn run(
 }
 
 /// D1a's other half: the V2 walk over this round's months, then the V2
-/// commit. A refusal or partial walk returns before the commit, so the live
-/// file and the sidecar stay as they were. Any failure here covers the
-/// account like a walk failure (`covers_account`): write_failed and
-/// disabled do not.
+/// commit, with the count of rows the walk dropped (`Outcome::dropped`). A
+/// refusal or partial walk returns before the commit, so the live file and
+/// the sidecar stay as they were. Any failure here covers the account like
+/// a walk failure (`covers_account`): write_failed and disabled do not.
 #[allow(clippy::too_many_arguments)]
 async fn billing_v2(
     client: &reqwest::Client,
@@ -1951,12 +2014,21 @@ async fn billing_v2(
     cookie: &reqwest::header::HeaderValue,
     limits: Limits,
     enabled: &dyn Fn() -> bool,
-) -> Result<(Committed, usize), Stop> {
+) -> (Result<(Committed, usize), Stop>, usize) {
     let now_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_millis() as i64);
-    let (windows, stop_after_empty) = v2_windows(dir, stem, limits.explicit, now_ms);
-    let fetched = cursor_billing_v2::walk(
+    // A sidecar or live file the commit could not read fails here, before
+    // any request (the commit would refuse it after the whole walk).
+    let Ok(history) = read_history(dir, stem) else {
+        return (Err(Stop::error("write_failed")), 0);
+    };
+    let Ok(live) = read_live(dir, stem) else {
+        return (Err(Stop::error("write_failed")), 0);
+    };
+    let (windows, stop_after_empty) = v2_windows(history.as_ref(), &live, limits.explicit, now_ms);
+    drop((history, live));
+    let fetched = match cursor_billing_v2::walk(
         client,
         target.billing_url,
         cookie,
@@ -1967,8 +2039,13 @@ async fn billing_v2(
         stop_after_empty,
         now_ms,
     )
-    .await?;
-    commit_v2(dir, stem, fetched, now_ms, enabled)
+    .await
+    {
+        Ok(fetched) => fetched,
+        Err(stop) => return (Err(stop), 0),
+    };
+    let dropped = fetched.dropped;
+    (commit_v2(dir, stem, fetched, now_ms, enabled), dropped)
 }
 
 // ---------------------------------------------------------------------------
@@ -2180,6 +2257,9 @@ fn sync_with(
             }
             if let Some(first) = outcome.duplicate_of.and_then(|i| profiles.get(i)) {
                 entry["duplicateOf"] = first.id.clone().into();
+            }
+            if outcome.dropped > 0 {
+                entry["droppedRows"] = outcome.dropped.into();
             }
             entry
         })

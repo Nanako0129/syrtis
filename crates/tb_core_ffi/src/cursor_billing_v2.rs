@@ -25,10 +25,11 @@ use std::time::Instant;
 
 pub(crate) const BILLING_ITEMS_URL: &str =
     "https://cursor.com/api/dashboard/v2/query-billing-items";
+/// Items per page (whereToken's fixed size; the cap is unpublished).
 const PAGE_SIZE: &str = "100";
 const MAX_CURSOR_BYTES: usize = 4096;
-/// Design 5: with no cutover, a walk ends after this many windows in a row
-/// that gave no rows.
+/// Design 5: a background walk with no cutover ends after this many
+/// consecutive calendar months that gave no rows.
 const EMPTY_WINDOWS_STOP: usize = 3;
 
 #[derive(Deserialize)]
@@ -79,8 +80,51 @@ struct Meters {
 
 #[derive(Deserialize)]
 struct Pricing {
-    /// USD, not cents.
-    contracted: Option<Num>,
+    currency: Option<String>,
+    /// In `currency` units, not cents.
+    contracted: Option<Cents>,
+}
+
+/// A decimal amount (a JSON string or number such as `"0.0700000000"`) as
+/// integer hundredths, rounded half up on the third decimal, computed from
+/// its digits (no float). Anything else fails the page, like `Num`.
+struct Cents(i64);
+
+impl<'de> Deserialize<'de> for Cents {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::Error as _;
+        let text = match serde_json::Value::deserialize(deserializer)? {
+            serde_json::Value::String(text) => text,
+            serde_json::Value::Number(number) => number.to_string(),
+            _ => return Err(D::Error::custom("not a decimal")),
+        };
+        cents(text.trim())
+            .map(Cents)
+            .ok_or_else(|| D::Error::custom("not a decimal"))
+    }
+}
+
+/// `-?digits(.digits)?` (at most 15 whole digits) -> hundredths.
+fn cents(text: &str) -> Option<i64> {
+    let (negative, digits) = match text.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, text),
+    };
+    let (whole, fraction) = match digits.split_once('.') {
+        Some((whole, fraction)) if !fraction.is_empty() => (whole, fraction),
+        Some(_) => return None,
+        None => (digits, ""),
+    };
+    let all_digits = |part: &str| part.bytes().all(|b| b.is_ascii_digit());
+    if whole.is_empty() || whole.len() > 15 || !all_digits(whole) || !all_digits(fraction) {
+        return None;
+    }
+    let digit = |i: usize| fraction.as_bytes().get(i).map_or(0, |b| i64::from(b - b'0'));
+    let mut hundredths = whole.parse::<i64>().ok()? * 100 + digit(0) * 10 + digit(1);
+    if digit(2) >= 5 {
+        hundredths += 1;
+    }
+    Some(if negative { -hundredths } else { hundredths })
 }
 
 #[derive(Deserialize)]
@@ -100,6 +144,9 @@ pub(crate) struct Fetched {
     pub(crate) rows: Vec<Row>,
     /// The windows read to their last page, newest first.
     pub(crate) months: Vec<i32>,
+    /// `cursor` rows left out: `eventTime` unreadable or no model (deduped
+    /// by id; never a row, never counted against `billing_v2_no_items`).
+    pub(crate) dropped: usize,
 }
 
 /// UTC calendar month as `year * 12 + month0`.
@@ -121,7 +168,11 @@ fn month_start(index: i32) -> Option<chrono::DateTime<Utc>> {
 }
 
 /// One month's `startTime`/`endTime`, `yyyy-MM-ddTHH:mm:ssZ`: an earlier
-/// month ends 23:59:59Z on its last day, the current one now.
+/// month ends 23:59:59Z on its last day, the current one now. Kept to the
+/// second on purpose: whereToken measured that a month ending at the next
+/// midnight or at 23:59:59.999 answers availability-only, while 23:59:59Z
+/// pages (discovery §1; `billing_v2.go:51-60`). An event in the month's last
+/// second is the accepted cost.
 fn bounds(index: i32, now_ms: i64) -> Option<(String, String)> {
     let start = month_start(index)?;
     let last = month_start(index + 1)? - chrono::Duration::seconds(1);
@@ -133,28 +184,53 @@ fn bounds(index: i32, now_ms: i64) -> Option<(String, String)> {
     ))
 }
 
-/// The item as an engine row, with its id for dedupe; None for a row that is
-/// not written: another product (D3), `hasTokenMeters:false`, no id, or an
-/// `eventTime` that does not parse (S8).
-fn map(item: Item) -> Option<(String, Row)> {
+enum Mapped {
+    Row(String, Row),
+    /// A `cursor` row that cannot be written: counted (by id), not written.
+    Dropped(String),
+    /// Not one of ours to write (another product, no token meters, no id).
+    Skipped,
+}
+
+/// The item as an engine row, with its id for dedupe. Skipped: another
+/// product (D3), `hasTokenMeters:false`, no id. Dropped: an `eventTime`
+/// that does not parse (S8), or no model (the engine drops a model-less row
+/// anyway; dropping it here keeps it out of `events` and of D6).
+fn map(item: Item) -> Mapped {
     if item.product.as_deref() != Some("cursor") {
-        return None;
+        return Mapped::Skipped;
     }
     if item.has_token_meters == Some(false) {
-        return None;
+        return Mapped::Skipped;
     }
-    let id = item.billing_item_id?;
-    let ms = timestamp_ms(&item.event_time?)?;
-    let month = month_index(ms)?;
+    let Some(id) = item.billing_item_id else {
+        return Mapped::Skipped;
+    };
+    let Some((ms, month)) = item
+        .event_time
+        .as_deref()
+        .and_then(timestamp_ms)
+        .and_then(|ms| Some((ms, month_index(ms)?)))
+    else {
+        return Mapped::Dropped(id);
+    };
+    let Some(model) = item
+        .display_extras
+        .and_then(|extras| extras.model)
+        .filter(|model| !model.is_empty())
+    else {
+        return Mapped::Dropped(id);
+    };
     // D2: a plan-included row (contracted 0) carries no cost, so the engine
-    // prices it locally; a paid one is USD -> cents.
+    // prices it locally; so does a row in another currency. A paid USD row
+    // is integer cents.
     let charged_cents = item
         .pricing
+        .filter(|pricing| pricing.currency.as_deref() == Some("USD"))
         .and_then(|pricing| pricing.contracted)
-        .and_then(|usd| usd.0.as_f64())
-        .filter(|usd| *usd > 0.0)
-        .and_then(|usd| serde_json::Number::from_f64(usd * 100.0))
-        .map(Num);
+        .map(|contracted| contracted.0)
+        .filter(|cents| *cents > 0)
+        .map(|cents| Num(serde_json::Number::from(cents)));
     let token_usage = item.usage.map(|usage| TokenUsage {
         input_tokens: usage.prompt,
         output_tokens: usage.completion,
@@ -166,17 +242,17 @@ fn map(item: Item) -> Option<(String, Row)> {
         // D4: no conversation id in V2; the engine keys sessions per day.
         conversation_id: None,
         timestamp: Some(Timestamp::Text(ms.to_string())),
-        model: item.display_extras.and_then(|extras| extras.model),
+        model: Some(model),
         charged_cents,
         token_usage,
     };
-    Some((id, Row { month, ms, event }))
+    Mapped::Row(id, Row { month, ms, event })
 }
 
 /// Read `windows` (UTC month indexes, newest first). `user` is the cookie's
 /// own user id: every item of every page must carry it as `principal.id`.
-/// `stop_after_empty`: end after `EMPTY_WINDOWS_STOP` windows in a row with
-/// no rows (design 5).
+/// `stop_after_empty`: end after `EMPTY_WINDOWS_STOP` consecutive calendar
+/// months with no rows (design 5); a gap between windows restarts the count.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn walk(
     client: &reqwest::Client,
@@ -197,6 +273,8 @@ pub(crate) async fn walk(
     let mut rows: Vec<Row> = Vec::new();
     let mut months: Vec<i32> = Vec::new();
     let mut empty_run = 0usize;
+    let mut previous: Option<i32> = None;
+    let mut dropped = 0usize;
     for &month in windows {
         let Some((start, end)) = bounds(month, now_ms) else {
             continue;
@@ -206,7 +284,7 @@ pub(crate) async fn walk(
         let mut cursors: HashSet<String> = HashSet::new();
         loop {
             pages += 1;
-            if pages > limits.max_pages {
+            if pages > limits.max_v2_pages {
                 return Err(Stop::new(State::Partial, Some("too_many_pages")));
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
@@ -268,10 +346,18 @@ pub(crate) async fn walk(
                 return Err(Stop::error("billing_v2_principal_mismatch"));
             }
             for item in items {
-                if let Some((id, row)) = map(item) {
-                    if ids.insert(id) {
-                        rows.push(row);
+                match map(item) {
+                    Mapped::Row(id, row) => {
+                        if ids.insert(id) {
+                            rows.push(row);
+                        }
                     }
+                    Mapped::Dropped(id) => {
+                        if ids.insert(id) {
+                            dropped += 1;
+                        }
+                    }
+                    Mapped::Skipped => {}
                 }
             }
             match page
@@ -289,6 +375,10 @@ pub(crate) async fn walk(
             }
         }
         months.push(month);
+        if previous.is_some_and(|previous| previous - 1 != month) {
+            empty_run = 0;
+        }
+        previous = Some(month);
         empty_run = if rows.len() == rows_before {
             empty_run + 1
         } else {
@@ -301,5 +391,34 @@ pub(crate) async fn walk(
     // A row dated in a month this walk did not read to the end would sit
     // beside that month's earlier rows (design 5b): dropped.
     rows.retain(|row| months.contains(&row.month));
-    Ok(Fetched { rows, months })
+    Ok(Fetched {
+        rows,
+        months,
+        dropped,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    /// Integer cents from the decimal text, rounded half up. Mutation:
+    /// `if digit(2) >= 5 {` -> `if digit(2) > 5 {`.
+    #[test]
+    fn cents_come_from_the_digits() {
+        for (text, expected) in [
+            ("0.0700000000", Some(7)),
+            ("0.0000000000", Some(0)),
+            ("0.075", Some(8)),
+            ("0.0749", Some(7)),
+            ("12", Some(1200)),
+            ("3.1", Some(310)),
+            ("-0.07", Some(-7)),
+            ("1.", None),
+            (".5", None),
+            ("1e-5", None),
+            ("abc", None),
+            ("1234567890123456", None),
+        ] {
+            assert_eq!(super::cents(text), expected, "{text}");
+        }
+    }
 }
