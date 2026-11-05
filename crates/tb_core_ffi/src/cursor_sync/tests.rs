@@ -4333,7 +4333,11 @@ fn no_old_file_and_rows_only_this_month_commit_after_four_windows() {
     // The default profile's key is the same in every test: forget what an
     // earlier test's last round left, so this background round sees a
     // profile with no file (full budget).
-    IN_FLIGHT.lock().unwrap_or_else(|p| p.into_inner()).no_file.clear();
+    IN_FLIGHT
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .no_file
+        .clear();
     let f = fixture();
     let (url, seen) = serve(vec![
         old_migrated(),
@@ -4621,6 +4625,10 @@ fn v2_items_map_to_engine_rows() {
     paid["pricing"]["contracted"] = "0.0700000000".into();
     let mut euro = item("euro", t + 4);
     euro["pricing"] = serde_json::json!({"currency": "EUR", "contracted": "0.0700000000"});
+    let mut garbage = item("garbage", t + 5);
+    garbage["pricing"]["contracted"] = "FREETEXTCANARY".into();
+    let mut number = item("number", t + 6);
+    number["pricing"]["contracted"] = serde_json::json!(4e-3);
     let mut grok = item("grok", t + 2);
     grok["product"] = "grok-bot".into();
     let mut meterless = item("meterless", t + 3);
@@ -4629,18 +4637,38 @@ fn v2_items_map_to_engine_rows() {
         &f,
         vec![
             old_migrated(),
-            v2_page(&[included, paid, grok, meterless, euro], None),
+            v2_page(
+                &[included, paid, grok, meterless, euro, garbage, number],
+                None,
+            ),
             v2_empty(),
             v2_empty(),
             v2_empty(),
         ],
         v2_limits(false),
     );
-    assert_eq!(outcome, ok(3));
+    assert_eq!(outcome, ok(5));
     let rows = live_rows(&f.dir);
-    assert_eq!(rows.len(), 3);
+    assert_eq!(rows.len(), 5);
+    let garbage = rows.iter().find(|r| row_ms(r) == t + 5).unwrap();
+    assert!(
+        garbage.get("chargedCents").is_none(),
+        "free text priced the row"
+    );
+    assert!(!live_rows(&f.dir)
+        .iter()
+        .any(|r| r.to_string().contains("FREETEXTCANARY")));
+    let number = rows.iter().find(|r| row_ms(r) == t + 6).unwrap();
+    assert_eq!(
+        number["chargedCents"].to_string(),
+        "1",
+        "a paid row floors at 1 cent"
+    );
     let euro = rows.iter().find(|r| row_ms(r) == t + 4).unwrap();
-    assert!(euro.get("chargedCents").is_none(), "a EUR amount was written as cents");
+    assert!(
+        euro.get("chargedCents").is_none(),
+        "a EUR amount was written as cents"
+    );
     let included = rows.iter().find(|r| row_ms(r) == t).unwrap();
     let paid = rows.iter().find(|r| row_ms(r) == t + 1).unwrap();
     assert_eq!(included["timestamp"], t.to_string());
@@ -4650,7 +4678,11 @@ fn v2_items_map_to_engine_rows() {
         included.get("chargedCents").is_none(),
         "D2: included row priced"
     );
-    assert_eq!(paid["chargedCents"].to_string(), "7", "integer cents, no float");
+    assert_eq!(
+        paid["chargedCents"].to_string(),
+        "7",
+        "integer cents, no float"
+    );
     let usage = &included["tokenUsage"];
     assert_eq!(usage["inputTokens"], 1263.0);
     assert_eq!(usage["cacheReadTokens"], 46400.0);
@@ -4727,15 +4759,21 @@ fn a_duplicate_profile_keeps_its_own_sidecar() {
     std::fs::create_dir_all(&dir).unwrap();
     let own_sidecar = sidecar_path(&dir);
     let other_sidecar = dir.join(format!("{SIDECAR_PREFIX}{}.json", "e".repeat(64)));
-    std::fs::write(expected_file(&dir), r#"{"totalUsageEventsCount":0,"usageEventsDisplay":[]}"#)
-        .unwrap();
+    std::fs::write(
+        expected_file(&dir),
+        r#"{"totalUsageEventsCount":0,"usageEventsDisplay":[]}"#,
+    )
+    .unwrap();
     std::fs::write(&own_sidecar, "{}").unwrap();
     std::fs::write(&other_sidecar, "{}").unwrap();
     let (url, _) = serve(vec![json_ok(&page(1, &["a"]))]);
     let status = sync_round(&default_db, &url, &registry);
     assert_eq!(states(&status), ["ok", "duplicate"]);
     assert!(expected_file(&dir).exists());
-    assert!(own_sidecar.exists(), "the duplicate dropped its own sidecar");
+    assert!(
+        own_sidecar.exists(),
+        "the duplicate dropped its own sidecar"
+    );
     assert!(!other_sidecar.exists());
 }
 
@@ -4756,22 +4794,17 @@ fn a_v2_walk_past_the_old_page_cap_commits() {
         )
     }));
     replies.extend((0..3).map(|_| v2_empty()));
-    let (outcome, seen) = run_v2(
-        &f,
-        replies,
-        Limits::production(Duration::from_secs(120)),
-    );
+    let (outcome, seen) = run_v2(&f, replies, Limits::production(Duration::from_secs(120)));
     assert_eq!(outcome, ok(pages));
     assert_eq!(v2_requests(&seen).len(), pages + 3);
 }
 
-/// A sidecar the commit could not read fails before any V2 request.
-/// Mutation: in `billing_v2`, `let Ok(history) = read_history(dir, stem)
-/// else { return (Err(Stop::error("write_failed")), 0); };` -> `let history =
-/// read_history(dir, stem).ok().flatten();` (found only by the commit, after
-/// the walk).
+/// D5: a same-stem sidecar Syrtis cannot read (a directory, or a file that
+/// does not parse) stops the round before any request, old or V2.
+/// Mutation: delete the `if read_history(dir, &stem).is_err() { return
+/// stopped(Stop::error("write_failed")); }` block in `run`.
 #[test]
-fn an_unreadable_sidecar_fails_before_any_v2_request() {
+fn an_unreadable_sidecar_fails_before_any_request() {
     for make in [
         (|path: &Path| std::fs::create_dir_all(path).unwrap()) as fn(&Path),
         |path: &Path| std::fs::write(path, "not json").unwrap(),
@@ -4780,83 +4813,197 @@ fn an_unreadable_sidecar_fails_before_any_v2_request() {
         std::fs::create_dir_all(&f.dir).unwrap();
         make(&sidecar_path(&f.dir));
         let mut replies = vec![old_migrated()];
-        replies.extend(
-            (0..12).map(|i| v2_page(&[item(&format!("u{i}"), month_start_ms(0))], None)),
-        );
+        replies
+            .extend((0..12).map(|i| v2_page(&[item(&format!("u{i}"), month_start_ms(0))], None)));
         let (outcome, seen) = run_v2(&f, replies, v2_limits(true));
         assert_eq!(outcome, stop(State::Error, Some("write_failed")));
-        assert!(v2_requests(&seen).is_empty(), "requests sent before failing");
+        assert!(seen.is_empty(), "requests sent before failing");
         assert!(!expected_file(&f.dir).exists());
     }
 }
 
-/// An old walk's commit is unchanged by a non-file at the sidecar's name:
-/// it succeeds with no cleanup failure, and the entry stays. Mutations: in
-/// `commit_file`, `let _ = std::fs::remove_file(dir.join(sidecar_name(stem)));`
-/// -> `if let Err(error) = std::fs::remove_file(dir.join(sidecar_name(stem)))
-/// { if error.kind() != std::io::ErrorKind::NotFound { return
-/// Err(failed()); } }`; delete the `if is_sidecar_name(&name) &&
-/// entry.file_type().is_ok_and(|kind| kind.is_dir()) { continue; }` block in
-/// `remove_usage_files`.
+/// The old walk's commit is unchanged by a directory at another stem's
+/// sidecar name (no cleanup failure; the entry stays), while disable still
+/// tries it and reports it. Mutations: delete the `if spare_sidecar_dirs &&
+/// is_sidecar_name(&name) && entry.file_type().is_ok_and(|kind|
+/// kind.is_dir()) { continue; }` block in `remove_usage_files`; in
+/// `locked_removal`, `let result = remove_usage_files(dir, keep, false);`
+/// -> `let result = remove_usage_files(dir, keep, true);`.
 #[test]
-fn a_directory_at_the_sidecar_name_does_not_fail_an_old_commit() {
+fn a_directory_at_a_sidecar_name_spares_only_the_old_commit() {
+    let other = format!("{SIDECAR_PREFIX}{}.json", "d".repeat(64));
     let f = fixture();
-    std::fs::create_dir_all(sidecar_path(&f.dir)).unwrap();
+    std::fs::create_dir_all(f.dir.join(&other)).unwrap();
     let (outcome, _) = run_v2(&f, vec![json_ok(&page(1, &["a"]))], v2_limits(false));
     assert_eq!(outcome, ok(1));
-    assert!(sidecar_path(&f.dir).is_dir());
+    assert!(f.dir.join(&other).is_dir());
     assert_eq!(live_rows(&f.dir).len(), 1);
+
+    let _guard = lock();
+    set_for_test(Config::default());
+    let home = tempfile::tempdir().unwrap();
+    let off = serde_json::json!({"enabled": false, "bundleId": BUNDLE});
+    set_in(home.path(), off.clone()).unwrap();
+    let default = app_dir_in(home.path()).join("cursor-cache");
+    std::fs::create_dir_all(default.join(&other).join("inside")).unwrap();
+    let result = set_in(home.path(), off).unwrap();
+    assert_eq!(result["cleanupFailed"], true, "{result}");
+    set_for_test(Config::default());
 }
 
-/// Rollback safety: after a V2 commit, another writer (an older build's old
-/// walk) replaces the live file. The next V2 commit takes none of its rows
-/// by position: rows = frozen + this round, nothing counted twice, and the
-/// months are read again. Mutation: `if history.trusts(live_print.as_ref())
-/// {` -> `if true {`.
+/// Item 1 (round 3): a V2 commit, then an old walk whose sidecar delete
+/// failed (the stale sidecar is put back), then V2 again. The stale sidecar
+/// is not trusted: the commit freezes the old walk's file (every old row
+/// kept), the cutover moves to its newest row, the months are read again,
+/// and nothing is counted twice. Mutation: `Some(history) if trusted =>` ->
+/// `Some(history) =>`.
 #[test]
-fn a_live_file_another_writer_replaced_gives_no_v2_rows() {
+fn a_stale_sidecar_is_frozen_again_from_the_old_walks_file() {
     let f = fixture();
     assert_eq!(first_v2_round(&f).stop.state, State::Ok);
+    let stale = std::fs::read(sidecar_path(&f.dir)).unwrap();
     let cutover = v2_cutover();
+    let newest = cutover + 3 * HOUR;
     let rows = [
         old_row("a", month_start_ms(1) + HOUR),
         old_row("b", cutover),
-        old_row("c", month_start_ms(3) + HOUR),
+        old_row("c", newest),
     ];
-    std::fs::write(
-        expected_file(&f.dir),
-        serde_json::json!({"totalUsageEventsCount": 3, "usageEventsDisplay": rows}).to_string(),
-    )
-    .unwrap();
+    let (outcome, _) = run_v2(&f, vec![old_page(&rows)], v2_limits(false));
+    assert_eq!(outcome, ok(3));
+    std::fs::write(sidecar_path(&f.dir), &stale).unwrap();
     let (outcome, seen) = run_v2(
         &f,
         vec![
             old_migrated(),
             v2_page(&[item("v-current", month_start_ms(0))], None),
-            v2_page(&[item("v-after", cutover + HOUR)], None),
+            v2_page(
+                &[
+                    item("v-after", cutover + HOUR),
+                    item("v-late", newest + HOUR),
+                ],
+                None,
+            ),
         ],
         v2_limits(false),
     );
-    assert_eq!(outcome, ok(4));
+    assert_eq!(outcome, ok(5));
     assert_eq!(v2_requests(&seen).len(), 2);
     let times: Vec<i64> = live_rows(&f.dir).iter().map(row_ms).collect();
-    assert!(!times.contains(&(month_start_ms(3) + HOUR)), "a foreign row was taken");
+    for old in [month_start_ms(1) + HOUR, cutover, newest] {
+        assert!(times.contains(&old), "old row {old} lost");
+    }
+    assert!(
+        !times.contains(&(cutover + HOUR)),
+        "counted twice: before the new cutover"
+    );
     let total: f64 = live_rows(&f.dir).iter().map(row_tokens).sum();
-    assert_eq!(total, 2.0 * OLD_ROW_TOKENS + 2.0 * ITEM_TOKENS);
+    assert_eq!(total, 3.0 * OLD_ROW_TOKENS + 2.0 * ITEM_TOKENS);
+    let history = sidecar_json(&f.dir);
+    assert_eq!(history["cutoverMs"], newest);
+    assert_eq!(history["frozen"].as_array().unwrap().len(), 3);
     assert_eq!(
-        sidecar_json(&f.dir)["fetched"],
+        history["fetched"],
         serde_json::json!([month_of(1), month_of(0)])
     );
+    assert!(history["liveSha256"]
+        .as_str()
+        .is_some_and(|d| d.len() == 64));
+}
+
+/// Item 2 (round 3): no cutover, and the live file is gone (an older
+/// build's disable deletes it but not the sidecar). The background round
+/// reads the full range, with no 3-empty stop, so a month V2 had read is
+/// not dropped. Mutation: `let stop_after_empty = cutover.is_none() &&
+/// !explicit && !stale;` -> `let stop_after_empty = cutover.is_none() &&
+/// !explicit;`.
+#[test]
+fn a_stale_sidecar_without_a_cutover_reads_the_full_range() {
+    let f = fixture();
+    let months = |replies: &mut Vec<Reply>| {
+        replies.push(v2_page(&[item("m0", month_start_ms(0))], None));
+        replies.extend((0..4).map(|_| v2_empty()));
+        replies.push(v2_page(&[item("m5", month_start_ms(5) + HOUR)], None));
+        replies.extend((0..6).map(|_| v2_empty()));
+    };
+    let mut replies = vec![old_migrated()];
+    months(&mut replies);
+    let (outcome, _) = run_v2(&f, replies, v2_limits(true));
+    assert_eq!(outcome, ok(2));
+    std::fs::remove_file(expected_file(&f.dir)).unwrap();
+    let mut replies = vec![old_migrated()];
+    months(&mut replies);
+    let (outcome, seen) = run_v2(&f, replies, v2_limits(false));
+    assert_eq!(outcome, ok(2));
+    assert_eq!(v2_requests(&seen).len(), 12);
+    assert_eq!(tokens_in_month(&f.dir, 5), ITEM_TOKENS);
+}
+
+/// Item 6 (round 3): a dropped copy never hides a complete copy of the same
+/// id, and only drops that would otherwise have been written count (a read
+/// month, after the cutover). Mutations: in `walk`, `                        id,\n
+/// month: ms.and_then(month_index).unwrap_or(month),` -> `id: {
+/// ids.insert(id.clone()); id },\n month: …`; delete `.filter(|item|
+/// self.months.contains(&item.month))`; delete the `.filter(|item| { item.ms
+/// .is_none_or(…) })` filter in `dropped_after`.
+#[test]
+fn only_drops_that_would_have_been_written_count() {
+    let f = fixture();
+    let t = month_start_ms(0);
+    let mut partial = item("same", t);
+    partial["displayExtras"] = serde_json::json!({});
+    // No cutover here, so only the month filter keeps this one out: M-6 is
+    // a month this background walk never reads.
+    let mut unread = item("unread", month_start_ms(6) + HOUR);
+    unread["displayExtras"] = serde_json::json!({});
+    let (outcome, _) = run_v2(
+        &f,
+        vec![
+            old_migrated(),
+            v2_page(&[partial, unread], Some("n")),
+            v2_page(&[item("same", t)], None),
+            v2_empty(),
+            v2_empty(),
+            v2_empty(),
+        ],
+        v2_limits(false),
+    );
+    assert_eq!(
+        outcome,
+        ok(1),
+        "the complete copy was not written, or a drop that would not be written was counted"
+    );
+
+    let f = fixture();
+    assert_eq!(first_v2_round(&f).stop.state, State::Ok);
+    let cutover = v2_cutover();
+    let model_less = |id: &str, ms: i64| {
+        let mut row = item(id, ms);
+        row["displayExtras"] = serde_json::json!({});
+        row
+    };
+    let (outcome, _) = run_v2(
+        &f,
+        vec![
+            old_migrated(),
+            v2_page(
+                &[
+                    model_less("after", (now_ms_i64() - 60_000).max(t + 1)),
+                    model_less("unread-month", month_start_ms(5) + HOUR),
+                ],
+                None,
+            ),
+            v2_page(&[model_less("before", cutover - HOUR / 2)], None),
+        ],
+        v2_limits(false),
+    );
+    assert_eq!(outcome.stop.state, State::Ok);
+    assert_eq!(outcome.dropped, 1);
 }
 
 /// Rows with an unreadable `eventTime` or no model are dropped and counted
 /// (`droppedRows`, a number only); they never count toward `events` or
-/// against `billing_v2_no_items`. Mutations: in `map`, `let Some(model) =
-/// item … .filter(|model| !model.is_empty()) else { return
-/// Mapped::Dropped(id); };` -> `let model =
-/// item.display_extras.and_then(|extras| extras.model).unwrap_or_default();`;
-/// `dropped += 1;` -> `` ; delete the `if outcome.dropped > 0 {
-/// entry["droppedRows"] = …; }` block in `sync_with`.
+/// against `billing_v2_no_items`. Mutations N8a-c: see the executor report.
 #[test]
 fn rows_without_a_time_or_model_are_dropped_and_counted() {
     let _guard = lock();
@@ -4870,7 +5017,10 @@ fn rows_without_a_time_or_model_are_dropped_and_counted() {
     empty_model["displayExtras"]["model"] = "".into();
     let (url, _) = serve(vec![
         old_migrated(),
-        v2_page(&[item("good", t + 3), bad_time, no_model, empty_model.clone()], None),
+        v2_page(
+            &[item("good", t + 3), bad_time, no_model, empty_model.clone()],
+            None,
+        ),
         v2_empty(),
         v2_empty(),
         v2_empty(),

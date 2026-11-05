@@ -737,8 +737,8 @@ struct Removal {
 /// Delete Syrtis usage files (and temp leftovers and history sidecars) in
 /// `dir` except the names in `keep`. Never touches anything else. Caller
 /// holds the dir lock. `failed`: any of ours could not be deleted, or the dir
-/// could not be read.
-fn remove_usage_files(dir: &Path, keep: &[&str]) -> Removal {
+/// could not be read. `spare_sidecar_dirs`: the old walk's commit only.
+fn remove_usage_files(dir: &Path, keep: &[&str], spare_sidecar_dirs: bool) -> Removal {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Removal {
             failed: true,
@@ -757,9 +757,13 @@ fn remove_usage_files(dir: &Path, keep: &[&str]) -> Removal {
             continue;
         }
         // Syrtis only ever writes a sidecar as a file: a directory with that
-        // name is not ours to delete, and must not turn an old walk's
-        // otherwise unchanged commit into a cleanup failure.
-        if is_sidecar_name(&name) && entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+        // name must not turn an old walk's otherwise unchanged commit into a
+        // cleanup failure. Disable and profile removal still try it, and
+        // report it when it cannot go.
+        if spare_sidecar_dirs
+            && is_sidecar_name(&name)
+            && entry.file_type().is_ok_and(|kind| kind.is_dir())
+        {
             continue;
         }
         match std::fs::remove_file(entry.path()) {
@@ -836,7 +840,7 @@ fn locked_removal(dir: &Path, keep: &[&str], remove_dir: bool) -> Removal {
             ..nothing
         };
     }
-    let result = remove_usage_files(dir, keep);
+    let result = remove_usage_files(dir, keep, false);
     if remove_dir && !result.failed {
         let _ = std::fs::remove_file(dir.join(LOCK_FILE_NAME));
         let _ = std::fs::remove_dir(dir);
@@ -915,9 +919,10 @@ fn commit_file(
     let _lock = lock_dir(dir, still_wanted)?;
     // An old walk brings the full old history back, so this stem's Billing
     // V2 sidecar goes, before the live file is replaced. Best effort: the old
-    // walk's commit never fails on it (a non-file at that name stays), and a
-    // sidecar that outlives this commit no longer matches the live file's
-    // fingerprint, so `commit_v2` takes no V2 rows from this file.
+    // walk's commit never fails on it, and a sidecar that outlives this
+    // commit no longer matches the live file's SHA-256: it is stale, and the
+    // next V2 commit freezes this file afresh (`commit_v2`). A non-file at
+    // that name never gets here (`run` refuses the round first).
     let _ = std::fs::remove_file(dir.join(sidecar_name(stem)));
     let payload = serde_json::to_vec(&UsageFile {
         total_usage_events_count: events.len(),
@@ -926,7 +931,7 @@ fn commit_file(
     .map_err(|_| failed())?;
     let final_name = live_name(stem);
     let changed = write_atomic(dir, &final_name, &payload)?;
-    let removal = remove_usage_files(dir, &[&final_name]);
+    let removal = remove_usage_files(dir, &[&final_name], true);
     Ok(Committed {
         changed: changed || removal.usage > 0,
         cleanup_failed: removal.failed,
@@ -991,55 +996,63 @@ fn write_atomic(dir: &Path, name: &str, payload: &[u8]) -> Result<bool, Stop> {
 // ---------------------------------------------------------------------------
 // Billing V2 history (plan CURSOR-BV2-M r4, design 3-5b, D5, D6).
 
-/// The sidecar `.cursor-sync.history.<stem>.json`. Created only by the first
-/// V2 commit for a stem (no same-stem sidecar yet), from that stem's live
-/// file; after that `frozen` and `cutover_ms` never change, only `fetched`
-/// and `live`. Every V2 commit writes the live file as `frozen` followed by
-/// its V2 rows, so the live file's V2 rows are the ones after the first
-/// `frozen.len()`: trusted only while the live file is still the one the
-/// last V2 commit wrote (`live`), never taken from a file another writer
-/// replaced (an older build's old walk, a failed sidecar delete).
-#[derive(Serialize, Deserialize)]
+/// The sidecar `.cursor-sync.history.<stem>.json`. The first V2 commit for a
+/// stem creates it from that stem's live file. While the live file is the
+/// one its last V2 commit wrote (`live_sha256`), `frozen` and `cutover_ms`
+/// never change, only `fetched` and `live_sha256`. Every V2 commit writes
+/// the live file as `frozen` followed by its V2 rows, so those V2 rows are
+/// the ones after the first `frozen.len()`. A live file another writer
+/// replaced (an old walk whose sidecar delete failed, an older build) makes
+/// the sidecar stale: it is never trusted, and the next V2 commit freezes
+/// again from that live file, which then holds the old endpoint's history.
+#[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct History {
-    /// The old endpoint's rows as they were at the first V2 commit.
+    /// The old endpoint's rows as they were when this sidecar was made.
     frozen: Vec<Event>,
     /// V2 rows at or before it are never written. None: no old rows.
     cutover_ms: Option<i64>,
     /// UTC months (`cursor_billing_v2::month_index`) V2 has read to their
     /// last page.
     fetched: std::collections::BTreeSet<i32>,
-    /// The live file the last V2 commit wrote.
+    /// SHA-256 (hex) of the live file the last V2 commit wrote.
     #[serde(default)]
-    live: Option<Fingerprint>,
+    live_sha256: Option<String>,
 }
 
-#[derive(Serialize, Deserialize, PartialEq, Eq)]
-struct Fingerprint {
-    sha256: String,
-    rows: usize,
+/// `History` as written, its frozen rows borrowed from the live file's rows.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct HistoryOut<'a> {
+    frozen: &'a [Event],
+    cutover_ms: Option<i64>,
+    fetched: &'a std::collections::BTreeSet<i32>,
+    live_sha256: &'a str,
 }
 
-fn fingerprint(bytes: &[u8], rows: usize) -> Fingerprint {
+fn sha256_hex(bytes: &[u8]) -> String {
     use sha2::Digest as _;
-    Fingerprint {
-        sha256: sha2::Sha256::digest(bytes)
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect(),
-        rows,
-    }
+    sha2::Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// The stem's live file: its rows and the SHA-256 of its bytes.
+struct Live {
+    rows: Vec<Event>,
+    sha256: Option<String>,
 }
 
 impl History {
-    /// The live file is the one this sidecar's last V2 commit wrote.
-    fn trusts(&self, live: Option<&Fingerprint>) -> bool {
-        self.live.is_some() && self.live.as_ref() == live
+    /// This sidecar describes the live file (its last V2 commit wrote it).
+    fn trusts(&self, live: &Live) -> bool {
+        self.live_sha256.is_some() && self.live_sha256 == live.sha256
     }
 }
 
 /// The stem's sidecar: None when there is none; Err when one is there but is
-/// not a regular file we can read and parse (fail closed: no V2 round).
+/// not a regular file we can read and parse (fail closed: no round).
 fn read_history(dir: &Path, stem: &str) -> Result<Option<History>, ()> {
     let path = dir.join(sidecar_name(stem));
     match std::fs::symlink_metadata(&path) {
@@ -1052,20 +1065,25 @@ fn read_history(dir: &Path, stem: &str) -> Result<Option<History>, ()> {
     }
 }
 
-/// The stem's live file's rows and fingerprint; none when it is absent or
-/// not a regular file (never followed, as in `refresh_if_same`); Err when it
+/// The stem's live file; no rows and no digest when it is absent or not a
+/// regular file (never followed, as in `refresh_if_same`); Err when it
 /// cannot be parsed.
-fn read_live(dir: &Path, stem: &str) -> Result<(Vec<Event>, Option<Fingerprint>), ()> {
+fn read_live(dir: &Path, stem: &str) -> Result<Live, ()> {
     let path = dir.join(live_name(stem));
     if !std::fs::symlink_metadata(&path).is_ok_and(|meta| meta.is_file()) {
-        return Ok((Vec::new(), None));
+        return Ok(Live {
+            rows: Vec::new(),
+            sha256: None,
+        });
     }
     let bytes = std::fs::read(&path).map_err(|_| ())?;
     let rows = serde_json::from_slice::<Page>(&bytes)
         .map(|page| page.usage_events_display)
         .map_err(|_| ())?;
-    let print = fingerprint(&bytes, rows.len());
-    Ok((rows, Some(print)))
+    Ok(Live {
+        rows,
+        sha256: Some(sha256_hex(&bytes)),
+    })
 }
 
 /// Unix ms from a timestamp the engine accepts: base-10 ms, else RFC 3339
@@ -1104,32 +1122,40 @@ fn cutover_of(frozen: &[Event], now_ms: i64) -> Option<i64> {
     )
 }
 
-/// Design 5/6: the months this V2 round reads, newest first, and whether it
-/// stops after 3 empty calendar months in a row. Range: the cutover's month
-/// (or 11 months back, whichever is later) to now. An explicit round reads
-/// all of it, with no early stop; a background one the last three months
-/// (not before the range) plus any month V2 never read (every month, when
-/// the live file is not the one the sidecar's last commit wrote), and with
-/// no cutover stops after 3 empty months. `history` and `live` are read
-/// without the lock; the commit re-reads both under it.
+/// The months a V2 round reads, newest first; whether it stops after 3
+/// empty calendar months in a row; and the cutover it plans with.
+struct Plan {
+    windows: Vec<i32>,
+    stop_after_empty: bool,
+    cutover: Option<i64>,
+}
+
+/// Design 5/6. Range: the cutover's month (or 11 months back, whichever is
+/// later) to now. An explicit round reads all of it with no early stop; a
+/// background one the last three months (not before the range) plus any
+/// month V2 never read, and with no cutover stops after 3 empty months.
+/// `history` is the trusted sidecar (None: none, or `stale`); a stale one
+/// plans as a first commit would (cutover from the live file, nothing read
+/// yet), with no early stop, so no month V2 had read drops out. Read
+/// without the lock; the commit re-reads both files under it.
 fn v2_windows(
     history: Option<&History>,
-    live: &(Vec<Event>, Option<Fingerprint>),
+    live: &[Event],
+    stale: bool,
     explicit: bool,
     now_ms: i64,
-) -> (Vec<i32>, bool) {
+) -> Plan {
     let (cutover, fetched) = match history {
-        Some(history) => (
-            history.cutover_ms,
-            history
-                .trusts(live.1.as_ref())
-                .then_some(&history.fetched),
-        ),
-        None => (cutover_of(&live.0, now_ms), None),
+        Some(history) => (history.cutover_ms, Some(&history.fetched)),
+        None => (cutover_of(live, now_ms), None),
     };
-    let stop_after_empty = cutover.is_none() && !explicit;
+    let stop_after_empty = cutover.is_none() && !explicit && !stale;
     let Some(current) = cursor_billing_v2::month_index(now_ms) else {
-        return (Vec::new(), stop_after_empty);
+        return Plan {
+            windows: Vec::new(),
+            stop_after_empty,
+            cutover,
+        };
     };
     let floor = current - 11;
     let first = cutover
@@ -1142,18 +1168,21 @@ fn v2_windows(
             explicit || *month >= recent || !fetched.is_some_and(|read| read.contains(month))
         })
         .collect();
-    (windows, stop_after_empty)
+    Plan {
+        windows,
+        stop_after_empty,
+        cutover,
+    }
 }
 
 /// Design 4/5b, D6: under the dir lock, the live file becomes frozen rows ∪
 /// the live file's V2 rows in months this walk did not re-read with rows ∪
-/// this walk's rows after the cutover; the sidecar is created on the first
-/// V2 commit (from the same stem's live file) and afterwards only its
-/// `fetched` and `live` change. A month re-read with no rows keeps its rows.
-/// A live file the sidecar's last commit did not write has no V2 rows (and
-/// every month counts as never read again). Nothing at all to write (no old
-/// rows, no V2 rows): `billing_v2_no_items`, nothing written. Returns the
-/// commit and the live file's row count.
+/// this walk's rows after the cutover. With no sidecar, or a stale one (the
+/// live file is not the one its last V2 commit wrote), the sidecar is made
+/// afresh from this live file: frozen = its rows, cutover = min(newest,
+/// now), nothing read yet. A month re-read with no rows keeps its rows.
+/// Nothing at all to write (no old rows, no V2 rows): `billing_v2_no_items`,
+/// nothing written. Returns the commit and the live file's row count.
 fn commit_v2(
     dir: &Path,
     stem: &str,
@@ -1163,26 +1192,22 @@ fn commit_v2(
 ) -> Result<(Committed, usize), Stop> {
     let failed = || Stop::error("write_failed");
     let _lock = lock_dir(dir, still_wanted)?;
-    let (live, live_print) = read_live(dir, stem).map_err(|_| failed())?;
-    let (mut history, live_v2) = match read_history(dir, stem).map_err(|_| failed())? {
-        Some(mut history) => {
-            if history.trusts(live_print.as_ref()) {
-                let v2: Vec<Event> = live.into_iter().skip(history.frozen.len()).collect();
-                (history, v2)
-            } else {
-                // Another writer replaced the live file: none of its rows
-                // are taken by position, and the months V2 had read are
-                // read again.
-                history.fetched.clear();
-                (history, Vec::new())
-            }
+    let live = read_live(dir, stem).map_err(|_| failed())?;
+    let stored = read_history(dir, stem).map_err(|_| failed())?;
+    let trusted = stored.as_ref().is_some_and(|history| history.trusts(&live));
+    let (mut history, live_v2) = match stored {
+        Some(history) if trusted => {
+            let v2: Vec<Event> = live.rows.into_iter().skip(history.frozen.len()).collect();
+            (history, v2)
         }
-        None => (
+        // No sidecar, or a stale one: never keep stale frozen rows over a
+        // newer old-walk file; freeze the live file as it now stands.
+        _ => (
             History {
-                cutover_ms: cutover_of(&live, now_ms),
-                frozen: live,
+                cutover_ms: cutover_of(&live.rows, now_ms),
+                frozen: live.rows,
                 fetched: std::collections::BTreeSet::new(),
-                live: None,
+                live_sha256: None,
             },
             Vec::new(),
         ),
@@ -1201,7 +1226,8 @@ fn commit_v2(
             .and_then(cursor_billing_v2::month_index)
             .is_some_and(|month| with_rows.contains(&month))
     };
-    let mut events = history.frozen.clone();
+    let frozen_len = history.frozen.len();
+    let mut events = history.frozen;
     events.extend(live_v2.into_iter().filter(|event| !replaced(event)));
     events.extend(fresh.into_iter().map(|row| row.event));
     if events.is_empty() {
@@ -1212,18 +1238,23 @@ fn commit_v2(
         usage_events_display: &events,
     })
     .map_err(|_| failed())?;
-    history.live = Some(fingerprint(&payload, events.len()));
-    let sidecar = serde_json::to_vec(&history).map_err(|_| failed())?;
+    let live_sha256 = sha256_hex(&payload);
+    let sidecar = serde_json::to_vec(&HistoryOut {
+        frozen: &events[..frozen_len],
+        cutover_ms: cutover,
+        fetched: &history.fetched,
+        live_sha256: &live_sha256,
+    })
+    .map_err(|_| failed())?;
     let sidecar_name = sidecar_name(stem);
     let final_name = live_name(stem);
-    // The live file first. Should the sidecar write then fail, a first
-    // commit leaves no sidecar (the next one freezes this live file whole,
-    // cutover at its newest row: nothing counted twice), and a later one
-    // keeps the previous sidecar, whose fingerprint no longer matches: the
-    // next commit takes no V2 rows by position and reads every month again.
+    // The live file first. Should the sidecar write then fail, the previous
+    // sidecar (or none) no longer matches this live file, so the next
+    // commit freezes this file whole (cutover at its newest row): nothing
+    // counted twice.
     let changed = write_atomic(dir, &final_name, &payload)?;
     write_atomic(dir, &sidecar_name, &sidecar)?;
-    let removal = remove_usage_files(dir, &[&final_name, &sidecar_name]);
+    let removal = remove_usage_files(dir, &[&final_name, &sidecar_name], false);
     Ok((
         Committed {
             changed: changed || removal.usage > 0,
@@ -1258,7 +1289,7 @@ struct Page {
 
 /// The event timestamp: Unix ms as a string (observed) or a number; the
 /// engine accepts both.
-#[derive(Deserialize, Serialize, Clone)]
+#[derive(Deserialize, Serialize)]
 #[serde(untagged)]
 pub(crate) enum Timestamp {
     Text(String),
@@ -1269,7 +1300,7 @@ pub(crate) enum Timestamp {
 /// (`de_opt_*_lenient`), so both are accepted here; anything else (an object,
 /// a non-numeric string) fails the page rather than carrying free text into
 /// the file. Written back as a JSON number.
-#[derive(Serialize, Clone)]
+#[derive(Serialize)]
 #[serde(transparent)]
 pub(crate) struct Num(pub(crate) serde_json::Number);
 
@@ -1290,7 +1321,7 @@ impl<'de> Deserialize<'de> for Num {
     }
 }
 
-#[derive(Deserialize, Serialize, Clone)]
+#[derive(Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct TokenUsage {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1306,7 +1337,7 @@ pub(crate) struct TokenUsage {
     pub(crate) total_cents: Option<Num>,
 }
 
-#[derive(Deserialize, Serialize, Clone)]
+#[derive(Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Event {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1422,10 +1453,10 @@ pub(crate) struct Limits {
     pub(crate) budget: Duration,
     pub(crate) page_timeout: Duration,
     page_size: u32,
-    /// Per walk: the old walk's pages, or the V2 walk's pages over all its
-    /// windows (S4). The byte cap likewise.
+    /// The old walk's page cap.
     pub(crate) max_pages: u32,
-    /// The V2 walk's own page cap (`MAX_V2_PAGES`), over all its windows.
+    /// The V2 walk's own page cap (`MAX_V2_PAGES`), over all its windows
+    /// (S4). The byte cap is per walk too, old or V2.
     pub(crate) max_v2_pages: u32,
     pub(crate) max_body_bytes: usize,
     /// The round was started by the user: a V2 walk re-reads every month in
@@ -1940,6 +1971,11 @@ async fn run(
         budget: limits.budget.saturating_sub(started.elapsed()),
         ..limits
     };
+    // D5: a same-stem sidecar Syrtis cannot read (a non-file, or not ours
+    // to parse) stops the round before any request, old or V2.
+    if read_history(dir, &stem).is_err() {
+        return stopped(Stop::error("write_failed"));
+    }
     let client = match client(target) {
         Ok(client) => client,
         Err(stop) => return stopped(stop),
@@ -2018,15 +2054,16 @@ async fn billing_v2(
     let now_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_millis() as i64);
-    // A sidecar or live file the commit could not read fails here, before
-    // any request (the commit would refuse it after the whole walk).
-    let Ok(history) = read_history(dir, stem) else {
+    // A live file (or a sidecar, since `run` checked it) the commit could
+    // not read fails here, before any V2 request.
+    let (Ok(stored), Ok(live)) = (read_history(dir, stem), read_live(dir, stem)) else {
         return (Err(Stop::error("write_failed")), 0);
     };
-    let Ok(live) = read_live(dir, stem) else {
-        return (Err(Stop::error("write_failed")), 0);
-    };
-    let (windows, stop_after_empty) = v2_windows(history.as_ref(), &live, limits.explicit, now_ms);
+    let stale = stored
+        .as_ref()
+        .is_some_and(|history| !history.trusts(&live));
+    let history = stored.filter(|_| !stale);
+    let plan = v2_windows(history.as_ref(), &live.rows, stale, limits.explicit, now_ms);
     drop((history, live));
     let fetched = match cursor_billing_v2::walk(
         client,
@@ -2035,8 +2072,8 @@ async fn billing_v2(
         user,
         limits,
         enabled,
-        &windows,
-        stop_after_empty,
+        &plan.windows,
+        plan.stop_after_empty,
         now_ms,
     )
     .await
@@ -2044,7 +2081,7 @@ async fn billing_v2(
         Ok(fetched) => fetched,
         Err(stop) => return (Err(stop), 0),
     };
-    let dropped = fetched.dropped;
+    let dropped = fetched.dropped_after(plan.cutover);
     (commit_v2(dir, stem, fetched, now_ms, enabled), dropped)
 }
 

@@ -82,49 +82,79 @@ struct Meters {
 struct Pricing {
     currency: Option<String>,
     /// In `currency` units, not cents.
-    contracted: Option<Cents>,
+    contracted: Option<Charge>,
 }
 
-/// A decimal amount (a JSON string or number such as `"0.0700000000"`) as
-/// integer hundredths, rounded half up on the third decimal, computed from
-/// its digits (no float). Anything else fails the page, like `Num`.
-struct Cents(i64);
+/// `contracted` as cents to charge (`charged_cents`). Never fails the page:
+/// a value that is not a decimal only leaves that row without a cost.
+struct Charge(Option<i64>);
 
-impl<'de> Deserialize<'de> for Cents {
+impl<'de> Deserialize<'de> for Charge {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        use serde::de::Error as _;
-        let text = match serde_json::Value::deserialize(deserializer)? {
-            serde_json::Value::String(text) => text,
-            serde_json::Value::Number(number) => number.to_string(),
-            _ => return Err(D::Error::custom("not a decimal")),
-        };
-        cents(text.trim())
-            .map(Cents)
-            .ok_or_else(|| D::Error::custom("not a decimal"))
+        Ok(Charge(
+            match serde_json::Value::deserialize(deserializer)? {
+                serde_json::Value::String(text) => charged_cents(&text),
+                serde_json::Value::Number(number) => charged_cents(&number.to_string()),
+                _ => None,
+            },
+        ))
     }
 }
 
-/// `-?digits(.digits)?` (at most 15 whole digits) -> hundredths.
-fn cents(text: &str) -> Option<i64> {
-    let (negative, digits) = match text.strip_prefix('-') {
-        Some(rest) => (true, rest),
-        None => (false, text),
+/// D2 on the exact decimal (a JSON string or number; `1e-7`, `2.5E+1`
+/// accepted), computed from its digits with no float: zero or negative ->
+/// None (no `chargedCents`); positive -> cents rounded half up, at least 1
+/// (a paid row is never priced locally); not a decimal, or more than 18
+/// digits of cents -> None.
+fn charged_cents(text: &str) -> Option<i64> {
+    let text = text.trim();
+    let (negative, unsigned) = match text.as_bytes().first() {
+        Some(b'-') => (true, &text[1..]),
+        Some(b'+') => (false, &text[1..]),
+        _ => (false, text),
     };
-    let (whole, fraction) = match digits.split_once('.') {
-        Some((whole, fraction)) if !fraction.is_empty() => (whole, fraction),
-        Some(_) => return None,
-        None => (digits, ""),
+    let (mantissa, exponent) = match unsigned.find(['e', 'E']) {
+        Some(at) => (&unsigned[..at], unsigned[at + 1..].parse::<i32>().ok()?),
+        None => (unsigned, 0),
     };
-    let all_digits = |part: &str| part.bytes().all(|b| b.is_ascii_digit());
-    if whole.is_empty() || whole.len() > 15 || !all_digits(whole) || !all_digits(fraction) {
+    let (whole, fraction) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    if (whole.is_empty() && fraction.is_empty())
+        || !whole
+            .bytes()
+            .chain(fraction.bytes())
+            .all(|b| b.is_ascii_digit())
+    {
         return None;
     }
-    let digit = |i: usize| fraction.as_bytes().get(i).map_or(0, |b| i64::from(b - b'0'));
-    let mut hundredths = whole.parse::<i64>().ok()? * 100 + digit(0) * 10 + digit(1);
-    if digit(2) >= 5 {
-        hundredths += 1;
+    let digits = format!("{whole}{fraction}");
+    let digits = digits.trim_start_matches('0');
+    if digits.is_empty() || negative {
+        return None;
     }
-    Some(if negative { -hundredths } else { hundredths })
+    // value = digits x 10^(exponent - fraction digits); cents = value x 100.
+    let shift = i64::from(exponent) - fraction.len() as i64 + 2;
+    let cents = if shift >= 0 {
+        if digits.len() as i64 + shift > 18 {
+            return None;
+        }
+        format!("{digits}{}", "0".repeat(shift as usize))
+            .parse::<i64>()
+            .ok()?
+    } else {
+        let cut = usize::try_from(-shift).ok()?;
+        let keep = digits.len().saturating_sub(cut);
+        if keep > 18 {
+            return None;
+        }
+        let whole_cents = if keep == 0 {
+            0
+        } else {
+            digits[..keep].parse::<i64>().ok()?
+        };
+        let next = digits.as_bytes().get(keep).filter(|_| cut <= digits.len());
+        whole_cents + i64::from(next.is_some_and(|digit| *digit >= b'5'))
+    };
+    Some(cents.max(1))
 }
 
 #[derive(Deserialize)]
@@ -144,9 +174,38 @@ pub(crate) struct Fetched {
     pub(crate) rows: Vec<Row>,
     /// The windows read to their last page, newest first.
     pub(crate) months: Vec<i32>,
-    /// `cursor` rows left out: `eventTime` unreadable or no model (deduped
-    /// by id; never a row, never counted against `billing_v2_no_items`).
-    pub(crate) dropped: usize,
+    /// `cursor` items left out for an unreadable `eventTime` or no model.
+    dropped: Vec<Dropped>,
+    /// The ids of the items mapped to rows (in memory only).
+    ids: HashSet<String>,
+}
+
+/// A dropped item: its id, its month (the window's when its time does not
+/// parse) and its time.
+struct Dropped {
+    id: String,
+    month: i32,
+    ms: Option<i64>,
+}
+
+impl Fetched {
+    /// Dropped items that would otherwise have been written: in a month the
+    /// walk read to the end, after `cutover` (an unreadable time counts), and
+    /// with no complete copy of the same id written; counted once per id.
+    /// Never a row, never counted against `billing_v2_no_items`.
+    pub(crate) fn dropped_after(&self, cutover: Option<i64>) -> usize {
+        self.dropped
+            .iter()
+            .filter(|item| self.months.contains(&item.month))
+            .filter(|item| {
+                item.ms
+                    .is_none_or(|ms| cutover.is_none_or(|cutover| ms > cutover))
+            })
+            .filter(|item| !self.ids.contains(&item.id))
+            .map(|item| item.id.as_str())
+            .collect::<HashSet<_>>()
+            .len()
+    }
 }
 
 /// UTC calendar month as `year * 12 + month0`.
@@ -186,8 +245,8 @@ fn bounds(index: i32, now_ms: i64) -> Option<(String, String)> {
 
 enum Mapped {
     Row(String, Row),
-    /// A `cursor` row that cannot be written: counted (by id), not written.
-    Dropped(String),
+    /// A `cursor` row that cannot be written, with its time if it parses.
+    Dropped(String, Option<i64>),
     /// Not one of ours to write (another product, no token meters, no id).
     Skipped,
 }
@@ -212,24 +271,23 @@ fn map(item: Item) -> Mapped {
         .and_then(timestamp_ms)
         .and_then(|ms| Some((ms, month_index(ms)?)))
     else {
-        return Mapped::Dropped(id);
+        return Mapped::Dropped(id, None);
     };
     let Some(model) = item
         .display_extras
         .and_then(|extras| extras.model)
         .filter(|model| !model.is_empty())
     else {
-        return Mapped::Dropped(id);
+        return Mapped::Dropped(id, Some(ms));
     };
     // D2: a plan-included row (contracted 0) carries no cost, so the engine
     // prices it locally; so does a row in another currency. A paid USD row
-    // is integer cents.
+    // is integer cents (`charged_cents`).
     let charged_cents = item
         .pricing
         .filter(|pricing| pricing.currency.as_deref() == Some("USD"))
         .and_then(|pricing| pricing.contracted)
-        .map(|contracted| contracted.0)
-        .filter(|cents| *cents > 0)
+        .and_then(|contracted| contracted.0)
         .map(|cents| Num(serde_json::Number::from(cents)));
     let token_usage = item.usage.map(|usage| TokenUsage {
         input_tokens: usage.prompt,
@@ -274,7 +332,7 @@ pub(crate) async fn walk(
     let mut months: Vec<i32> = Vec::new();
     let mut empty_run = 0usize;
     let mut previous: Option<i32> = None;
-    let mut dropped = 0usize;
+    let mut dropped: Vec<Dropped> = Vec::new();
     for &month in windows {
         let Some((start, end)) = bounds(month, now_ms) else {
             continue;
@@ -352,11 +410,13 @@ pub(crate) async fn walk(
                             rows.push(row);
                         }
                     }
-                    Mapped::Dropped(id) => {
-                        if ids.insert(id) {
-                            dropped += 1;
-                        }
-                    }
+                    // Its id stays out of `ids`: a later complete copy is
+                    // still written.
+                    Mapped::Dropped(id, ms) => dropped.push(Dropped {
+                        id,
+                        month: ms.and_then(month_index).unwrap_or(month),
+                        ms,
+                    }),
                     Mapped::Skipped => {}
                 }
             }
@@ -395,30 +455,39 @@ pub(crate) async fn walk(
         rows,
         months,
         dropped,
+        ids,
     })
 }
 
 #[cfg(test)]
 mod tests {
-    /// Integer cents from the decimal text, rounded half up. Mutation:
-    /// `if digit(2) >= 5 {` -> `if digit(2) > 5 {`.
+    /// D2 on the exact decimal. Mutations: `Some(cents.max(1))` ->
+    /// `Some(cents)`; `if digits.is_empty() || negative {` -> `if negative {`;
+    /// `.is_some_and(|digit| *digit >= b'5')` -> `.is_some_and(|digit| *digit > b'5')`.
     #[test]
-    fn cents_come_from_the_digits() {
+    fn charged_cents_come_from_the_digits() {
         for (text, expected) in [
             ("0.0700000000", Some(7)),
-            ("0.0000000000", Some(0)),
+            ("0.0040000000", Some(1)),
+            ("0.0000000001", Some(1)),
             ("0.075", Some(8)),
             ("0.0749", Some(7)),
             ("12", Some(1200)),
             ("3.1", Some(310)),
-            ("-0.07", Some(-7)),
-            ("1.", None),
-            (".5", None),
-            ("1e-5", None),
+            ("1e-7", Some(1)),
+            ("2.5E+1", Some(2500)),
+            ("7E-2", Some(7)),
+            (".5", Some(50)),
+            ("0", None),
+            ("0.0000000000", None),
+            ("0e5", None),
+            ("-0.07", None),
             ("abc", None),
-            ("1234567890123456", None),
+            ("1e", None),
+            ("1.2.3", None),
+            ("1e30", None),
         ] {
-            assert_eq!(super::cents(text), expected, "{text}");
+            assert_eq!(super::charged_cents(text), expected, "{text}");
         }
     }
 }
