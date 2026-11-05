@@ -64,8 +64,9 @@ struct Extras {
     model: Option<String>,
 }
 
-/// Decimal strings on the wire; `Num` accepts a number or a numeric string
-/// and refuses free text (the page then fails as `unexpected_response`).
+/// Third-party reports (not observed by us) show these as decimal strings;
+/// `Num` accepts a number or a numeric string and refuses free text (the page
+/// then fails as `unexpected_response`).
 #[derive(Deserialize)]
 struct Meters {
     #[serde(rename = "prompt-text-tokens")]
@@ -81,7 +82,8 @@ struct Meters {
 #[derive(Deserialize)]
 struct Pricing {
     currency: Option<String>,
-    /// In `currency` units, not cents.
+    /// Taken to be in `currency` units, not cents (third-party reports; not
+    /// observed by us).
     contracted: Option<Charge>,
 }
 
