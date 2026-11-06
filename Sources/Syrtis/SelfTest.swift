@@ -4315,6 +4315,7 @@ enum SelfTest {
             (.storeCapacity, "Pace unavailable · history storage full"),
             (.history, "Pace unavailable · history unavailable"),
             (.nonRecurring, "Pace unavailable · non-recurring quota"),
+            (.accountFetchFailed, "Pace unavailable · this account's quota check failed"),
         ]
         for (reason, copy) in unavailableCopies {
             expect(
@@ -22294,18 +22295,27 @@ enum SelfTest {
                "WCP2-oauth T15 a boundAccountKey other than the current key is not merged")
         expect(wcpMerge(wcpOAuthPayload(marker: "m1", bound: wcpAgyKey, error: "boom")).agents.count == 2,
                "WCP2-oauth an errored substituted primary is not merged")
-        for (name, raw) in [
+        for (name, raw, reason) in [
             ("K errored", wcpAgyPayload(primary: [wcpAgyUnscoped], captured: [wcpAgyKAvailable],
-                                        capturedError: "boom")),
-            ("K has no windows", wcpAgyPayload(primary: [wcpAgyUnscoped], captured: [])),
+                                        capturedError: "boom"), UsagePaceUnavailableReason.accountFetchFailed),
+            ("K has no windows", wcpAgyPayload(primary: [wcpAgyUnscoped], captured: []), .accountScope),
         ] {
             let primary = wcpPrimary(wcpMerge(raw))
             let w = primary?.windows.first
-            expect(primary?.historyAccountKey == nil && w?.paceStatus.reason == .accountScope
+            expect(primary?.historyAccountKey == nil && w?.paceStatus.reason == reason
                        && w?.paceStatus.historyKey == nil && w?.historicalPace == nil
+                       && w?.usedPercent == 10 && w?.remainingPercent == 90
                        && wcpMerge(raw).agents.count == 1,
-                   "WCP2-merge \(name): the primary is untouched and records no history account")
+                   "WCP2-merge \(name): one card, no history account, the primary's usage, pace reason \(reason.rawValue)")
         }
+        // A K-errored merge relabels only accountScope windows.
+        let wcpKErrored = wcpMerge(wcpAgyPayload(
+            primary: [wcpAgyUnscoped, wcpAgyPaceJSON(card: "agy.b2.v1", state: "unavailable",
+                                                     duration: nil, reason: "history")],
+            captured: [wcpAgyKAvailable], capturedError: "boom"))
+        expect(wcpPrimary(wcpKErrored)?.windows.map { $0.paceStatus.reason }
+                   == [.accountFetchFailed, .history],
+               "WCP2-merge K errored: only the accountScope window is relabelled")
         // Duration guard: a K window of a different cycle length is not borrowed.
         let wcpAgyPrimary3600 = wcpAgyPaceJSON(
             card: "agy.b1.v1", state: "unavailable", duration: 3_600, reason: "accountScope")

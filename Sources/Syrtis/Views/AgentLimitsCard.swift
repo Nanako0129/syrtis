@@ -205,6 +205,8 @@ struct AgentLimitsCard: View {
                 return "Pace unavailable · history storage full".localized
             case .history:
                 return "Pace unavailable · history unavailable".localized
+            case .accountFetchFailed:
+                return "Pace unavailable · this account's quota check failed".localized
             case .nonRecurring:
                 return "Pace unavailable · non-recurring quota".localized
             }
