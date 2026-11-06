@@ -364,6 +364,7 @@
 "Pace unavailable · missing reset" = "消耗节奏不可用 · 缺少重置时间";
 "Pace unavailable · invalid quota data" = "消耗节奏不可用 · 额度数据无效";
 "Pace unavailable · account identity unavailable" = "消耗节奏不可用 · 无法识别账户";
+"Pace unavailable · this account's quota check failed" = "消耗节奏不可用 · 此账户的额度查询失败";
 "Pace unavailable · history storage full" = "消耗节奏不可用 · 历史存储已满";
 "Pace unavailable · history unavailable" = "消耗节奏不可用 · 历史数据不可用";
 "Pace unavailable · non-recurring quota" = "消耗节奏不可用 · 非周期性额度";

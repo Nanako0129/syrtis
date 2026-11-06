@@ -126,6 +126,11 @@ public enum UsagePaceUnavailableReason: String, Decodable, Sendable, Equatable {
     case storeCapacity
     case history
     case nonRecurring
+    /// Swift only, never sent by the engine: an `accountScope` window of the
+    /// Antigravity agy primary whose merged captured account (the same
+    /// account) failed its own fetch (`AgentUsageSnapshot.adoptingHistory`).
+    /// Like `accountScope`, nothing is recorded or read for it.
+    case accountFetchFailed
 }
 
 /// The typed Rust v3 pace status nested inside one quota window.
@@ -145,8 +150,11 @@ public struct PaceStatus: Decodable, Sendable, Equatable {
     /// "binding is unavailable" on every publication, and reading it anyway
     /// reported a permanent absence as a failed read that "will be retried".
     /// A storage failure is reported as `history` instead and is still read.
+    /// `accountFetchFailed` is an `accountScope` window relabelled for display,
+    /// so it is not read either.
     public var historyKey: String? {
-        state == .unavailable && reason == .accountScope ? nil : windowKey
+        state == .unavailable && (reason == .accountScope || reason == .accountFetchFailed)
+            ? nil : windowKey
     }
 
     public init(
@@ -932,13 +940,21 @@ extension AgentUsageSnapshot {
     /// `captured`'s pace status, historical pace and duration per matching card
     /// id (so its windows carry history keys), and records `captured` as the account to read curves under.
     ///
-    /// Only when `captured` has no error and offers windows; otherwise this
-    /// card is returned untouched. A window `captured` lacks keeps its own pace
+    /// Only when `captured` has no error and offers windows. When `captured`
+    /// errored (its fetch failed: a blocked account, an expired login), every
+    /// `accountScope` window here is marked `accountFetchFailed` instead, so
+    /// the merged card says the account's check failed rather than that its
+    /// identity is unknown; nothing else changes. Otherwise this card is
+    /// returned untouched. A window `captured` lacks keeps its own pace
     /// status. Never traps: see `UsageWindow.replacingPace(from:)`.
     package func adoptingHistory(of captured: AgentUsageSnapshot) -> AgentUsageSnapshot {
-        guard captured.error == nil, let key = captured.accountKey,
-              !captured.windows.isEmpty
-        else { return self }
+        guard let key = captured.accountKey else { return self }
+        if captured.error != nil {
+            return AgentUsageSnapshot(
+                copying: self, identity: identity,
+                windows: windows.map { $0.markingAccountFetchFailed() })
+        }
+        guard !captured.windows.isEmpty else { return self }
         let theirs = captured.rawCardWindows
         let merged = windows.map { window in
             theirs.first { $0.cardId == window.cardId }
@@ -995,6 +1011,19 @@ extension UsageWindow {
         return UsageWindow(
             copying: self, paceStatus: other.paceStatus, historicalPace: other.historicalPace,
             durationSeconds: other.durationSeconds, windowMinutes: other.windowMinutes)
+    }
+
+    /// This window with its `accountScope` reason replaced by
+    /// `accountFetchFailed`; any other window is returned unchanged.
+    package func markingAccountFetchFailed() -> UsageWindow {
+        guard paceStatus.state == .unavailable, paceStatus.reason == .accountScope else { return self }
+        let status = PaceStatus(
+            state: .unavailable, windowKey: paceStatus.windowKey,
+            durationSeconds: paceStatus.durationSeconds, durationSource: paceStatus.durationSource,
+            completeCycles: paceStatus.completeCycles, reason: .accountFetchFailed)
+        return UsageWindow(
+            copying: self, paceStatus: status, historicalPace: historicalPace,
+            durationSeconds: durationSeconds, windowMinutes: windowMinutes)
     }
 
     private init(

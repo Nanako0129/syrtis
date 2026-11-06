@@ -365,6 +365,7 @@
 "Pace unavailable · missing reset" = "無步調資料 · 缺少重置時間";
 "Pace unavailable · invalid quota data" = "無步調資料 · 額度資料無效";
 "Pace unavailable · account identity unavailable" = "無步調資料 · 無法取得帳號識別";
+"Pace unavailable · this account's quota check failed" = "無步調資料 · 這個帳號的額度查詢失敗";
 "Pace unavailable · history storage full" = "無步調資料 · 歷史儲存空間已滿";
 "Pace unavailable · history unavailable" = "無步調資料 · 沒有歷史資料";
 "Pace unavailable · non-recurring quota" = "無步調資料 · 非週期性額度";

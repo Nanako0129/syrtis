@@ -675,7 +675,10 @@ final class AntigravityAutoCapture: ObservableObject {
 /// and strip are read under the captured account's own scope
 /// (`AgentUsageSnapshot.adoptingHistory(of:)`). `accountKey` stays nil and no
 /// scope is rewritten; the captured account is still fetched and recorded in
-/// the core. If it errored or has no windows the primary is left as it was.
+/// the core. If it has no windows the primary is left as it was. If it
+/// errored (e.g. Google blocked the account), its card is still dropped, and
+/// the primary's `accountScope` windows say `accountFetchFailed`
+/// ("this account's quota check failed") instead of an unknown identity.
 /// Applied to BOTH `AgentUsagePublicationCoordinator.resolve` and
 /// `.latestPayload`, which every quota consumer reads. Idempotent.
 enum AntigravityDedup {
