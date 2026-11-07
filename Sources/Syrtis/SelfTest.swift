@@ -21565,6 +21565,8 @@ enum SelfTest {
         // run pins the shapes; other labels pass through unchanged.
         expect(WindowUsageCard.shortLabel("Gemini Models · Weekly Limit Remaining") == "Gemini · Weekly"
                    && WindowUsageCard.shortLabel("Claude and GPT models · Five Hour Limit Remaining") == "Claude/GPT · 5h"
+                   && WindowUsageCard.shortLabel("Gemini Models · Weekly Limit") == "Gemini · Weekly"
+                   && WindowUsageCard.shortLabel("Claude and GPT models · Five Hour Limit") == "Claude/GPT · 5h"
                    && WindowUsageCard.shortLabel("Session") == "Session"
                    && WindowUsageCard.shortLabel("Codex Spark · 5h") == "Codex Spark · 5h",
                "WCP-label grouped Antigravity window names are shortened; other labels are unchanged")
@@ -21573,6 +21575,7 @@ enum SelfTest {
         expect(WindowUsageCard.shortLabel("Gemini 4 Argon · Gemini 4 Argon Weekly Limit") == "Gemini 4 Argon · Weekly"
                    && WindowUsageCard.shortLabel("Gemini 4 Argon · Gemini 4 Argon Five Hour Limit") == "Gemini 4 Argon · 5h"
                    && WindowUsageCard.shortLabel("Gemini 4 Argon · Other Weekly Limit") == "Gemini 4 Argon · Other Weekly Limit"
+                   && WindowUsageCard.shortLabel("Gemini Models · Other Limit") == "Gemini Models · Other Limit"
                    && WindowUsageCard.shortLabel("Gemini 4 Argon · Gemini 4 Argon Limit") == "Gemini 4 Argon · Gemini 4 Argon Limit",
                "WCP-label the Argon \"<group> <window> Limit\" bucket is shortened; a bucket naming another group is not")
 
