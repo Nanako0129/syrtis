@@ -3,6 +3,28 @@
     <channel>
         <title>TokenBar updates</title>
         <item>
+            <title>2.11.2</title>
+            <pubDate>Sat, 07 Nov 2026 09:13:26 +0000</pubDate>
+            <link>https://github.com/Nanako0129/syrtis/releases/tag/v2.11.2</link>
+            <sparkle:version>1799</sparkle:version>
+            <sparkle:shortVersionString>2.11.2</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
+            <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
+            <description><![CDATA[<b>Fixes:</b>
+<ul>
+<li>Cursor usage syncs again for accounts moved to Cursor's new billing: when the old usage endpoint's answer has no list of usage events, Syrtis reads v2/query-billing-items instead. Usage from before the switch is kept, sessions are counted per day, and plan-included rows are priced from Syrtis's own table. A failure shows a code such as "(billing_v2_team_required)". This has not run against an account that is actually on the new billing; it was tested against a stand-in server, and an account still on the old billing synced as before. Thanks @ohari5336.</li>
+<li>Antigravity cards show the Gemini bars again, and Gemini 4 Argon for an account that has it, by reading Google's quota summary from its daily host. The four read-only quota requests now send the User-Agent antigravity/hub/2.23.0 with the platform, the way the Antigravity hub does.</li>
+<li>A merged Antigravity card whose captured account failed its own quota check now reads "Pace unavailable · this account's quota check failed" instead of "account identity unavailable". Covered by tests, not seen on a running app.</li>
+</ul>
+<b>Known issues:</b>
+<ul>
+<li>The merged card does not show why the captured account's check failed.</li>
+<li>Once, on a test build, the Antigravity primary showed an extra card from the agy CLI that did not come back on relaunch; the cause is not known.</li>
+</ul>
+]]></description>
+            <enclosure url="https://github.com/Nanako0129/syrtis/releases/download/v2.11.2/Syrtis.app.tar.gz" length="14959267" type="application/octet-stream" sparkle:edSignature="n+KrSYuv4Eyc2lZhax48oNMlbFSQDQvdSFR+nvoMX9ea8XDUeHy7amPmTc8zu2dzhxVnOIBgktN59+NNHdeXCA=="/>
+        </item>
+        <item>
             <title>2.11.1</title>
             <pubDate>Wed, 04 Nov 2026 11:11:07 +0000</pubDate>
             <link>https://github.com/Nanako0129/syrtis/releases/tag/v2.11.1</link>
@@ -101,21 +123,6 @@
 </ul>
 ]]></description>
             <enclosure url="https://github.com/Nanako0129/syrtis/releases/download/v2.9.1/Syrtis.app.tar.gz" length="14121962" type="application/octet-stream" sparkle:edSignature="RN6z65olV0Yt7/eNcMQDgU2Uzh0RoMR49XJXlV4U+gIdHHVTCYyXdQmsxS63FzF/kVgjiKEdeq2LUiJze92DBw=="/>
-        </item>
-        <item>
-            <title>2.9.0</title>
-            <pubDate>Sat, 17 Oct 2026 16:29:25 +0000</pubDate>
-            <link>https://github.com/Nanako0129/syrtis/releases/tag/v2.9.0</link>
-            <sparkle:version>1592</sparkle:version>
-            <sparkle:shortVersionString>2.9.0</sparkle:shortVersionString>
-            <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
-            <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
-            <description><![CDATA[<b>Features:</b>
-<ul>
-<li>Menu bar gauge icons now show a letter for the length of the window they follow: H (up to 6 hours), D (about a day), W (about a week), M (about a month). Turn it off with "Show window length letter" in Settings.</li>
-</ul>
-]]></description>
-            <enclosure url="https://github.com/Nanako0129/syrtis/releases/download/v2.9.0/Syrtis.app.tar.gz" length="14117728" type="application/octet-stream" sparkle:edSignature="22vbKDLyjqL7ptXfAII6s/dFTPn+3kDopFuMzn1eteQhkXowQzfsCdX4BpjJRIC8b+DCed8k3le6cmsphMdrAw=="/>
         </item>
         <item>
             <title>1.1.1</title>
