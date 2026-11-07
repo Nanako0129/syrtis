@@ -1,0 +1,8 @@
+Fixes:
+- Cursor usage syncs again for accounts moved to Cursor's new billing: when the old usage endpoint's answer has no list of usage events, Syrtis reads v2/query-billing-items instead. Usage from before the switch is kept, sessions are counted per day, and plan-included rows are priced from Syrtis's own table. A failure shows a code such as "(billing_v2_team_required)". This has not run against an account that is actually on the new billing; it was tested against a stand-in server, and an account still on the old billing synced as before. Thanks @ohari5336.
+- Antigravity cards show the Gemini bars again, and Gemini 4 Argon for an account that has it, by reading Google's quota summary from its daily host. The four read-only quota requests now send the User-Agent antigravity/hub/2.23.0 with the platform, the way the Antigravity hub does.
+- A merged Antigravity card whose captured account failed its own quota check now reads "Pace unavailable · this account's quota check failed" instead of "account identity unavailable". Covered by tests, not seen on a running app.
+
+Known issues:
+- The merged card does not show why the captured account's check failed.
+- Once, on a test build, the Antigravity primary showed an extra card from the agy CLI that did not come back on relaunch; the cause is not known.
