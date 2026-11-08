@@ -26,8 +26,14 @@ public struct ModelReportEntry: Decodable, Sendable {
     /// decodes.
     public let costEstimate: Double?
     /// Set only on a row `tabEntries(clientIds:)` merged from several clients:
-    /// each client's token total, largest first. Never on the wire.
+    /// each client's token total, largest first, ties by client id. Never on
+    /// the wire.
     public var clientParts: [ClientPart]? = nil
+    /// True for a row `tabEntries(clientIds:)` keyed by model and provider in a
+    /// multi-client tab, merged or not yet: its identity must not depend on
+    /// which client it came from, or it would change when a second client
+    /// starts using the model. Never on the wire.
+    public var tabKeyed = false
 
     private enum CodingKeys: String, CodingKey {
         case client, model, provider, input, output, cacheRead, cacheWrite, reasoning, total
@@ -126,7 +132,9 @@ public extension ModelReport {
     /// tab covers more than one client, one row per model and provider across
     /// them (the Antigravity tab's `antigravity-cli` and `antigravity-extension`
     /// both report `gemini-3.8-flash`/google; maintainer decision 2026-11-08). A
-    /// merged row lists every client's token total in `clientParts`.
+    /// merged row lists every client's token total in `clientParts`; its
+    /// `client` is whichever client the engine listed first, so do not key or
+    /// label a `tabKeyed` row by it.
     ///
     /// A row whose own cost is flagged by `implausibleCostRatio` is never
     /// merged: summed with a healthy row of the same model its ratio would
@@ -140,8 +148,9 @@ public extension ModelReport {
         return Self.fold(perClient) { entry in
             entry.implausibleCostRatio == nil ? "\(entry.model)\u{0}\(entry.provider)" : nil
         }.map { group in
-            guard group.members.count > 1 else { return group.row }
             var row = group.row
+            row.tabKeyed = row.implausibleCostRatio == nil || group.members.count > 1
+            guard group.members.count > 1 else { return row }
             row.clientParts = group.members
                 .map { ClientPart(client: $0.client, total: $0.total) }
                 .sorted { $0.total != $1.total ? $0.total > $1.total : $0.client < $1.client }
@@ -158,13 +167,14 @@ public extension ModelReport {
         var indices: [String: Int] = [:]
         var groups: [(row: ModelReportEntry, members: [ModelReportEntry])] = []
         for entry in rows {
-            guard let key = key(entry), let index = indices[key] else {
-                if let key = key(entry) { indices[key] = groups.count }
-                groups.append((entry, [entry]))
+            let groupKey = key(entry)
+            if let groupKey, let index = indices[groupKey] {
+                groups[index].row = merged(groups[index].row, entry)
+                groups[index].members.append(entry)
                 continue
             }
-            groups[index].row = merged(groups[index].row, entry)
-            groups[index].members.append(entry)
+            if let groupKey { indices[groupKey] = groups.count }
+            groups.append((entry, [entry]))
         }
         return groups
     }

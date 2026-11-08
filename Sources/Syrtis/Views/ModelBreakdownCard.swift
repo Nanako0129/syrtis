@@ -369,10 +369,11 @@ struct ModelUsageTooltip: View {
 
 extension ModelReportEntry {
     /// Stable row identity across re-sorts (client+model+provider triple). A
-    /// row merged across clients is unique by model+provider in its tab, and
-    /// its first client depends on the engine's row order, so it is left out.
+    /// `tabKeyed` row is unique by model+provider in its tab and its client
+    /// depends on the engine's row order, so the client is left out; a flagged
+    /// row in such a tab keeps the triple and cannot collide with it.
     var rowID: String {
-        clientParts == nil ? "\(client)|\(model)|\(provider)" : "*|\(model)|\(provider)"
+        tabKeyed ? "*|\(model)|\(provider)" : "\(client)|\(model)|\(provider)"
     }
 }
 

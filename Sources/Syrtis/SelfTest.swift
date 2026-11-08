@@ -1721,6 +1721,37 @@ enum SelfTest {
         expect(
             tiedTab.count == 1 && tiedTab.first?.clientParts?.map(\.client) == ["alpha", "zeta"],
             "tied client parts order by client id")
+        // Row identity in a multi-client tab: the same with the engine's row
+        // order reversed, and the same before and after a second client starts
+        // using the model (hover and ForEach identity hold across refreshes).
+        let forward = tabReportOf([
+            tabRow("a", "p", 10, cost: 1, estimate: 1), tabRow("b", "p", 20, cost: 1, estimate: 1),
+        ]).tabEntries(clientIds: ["a", "b"])
+        let reversed = tabReportOf([
+            tabRow("b", "p", 20, cost: 1, estimate: 1), tabRow("a", "p", 10, cost: 1, estimate: 1),
+        ]).tabEntries(clientIds: ["a", "b"])
+        let alone = tabReportOf([tabRow("b", "p", 20, cost: 1, estimate: 1)])
+            .tabEntries(clientIds: ["a", "b"])
+        expect(
+            forward.map(\.rowID) == ["*|m|p"] && reversed.map(\.rowID) == ["*|m|p"]
+                && alone.map(\.rowID) == ["*|m|p"] && alone.first?.clientParts == nil,
+            "a multi-client tab's row id ignores client order and whether another client joined")
+        // Three clients, one flagged: the flagged row stands alone with its own
+        // id and ratio, the two healthy ones still merge.
+        let threeTab = tabReportOf([
+            tabRow("a", "p", 10, cost: 300, estimate: 1),
+            tabRow("b", "p", 10, cost: 1, estimate: 1),
+            tabRow("c", "p", 30, cost: 1, estimate: 1),
+        ]).tabEntries(clientIds: ["a", "b", "c"])
+        let flaggedRow = threeTab.first { $0.client == "a" }
+        let healthyRow = threeTab.first { $0.client != "a" }
+        expect(
+            threeTab.count == 2
+                && flaggedRow?.rowID == "a|m|p" && flaggedRow?.clientParts == nil
+                && flaggedRow?.implausibleCostRatio != nil
+                && healthyRow?.rowID == "*|m|p" && healthyRow?.total == 40
+                && healthyRow?.clientParts?.map(\.client) == ["c", "b"],
+            "with one flagged client of three, the flagged row stands alone and the healthy two merge")
 
         // Implausible self-reported cost. A client that records its own cost
         // (OpenCode, MiMo Code) has it taken verbatim by tokscale-core and
