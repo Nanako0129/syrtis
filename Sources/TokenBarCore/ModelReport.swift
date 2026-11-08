@@ -25,6 +25,31 @@ public struct ModelReportEntry: Decodable, Sendable {
     /// Optional so a report serialized before this field existed still
     /// decodes.
     public let costEstimate: Double?
+    /// Set only on a row `tabEntries(clientIds:)` merged from several clients:
+    /// each client's token total, largest first, ties by client id. Never on
+    /// the wire.
+    public var clientParts: [ClientPart]? = nil
+    /// True for a row `tabEntries(clientIds:)` keyed by model and provider in a
+    /// multi-client tab, merged or not yet: its identity must not depend on
+    /// which client it came from, or it would change when a second client
+    /// starts using the model. Never on the wire.
+    public var tabKeyed = false
+
+    private enum CodingKeys: String, CodingKey {
+        case client, model, provider, input, output, cacheRead, cacheWrite, reasoning, total
+        case messageCount, cost, msPer1kTokens, costEstimate
+    }
+}
+
+/// One client's share of a model row merged across a tab's clients.
+public struct ClientPart: Sendable, Equatable {
+    public let client: String
+    public let total: Int64
+
+    public init(client: String, total: Int64) {
+        self.client = client
+        self.total = total
+    }
 }
 
 public extension ModelReportEntry {
@@ -100,55 +125,99 @@ public extension ModelReport {
     /// existing cards. Throughput is intentionally dropped when rows merge:
     /// tokscale only computes it honestly over the complete rollup.
     var modelLevelEntries: [ModelReportEntry] {
-        var indices: [String: Int] = [:]
-        var folded: [ModelReportEntry] = []
+        Self.fold(entries) { "\($0.client)\u{0}\($0.model)" }.map(\.row)
+    }
 
-        for entry in entries {
-            let key = "\(entry.client)\u{0}\(entry.model)"
-            guard let index = indices[key] else {
-                indices[key] = folded.count
-                folded.append(entry)
+    /// The rows one tab shows: `modelLevelEntries` of `clientIds`, and when the
+    /// tab covers more than one client, one row per model and provider across
+    /// them (the Antigravity tab's `antigravity-cli` and `antigravity-extension`
+    /// both report `gemini-3.8-flash`/google; maintainer decision 2026-11-08). A
+    /// merged row lists every client's token total in `clientParts`; its
+    /// `client` is whichever client the engine listed first, so do not label a
+    /// merged row (`clientParts != nil`) by it, nor key any `tabKeyed` row by it
+    /// (an unmerged one still has exactly one client and may be labelled).
+    ///
+    /// A row whose own cost is flagged by `implausibleCostRatio` is never
+    /// merged: summed with a healthy row of the same model its ratio would
+    /// drop under the threshold and the warning would vanish while the
+    /// inflated cost stayed on screen.
+    func tabEntries(clientIds: [String]) -> [ModelReportEntry] {
+        let allow = Set(clientIds)
+        let perClient = modelLevelEntries.filter { allow.contains($0.client) }
+        guard allow.count > 1 else { return perClient }
+
+        return Self.fold(perClient) { entry in
+            entry.implausibleCostRatio == nil ? "\(entry.model)\u{0}\(entry.provider)" : nil
+        }.map { group in
+            var row = group.row
+            row.tabKeyed = row.implausibleCostRatio == nil || group.members.count > 1
+            guard group.members.count > 1 else { return row }
+            row.clientParts = group.members
+                .map { ClientPart(client: $0.client, total: $0.total) }
+                .sorted { $0.total != $1.total ? $0.total > $1.total : $0.client < $1.client }
+            return row
+        }
+    }
+
+    /// Fold `rows` that share a key into one (`merged`), in first-seen order;
+    /// a nil key keeps the row on its own. Each group keeps its members so a
+    /// caller can describe what went in.
+    private static func fold(
+        _ rows: [ModelReportEntry], key: (ModelReportEntry) -> String?
+    ) -> [(row: ModelReportEntry, members: [ModelReportEntry])] {
+        var indices: [String: Int] = [:]
+        var groups: [(row: ModelReportEntry, members: [ModelReportEntry])] = []
+        for entry in rows {
+            let groupKey = key(entry)
+            if let groupKey, let index = indices[groupKey] {
+                groups[index].row = merged(groups[index].row, entry)
+                groups[index].members.append(entry)
                 continue
             }
-
-            let current = folded[index]
-            let input = current.input.saturatingAdding(entry.input)
-            let output = current.output.saturatingAdding(entry.output)
-            let cacheRead = current.cacheRead.saturatingAdding(entry.cacheRead)
-            let cacheWrite = current.cacheWrite.saturatingAdding(entry.cacheWrite)
-            let reasoning = current.reasoning.saturatingAdding(entry.reasoning)
-            let messageCount = current.messageCount.addingReportingOverflow(entry.messageCount)
-            folded[index] = ModelReportEntry(
-                client: current.client,
-                model: current.model,
-                provider: Self.mergedProviders(current.provider, entry.provider),
-                input: input,
-                output: output,
-                cacheRead: cacheRead,
-                cacheWrite: cacheWrite,
-                reasoning: reasoning,
-                total: input
-                    .saturatingAdding(output)
-                    .saturatingAdding(cacheRead)
-                    .saturatingAdding(cacheWrite)
-                    .saturatingAdding(reasoning),
-                messageCount: messageCount.overflow
-                    ? Int.max
-                    : messageCount.partialValue,
-                cost: current.cost + entry.cost,
-                msPer1kTokens: nil,
-                // Sum the estimates alongside the costs, so the ratio taken
-                // from the merged row describes the merged cost. All-or-
-                // nothing: if any contributing provider could not be priced,
-                // the sum is a partial denominator that would overstate the
-                // ratio for the whole row, so the merged row reports no
-                // estimate rather than a misleading one.
-                costEstimate: current.costEstimate.flatMap { c in
-                    entry.costEstimate.map { c + $0 }
-                }
-            )
+            if let groupKey { indices[groupKey] = groups.count }
+            groups.append((entry, [entry]))
         }
-        return folded
+        return groups
+    }
+
+    /// `current` plus `entry`, keeping `current`'s client and model. Throughput
+    /// is dropped: tokscale only computes it honestly over the complete rollup.
+    private static func merged(_ current: ModelReportEntry, _ entry: ModelReportEntry) -> ModelReportEntry {
+        let input = current.input.saturatingAdding(entry.input)
+        let output = current.output.saturatingAdding(entry.output)
+        let cacheRead = current.cacheRead.saturatingAdding(entry.cacheRead)
+        let cacheWrite = current.cacheWrite.saturatingAdding(entry.cacheWrite)
+        let reasoning = current.reasoning.saturatingAdding(entry.reasoning)
+        let messageCount = current.messageCount.addingReportingOverflow(entry.messageCount)
+        return ModelReportEntry(
+            client: current.client,
+            model: current.model,
+            provider: Self.mergedProviders(current.provider, entry.provider),
+            input: input,
+            output: output,
+            cacheRead: cacheRead,
+            cacheWrite: cacheWrite,
+            reasoning: reasoning,
+            total: input
+                .saturatingAdding(output)
+                .saturatingAdding(cacheRead)
+                .saturatingAdding(cacheWrite)
+                .saturatingAdding(reasoning),
+            messageCount: messageCount.overflow
+                ? Int.max
+                : messageCount.partialValue,
+            cost: current.cost + entry.cost,
+            msPer1kTokens: nil,
+            // Sum the estimates alongside the costs, so the ratio taken
+            // from the merged row describes the merged cost. All-or-
+            // nothing: if any contributing row could not be priced, the
+            // sum is a partial denominator that would overstate the ratio
+            // for the whole row, so the merged row reports no estimate
+            // rather than a misleading one.
+            costEstimate: current.costEstimate.flatMap { c in
+                entry.costEstimate.map { c + $0 }
+            }
+        )
     }
 
     private static func mergedProviders(_ first: String, _ second: String) -> String {

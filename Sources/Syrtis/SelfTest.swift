@@ -1647,6 +1647,112 @@ enum SelfTest {
             modelLevelEntries.first { $0.model == "shared-model" }?.msPer1kTokens == nil,
             "provider-split model fold omits unrecomputable throughput")
 
+        // A tab covering several clients shows one row per model (the
+        // Antigravity tab: antigravity-cli and antigravity-extension both report
+        // gemini-3.8-flash), with each client's tokens in clientParts; a
+        // one-client tab keeps its rows, and clients outside the tab stay out.
+        let tabReportJSON = """
+        {"entries":[
+          {"client":"antigravity-cli","model":"gemini-3.8-flash","provider":"google",
+           "input":900,"output":0,"cacheRead":0,"cacheWrite":0,"reasoning":0,
+           "total":900,"messageCount":9,"cost":0.9,"msPer1kTokens":1.0,"costEstimate":1.0},
+          {"client":"antigravity-extension","model":"gemini-3.8-flash","provider":"google",
+           "input":100,"output":0,"cacheRead":0,"cacheWrite":0,"reasoning":0,
+           "total":100,"messageCount":1,"cost":0.1,"msPer1kTokens":1.0,"costEstimate":0.5},
+          {"client":"antigravity-cli","model":"gemini-3.1-pro","provider":"google",
+           "input":50,"output":0,"cacheRead":0,"cacheWrite":0,"reasoning":0,
+           "total":50,"messageCount":1,"cost":0.2,"msPer1kTokens":1.0},
+          {"client":"claude","model":"gemini-3.8-flash","provider":"google",
+           "input":7,"output":0,"cacheRead":0,"cacheWrite":0,"reasoning":0,
+           "total":7,"messageCount":1,"cost":0.01,"msPer1kTokens":1.0}
+        ],"totalInput":1057,"totalOutput":0,"totalCacheRead":0,"totalCacheWrite":0,
+        "totalMessages":12,"totalCost":1.21}
+        """
+        let tabReport = try! JSONDecoder().decode(ModelReport.self, from: Data(tabReportJSON.utf8))
+        let antigravityRows = tabReport.tabEntries(clientIds: ["antigravity-cli", "antigravity-extension"])
+        let mergedFlash = antigravityRows.first { $0.model == "gemini-3.8-flash" }
+        expect(
+            antigravityRows.count == 2
+                && antigravityRows.filter { $0.model == "gemini-3.8-flash" }.count == 1
+                && mergedFlash?.total == 1000 && mergedFlash?.messageCount == 10
+                && mergedFlash?.costEstimate == 1.5
+                && mergedFlash?.clientParts == [
+                    ClientPart(client: "antigravity-cli", total: 900),
+                    ClientPart(client: "antigravity-extension", total: 100),
+                ]
+                && antigravityRows.first { $0.model == "gemini-3.1-pro" }?.clientParts == nil,
+            "a multi-client tab merges one model's rows and lists each client's tokens")
+        let claudeRows = tabReport.tabEntries(clientIds: ["claude"])
+        expect(
+            claudeRows.count == 1 && claudeRows.first?.total == 7 && claudeRows.first?.clientParts == nil,
+            "a one-client tab keeps its own rows and adds no client parts")
+        // Same model, but another provider, a flagged self-reported cost, or a
+        // tie: providers stay apart (their colours differ), a flagged row is
+        // never diluted into a healthy one, and tied parts order by client.
+        func tabRow(_ client: String, _ provider: String, _ total: Int, cost: Double, estimate: Double) -> String {
+            """
+            {"client":"\(client)","model":"m","provider":"\(provider)",
+             "input":\(total),"output":0,"cacheRead":0,"cacheWrite":0,"reasoning":0,
+             "total":\(total),"messageCount":1,"cost":\(cost),"msPer1kTokens":null,"costEstimate":\(estimate)}
+            """
+        }
+        func tabReportOf(_ rows: [String]) -> ModelReport {
+            try! JSONDecoder().decode(ModelReport.self, from: Data("""
+                {"entries":[\(rows.joined(separator: ","))],"totalInput":0,"totalOutput":0,
+                 "totalCacheRead":0,"totalCacheWrite":0,"totalMessages":0,"totalCost":0}
+                """.utf8))
+        }
+        let providerSplitTab = tabReportOf([
+            tabRow("a", "openrouter", 10, cost: 1, estimate: 1), tabRow("b", "anthropic", 10, cost: 1, estimate: 1),
+        ]).tabEntries(clientIds: ["a", "b"])
+        expect(
+            providerSplitTab.count == 2 && providerSplitTab.allSatisfy { $0.clientParts == nil },
+            "a model from two providers stays two rows in a multi-client tab")
+        let flaggedTab = tabReportOf([
+            tabRow("a", "p", 10, cost: 300, estimate: 1), tabRow("b", "p", 10, cost: 1, estimate: 100),
+        ]).tabEntries(clientIds: ["a", "b"])
+        expect(
+            flaggedTab.count == 2
+                && flaggedTab.first { $0.client == "a" }?.implausibleCostRatio != nil,
+            "a row with a flagged cost is not merged, so its warning survives")
+        let tiedTab = tabReportOf([
+            tabRow("zeta", "p", 5, cost: 1, estimate: 1), tabRow("alpha", "p", 5, cost: 1, estimate: 1),
+        ]).tabEntries(clientIds: ["zeta", "alpha"])
+        expect(
+            tiedTab.count == 1 && tiedTab.first?.clientParts?.map(\.client) == ["alpha", "zeta"],
+            "tied client parts order by client id")
+        // Row identity in a multi-client tab: the same with the engine's row
+        // order reversed, and the same before and after a second client starts
+        // using the model (hover and ForEach identity hold across refreshes).
+        let forward = tabReportOf([
+            tabRow("a", "p", 10, cost: 1, estimate: 1), tabRow("b", "p", 20, cost: 1, estimate: 1),
+        ]).tabEntries(clientIds: ["a", "b"])
+        let reversed = tabReportOf([
+            tabRow("b", "p", 20, cost: 1, estimate: 1), tabRow("a", "p", 10, cost: 1, estimate: 1),
+        ]).tabEntries(clientIds: ["a", "b"])
+        let alone = tabReportOf([tabRow("b", "p", 20, cost: 1, estimate: 1)])
+            .tabEntries(clientIds: ["a", "b"])
+        expect(
+            forward.map(\.rowID) == ["*|m|p"] && reversed.map(\.rowID) == ["*|m|p"]
+                && alone.map(\.rowID) == ["*|m|p"] && alone.first?.clientParts == nil,
+            "a multi-client tab's row id ignores client order and whether another client joined")
+        // Three clients, one flagged: the flagged row stands alone with its own
+        // id and ratio, the two healthy ones still merge.
+        let threeTab = tabReportOf([
+            tabRow("a", "p", 10, cost: 300, estimate: 1),
+            tabRow("b", "p", 10, cost: 1, estimate: 1),
+            tabRow("c", "p", 30, cost: 1, estimate: 1),
+        ]).tabEntries(clientIds: ["a", "b", "c"])
+        let flaggedRow = threeTab.first { $0.client == "a" }
+        let healthyRow = threeTab.first { $0.client != "a" }
+        expect(
+            threeTab.count == 2
+                && flaggedRow?.rowID == "a|m|p" && flaggedRow?.clientParts == nil
+                && flaggedRow?.implausibleCostRatio != nil
+                && healthyRow?.rowID == "*|m|p" && healthyRow?.total == 40
+                && healthyRow?.clientParts?.map(\.client) == ["c", "b"],
+            "with one flagged client of three, the flagged row stands alone and the healthy two merge")
+
         // Implausible self-reported cost. A client that records its own cost
         // (OpenCode, MiMo Code) has it taken verbatim by tokscale-core and
         // never priced, so this comparison against the local estimate is the
@@ -4037,8 +4143,8 @@ enum SelfTest {
             return cases
         }()
         expect(
-            groupingCases.count >= 17 && groupingCases.allSatisfy { $0.count == 2 },
-            "the model-grouping case table was found and has its 17 rows (without this "
+            groupingCases.count >= 28 && groupingCases.allSatisfy { $0.count == 2 },
+            "the model-grouping case table was found and has its 28 rows (without this "
                 + "every case below would pass on an empty table)")
         for pair in groupingCases where pair.count == 2 {
             expect(

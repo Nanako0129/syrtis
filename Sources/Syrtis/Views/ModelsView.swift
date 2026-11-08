@@ -34,9 +34,7 @@ struct ModelsView: View {
     ]
 
     var body: some View {
-        let allow = Set(clientIds)
-        let rows = (report?.modelLevelEntries ?? [])
-            .filter { allow.contains($0.client) }
+        let rows = (report?.tabEntries(clientIds: clientIds) ?? [])
             .sorted { $0.cost != $1.cost ? $0.cost > $1.cost : $0.total > $1.total }
         let totalCost = rows.reduce(0) { $0 + $1.cost }
         let totalTokens = rows.reduce(Int64(0)) { $0.saturatingAdding($1.total) }
@@ -179,7 +177,8 @@ struct ModelsView: View {
         ModelUsageTooltip(
             model: entry.model,
             provider: entry.provider,
-            context: ClientRegistry.style(entry.client).displayName,
+            // A row merged across the tab's clients names them in its parts.
+            context: entry.clientParts == nil ? ClientRegistry.style(entry.client).displayName : nil,
             color: colors.color(entry.provider, entry.model),
             input: entry.input,
             output: entry.output,
@@ -189,6 +188,7 @@ struct ModelsView: View {
             total: entry.total,
             cost: entry.cost,
             costRatio: entry.implausibleCostRatio,
+            clientParts: entry.clientParts,
             measuredSize: $tooltipSize)
     }
 }

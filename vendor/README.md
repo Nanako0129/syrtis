@@ -4,7 +4,7 @@ id: vendor-readme
 kind: reference
 scope: repository
 read_when: advancing or auditing the vendor/tokscale-core consumer pin
-last_verified: 2026-11-04
+last_verified: 2026-11-08
 sources: [".gitmodules", "vendor/tokscale-core", "docs/knowledge/vendor-tokscale.md"]
 ---
 
@@ -19,8 +19,8 @@ repository as a Git submodule. Consumer integration rules are documented in
 |---|---|
 | Path | `vendor/tokscale-core` |
 | Repository | `https://github.com/Nanako0129/tokscale-core.git` |
-| Reviewed pin | `fc339e98237fcb71f32ab1208b61aa77c3c35c02` |
-| Upstream and local-patch ledger | Immutable [`UPSTREAM.md`](https://github.com/Nanako0129/tokscale-core/blob/fc339e98237fcb71f32ab1208b61aa77c3c35c02/UPSTREAM.md) |
+| Reviewed pin | `e156d67caa9708458fd2030f379d3c2a77ff05bf` |
+| Upstream and local-patch ledger | Immutable [`UPSTREAM.md`](https://github.com/Nanako0129/tokscale-core/blob/e156d67caa9708458fd2030f379d3c2a77ff05bf/UPSTREAM.md) |
 
 ## Ownership
 
