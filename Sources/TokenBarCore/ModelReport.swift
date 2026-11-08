@@ -133,8 +133,9 @@ public extension ModelReport {
     /// them (the Antigravity tab's `antigravity-cli` and `antigravity-extension`
     /// both report `gemini-3.8-flash`/google; maintainer decision 2026-11-08). A
     /// merged row lists every client's token total in `clientParts`; its
-    /// `client` is whichever client the engine listed first, so do not key or
-    /// label a `tabKeyed` row by it.
+    /// `client` is whichever client the engine listed first, so do not label a
+    /// merged row (`clientParts != nil`) by it, nor key any `tabKeyed` row by it
+    /// (an unmerged one still has exactly one client and may be labelled).
     ///
     /// A row whose own cost is flagged by `implausibleCostRatio` is never
     /// merged: summed with a healthy row of the same model its ratio would
