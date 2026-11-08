@@ -24,10 +24,9 @@ struct StatsView: View {
     /// unavailable rather than as a request still in flight.
     var reportLoading = false
 
+    /// The same rows the tab's Models list shows, so the two agree.
     private var favorite: ModelReportEntry? {
-        let allow = Set(clientIds)
-        return (modelReport?.modelLevelEntries ?? [])
-            .filter { allow.contains($0.client) }
+        (modelReport?.tabEntries(clientIds: clientIds) ?? [])
             .max { $0.cost < $1.cost }
     }
 

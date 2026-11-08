@@ -320,6 +320,8 @@ struct ModelUsageTooltip: View {
                 ForEach(clientParts, id: \.client) { part in
                     HStack {
                         Text(ClientRegistry.style(part.client).displayName)
+                            .lineLimit(1)
+                            .truncationMode(.tail)
                         Spacer()
                         Text("\(Format.compactTokens(part.total)) · \(Int((Double(part.total) / Double(max(1, total)) * 100).rounded()))%")
                             .foregroundStyle(.secondary)
@@ -366,8 +368,12 @@ struct ModelUsageTooltip: View {
 }
 
 extension ModelReportEntry {
-    /// Stable row identity across re-sorts (client+model+provider triple).
-    var rowID: String { "\(client)|\(model)|\(provider)" }
+    /// Stable row identity across re-sorts (client+model+provider triple). A
+    /// row merged across clients is unique by model+provider in its tab, and
+    /// its first client depends on the engine's row order, so it is left out.
+    var rowID: String {
+        clientParts == nil ? "\(client)|\(model)|\(provider)" : "*|\(model)|\(provider)"
+    }
 }
 
 extension CostPlausibility {

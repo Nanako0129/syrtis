@@ -1686,6 +1686,41 @@ enum SelfTest {
         expect(
             claudeRows.count == 1 && claudeRows.first?.total == 7 && claudeRows.first?.clientParts == nil,
             "a one-client tab keeps its own rows and adds no client parts")
+        // Same model, but another provider, a flagged self-reported cost, or a
+        // tie: providers stay apart (their colours differ), a flagged row is
+        // never diluted into a healthy one, and tied parts order by client.
+        func tabRow(_ client: String, _ provider: String, _ total: Int, cost: Double, estimate: Double) -> String {
+            """
+            {"client":"\(client)","model":"m","provider":"\(provider)",
+             "input":\(total),"output":0,"cacheRead":0,"cacheWrite":0,"reasoning":0,
+             "total":\(total),"messageCount":1,"cost":\(cost),"msPer1kTokens":null,"costEstimate":\(estimate)}
+            """
+        }
+        func tabReportOf(_ rows: [String]) -> ModelReport {
+            try! JSONDecoder().decode(ModelReport.self, from: Data("""
+                {"entries":[\(rows.joined(separator: ","))],"totalInput":0,"totalOutput":0,
+                 "totalCacheRead":0,"totalCacheWrite":0,"totalMessages":0,"totalCost":0}
+                """.utf8))
+        }
+        let providerSplitTab = tabReportOf([
+            tabRow("a", "openrouter", 10, cost: 1, estimate: 1), tabRow("b", "anthropic", 10, cost: 1, estimate: 1),
+        ]).tabEntries(clientIds: ["a", "b"])
+        expect(
+            providerSplitTab.count == 2 && providerSplitTab.allSatisfy { $0.clientParts == nil },
+            "a model from two providers stays two rows in a multi-client tab")
+        let flaggedTab = tabReportOf([
+            tabRow("a", "p", 10, cost: 300, estimate: 1), tabRow("b", "p", 10, cost: 1, estimate: 100),
+        ]).tabEntries(clientIds: ["a", "b"])
+        expect(
+            flaggedTab.count == 2
+                && flaggedTab.first { $0.client == "a" }?.implausibleCostRatio != nil,
+            "a row with a flagged cost is not merged, so its warning survives")
+        let tiedTab = tabReportOf([
+            tabRow("zeta", "p", 5, cost: 1, estimate: 1), tabRow("alpha", "p", 5, cost: 1, estimate: 1),
+        ]).tabEntries(clientIds: ["zeta", "alpha"])
+        expect(
+            tiedTab.count == 1 && tiedTab.first?.clientParts?.map(\.client) == ["alpha", "zeta"],
+            "tied client parts order by client id")
 
         // Implausible self-reported cost. A client that records its own cost
         // (OpenCode, MiMo Code) has it taken verbatim by tokscale-core and

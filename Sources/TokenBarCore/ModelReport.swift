@@ -119,51 +119,54 @@ public extension ModelReport {
     /// existing cards. Throughput is intentionally dropped when rows merge:
     /// tokscale only computes it honestly over the complete rollup.
     var modelLevelEntries: [ModelReportEntry] {
-        var indices: [String: Int] = [:]
-        var folded: [ModelReportEntry] = []
-
-        for entry in entries {
-            let key = "\(entry.client)\u{0}\(entry.model)"
-            guard let index = indices[key] else {
-                indices[key] = folded.count
-                folded.append(entry)
-                continue
-            }
-
-            folded[index] = Self.merged(folded[index], entry)
-        }
-        return folded
+        Self.fold(entries) { "\($0.client)\u{0}\($0.model)" }.map(\.row)
     }
 
     /// The rows one tab shows: `modelLevelEntries` of `clientIds`, and when the
-    /// tab covers more than one client, one row per model across them (the
-    /// Antigravity tab's `antigravity-cli` and `antigravity-extension` both
-    /// report `gemini-3.8-flash`; maintainer decision 2026-11-08). A merged row
-    /// keeps the first client's id for its identity and lists every client's
-    /// token total in `clientParts`.
+    /// tab covers more than one client, one row per model and provider across
+    /// them (the Antigravity tab's `antigravity-cli` and `antigravity-extension`
+    /// both report `gemini-3.8-flash`/google; maintainer decision 2026-11-08). A
+    /// merged row lists every client's token total in `clientParts`.
+    ///
+    /// A row whose own cost is flagged by `implausibleCostRatio` is never
+    /// merged: summed with a healthy row of the same model its ratio would
+    /// drop under the threshold and the warning would vanish while the
+    /// inflated cost stayed on screen.
     func tabEntries(clientIds: [String]) -> [ModelReportEntry] {
         let allow = Set(clientIds)
         let perClient = modelLevelEntries.filter { allow.contains($0.client) }
         guard allow.count > 1 else { return perClient }
 
+        return Self.fold(perClient) { entry in
+            entry.implausibleCostRatio == nil ? "\(entry.model)\u{0}\(entry.provider)" : nil
+        }.map { group in
+            guard group.members.count > 1 else { return group.row }
+            var row = group.row
+            row.clientParts = group.members
+                .map { ClientPart(client: $0.client, total: $0.total) }
+                .sorted { $0.total != $1.total ? $0.total > $1.total : $0.client < $1.client }
+            return row
+        }
+    }
+
+    /// Fold `rows` that share a key into one (`merged`), in first-seen order;
+    /// a nil key keeps the row on its own. Each group keeps its members so a
+    /// caller can describe what went in.
+    private static func fold(
+        _ rows: [ModelReportEntry], key: (ModelReportEntry) -> String?
+    ) -> [(row: ModelReportEntry, members: [ModelReportEntry])] {
         var indices: [String: Int] = [:]
-        var folded: [ModelReportEntry] = []
-        var parts: [[ClientPart]] = []
-        for entry in perClient {
-            let part = ClientPart(client: entry.client, total: entry.total)
-            guard let index = indices[entry.model] else {
-                indices[entry.model] = folded.count
-                folded.append(entry)
-                parts.append([part])
+        var groups: [(row: ModelReportEntry, members: [ModelReportEntry])] = []
+        for entry in rows {
+            guard let key = key(entry), let index = indices[key] else {
+                if let key = key(entry) { indices[key] = groups.count }
+                groups.append((entry, [entry]))
                 continue
             }
-            folded[index] = Self.merged(folded[index], entry)
-            parts[index].append(part)
+            groups[index].row = merged(groups[index].row, entry)
+            groups[index].members.append(entry)
         }
-        for index in folded.indices where parts[index].count > 1 {
-            folded[index].clientParts = parts[index].sorted { $0.total > $1.total }
-        }
-        return folded
+        return groups
     }
 
     /// `current` plus `entry`, keeping `current`'s client and model. Throughput
