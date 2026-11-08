@@ -252,7 +252,7 @@ mod tests {
         let table: serde_json::Value = serde_json::from_str(&text).expect("case table parses");
         let cases = table["cases"].as_array().expect("`cases` is an array");
         // Control: an empty or truncated table must not pass vacuously.
-        assert!(cases.len() >= 17, "case table has {} rows, expected >= 17", cases.len());
+        assert!(cases.len() >= 28, "case table has {} rows, expected >= 28", cases.len());
         for case in cases {
             let input = case[0].as_str().expect("input is a string");
             let expected = case[1].as_str().expect("expected is a string");

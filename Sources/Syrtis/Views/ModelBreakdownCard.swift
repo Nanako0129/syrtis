@@ -53,9 +53,7 @@ struct ModelBreakdownCard: View {
         zip(TokenKindPalette.all, picks).map { ($0.label, $0.color, $1) }
 
     var body: some View {
-        let allow = Set(clientIds)
-        let rows = (report?.modelLevelEntries ?? [])
-            .filter { allow.contains($0.client) }
+        let rows = (report?.tabEntries(clientIds: clientIds) ?? [])
             .sorted { $0.cost != $1.cost ? $0.cost > $1.cost : $0.total > $1.total }
         let totalCost = rows.reduce(0) { $0 + $1.cost }
 
@@ -235,7 +233,8 @@ struct ModelBreakdownCard: View {
         ModelUsageTooltip(
             model: entry.model,
             provider: entry.provider,
-            context: ClientRegistry.style(entry.client).displayName,
+            // A row merged across the tab's clients names them in its parts.
+            context: entry.clientParts == nil ? ClientRegistry.style(entry.client).displayName : nil,
             color: colors.color(entry.provider, entry.model),
             input: entry.input,
             output: entry.output,
@@ -245,6 +244,7 @@ struct ModelBreakdownCard: View {
             total: entry.total,
             cost: entry.cost,
             costRatio: entry.implausibleCostRatio,
+            clientParts: entry.clientParts,
             measuredSize: $tooltipSize)
     }
 }
@@ -266,6 +266,9 @@ struct ModelUsageTooltip: View {
     /// See `ModelReportEntry.implausibleCostRatio`. Defaults to nil so the day/month
     /// slice callers, which have no pricing comparison, need not pass it.
     var costRatio: Double? = nil
+    /// Per-client token totals of a row merged across a tab's clients
+    /// (`ModelReport.tabEntries`); nil for a single-client row.
+    var clientParts: [ClientPart]? = nil
     @Binding var measuredSize: CGSize
 
     private var kinds: [(label: String, color: String, value: Int64)] {
@@ -313,6 +316,18 @@ struct ModelUsageTooltip: View {
             Text([context, provider].compactMap { $0 }.joined(separator: " · "))
                 .font(.caption2)
                 .foregroundStyle(.tertiary)
+            if let clientParts {
+                ForEach(clientParts, id: \.client) { part in
+                    HStack {
+                        Text(ClientRegistry.style(part.client).displayName)
+                        Spacer()
+                        Text("\(Format.compactTokens(part.total)) · \(Int((Double(part.total) / Double(max(1, total)) * 100).rounded()))%")
+                            .foregroundStyle(.secondary)
+                    }
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+                }
+            }
             HStack {
                 Text("%@ tokens".localized(Format.compactTokens(total)))
                 Spacer()
