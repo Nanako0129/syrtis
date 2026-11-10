@@ -176,8 +176,8 @@ enum Owner<'a> {
     /// (both measured shapes, t3code's sample and the #520 reporter, carry
     /// it; no other spelling has been seen).
     OtherUser(&'a str),
-    /// Anything else: missing, empty id, or another id that is not
-    /// `type: user` (a team principal).
+    /// Anything else: a missing principal, an empty id, or another id whose
+    /// `type` is not exactly `user` (`team`, `organization`, `User`, none).
     Refused,
 }
 
