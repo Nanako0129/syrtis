@@ -9,8 +9,9 @@
 //! - The client (no redirects, https only) and the sensitive cookie are the
 //!   old walk's. Pages and body bytes are capped across every window of one
 //!   walk; any refusal (3xx/401/403/429/5xx, an `availability` answer,
-//!   an item that is not the walk's one user principal) ends the walk, and
-//!   the caller then writes nothing.
+//!   an item neither on the cookie's user id nor on the walk's one other
+//!   `type: user` principal, see `owner`) ends the walk, and the caller then
+//!   writes nothing.
 //! - Items are read into a typed struct with only the fields below:
 //!   `displayExtras.userEmail` is never deserialised; `principal.id` and
 //!   `billingItemId` live only in memory (comparison, dedupe). No log line.
@@ -171,8 +172,9 @@ struct Principal {
 enum Owner<'a> {
     /// The cookie's own user id, whatever `type` says (main's rule).
     Cookie,
-    /// Another non-empty id on a `type: user` principal (both measured
-    /// shapes, t3code's sample and the #520 reporter, carry `type: user`).
+    /// Another non-empty id on a `type: user` principal, compared without
+    /// case (both measured shapes, t3code's sample and the #520 reporter,
+    /// carry `type: user`).
     OtherUser(&'a str),
     /// Anything else: missing, empty id, or another id that is not
     /// `type: user` (a team principal).
@@ -185,7 +187,13 @@ fn owner<'a>(principal: Option<&'a Principal>, cookie_user: &str) -> Owner<'a> {
     };
     match principal.id.as_deref() {
         Some(id) if id == cookie_user => Owner::Cookie,
-        Some(id) if !id.is_empty() && principal.kind.as_deref() == Some("user") => {
+        Some(id)
+            if !id.is_empty()
+                && principal
+                    .kind
+                    .as_deref()
+                    .is_some_and(|kind| kind.eq_ignore_ascii_case("user")) =>
+        {
             Owner::OtherUser(id)
         }
         _ => Owner::Refused,

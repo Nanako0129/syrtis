@@ -281,9 +281,9 @@ enum CursorSync {
         static let billingV2Unavailable = "Cursor's new billing didn't provide this account's usage (%@). Syrtis will try again later."
         /// `billing_v2_no_items`: no earlier usage and V2 returned none.
         static let billingV2NoItems = "Cursor's new billing has no usage for this account yet (%@). Syrtis will try again later."
-        /// `billing_v2_principal_mismatch`: a V2 item was neither the cookie's user nor the walk's
-        /// one other `type: user` principal (a second other user, a team, a missing principal);
-        /// nothing saved.
+        /// `billing_v2_principal_mismatch`: a V2 item was neither on the cookie's user id nor on
+        /// the walk's one other `type: user` principal (a second other user, another id that is not
+        /// `type: user`, an empty id, a missing principal); nothing saved.
         static let billingV2PrincipalMismatch = "Cursor returned usage of another account, so Syrtis saved nothing (%@)."
 
         static var all: [String] {
