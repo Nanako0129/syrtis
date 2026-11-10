@@ -167,18 +167,28 @@ struct Principal {
     id: Option<String>,
 }
 
-impl Principal {
-    /// The non-empty id of a user principal: one with `type: user` (both
-    /// measured shapes, t3code's sample and the #520 reporter, carry it), or
-    /// an untyped one whose id is `cookie_user`. Any other principal is
-    /// `None`; `type` is what keeps a team principal out of the walk.
-    fn user_id(&self, cookie_user: &str) -> Option<&str> {
-        let id = self.id.as_deref().filter(|id| !id.is_empty())?;
-        match self.kind.as_deref() {
-            Some("user") => Some(id),
-            None if id == cookie_user => Some(id),
-            _ => None,
+/// S7's answer for one item's principal.
+enum Owner<'a> {
+    /// The cookie's own user id, whatever `type` says (main's rule).
+    Cookie,
+    /// Another non-empty id on a `type: user` principal (both measured
+    /// shapes, t3code's sample and the #520 reporter, carry `type: user`).
+    OtherUser(&'a str),
+    /// Anything else: missing, empty id, or another id that is not
+    /// `type: user` (a team principal).
+    Refused,
+}
+
+fn owner<'a>(principal: Option<&'a Principal>, cookie_user: &str) -> Owner<'a> {
+    let Some(principal) = principal else {
+        return Owner::Refused;
+    };
+    match principal.id.as_deref() {
+        Some(id) if id == cookie_user => Owner::Cookie,
+        Some(id) if !id.is_empty() && principal.kind.as_deref() == Some("user") => {
+            Owner::OtherUser(id)
         }
+        _ => Owner::Refused,
     }
 }
 
@@ -327,11 +337,12 @@ fn map(item: Item) -> Mapped {
     Mapped::Row(id, Row { month, ms, event })
 }
 
-/// Read `windows` (UTC month indexes, newest first). Every item of every page
-/// must carry one and the same user principal (`Principal::user_id`; `user`
-/// is the cookie's own user id). That id may differ from `user`: after
-/// Cursor's billing move one migrated account's items carried another user
-/// id (#520: 100 of 100 items, one distinct id).
+/// Read `windows` (UTC month indexes, newest first). `user` is the cookie's
+/// own user id. Every item of every page must belong to `user` or to one
+/// other `type: user` principal, the same for the whole walk (`owner`):
+/// after Cursor's billing move one migrated account's items carried another
+/// user id (#520: 100 of 100 items, one distinct id), and months before the
+/// move may still carry `user`.
 /// `stop_after_empty`: end after `EMPTY_WINDOWS_STOP` consecutive calendar
 /// months with no rows (design 5); a gap between windows restarts the count.
 #[allow(clippy::too_many_arguments)]
@@ -356,7 +367,7 @@ pub(crate) async fn walk(
     let mut empty_run = 0usize;
     let mut previous: Option<i32> = None;
     let mut dropped: Vec<Dropped> = Vec::new();
-    let mut principal: Option<String> = None;
+    let mut other: Option<String> = None;
     for &month in windows {
         let Some((start, end)) = bounds(month, now_ms) else {
             continue;
@@ -420,14 +431,16 @@ pub(crate) async fn walk(
                 None => {}
             }
             let items = page.data.unwrap_or_default();
-            // S7: every item, written or not, is the walk's one user principal;
-            // the first item read fixes it for every later page and window.
+            // S7: every item, written or not, is the cookie's user or the
+            // walk's one other user; the first other id read fixes it for
+            // every later page and window.
             for item in &items {
-                let id = item.principal.as_ref().and_then(|p| p.user_id(user));
-                let Some(id) = id else {
-                    return Err(Stop::error("billing_v2_principal_mismatch"));
+                let accepted = match owner(item.principal.as_ref(), user) {
+                    Owner::Cookie => true,
+                    Owner::OtherUser(id) => other.get_or_insert_with(|| id.to_string()) == id,
+                    Owner::Refused => false,
                 };
-                if principal.get_or_insert_with(|| id.to_string()) != id {
+                if !accepted {
                     return Err(Stop::error("billing_v2_principal_mismatch"));
                 }
             }

@@ -12,6 +12,7 @@ use std::sync::Arc;
 
 const USER: &str = "user_CANARYuser0123456789AB";
 const OTHER_USER: &str = "user_OTHERuser01234567890CD";
+const THIRD_USER: &str = "user_THIRDuser01234567890EF";
 const SIGNATURE: &str = "CANARYsignatureXYZ";
 const OWNING_CANARY: &str = "OWNINGUSERCANARY42";
 const KEY: [u8; 32] = [7; 32];
@@ -4502,12 +4503,12 @@ fn cleanup_deletes_sidecars_and_ignores_another_stems() {
 }
 
 /// S5/S7: `userEmail`, `principal.id`, `billingItemId`, the token and the
-/// cookie never reach a file or the status; a page mixing in another
-/// principal, or an item without one, stops the walk with nothing written
-/// (a walk on one other user is accepted:
+/// cookie never reach a file or the status; a page carrying two users
+/// other than the cookie's, or an item without a principal, stops the walk
+/// with nothing written (one other user is accepted:
 /// `v2_one_user_principal_other_than_the_cookie_user`). Mutations: in
 /// `struct Extras`, put `#[serde(rename = "userEmail")]` on `model`; make
-/// both principal refusals in `walk` `continue`.
+/// the principal refusal in `walk` `if false`.
 #[test]
 fn v2_canaries_stay_out_and_another_principal_writes_nothing() {
     let _guard = lock();
@@ -4534,14 +4535,15 @@ fn v2_canaries_stay_out_and_another_principal_writes_nothing() {
 
     let mut other = item("o", month_start_ms(0));
     other["principal"]["id"] = OTHER_USER.into();
+    let mut third = item("t", month_start_ms(0));
+    third["principal"]["id"] = THIRD_USER.into();
     let mut missing = item("m", month_start_ms(0));
     missing.as_object_mut().unwrap().remove("principal");
-    for bad in [other, missing] {
+    for bad in [vec![other, third], vec![missing]] {
         let f = fixture();
-        let (url, _) = serve(vec![
-            old_migrated(),
-            v2_page(&[item("fine", month_start_ms(0)), bad], None),
-        ]);
+        let mut page = vec![item("fine", month_start_ms(0))];
+        page.extend(bad);
+        let (url, _) = serve(vec![old_migrated(), v2_page(&page, None)]);
         let status = sync_status(&f, &url, &registry(true, &f.dir));
         assert_eq!(status["state"], "error");
         assert_eq!(status["reason"], "billing_v2_principal_mismatch");
@@ -4555,6 +4557,7 @@ fn v2_canaries_stay_out_and_another_principal_writes_nothing() {
         EMAIL_CANARY,
         USER,
         OTHER_USER,
+        THIRD_USER,
         ITEM_ID_CANARY,
         SIGNATURE,
         f.token.as_str(),
@@ -4567,15 +4570,16 @@ fn v2_canaries_stay_out_and_another_principal_writes_nothing() {
 
 /// #520: a migrated account's items can carry one user id that is not the
 /// cookie's (reporter: 100 of 100 items, one distinct id). The walk accepts
-/// it across pages and windows, keeps that id out of the files and the
-/// status, and refuses, after the pin, another id on a later page or
-/// window, and a `team`, untyped or missing principal; a first `team`
-/// principal; and items whose ids are all empty. An untyped principal on
-/// the cookie's own id passes, as it did before #520. Mutations: in
-/// `walk`, accept only the cookie's user id; drop the pin comparison;
-/// declare `principal` inside the window loop; skip an item without a user
-/// principal; in `Principal::user_id`, drop the `type` test; pass any
-/// untyped id; refuse an untyped one; pass an empty id.
+/// it across pages and windows and keeps it out of the files and the
+/// status; it accepts it beside the cookie's own id (months before the
+/// move), whose `type` is not read, as on main. After the first other id it
+/// refuses a third id on a later page or window, a `team` or untyped
+/// principal on another id, and a missing principal; it refuses a first
+/// `team` principal on another id and items whose ids are all empty.
+/// Mutations: in `walk`, refuse `Owner::OtherUser`; accept it without the
+/// comparison; declare `other` inside the window loop; accept
+/// `Owner::Refused`; in `owner`, drop the `type` test; let an untyped other
+/// id pass; require `type: user` for the cookie's id; pass an empty id.
 #[test]
 fn v2_one_user_principal_other_than_the_cookie_user() {
     let _guard = lock();
@@ -4611,15 +4615,27 @@ fn v2_one_user_principal_other_than_the_cookie_user() {
     // Control: the outputs searched hold the written rows.
     assert!(expected_file(&f.dir).exists() && all.contains("composer-2.5"));
 
+    // The move inside one walk: the newest month on the other id, older
+    // items on the cookie's id with `type: user`, none, or another spelling.
     let f = fixture();
-    let mut untyped = item("u", month_start_ms(0));
+    let mut untyped = item("c2", month_start_ms(0) + 2);
     untyped["principal"].as_object_mut().unwrap().remove("type");
-    let mut replies = vec![old_migrated(), v2_page(&[untyped], None)];
-    replies.extend((0..11).map(|_| v2_empty()));
+    let mut spelled = item("c3", month_start_ms(0) + 3);
+    spelled["principal"]["type"] = "USER".into();
+    let mut replies = vec![
+        old_migrated(),
+        v2_page(&[as_user("o1", month_start_ms(0), OTHER_USER)], Some("n1")),
+        v2_page(&[untyped, spelled], None),
+        v2_page(&[item("c4", month_start_ms(1))], None),
+    ];
+    replies.extend((0..10).map(|_| v2_empty()));
     let (url, _) = serve(replies);
     let status = sync_status(&f, &url, &registry(true, &f.dir));
-    assert_eq!(status["state"], "ok", "untyped cookie user: {status}");
-    assert_eq!(status["events"], 1, "{status}");
+    assert_eq!(
+        status["state"], "ok",
+        "cookie id beside the other: {status}"
+    );
+    assert_eq!(status["events"], 4, "{status}");
 
     let pinned = || as_user("a", month_start_ms(0), OTHER_USER);
     let later = |change: &dyn Fn(&mut serde_json::Value)| {
@@ -4627,15 +4643,18 @@ fn v2_one_user_principal_other_than_the_cookie_user() {
         change(&mut item);
         vec![v2_page(&[pinned()], Some("n1")), v2_page(&[item], None)]
     };
-    let mut team = item("t", month_start_ms(0));
+    let mut team = as_user("t", month_start_ms(0), OTHER_USER);
     team["principal"]["type"] = "team".into();
     let cases = [
-        ("later page", later(&|i| i["principal"]["id"] = USER.into())),
         (
-            "later window",
+            "third id on a later page",
+            later(&|i| i["principal"]["id"] = THIRD_USER.into()),
+        ),
+        (
+            "third id in a later window",
             vec![
                 v2_page(&[pinned()], None),
-                v2_page(&[as_user("b", month_start_ms(1), USER)], None),
+                v2_page(&[as_user("b", month_start_ms(1), THIRD_USER)], None),
             ],
         ),
         (
@@ -4643,7 +4662,7 @@ fn v2_one_user_principal_other_than_the_cookie_user() {
             later(&|i| i["principal"]["type"] = "team".into()),
         ),
         (
-            "untyped after the pin",
+            "untyped other after the pin",
             later(&|i| {
                 i["principal"].as_object_mut().unwrap().remove("type");
             }),
