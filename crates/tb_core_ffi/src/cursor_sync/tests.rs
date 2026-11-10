@@ -4570,18 +4570,16 @@ fn v2_canaries_stay_out_and_a_second_other_principal_writes_nothing() {
 
 /// #520: a migrated account's items can carry one user id that is not the
 /// cookie's (reporter: 100 of 100 items, one distinct id). The walk accepts
-/// it across pages and windows (`type` compared without case) and keeps it
-/// out of the files and the
+/// it across pages and windows and keeps it out of the files and the
 /// status; it accepts it beside the cookie's own id (months before the
 /// move), whose `type` is not read, as on main. After the first other id it
-/// refuses a third id on a later page or window, a `team` or untyped
-/// principal on another id, and a missing principal; it refuses a first
+/// refuses a third id on a later page or window, a `team`, `organization`
+/// or untyped principal on another id, and a missing principal; it refuses a first
 /// `team` principal on another id and items whose ids are all empty.
 /// Mutations: in `walk`, refuse `Owner::OtherUser`; accept it without the
 /// comparison; declare `other` inside the window loop; accept
-/// `Owner::Refused`; in `owner`, drop the `type` test; let an untyped other
-/// id pass; compare `type` with case; require `type: user` for the cookie's
-/// id; pass an empty id.
+/// `Owner::Refused`; in `owner`, drop the `type` test; refuse only `team`;
+/// let an untyped other id pass; require `type: user` for the cookie's id; pass an empty id.
 #[test]
 fn v2_one_user_principal_other_than_the_cookie_user() {
     let _guard = lock();
@@ -4591,12 +4589,10 @@ fn v2_one_user_principal_other_than_the_cookie_user() {
         item
     };
     let f = fixture();
-    let mut cased = as_user("o2", month_start_ms(0) + 1, OTHER_USER);
-    cased["principal"]["type"] = "User".into();
     let mut replies = vec![
         old_migrated(),
         v2_page(&[as_user("o1", month_start_ms(0), OTHER_USER)], Some("n1")),
-        v2_page(&[cased], None),
+        v2_page(&[as_user("o2", month_start_ms(0) + 1, OTHER_USER)], None),
         v2_page(&[as_user("o3", month_start_ms(1), OTHER_USER)], None),
     ];
     replies.extend((0..10).map(|_| v2_empty()));
@@ -4664,6 +4660,10 @@ fn v2_one_user_principal_other_than_the_cookie_user() {
         (
             "team after the pin",
             later(&|i| i["principal"]["type"] = "team".into()),
+        ),
+        (
+            "organization after the pin",
+            later(&|i| i["principal"]["type"] = "organization".into()),
         ),
         (
             "untyped other after the pin",

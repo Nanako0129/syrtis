@@ -172,9 +172,9 @@ struct Principal {
 enum Owner<'a> {
     /// The cookie's own user id, whatever `type` says (main's rule).
     Cookie,
-    /// Another non-empty id on a `type: user` principal, compared without
-    /// case (both measured shapes, t3code's sample and the #520 reporter,
-    /// carry `type: user`).
+    /// Another non-empty id on a principal whose `type` is exactly `user`
+    /// (both measured shapes, t3code's sample and the #520 reporter, carry
+    /// it; no other spelling has been seen).
     OtherUser(&'a str),
     /// Anything else: missing, empty id, or another id that is not
     /// `type: user` (a team principal).
@@ -187,13 +187,7 @@ fn owner<'a>(principal: Option<&'a Principal>, cookie_user: &str) -> Owner<'a> {
     };
     match principal.id.as_deref() {
         Some(id) if id == cookie_user => Owner::Cookie,
-        Some(id)
-            if !id.is_empty()
-                && principal
-                    .kind
-                    .as_deref()
-                    .is_some_and(|kind| kind.eq_ignore_ascii_case("user")) =>
-        {
+        Some(id) if !id.is_empty() && principal.kind.as_deref() == Some("user") => {
             Owner::OtherUser(id)
         }
         _ => Owner::Refused,
