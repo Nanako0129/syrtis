@@ -4502,8 +4502,10 @@ fn cleanup_deletes_sidecars_and_ignores_another_stems() {
 }
 
 /// S5/S7: `userEmail`, `principal.id`, `billingItemId`, the token and the
-/// cookie never reach a file or the status; another principal stops the
-/// walk with nothing written. Mutations: in `struct Extras`, put
+/// cookie never reach a file or the status; a page mixing in another
+/// principal, or an item without one, stops the walk with nothing written
+/// (a walk on one other user is accepted:
+/// `v2_one_user_principal_other_than_the_cookie_user`). Mutations: in `struct Extras`, put
 /// `#[serde(rename = "userEmail")]` on `model`; make the principal check's
 /// refusing arm `_ => {}`.
 #[test]
@@ -4565,15 +4567,14 @@ fn v2_canaries_stay_out_and_another_principal_writes_nothing() {
 
 /// #520: a migrated account's items can carry one user id that is not the
 /// cookie's (reporter: 100 of 100 items, one distinct id). The walk accepts
-/// it across pages and windows (one item without `type`, as when only the
-/// id was compared), keeps that id out of the files and the status, and
-/// refuses, after the pin, another id on a later page or window, and a
-/// `team` or missing principal; a first `team` principal; and items whose
-/// ids are all empty. Mutations: in `walk`, compare with the cookie's user
-/// id again; match `(Some(_), Some(_))` without the guard; declare
-/// `principal` inside the window loop; drop the `type` test in
-/// `Principal::user_id`; require `type: user` there; let it pass an empty
-/// id; accept `(None, Some(_))`.
+/// it across pages and windows, keeps that id out of the files and the
+/// status, and refuses, after the pin, another id on a later page or
+/// window, and a `team`, untyped or missing principal; a first `team`
+/// principal; and items whose ids are all empty. Mutations: in `walk`,
+/// compare with the cookie's user id again; match `(Some(_), Some(_))`
+/// without the guard; declare `principal` inside the window loop; drop the
+/// `type` test in `Principal::user_id`; let a missing `type` pass there;
+/// let it pass an empty id; accept `(None, Some(_))`.
 #[test]
 fn v2_one_user_principal_other_than_the_cookie_user() {
     let _guard = lock();
@@ -4583,12 +4584,10 @@ fn v2_one_user_principal_other_than_the_cookie_user() {
         item
     };
     let f = fixture();
-    let mut untyped = as_user("o2", month_start_ms(0) + 1, OTHER_USER);
-    untyped["principal"].as_object_mut().unwrap().remove("type");
     let mut replies = vec![
         old_migrated(),
         v2_page(&[as_user("o1", month_start_ms(0), OTHER_USER)], Some("n1")),
-        v2_page(&[untyped], None),
+        v2_page(&[as_user("o2", month_start_ms(0) + 1, OTHER_USER)], None),
         v2_page(&[as_user("o3", month_start_ms(1), OTHER_USER)], None),
     ];
     replies.extend((0..10).map(|_| v2_empty()));
@@ -4631,6 +4630,12 @@ fn v2_one_user_principal_other_than_the_cookie_user() {
         (
             "team after the pin",
             later(&|i| i["principal"]["type"] = "team".into()),
+        ),
+        (
+            "untyped after the pin",
+            later(&|i| {
+                i["principal"].as_object_mut().unwrap().remove("type");
+            }),
         ),
         (
             "missing after the pin",

@@ -168,11 +168,12 @@ struct Principal {
 }
 
 impl Principal {
-    /// The non-empty id of a user principal; `None` for a principal whose
-    /// `type` names something else. A missing `type` passes, as it did when
-    /// only the id was compared (both measured shapes carry `type: user`).
+    /// The non-empty id of a `type: user` principal; `None` for any other
+    /// principal, an untyped one included. With the cookie's user id no
+    /// longer compared, `type` is what keeps a team principal out; both
+    /// measured shapes (t3code's sample, the #520 reporter) carry it.
     fn user_id(&self) -> Option<&str> {
-        let user = self.kind.as_deref().is_none_or(|kind| kind == "user");
+        let user = self.kind.as_deref() == Some("user");
         self.id.as_deref().filter(|id| user && !id.is_empty())
     }
 }
