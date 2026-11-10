@@ -1989,7 +1989,7 @@ async fn run(
                 ..limits
             };
             let (synced, dropped) =
-                billing_v2(&client, target, dir, &stem, &user, &cookie, limits, enabled).await;
+                billing_v2(&client, target, dir, &stem, &cookie, limits, enabled).await;
             drop(cookie);
             return match synced {
                 Ok((committed, events)) => {
@@ -2046,7 +2046,6 @@ async fn billing_v2(
     target: &Target<'_>,
     dir: &Path,
     stem: &str,
-    user: &str,
     cookie: &reqwest::header::HeaderValue,
     limits: Limits,
     enabled: &dyn Fn() -> bool,
@@ -2069,7 +2068,6 @@ async fn billing_v2(
         client,
         target.billing_url,
         cookie,
-        user,
         limits,
         enabled,
         &plan.windows,

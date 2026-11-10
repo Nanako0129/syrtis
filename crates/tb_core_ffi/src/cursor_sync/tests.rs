@@ -4504,8 +4504,8 @@ fn cleanup_deletes_sidecars_and_ignores_another_stems() {
 /// S5/S7: `userEmail`, `principal.id`, `billingItemId`, the token and the
 /// cookie never reach a file or the status; another principal stops the
 /// walk with nothing written. Mutations: in `struct Extras`, put
-/// `#[serde(rename = "userEmail")]` on `model`; replace the principal
-/// check's condition with `false`.
+/// `#[serde(rename = "userEmail")]` on `model`; make the principal check's
+/// refusing arm `_ => {}`.
 #[test]
 fn v2_canaries_stay_out_and_another_principal_writes_nothing() {
     let _guard = lock();
@@ -4561,6 +4561,68 @@ fn v2_canaries_stay_out_and_another_principal_writes_nothing() {
     }
     // Control: the outputs searched hold the written row and the refusal.
     assert!(all.contains("composer-2.5") && all.contains("billing_v2_principal_mismatch"));
+}
+
+/// #520: a migrated account's items carry one user id that is not the
+/// cookie's (reporter: 100 of 100 items, one distinct id). The walk accepts
+/// it across pages and windows, and refuses another id on a later page or a
+/// later window, and a principal that is not `type: user`. Mutations: in
+/// `walk`, compare with the cookie's user id again; match `(Some(_),
+/// Some(_))` without the guard; declare `principal` inside the window loop;
+/// drop the `kind` filter in `Principal::user_id`.
+#[test]
+fn v2_one_user_principal_other_than_the_cookie_user() {
+    let _guard = lock();
+    let as_user = |id: &str, ms: i64, user: &str| {
+        let mut item = item(id, ms);
+        item["principal"]["id"] = user.into();
+        item
+    };
+    let f = fixture();
+    let mut replies = vec![
+        old_migrated(),
+        v2_page(&[as_user("o1", month_start_ms(0), OTHER_USER)], Some("n1")),
+        v2_page(&[as_user("o2", month_start_ms(0) + 1, OTHER_USER)], None),
+        v2_page(&[as_user("o3", month_start_ms(1), OTHER_USER)], None),
+    ];
+    replies.extend((0..10).map(|_| v2_empty()));
+    let (url, _) = serve(replies);
+    let status = sync_status(&f, &url, &registry(true, &f.dir));
+    assert_eq!(status["state"], "ok", "{status}");
+    assert_eq!(status["events"], 3, "{status}");
+    assert!(expected_file(&f.dir).exists());
+
+    let mut team = item("t", month_start_ms(0));
+    team["principal"]["type"] = "team".into();
+    let cases = [
+        (
+            "later page",
+            vec![
+                v2_page(&[as_user("a", month_start_ms(0), OTHER_USER)], Some("n1")),
+                v2_page(&[as_user("b", month_start_ms(0) + 1, USER)], None),
+            ],
+        ),
+        (
+            "later window",
+            vec![
+                v2_page(&[as_user("a", month_start_ms(0), OTHER_USER)], None),
+                v2_page(&[as_user("b", month_start_ms(1), USER)], None),
+            ],
+        ),
+        ("not a user", vec![v2_page(&[team], None)]),
+    ];
+    for (case, pages) in cases {
+        let f = fixture();
+        let mut replies = vec![old_migrated()];
+        replies.extend(pages);
+        replies.extend((0..12).map(|_| v2_empty()));
+        let (url, _) = serve(replies);
+        let status = sync_status(&f, &url, &registry(true, &f.dir));
+        assert_eq!(status["state"], "error", "{case}: {status}");
+        assert_eq!(status["reason"], "billing_v2_principal_mismatch", "{case}");
+        assert!(!expected_file(&f.dir).exists(), "{case}");
+        assert!(!sidecar_path(&f.dir).exists(), "{case}");
+    }
 }
 
 /// S8: an unparseable `eventTime` is dropped; a future newest old row
