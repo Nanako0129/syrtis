@@ -168,11 +168,12 @@ struct Principal {
 }
 
 impl Principal {
-    /// The id of a `type: user` principal; `None` for any other principal.
+    /// The non-empty id of a user principal; `None` for a principal whose
+    /// `type` names something else. A missing `type` passes, as it did when
+    /// only the id was compared (both measured shapes carry `type: user`).
     fn user_id(&self) -> Option<&str> {
-        self.id
-            .as_deref()
-            .filter(|id| !id.is_empty() && self.kind.as_deref() == Some("user"))
+        let user = self.kind.as_deref().is_none_or(|kind| kind == "user");
+        self.id.as_deref().filter(|id| user && !id.is_empty())
     }
 }
 
@@ -322,9 +323,9 @@ fn map(item: Item) -> Mapped {
 }
 
 /// Read `windows` (UTC month indexes, newest first). Every item of every page
-/// must carry one and the same `type: user` principal. That id is not the
-/// cookie's own user id: after Cursor's billing move a migrated account's
-/// items carry another user id (#520: 100 of 100 items, one distinct id).
+/// must carry one and the same user principal. That id may differ from the
+/// cookie's own user id: after Cursor's billing move one migrated account's
+/// items carried another user id (#520: 100 of 100 items, one distinct id).
 /// `stop_after_empty`: end after `EMPTY_WINDOWS_STOP` consecutive calendar
 /// months with no rows (design 5); a gap between windows restarts the count.
 #[allow(clippy::too_many_arguments)]

@@ -4563,13 +4563,17 @@ fn v2_canaries_stay_out_and_another_principal_writes_nothing() {
     assert!(all.contains("composer-2.5") && all.contains("billing_v2_principal_mismatch"));
 }
 
-/// #520: a migrated account's items carry one user id that is not the
+/// #520: a migrated account's items can carry one user id that is not the
 /// cookie's (reporter: 100 of 100 items, one distinct id). The walk accepts
-/// it across pages and windows, and refuses another id on a later page or a
-/// later window, and a principal that is not `type: user`. Mutations: in
-/// `walk`, compare with the cookie's user id again; match `(Some(_),
-/// Some(_))` without the guard; declare `principal` inside the window loop;
-/// drop the `kind` filter in `Principal::user_id`.
+/// it across pages and windows (one item without `type`, as when only the
+/// id was compared), keeps that id out of the files and the status, and
+/// refuses, after the pin, another id on a later page or window, and a
+/// `team` or missing principal; a first `team` principal; and items whose
+/// ids are all empty. Mutations: in `walk`, compare with the cookie's user
+/// id again; match `(Some(_), Some(_))` without the guard; declare
+/// `principal` inside the window loop; drop the `type` test in
+/// `Principal::user_id`; require `type: user` there; let it pass an empty
+/// id; accept `(None, Some(_))`.
 #[test]
 fn v2_one_user_principal_other_than_the_cookie_user() {
     let _guard = lock();
@@ -4579,10 +4583,12 @@ fn v2_one_user_principal_other_than_the_cookie_user() {
         item
     };
     let f = fixture();
+    let mut untyped = as_user("o2", month_start_ms(0) + 1, OTHER_USER);
+    untyped["principal"].as_object_mut().unwrap().remove("type");
     let mut replies = vec![
         old_migrated(),
         v2_page(&[as_user("o1", month_start_ms(0), OTHER_USER)], Some("n1")),
-        v2_page(&[as_user("o2", month_start_ms(0) + 1, OTHER_USER)], None),
+        v2_page(&[untyped], None),
         v2_page(&[as_user("o3", month_start_ms(1), OTHER_USER)], None),
     ];
     replies.extend((0..10).map(|_| v2_empty()));
@@ -4590,26 +4596,59 @@ fn v2_one_user_principal_other_than_the_cookie_user() {
     let status = sync_status(&f, &url, &registry(true, &f.dir));
     assert_eq!(status["state"], "ok", "{status}");
     assert_eq!(status["events"], 3, "{status}");
-    assert!(expected_file(&f.dir).exists());
+    let mut outputs = vec![status.to_string()];
+    for entry in std::fs::read_dir(&f.dir).unwrap().flatten() {
+        outputs.push(entry.file_name().to_string_lossy().into_owned());
+        if entry.file_type().unwrap().is_file() {
+            outputs.push(std::fs::read_to_string(entry.path()).unwrap());
+        }
+    }
+    let all = outputs.join("\n");
+    assert!(
+        !all.contains(OTHER_USER) && !all.contains(USER),
+        "principal leaked"
+    );
+    // Control: the outputs searched hold the written rows.
+    assert!(expected_file(&f.dir).exists() && all.contains("composer-2.5"));
 
+    let pinned = || as_user("a", month_start_ms(0), OTHER_USER);
+    let later = |change: &dyn Fn(&mut serde_json::Value)| {
+        let mut item = as_user("b", month_start_ms(0) + 1, OTHER_USER);
+        change(&mut item);
+        vec![v2_page(&[pinned()], Some("n1")), v2_page(&[item], None)]
+    };
     let mut team = item("t", month_start_ms(0));
     team["principal"]["type"] = "team".into();
     let cases = [
-        (
-            "later page",
-            vec![
-                v2_page(&[as_user("a", month_start_ms(0), OTHER_USER)], Some("n1")),
-                v2_page(&[as_user("b", month_start_ms(0) + 1, USER)], None),
-            ],
-        ),
+        ("later page", later(&|i| i["principal"]["id"] = USER.into())),
         (
             "later window",
             vec![
-                v2_page(&[as_user("a", month_start_ms(0), OTHER_USER)], None),
+                v2_page(&[pinned()], None),
                 v2_page(&[as_user("b", month_start_ms(1), USER)], None),
             ],
         ),
-        ("not a user", vec![v2_page(&[team], None)]),
+        (
+            "team after the pin",
+            later(&|i| i["principal"]["type"] = "team".into()),
+        ),
+        (
+            "missing after the pin",
+            later(&|i| {
+                i.as_object_mut().unwrap().remove("principal");
+            }),
+        ),
+        (
+            "every id empty",
+            vec![v2_page(
+                &[
+                    as_user("a", month_start_ms(0), ""),
+                    as_user("b", month_start_ms(0) + 1, ""),
+                ],
+                None,
+            )],
+        ),
+        ("first item a team", vec![v2_page(&[team], None)]),
     ];
     for (case, pages) in cases {
         let f = fixture();
