@@ -9,7 +9,9 @@
 //! - The client (no redirects, https only) and the sensitive cookie are the
 //!   old walk's. Pages and body bytes are capped across every window of one
 //!   walk; any refusal (3xx/401/403/429/5xx, an `availability` answer,
-//!   another principal) ends the walk, and the caller then writes nothing.
+//!   an item neither on the cookie's user id nor on the walk's one other
+//!   `type: user` principal, see `owner`) ends the walk, and the caller then
+//!   writes nothing.
 //! - Items are read into a typed struct with only the fields below:
 //!   `displayExtras.userEmail` is never deserialised; `principal.id` and
 //!   `billingItemId` live only in memory (comparison, dedupe). No log line.
@@ -161,7 +163,35 @@ fn charged_cents(text: &str) -> Option<i64> {
 
 #[derive(Deserialize)]
 struct Principal {
+    #[serde(rename = "type")]
+    kind: Option<String>,
     id: Option<String>,
+}
+
+/// S7's answer for one item's principal.
+enum Owner<'a> {
+    /// The cookie's own user id, whatever `type` says (main's rule).
+    Cookie,
+    /// Another non-empty id on a principal whose `type` is exactly `user`
+    /// (both measured shapes, t3code's sample and the #520 reporter, carry
+    /// it; no other spelling has been seen).
+    OtherUser(&'a str),
+    /// Anything else: a missing principal, an empty id, or another id whose
+    /// `type` is not exactly `user` (`team`, `organization`, `User`, none).
+    Refused,
+}
+
+fn owner<'a>(principal: Option<&'a Principal>, cookie_user: &str) -> Owner<'a> {
+    let Some(principal) = principal else {
+        return Owner::Refused;
+    };
+    match principal.id.as_deref() {
+        Some(id) if id == cookie_user => Owner::Cookie,
+        Some(id) if !id.is_empty() && principal.kind.as_deref() == Some("user") => {
+            Owner::OtherUser(id)
+        }
+        _ => Owner::Refused,
+    }
 }
 
 /// One mapped row and the UTC month its `eventTime` falls in.
@@ -310,7 +340,11 @@ fn map(item: Item) -> Mapped {
 }
 
 /// Read `windows` (UTC month indexes, newest first). `user` is the cookie's
-/// own user id: every item of every page must carry it as `principal.id`.
+/// own user id. Every item of every page must belong to `user` or to one
+/// other `type: user` principal, the same for the whole walk (`owner`):
+/// after Cursor's billing move one migrated account's items carried another
+/// user id (#520: 100 of 100 items, one distinct id), and months before the
+/// move may still carry `user`.
 /// `stop_after_empty`: end after `EMPTY_WINDOWS_STOP` consecutive calendar
 /// months with no rows (design 5); a gap between windows restarts the count.
 #[allow(clippy::too_many_arguments)]
@@ -335,6 +369,7 @@ pub(crate) async fn walk(
     let mut empty_run = 0usize;
     let mut previous: Option<i32> = None;
     let mut dropped: Vec<Dropped> = Vec::new();
+    let mut other: Option<String> = None;
     for &month in windows {
         let Some((start, end)) = bounds(month, now_ms) else {
             continue;
@@ -398,12 +433,18 @@ pub(crate) async fn walk(
                 None => {}
             }
             let items = page.data.unwrap_or_default();
-            // S7: every item, written or not, must be the cookie's own user.
-            if items
-                .iter()
-                .any(|item| item.principal.as_ref().and_then(|p| p.id.as_deref()) != Some(user))
-            {
-                return Err(Stop::error("billing_v2_principal_mismatch"));
+            // S7: every item, written or not, is the cookie's user or the
+            // walk's one other user; the first other id read fixes it for
+            // every later page and window.
+            for item in &items {
+                let accepted = match owner(item.principal.as_ref(), user) {
+                    Owner::Cookie => true,
+                    Owner::OtherUser(id) => other.get_or_insert_with(|| id.to_string()) == id,
+                    Owner::Refused => false,
+                };
+                if !accepted {
+                    return Err(Stop::error("billing_v2_principal_mismatch"));
+                }
             }
             for item in items {
                 match map(item) {

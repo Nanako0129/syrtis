@@ -12,6 +12,7 @@ use std::sync::Arc;
 
 const USER: &str = "user_CANARYuser0123456789AB";
 const OTHER_USER: &str = "user_OTHERuser01234567890CD";
+const THIRD_USER: &str = "user_THIRDuser01234567890EF";
 const SIGNATURE: &str = "CANARYsignatureXYZ";
 const OWNING_CANARY: &str = "OWNINGUSERCANARY42";
 const KEY: [u8; 32] = [7; 32];
@@ -4502,12 +4503,14 @@ fn cleanup_deletes_sidecars_and_ignores_another_stems() {
 }
 
 /// S5/S7: `userEmail`, `principal.id`, `billingItemId`, the token and the
-/// cookie never reach a file or the status; another principal stops the
-/// walk with nothing written. Mutations: in `struct Extras`, put
-/// `#[serde(rename = "userEmail")]` on `model`; replace the principal
-/// check's condition with `false`.
+/// cookie never reach a file or the status; a page carrying two users
+/// other than the cookie's, or an item without a principal, stops the walk
+/// with nothing written (one other user is accepted:
+/// `v2_one_user_principal_other_than_the_cookie_user`). Mutations: in
+/// `struct Extras`, put `#[serde(rename = "userEmail")]` on `model`; make
+/// the principal refusal in `walk` `if false`.
 #[test]
-fn v2_canaries_stay_out_and_another_principal_writes_nothing() {
+fn v2_canaries_stay_out_and_a_second_other_principal_writes_nothing() {
     let _guard = lock();
     let mut outputs = Vec::new();
     let mut collect = |f: &Fixture, status: serde_json::Value| {
@@ -4532,14 +4535,15 @@ fn v2_canaries_stay_out_and_another_principal_writes_nothing() {
 
     let mut other = item("o", month_start_ms(0));
     other["principal"]["id"] = OTHER_USER.into();
+    let mut third = item("t", month_start_ms(0));
+    third["principal"]["id"] = THIRD_USER.into();
     let mut missing = item("m", month_start_ms(0));
     missing.as_object_mut().unwrap().remove("principal");
-    for bad in [other, missing] {
+    for bad in [vec![other, third], vec![missing]] {
         let f = fixture();
-        let (url, _) = serve(vec![
-            old_migrated(),
-            v2_page(&[item("fine", month_start_ms(0)), bad], None),
-        ]);
+        let mut page = vec![item("fine", month_start_ms(0))];
+        page.extend(bad);
+        let (url, _) = serve(vec![old_migrated(), v2_page(&page, None)]);
         let status = sync_status(&f, &url, &registry(true, &f.dir));
         assert_eq!(status["state"], "error");
         assert_eq!(status["reason"], "billing_v2_principal_mismatch");
@@ -4553,6 +4557,7 @@ fn v2_canaries_stay_out_and_another_principal_writes_nothing() {
         EMAIL_CANARY,
         USER,
         OTHER_USER,
+        THIRD_USER,
         ITEM_ID_CANARY,
         SIGNATURE,
         f.token.as_str(),
@@ -4561,6 +4566,146 @@ fn v2_canaries_stay_out_and_another_principal_writes_nothing() {
     }
     // Control: the outputs searched hold the written row and the refusal.
     assert!(all.contains("composer-2.5") && all.contains("billing_v2_principal_mismatch"));
+}
+
+/// #520: a migrated account's items can carry one user id that is not the
+/// cookie's (reporter: 100 of 100 items, one distinct id). The walk accepts
+/// it across pages and windows and keeps it out of the files and the
+/// status; it accepts it beside the cookie's own id (months before the
+/// move), whose `type` is not read, as on main. After the first other id it
+/// refuses a third id on a later page or window, a principal on another id
+/// whose `type` is `User`, `organization`, `team` or missing, and a missing
+/// principal; it refuses a first `team` principal on another id and items
+/// whose ids are all empty. Mutations: in `walk`, refuse `OtherUser`;
+/// accept it without the comparison; declare `other` inside the window
+/// loop; accept `Refused`; in `owner`, drop the `type` test; refuse only
+/// `team`; compare `type` without case; let an untyped other id pass;
+/// require `type: user` for the cookie's id; pass an empty id.
+#[test]
+fn v2_one_user_principal_other_than_the_cookie_user() {
+    let _guard = lock();
+    let as_user = |id: &str, ms: i64, user: &str| {
+        let mut item = item(id, ms);
+        item["principal"]["id"] = user.into();
+        item
+    };
+    let f = fixture();
+    let mut replies = vec![
+        old_migrated(),
+        v2_page(&[as_user("o1", month_start_ms(0), OTHER_USER)], Some("n1")),
+        v2_page(&[as_user("o2", month_start_ms(0) + 1, OTHER_USER)], None),
+        v2_page(&[as_user("o3", month_start_ms(1), OTHER_USER)], None),
+    ];
+    replies.extend((0..10).map(|_| v2_empty()));
+    let (url, _) = serve(replies);
+    let status = sync_status(&f, &url, &registry(true, &f.dir));
+    assert_eq!(status["state"], "ok", "{status}");
+    assert_eq!(status["events"], 3, "{status}");
+    let mut outputs = vec![status.to_string()];
+    for entry in std::fs::read_dir(&f.dir).unwrap().flatten() {
+        outputs.push(entry.file_name().to_string_lossy().into_owned());
+        if entry.file_type().unwrap().is_file() {
+            outputs.push(std::fs::read_to_string(entry.path()).unwrap());
+        }
+    }
+    let all = outputs.join("\n");
+    assert!(
+        !all.contains(OTHER_USER) && !all.contains(USER),
+        "principal leaked"
+    );
+    // Control: the outputs searched hold the written rows.
+    assert!(expected_file(&f.dir).exists() && all.contains("composer-2.5"));
+
+    // The move inside one walk: the newest month on the other id, older
+    // items on the cookie's id with `type: user`, none, or another spelling.
+    let f = fixture();
+    let mut untyped = item("c2", month_start_ms(0) + 2);
+    untyped["principal"].as_object_mut().unwrap().remove("type");
+    let mut spelled = item("c3", month_start_ms(0) + 3);
+    spelled["principal"]["type"] = "USER".into();
+    let mut replies = vec![
+        old_migrated(),
+        v2_page(&[as_user("o1", month_start_ms(0), OTHER_USER)], Some("n1")),
+        v2_page(&[untyped, spelled], None),
+        v2_page(&[item("c4", month_start_ms(1))], None),
+    ];
+    replies.extend((0..10).map(|_| v2_empty()));
+    let (url, _) = serve(replies);
+    let status = sync_status(&f, &url, &registry(true, &f.dir));
+    assert_eq!(
+        status["state"], "ok",
+        "cookie id beside the other: {status}"
+    );
+    assert_eq!(status["events"], 4, "{status}");
+
+    let pinned = || as_user("a", month_start_ms(0), OTHER_USER);
+    let later = |change: &dyn Fn(&mut serde_json::Value)| {
+        let mut item = as_user("b", month_start_ms(0) + 1, OTHER_USER);
+        change(&mut item);
+        vec![v2_page(&[pinned()], Some("n1")), v2_page(&[item], None)]
+    };
+    let mut team = as_user("t", month_start_ms(0), OTHER_USER);
+    team["principal"]["type"] = "team".into();
+    let cases = [
+        (
+            "third id on a later page",
+            later(&|i| i["principal"]["id"] = THIRD_USER.into()),
+        ),
+        (
+            "third id in a later window",
+            vec![
+                v2_page(&[pinned()], None),
+                v2_page(&[as_user("b", month_start_ms(1), THIRD_USER)], None),
+            ],
+        ),
+        (
+            "team after the pin",
+            later(&|i| i["principal"]["type"] = "team".into()),
+        ),
+        (
+            "User-cased other after the pin",
+            later(&|i| i["principal"]["type"] = "User".into()),
+        ),
+        (
+            "organization after the pin",
+            later(&|i| i["principal"]["type"] = "organization".into()),
+        ),
+        (
+            "untyped other after the pin",
+            later(&|i| {
+                i["principal"].as_object_mut().unwrap().remove("type");
+            }),
+        ),
+        (
+            "missing after the pin",
+            later(&|i| {
+                i.as_object_mut().unwrap().remove("principal");
+            }),
+        ),
+        (
+            "every id empty",
+            vec![v2_page(
+                &[
+                    as_user("a", month_start_ms(0), ""),
+                    as_user("b", month_start_ms(0) + 1, ""),
+                ],
+                None,
+            )],
+        ),
+        ("first item a team", vec![v2_page(&[team], None)]),
+    ];
+    for (case, pages) in cases {
+        let f = fixture();
+        let mut replies = vec![old_migrated()];
+        replies.extend(pages);
+        replies.extend((0..12).map(|_| v2_empty()));
+        let (url, _) = serve(replies);
+        let status = sync_status(&f, &url, &registry(true, &f.dir));
+        assert_eq!(status["state"], "error", "{case}: {status}");
+        assert_eq!(status["reason"], "billing_v2_principal_mismatch", "{case}");
+        assert!(!expected_file(&f.dir).exists(), "{case}");
+        assert!(!sidecar_path(&f.dir).exists(), "{case}");
+    }
 }
 
 /// S8: an unparseable `eventTime` is dropped; a future newest old row
