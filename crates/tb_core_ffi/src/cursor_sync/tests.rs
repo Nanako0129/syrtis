@@ -4505,9 +4505,9 @@ fn cleanup_deletes_sidecars_and_ignores_another_stems() {
 /// cookie never reach a file or the status; a page mixing in another
 /// principal, or an item without one, stops the walk with nothing written
 /// (a walk on one other user is accepted:
-/// `v2_one_user_principal_other_than_the_cookie_user`). Mutations: in `struct Extras`, put
-/// `#[serde(rename = "userEmail")]` on `model`; make the principal check's
-/// refusing arm `_ => {}`.
+/// `v2_one_user_principal_other_than_the_cookie_user`). Mutations: in
+/// `struct Extras`, put `#[serde(rename = "userEmail")]` on `model`; make
+/// both principal refusals in `walk` `continue`.
 #[test]
 fn v2_canaries_stay_out_and_another_principal_writes_nothing() {
     let _guard = lock();
@@ -4570,11 +4570,12 @@ fn v2_canaries_stay_out_and_another_principal_writes_nothing() {
 /// it across pages and windows, keeps that id out of the files and the
 /// status, and refuses, after the pin, another id on a later page or
 /// window, and a `team`, untyped or missing principal; a first `team`
-/// principal; and items whose ids are all empty. Mutations: in `walk`,
-/// compare with the cookie's user id again; match `(Some(_), Some(_))`
-/// without the guard; declare `principal` inside the window loop; drop the
-/// `type` test in `Principal::user_id`; let a missing `type` pass there;
-/// let it pass an empty id; accept `(None, Some(_))`.
+/// principal; and items whose ids are all empty. An untyped principal on
+/// the cookie's own id passes, as it did before #520. Mutations: in
+/// `walk`, accept only the cookie's user id; drop the pin comparison;
+/// declare `principal` inside the window loop; skip an item without a user
+/// principal; in `Principal::user_id`, drop the `type` test; pass any
+/// untyped id; refuse an untyped one; pass an empty id.
 #[test]
 fn v2_one_user_principal_other_than_the_cookie_user() {
     let _guard = lock();
@@ -4609,6 +4610,16 @@ fn v2_one_user_principal_other_than_the_cookie_user() {
     );
     // Control: the outputs searched hold the written rows.
     assert!(expected_file(&f.dir).exists() && all.contains("composer-2.5"));
+
+    let f = fixture();
+    let mut untyped = item("u", month_start_ms(0));
+    untyped["principal"].as_object_mut().unwrap().remove("type");
+    let mut replies = vec![old_migrated(), v2_page(&[untyped], None)];
+    replies.extend((0..11).map(|_| v2_empty()));
+    let (url, _) = serve(replies);
+    let status = sync_status(&f, &url, &registry(true, &f.dir));
+    assert_eq!(status["state"], "ok", "untyped cookie user: {status}");
+    assert_eq!(status["events"], 1, "{status}");
 
     let pinned = || as_user("a", month_start_ms(0), OTHER_USER);
     let later = |change: &dyn Fn(&mut serde_json::Value)| {

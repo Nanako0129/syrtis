@@ -168,13 +168,17 @@ struct Principal {
 }
 
 impl Principal {
-    /// The non-empty id of a `type: user` principal; `None` for any other
-    /// principal, an untyped one included. With the cookie's user id no
-    /// longer compared, `type` is what keeps a team principal out; both
-    /// measured shapes (t3code's sample, the #520 reporter) carry it.
-    fn user_id(&self) -> Option<&str> {
-        let user = self.kind.as_deref() == Some("user");
-        self.id.as_deref().filter(|id| user && !id.is_empty())
+    /// The non-empty id of a user principal: one with `type: user` (both
+    /// measured shapes, t3code's sample and the #520 reporter, carry it), or
+    /// an untyped one whose id is `cookie_user`. Any other principal is
+    /// `None`; `type` is what keeps a team principal out of the walk.
+    fn user_id(&self, cookie_user: &str) -> Option<&str> {
+        let id = self.id.as_deref().filter(|id| !id.is_empty())?;
+        match self.kind.as_deref() {
+            Some("user") => Some(id),
+            None if id == cookie_user => Some(id),
+            _ => None,
+        }
     }
 }
 
@@ -324,9 +328,10 @@ fn map(item: Item) -> Mapped {
 }
 
 /// Read `windows` (UTC month indexes, newest first). Every item of every page
-/// must carry one and the same user principal. That id may differ from the
-/// cookie's own user id: after Cursor's billing move one migrated account's
-/// items carried another user id (#520: 100 of 100 items, one distinct id).
+/// must carry one and the same user principal (`Principal::user_id`; `user`
+/// is the cookie's own user id). That id may differ from `user`: after
+/// Cursor's billing move one migrated account's items carried another user
+/// id (#520: 100 of 100 items, one distinct id).
 /// `stop_after_empty`: end after `EMPTY_WINDOWS_STOP` consecutive calendar
 /// months with no rows (design 5); a gap between windows restarts the count.
 #[allow(clippy::too_many_arguments)]
@@ -334,6 +339,7 @@ pub(crate) async fn walk(
     client: &reqwest::Client,
     base: &str,
     cookie: &reqwest::header::HeaderValue,
+    user: &str,
     limits: Limits,
     enabled: &dyn Fn() -> bool,
     windows: &[i32],
@@ -417,11 +423,12 @@ pub(crate) async fn walk(
             // S7: every item, written or not, is the walk's one user principal;
             // the first item read fixes it for every later page and window.
             for item in &items {
-                let id = item.principal.as_ref().and_then(Principal::user_id);
-                match (id, principal.as_deref()) {
-                    (Some(id), Some(seen)) if id == seen => {}
-                    (Some(id), None) => principal = Some(id.to_string()),
-                    _ => return Err(Stop::error("billing_v2_principal_mismatch")),
+                let id = item.principal.as_ref().and_then(|p| p.user_id(user));
+                let Some(id) = id else {
+                    return Err(Stop::error("billing_v2_principal_mismatch"));
+                };
+                if principal.get_or_insert_with(|| id.to_string()) != id {
+                    return Err(Stop::error("billing_v2_principal_mismatch"));
                 }
             }
             for item in items {
