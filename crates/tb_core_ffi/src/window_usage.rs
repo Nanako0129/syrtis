@@ -119,24 +119,27 @@ fn registered_roots_under(dir: &str) -> Vec<PathBuf> {
 /// another folder as spelled but resolves into a primary root (an extra
 /// account whose `projects` is a symlink to `~/.claude/projects`, or the whole
 /// account folder a symlink to `~/.claude`) would still empty the primary
-/// window. Such an entry is dropped too, judged by canonical path: one that is
-/// a scan root or lies under one, or one that contains a scan root's own
-/// parent folder (`~/.claude` for its roots, Claude Desktop's folder, a
-/// cc-mirror variant's config), so the primary keeps reading those roots. For
-/// an alias of `~/.claude` or of `~/.claude/projects` the extra card reads the
-/// same shared transcripts (measured in the tests); what an alias of Desktop's
-/// folder or a variant's config reads on its own card was not exercised.
+/// window. Such an entry is dropped too, judged by canonical path: one that
+/// resolves to a scan root's own parent folder (`~/.claude` for its roots,
+/// Claude Desktop's folder, a cc-mirror variant's config), or to a scan root
+/// or under one, so the primary keeps reading those roots. That covers an
+/// alias made on either side: an account folder linked to `~/.claude`, and
+/// the real target of a `~/.claude` that is itself a link (a dotfiles
+/// layout). For an alias of `~/.claude` or of `~/.claude/projects` the extra
+/// card reads the same shared transcripts (measured in the tests); what an
+/// alias of Desktop's folder or a variant's config reads on its own card was
+/// not exercised.
 ///
-/// Canonical paths alone cannot tell which side holds the link, so an entry is
-/// dropped only when the link is on its own side: some component of the entry
-/// below the part it shares with that root's spelling is a symlink
-/// (`links_on_its_own`). When instead the primary's side links into a real
-/// extra account folder (`~/.claude/projects` -> `work/projects/shared` or
-/// `work`, or `~/.claude` -> `work/shared`), the account's entries are real
-/// folders and are kept: the primary scan also walks the registered extra
-/// roots, so dropping them would count the account's other transcripts on the
-/// primary card. The linked part then reads 0 on the primary card, as a
-/// linked file does
+/// The root test applies only to a root that resolves inside its own parent.
+/// A root that is itself a link out of it (`~/.claude/projects` ->
+/// `work/projects/shared` or `work`) lives in a real extra account folder;
+/// dropping that account's entries would let the primary scan, which also
+/// walks the registered extra roots, count the account's other transcripts.
+/// They are kept, and the linked root reads 0 on the primary card, as a linked
+/// file does. An entry that only contains a resolved parent is kept for the
+/// same reason, so when `~/.claude` itself links into an account folder
+/// (`~/.claude` -> `work/shared`) every primary root resolves under the kept
+/// `work` and the whole primary card reads 0
 /// (`a_primary_transcript_symlinked_into_an_extra_account_is_not_the_primarys`,
 /// `a_primary_root_linked_into_an_extra_account_keeps_the_account_out`,
 /// `a_primary_side_linked_into_an_account_keeps_both_registries_out`).
@@ -152,45 +155,28 @@ fn primary_exclusions(home: Option<&Path>) -> Vec<PathBuf> {
         // Read once for the whole list, not once per path.
         let primary = crate::claude_config_dirs::PrimaryRoots::for_home(home);
         excluded.retain(|path| !primary.collides(path));
-        // Each scan root and its own parent, resolved. A folder inside `~/.claude`
-        // but outside the scan roots, such as `~/.claude/accounts/work`, contains
-        // neither and stays an account like any other.
-        // A root with no parent (none exists today) skips the parent test
-        // rather than falling back to the root, which would drop every account
-        // folder containing it.
-        let roots: Vec<(&PathBuf, PathBuf, Option<PathBuf>)> = primary
+        // Each scan root's own parent, resolved, and the root resolved when it
+        // stays inside that parent. A folder inside `~/.claude` but outside the
+        // scan roots, such as `~/.claude/accounts/work`, is neither and stays
+        // an account like any other. A root with no parent (none exists today)
+        // is skipped.
+        let roots: Vec<(Option<PathBuf>, PathBuf)> = primary
             .roots()
             .iter()
-            .map(|root| (root, canonical(root), root.parent().map(canonical)))
+            .filter_map(|root| {
+                let parent = canonical(root.parent()?);
+                let resolved = canonical(root);
+                Some((resolved.starts_with(&parent).then_some(resolved), parent))
+            })
             .collect();
         excluded.retain(|path| {
             let resolved = canonical(path);
-            !roots.iter().any(|(spelled, root, parent)| {
-                (resolved.starts_with(root)
-                    || parent.as_ref().is_some_and(|p| p.starts_with(&resolved)))
-                    && links_on_its_own(path, spelled)
+            !roots.iter().any(|(root, parent)| {
+                resolved == *parent || root.as_ref().is_some_and(|root| resolved.starts_with(root))
             })
         });
     }
     excluded
-}
-
-/// Whether `path` reaches its target through a symlink of its own: a component
-/// of `path` below the leading components it shares with `other` is a symlink.
-/// Shared components (a symlinked prefix of the home folder, such as macOS's
-/// `/var`) lead both paths the same way and say nothing about which side links.
-fn links_on_its_own(path: &Path, other: &Path) -> bool {
-    let shared = path
-        .components()
-        .zip(other.components())
-        .take_while(|(a, b)| a == b)
-        .count();
-    let mut prefix = PathBuf::new();
-    path.components().enumerate().any(|(index, component)| {
-        prefix.push(component);
-        index >= shared
-            && std::fs::symlink_metadata(&prefix).is_ok_and(|meta| meta.file_type().is_symlink())
-    })
 }
 
 /// `path` with symlinks resolved, or as given when it cannot be resolved (a
@@ -1296,19 +1282,31 @@ mod tests {
         reset_registries();
     }
 
-    /// The primary's side links into a real extra account `work`, with both
-    /// registries populated: (a) `~/.claude/projects` -> `work` itself, (b)
-    /// `~/.claude` -> `work/shared`. `work`, `work/projects` and
-    /// `work/transcripts` are real folders, so no link is on their side and
-    /// they stay excluded: the primary card does not count `work`'s
-    /// transcripts (here 7,000 under `work/transcripts`), and the linked part
-    /// reads 0 there, as a linked file does. Mutations: drop `links_on_its_own`
-    /// from the drop rule, or its shared-prefix skip (the primary counts
-    /// `work`'s transcripts, 8,000 instead of 0).
+    /// `~/.claude` or one of its roots links into another folder `work`, which
+    /// is registered in both registries. (a) `~/.claude/projects` -> `work`:
+    /// the root lives in a real account, so `work` stays excluded; the primary
+    /// card keeps only its unlinked `~/.claude/transcripts` (500). (b)
+    /// `~/.claude` -> `work/shared`: every primary root resolves under the
+    /// kept `work`, so the whole primary card reads 0. (c) `~/.claude` ->
+    /// `work` (a dotfiles layout; `work` is the primary's own folder): `work`
+    /// is the resolved `~/.claude` and is dropped, so the primary keeps its
+    /// 1,000 and the account card reads the same shared 1,000. In (a) and (b)
+    /// the account card reads `work/transcripts` (7,000). Mutations (measured,
+    /// each failing a shape): no parent equality (c), no root test (c), the
+    /// root test without its inside-the-parent check (a: 8,500), a parent that
+    /// is merely contained (b: 1,000).
     #[cfg(unix)]
     #[test]
     fn a_primary_side_linked_into_an_account_keeps_both_registries_out() {
-        for shape in ["projects_to_account", "claude_to_account_subfolder"] {
+        for (shape, primary_output, account_output) in [
+            ("projects_to_account", 500, D_OUTPUT),
+            ("claude_to_account_subfolder", 0, D_OUTPUT),
+            (
+                "claude_to_its_dotfiles_target",
+                PRIMARY_OUTPUT,
+                PRIMARY_OUTPUT,
+            ),
+        ] {
             let _guards = lock_registries();
             reset_registries();
             let dir = tempfile::tempdir().unwrap();
@@ -1318,14 +1316,22 @@ mod tests {
                 std::fs::create_dir_all(&folder).unwrap();
                 std::fs::write(folder.join(format!("{id}.jsonl")), turn(id, output)).unwrap();
             };
-            seed(work.join("transcripts/t"), "w", D_OUTPUT);
-            if shape == "projects_to_account" {
-                seed(work.join("p"), "a", PRIMARY_OUTPUT);
-                std::fs::create_dir_all(home.join(".claude")).unwrap();
-                std::os::unix::fs::symlink(&work, home.join(".claude/projects")).unwrap();
-            } else {
-                seed(work.join("shared/projects/p"), "a", PRIMARY_OUTPUT);
-                std::os::unix::fs::symlink(work.join("shared"), home.join(".claude")).unwrap();
+            match shape {
+                "projects_to_account" => {
+                    seed(work.join("transcripts/t"), "w", D_OUTPUT);
+                    seed(work.join("p"), "a", PRIMARY_OUTPUT);
+                    seed(home.join(".claude/transcripts/t"), "c", 500);
+                    std::os::unix::fs::symlink(&work, home.join(".claude/projects")).unwrap();
+                }
+                "claude_to_account_subfolder" => {
+                    seed(work.join("transcripts/t"), "w", D_OUTPUT);
+                    seed(work.join("shared/projects/p"), "a", PRIMARY_OUTPUT);
+                    std::os::unix::fs::symlink(work.join("shared"), home.join(".claude")).unwrap();
+                }
+                _ => {
+                    seed(work.join("projects/p"), "a", PRIMARY_OUTPUT);
+                    std::os::unix::fs::symlink(&work, home.join(".claude")).unwrap();
+                }
             }
             crate::extra_scan_paths::set_from_json(
                 &serde_json::json!({ "claude": [
@@ -1345,11 +1351,17 @@ mod tests {
             };
 
             let primary = scan(&context, &PRIMARY);
+            let account = scan(&context, &Some(work.display().to_string()));
 
             assert_eq!(
                 output_tokens(&primary),
-                0,
-                "{shape}: the primary counted the account's transcripts: {primary}"
+                primary_output,
+                "{shape}: primary {primary}"
+            );
+            assert_eq!(
+                output_tokens(&account),
+                account_output,
+                "{shape}: account {account}"
             );
             reset_registries();
         }
@@ -1362,8 +1374,9 @@ mod tests {
     /// primary card counts neither `other` (reachable through the registered
     /// extra root `work/projects`) nor the linked `shared` (that account's, as
     /// #537 decided for a linked file). Mutation (measured): also drop an
-    /// exclusion that is an ancestor of a primary root; the primary then reads
-    /// 8,000 (`shared` + `other`).
+    /// exclusion that contains a resolved primary root, without the check that
+    /// the root resolves inside its parent; the primary then reads 8,000
+    /// (`shared` + `other`).
     #[cfg(unix)]
     #[test]
     fn a_primary_root_linked_into_an_extra_account_keeps_the_account_out() {
