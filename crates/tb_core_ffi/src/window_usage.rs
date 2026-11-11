@@ -119,13 +119,17 @@ fn registered_roots_under(dir: &str) -> Vec<PathBuf> {
 /// another folder as spelled but resolves into a primary root (an extra
 /// account whose `projects` is a symlink to `~/.claude/projects`, or the whole
 /// account folder a symlink to `~/.claude`) would still empty the primary
-/// window. Such an entry is dropped too: one whose canonical path is a scan
-/// root or lies under one, or is `~/.claude` itself or an ancestor. The shared
-/// transcripts are then counted on both cards, which beats a confidently zero
-/// primary. An entry that only contains a primary root (the root itself links
-/// into a real extra account folder) is kept, so the rest of that account is
-/// not counted on the primary card, and a file in a primary root that links
-/// into a real extra account folder stays that account's
+/// window. Such an entry is dropped too, judged by canonical path: one that is
+/// a scan root or lies under one, or one that contains a scan root's own
+/// parent folder (`~/.claude` for its roots, Claude Desktop's folder, a
+/// cc-mirror variant's config). The shared transcripts are then counted on
+/// both cards, which beats a confidently zero primary.
+///
+/// An entry that contains a scan root only because the root itself links into
+/// a real extra account folder (`~/.claude/projects` -> `work/projects/shared`)
+/// is kept: the primary scan also walks the registered extra roots, so
+/// dropping `work` would count `work`'s other projects on the primary card.
+/// The linked root then reads 0 on the primary card, as a linked file does
 /// (`a_primary_transcript_symlinked_into_an_extra_account_is_not_the_primarys`,
 /// `a_primary_root_linked_into_an_extra_account_keeps_the_account_out`).
 fn primary_exclusions(home: Option<&Path>) -> Vec<PathBuf> {
@@ -140,14 +144,24 @@ fn primary_exclusions(home: Option<&Path>) -> Vec<PathBuf> {
         // Read once for the whole list, not once per path.
         let primary = crate::claude_config_dirs::PrimaryRoots::for_home(home);
         excluded.retain(|path| !primary.collides(path));
-        // Resolved: each scan root, and `~/.claude` itself (a folder inside it
-        // but outside the scan roots, such as `~/.claude/accounts/work`, is an
-        // account like any other).
-        let roots: Vec<PathBuf> = primary.roots().iter().map(|root| canonical(root)).collect();
-        let claude = canonical(&home.join(".claude"));
+        // Each scan root and its own parent, resolved. A folder inside `~/.claude`
+        // but outside the scan roots, such as `~/.claude/accounts/work`, contains
+        // neither and stays an account like any other.
+        let roots: Vec<(PathBuf, PathBuf)> = primary
+            .roots()
+            .iter()
+            .map(|root| {
+                let parent = root
+                    .parent()
+                    .map_or_else(|| root.clone(), Path::to_path_buf);
+                (canonical(root), canonical(&parent))
+            })
+            .collect();
         excluded.retain(|path| {
             let path = canonical(path);
-            !(claude.starts_with(&path) || roots.iter().any(|root| path.starts_with(root)))
+            !roots
+                .iter()
+                .any(|(root, parent)| path.starts_with(root) || parent.starts_with(&path))
         });
     }
     excluded
@@ -1167,7 +1181,7 @@ mod tests {
     /// primary reads its own transcript; the extra card of the first two reads
     /// the same shared transcript, since nothing in a transcript names its
     /// account. Mutations: delete the canonical `retain` in
-    /// `primary_exclusions` (every case reads 0); drop the `~/.claude` test
+    /// `primary_exclusions` (every case reads 0); drop the parent test
     /// (`whole_folder` reads 0).
     #[cfg(unix)]
     #[test]
@@ -1223,14 +1237,47 @@ mod tests {
         }
     }
 
+    /// An extra account folder that is a symlink to the parent of a primary
+    /// scan root outside `~/.claude` (Claude Desktop's folder) is not excluded
+    /// from the primary window, while a genuine account next to it still is.
+    /// Mutation: drop the parent test in `primary_exclusions` (the alias is
+    /// listed).
+    #[cfg(unix)]
+    #[test]
+    fn an_alias_of_a_primary_roots_parent_is_not_excluded() {
+        let _guards = lock_registries();
+        reset_registries();
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().to_path_buf();
+        let desktop = home.join("Library/Application Support/Claude");
+        std::fs::create_dir_all(desktop.join("local-agent-mode-sessions")).unwrap();
+        std::fs::create_dir_all(home.join(".claude/projects")).unwrap();
+        let alias = home.join("claude-desktop");
+        std::os::unix::fs::symlink(&desktop, &alias).unwrap();
+        let genuine = home.join("work");
+        std::fs::create_dir_all(genuine.join("projects")).unwrap();
+        crate::claude_config_dirs::set_from_json(
+            &serde_json::json!([alias.display().to_string(), genuine.display().to_string()])
+                .to_string(),
+        )
+        .unwrap();
+
+        let excluded = primary_exclusions(Some(&home));
+
+        assert!(!excluded.contains(&alias), "{excluded:?}");
+        assert!(excluded.contains(&genuine), "{excluded:?}");
+        reset_registries();
+    }
+
     /// The reverse layout: the primary's `~/.claude/projects` is itself a link
     /// to one project folder (`shared`) inside a real extra account `work`
     /// that also holds another project (`other`). The exclusions for `work`
     /// and its roots only contain the primary root, so they are kept: the
-    /// primary card counts neither `other` (the rest of that account) nor the
-    /// linked `shared` (that account's, as #537 decided for a linked file).
-    /// Mutation: drop an exclusion that is an ancestor of a primary root too
-    /// (the primary then counts `work`'s projects).
+    /// primary card counts neither `other` (reachable through the registered
+    /// extra root `work/projects`) nor the linked `shared` (that account's, as
+    /// #537 decided for a linked file). Mutation (measured): also drop an
+    /// exclusion that is an ancestor of a primary root; the primary then reads
+    /// 8,000 (`shared` + `other`).
     #[cfg(unix)]
     #[test]
     fn a_primary_root_linked_into_an_extra_account_keeps_the_account_out() {
