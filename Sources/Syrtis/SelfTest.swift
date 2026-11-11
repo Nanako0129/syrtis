@@ -19408,17 +19408,19 @@ enum SelfTest {
                 CursorSync.statusLine(state: "error", lastSuccessMs: nil, reason: $0, now: now)
                     == CursorSync.Copy.error.localized
             }, "CURSOR-SYNC error without a valid reason code keeps the generic line")
-            let partialCode = CursorSync.statusLine(state: "partial", lastSuccessMs: nil, reason: "timeout", now: now)
-            expect(partialCode == CursorSync.Copy.partialWithReason.localized("timeout")
-                       && partialCode?.contains("timeout") == true,
-                   "CURSOR-SYNC partial with a reason code shows the code (#520): \(partialCode ?? "nil")")
+            for code in ["timeout", "budget_exhausted", "too_many_pages"] {
+                let partialCode = CursorSync.statusLine(state: "partial", lastSuccessMs: nil, reason: code, now: now)
+                expect(partialCode == CursorSync.Copy.partialWithReason.localized(code)
+                           && partialCode?.contains(code) == true,
+                       "CURSOR-SYNC partial with the core's \(code) shows the code (#520): \(partialCode ?? "nil")")
+            }
             expect(badCodes.allSatisfy {
                 CursorSync.statusLine(state: "partial", lastSuccessMs: nil, reason: $0, now: now)
                     == CursorSync.Copy.partial.localized
             }, "CURSOR-SYNC partial without a valid reason code keeps the generic line")
             expect(CursorSync.statusLine(state: "offline", lastSuccessMs: nil, reason: "http_status", now: now)
                        == CursorSync.Copy.offline.localized,
-                   "CURSOR-SYNC a reason does not change a non-error state's line")
+                   "CURSOR-SYNC a reason does not change the offline line")
             let ok = CursorSync.statusLine(state: "ok", lastSuccessMs: ms, now: now)
             expect(ok?.hasPrefix("Last synced ") == true && ok?.contains("1 hour ago") == true,
                    "CURSOR-SYNC status ok shows the relative time: \(ok ?? "nil")")
