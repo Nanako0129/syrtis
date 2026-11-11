@@ -119,9 +119,13 @@ fn registered_roots_under(dir: &str) -> Vec<PathBuf> {
 /// another folder as spelled but resolves into a primary root (an extra
 /// account whose `projects` is a symlink to `~/.claude/projects`, or the whole
 /// account folder a symlink to `~/.claude`) would still empty the primary
-/// window. Such an entry is dropped too, by canonical path, as
-/// `nested_exclusions` does for an extra account: the shared transcripts are
-/// then counted on both cards, which beats a confidently zero primary.
+/// window. Such an entry is dropped too, by canonical path (the ancestor
+/// direction is what `nested_exclusions` does for an extra account; this also
+/// drops a descendant): the shared transcripts are then counted on both
+/// cards, which beats a confidently zero primary. The other direction is
+/// unchanged: a file in a primary root that links into a real extra account
+/// folder is that account's, not the primary's
+/// (`a_primary_transcript_symlinked_into_an_extra_account_is_not_the_primarys`).
 fn primary_exclusions(home: Option<&Path>) -> Vec<PathBuf> {
     let mut excluded: Vec<PathBuf> = crate::claude_config_dirs::snapshot()
         .into_iter()
@@ -1158,9 +1162,11 @@ mod tests {
     /// `primary_exclusions` the primary window read 0 in each. With it, the
     /// primary reads its own transcript; the extra card of the first two reads
     /// the same shared transcript, since nothing in a transcript names its
-    /// account. Mutations: delete the canonical `retain` in
-    /// `primary_exclusions` (every case reads 0); keep only one direction of the
-    /// overlap test (the first two or the third case reads 0).
+    /// account. Mutations (measured): delete the canonical `retain` in
+    /// `primary_exclusions` (every case reads 0); keep only
+    /// `path.starts_with(root)` (`whole_folder` reads 0); keep only
+    /// `root.starts_with(&path)` (`projects_into_a_project` reads 0).
+    /// `projects_link` resolves to the root itself and survives either.
     #[cfg(unix)]
     #[test]
     fn an_extra_account_linked_to_the_primarys_transcripts_does_not_empty_the_primary() {
