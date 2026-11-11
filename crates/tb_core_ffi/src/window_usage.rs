@@ -119,13 +119,15 @@ fn registered_roots_under(dir: &str) -> Vec<PathBuf> {
 /// another folder as spelled but resolves into a primary root (an extra
 /// account whose `projects` is a symlink to `~/.claude/projects`, or the whole
 /// account folder a symlink to `~/.claude`) would still empty the primary
-/// window. Such an entry is dropped too, by canonical path (the ancestor
-/// direction is what `nested_exclusions` does for an extra account; this also
-/// drops a descendant): the shared transcripts are then counted on both
-/// cards, which beats a confidently zero primary. The other direction is
-/// unchanged: a file in a primary root that links into a real extra account
-/// folder is that account's, not the primary's
-/// (`a_primary_transcript_symlinked_into_an_extra_account_is_not_the_primarys`).
+/// window. Such an entry is dropped too: one whose canonical path is a scan
+/// root or lies under one, or is `~/.claude` itself or an ancestor. The shared
+/// transcripts are then counted on both cards, which beats a confidently zero
+/// primary. An entry that only contains a primary root (the root itself links
+/// into a real extra account folder) is kept, so the rest of that account is
+/// not counted on the primary card, and a file in a primary root that links
+/// into a real extra account folder stays that account's
+/// (`a_primary_transcript_symlinked_into_an_extra_account_is_not_the_primarys`,
+/// `a_primary_root_linked_into_an_extra_account_keeps_the_account_out`).
 fn primary_exclusions(home: Option<&Path>) -> Vec<PathBuf> {
     let mut excluded: Vec<PathBuf> = crate::claude_config_dirs::snapshot()
         .into_iter()
@@ -138,12 +140,14 @@ fn primary_exclusions(home: Option<&Path>) -> Vec<PathBuf> {
         // Read once for the whole list, not once per path.
         let primary = crate::claude_config_dirs::PrimaryRoots::for_home(home);
         excluded.retain(|path| !primary.collides(path));
+        // Resolved: each scan root, and `~/.claude` itself (a folder inside it
+        // but outside the scan roots, such as `~/.claude/accounts/work`, is an
+        // account like any other).
         let roots: Vec<PathBuf> = primary.roots().iter().map(|root| canonical(root)).collect();
+        let claude = canonical(&home.join(".claude"));
         excluded.retain(|path| {
             let path = canonical(path);
-            !roots
-                .iter()
-                .any(|root| root.starts_with(&path) || path.starts_with(root))
+            !(claude.starts_with(&path) || roots.iter().any(|root| path.starts_with(root)))
         });
     }
     excluded
@@ -1162,11 +1166,9 @@ mod tests {
     /// `primary_exclusions` the primary window read 0 in each. With it, the
     /// primary reads its own transcript; the extra card of the first two reads
     /// the same shared transcript, since nothing in a transcript names its
-    /// account. Mutations (measured): delete the canonical `retain` in
-    /// `primary_exclusions` (every case reads 0); keep only
-    /// `path.starts_with(root)` (`whole_folder` reads 0); keep only
-    /// `root.starts_with(&path)` (`projects_into_a_project` reads 0).
-    /// `projects_link` resolves to the root itself and survives either.
+    /// account. Mutations: delete the canonical `retain` in
+    /// `primary_exclusions` (every case reads 0); drop the `~/.claude` test
+    /// (`whole_folder` reads 0).
     #[cfg(unix)]
     #[test]
     fn an_extra_account_linked_to_the_primarys_transcripts_does_not_empty_the_primary() {
@@ -1219,6 +1221,63 @@ mod tests {
             }
             reset_registries();
         }
+    }
+
+    /// The reverse layout: the primary's `~/.claude/projects` is itself a link
+    /// to one project folder (`shared`) inside a real extra account `work`
+    /// that also holds another project (`other`). The exclusions for `work`
+    /// and its roots only contain the primary root, so they are kept: the
+    /// primary card counts neither `other` (the rest of that account) nor the
+    /// linked `shared` (that account's, as #537 decided for a linked file).
+    /// Mutation: drop an exclusion that is an ancestor of a primary root too
+    /// (the primary then counts `work`'s projects).
+    #[cfg(unix)]
+    #[test]
+    fn a_primary_root_linked_into_an_extra_account_keeps_the_account_out() {
+        let _guards = lock_registries();
+        reset_registries();
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().to_path_buf();
+        let work = home.join("work");
+        for (project, id, output) in [("shared", "s", PRIMARY_OUTPUT), ("other", "o", D_OUTPUT)] {
+            let folder = work.join("projects").join(project);
+            std::fs::create_dir_all(&folder).unwrap();
+            std::fs::write(folder.join(format!("{id}.jsonl")), turn(id, output)).unwrap();
+        }
+        std::fs::create_dir_all(home.join(".claude")).unwrap();
+        std::os::unix::fs::symlink(work.join("projects/shared"), home.join(".claude/projects"))
+            .unwrap();
+        crate::extra_scan_paths::set_from_json(
+            &serde_json::json!({ "claude": [
+                work.join("projects").display().to_string(),
+                work.join("transcripts").display().to_string(),
+            ] })
+            .to_string(),
+        )
+        .unwrap();
+        crate::claude_config_dirs::set_from_json(
+            &serde_json::json!([work.display().to_string()]).to_string(),
+        )
+        .unwrap();
+        let context = crate::LocalSourceContext {
+            home_dir: Some(home.clone()),
+            use_env_roots: false,
+        };
+
+        let primary = scan(&context, &PRIMARY);
+        let account = scan(&context, &Some(work.display().to_string()));
+
+        assert_eq!(
+            output_tokens(&primary),
+            0,
+            "the primary counted the extra account's projects: {primary}"
+        );
+        assert_eq!(
+            output_tokens(&account),
+            PRIMARY_OUTPUT + D_OUTPUT,
+            "{account}"
+        );
+        reset_registries();
     }
 
     /// A `.cc-mirror` variant under an extra account's directory may name a
