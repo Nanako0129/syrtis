@@ -105,7 +105,9 @@ fn registered_roots_under(dir: &str) -> Vec<PathBuf> {
 ///   lists can disagree, and the disagreement is silent.
 ///
 /// Excluding neither is how the extra account's transcripts land on the primary
-/// card, which is what issue #258 reports.
+/// card, which is what issue #258 reports. Since #561 the primary window does
+/// not walk the registered roots at all (`account_options`), so these
+/// exclusions guard the routes the engine finds on its own.
 ///
 /// Never excludes a path that collides with the primary's own roots
 /// (`claude_config_dirs::PrimaryRoots::collides` under `home`), whatever a
@@ -116,33 +118,26 @@ fn registered_roots_under(dir: &str) -> Vec<PathBuf> {
 ///
 /// `collides` compares spelling only. The engine canonicalises an exclusion and
 /// matches each file both as found and canonicalised, so an entry that is
-/// another folder as spelled but resolves into a primary root (an extra
-/// account whose `projects` is a symlink to `~/.claude/projects`, or the whole
-/// account folder a symlink to `~/.claude`) would still empty the primary
-/// window. Such an entry is dropped too, judged by canonical path: one that
-/// resolves to a scan root's own parent folder (`~/.claude` for its roots,
-/// Claude Desktop's folder, a cc-mirror variant's config), or to a scan root
-/// or under one, so the primary keeps reading those roots. That covers an
-/// alias made on either side: an account folder linked to `~/.claude`, and
-/// the real target of a `~/.claude` that is itself a link (a dotfiles
-/// layout). For an alias of `~/.claude` or of `~/.claude/projects` the extra
-/// card reads the same shared transcripts (measured in the tests); what an
-/// alias of Desktop's folder or a variant's config reads on its own card was
-/// not exercised.
-///
-/// The root test applies only to a root that resolves inside its own parent.
-/// A root that is itself a link out of it (`~/.claude/projects` ->
-/// `work/projects/shared` or `work`) lives in a real extra account folder;
-/// dropping that account's entries would let the primary scan, which also
-/// walks the registered extra roots, count the account's other transcripts.
-/// They are kept, and the linked root reads 0 on the primary card, as a linked
-/// file does. An entry that only contains a resolved parent is kept for the
-/// same reason, so when `~/.claude` itself links into an account folder
-/// (`~/.claude` -> `work/shared`) every primary root resolves under the kept
-/// `work` and the whole primary card reads 0
-/// (`a_primary_transcript_symlinked_into_an_extra_account_is_not_the_primarys`,
+/// another folder as spelled but resolves onto a primary root (an extra
+/// account whose `projects` is a symlink to `~/.claude/projects`, an account
+/// folder that is a symlink to `~/.claude`, the real target of a `~/.claude`
+/// that is itself a link) would still empty the primary window. Such an entry
+/// is dropped too, judged by canonical path: one whose resolved path contains
+/// a resolved scan root or lies under one. Dropping it can let in only what
+/// the engine reaches beyond the primary's roots on its own (a `.cc-mirror`
+/// variant, `TOKSCALE_EXTRA_DIRS`), because the primary window does not walk
+/// the registered extra roots (`account_options`). So each card counts what
+/// its own roots reach: transcripts shared through a link count on the
+/// primary card and on each card whose roots reach them, whichever side holds
+/// the link, and an account's transcripts that no primary root reaches stay
+/// out (measured in the tests named below). A transcript file linked on its
+/// own (#537) is unchanged: its exclusion overlaps no root. What an alias of
+/// Desktop's folder or a variant's config reads on its own card was not
+/// exercised
+/// (`an_extra_account_linked_to_the_primarys_transcripts_does_not_empty_the_primary`,
 /// `a_primary_root_linked_into_an_extra_account_keeps_the_account_out`,
-/// `a_primary_side_linked_into_an_account_keeps_both_registries_out`).
+/// `a_primary_side_link_counts_what_the_primarys_roots_reach`,
+/// `a_primary_transcript_symlinked_into_an_extra_account_is_not_the_primarys`).
 fn primary_exclusions(home: Option<&Path>) -> Vec<PathBuf> {
     let mut excluded: Vec<PathBuf> = crate::claude_config_dirs::snapshot()
         .into_iter()
@@ -155,25 +150,15 @@ fn primary_exclusions(home: Option<&Path>) -> Vec<PathBuf> {
         // Read once for the whole list, not once per path.
         let primary = crate::claude_config_dirs::PrimaryRoots::for_home(home);
         excluded.retain(|path| !primary.collides(path));
-        // Each scan root's own parent, resolved, and the root resolved when it
-        // stays inside that parent. A folder inside `~/.claude` but outside the
-        // scan roots, such as `~/.claude/accounts/work`, is neither and stays
-        // an account like any other. A root with no parent (none exists today)
-        // is skipped.
-        let roots: Vec<(Option<PathBuf>, PathBuf)> = primary
-            .roots()
-            .iter()
-            .filter_map(|root| {
-                let parent = canonical(root.parent()?);
-                let resolved = canonical(root);
-                Some((resolved.starts_with(&parent).then_some(resolved), parent))
-            })
-            .collect();
+        // Each scan root, resolved. A folder inside `~/.claude` but outside
+        // the scan roots, such as `~/.claude/accounts/work`, overlaps none and
+        // stays an account like any other.
+        let roots: Vec<PathBuf> = primary.roots().iter().map(|root| canonical(root)).collect();
         excluded.retain(|path| {
             let resolved = canonical(path);
-            !roots.iter().any(|(root, parent)| {
-                resolved == *parent || root.as_ref().is_some_and(|root| resolved.starts_with(root))
-            })
+            !roots
+                .iter()
+                .any(|root| resolved.starts_with(root) || root.starts_with(&resolved))
         });
     }
     excluded
@@ -284,6 +269,12 @@ fn account_options(
     Ok(match account {
         None => {
             let mut options = context.report_options(None, None);
+            // The registered Claude roots are the extra accounts' by
+            // definition: the primary window never walks them, so an
+            // exclusion dropped below can only let in what the engine reaches
+            // on its own (the primary's roots, a `.cc-mirror` variant,
+            // `TOKSCALE_EXTRA_DIRS`), never an account's registered root.
+            options.scanner_settings.extra_scan_paths.remove(CLAUDE);
             let excluded = primary_exclusions(context.home_dir.as_deref());
             if !excluded.is_empty() {
                 options
@@ -822,10 +813,12 @@ mod tests {
     /// disagree: a directory can reach `tb_set_extra_scan_paths` while
     /// `tb_set_claude_config_dirs` still holds the previous list.
     ///
-    /// The primary must still refuse it. Without the registry half of
-    /// `primary_exclusions` this is the shape that leaks — and it is the only
-    /// shape that does, which is why it needs its own fixture rather than
-    /// riding on the one above where both registries agree.
+    /// The primary must still refuse it. Two things keep it out: the primary
+    /// window does not walk the registered roots (`account_options`), and the
+    /// registry half of `primary_exclusions` excludes them from any route the
+    /// engine finds on its own. Mutation (measured): remove both and this test
+    /// fails; remove either alone and it passes. It needs its own fixture
+    /// rather than riding on the one above where both registries agree.
     #[test]
     fn primary_window_excludes_a_root_the_config_dir_registry_never_heard_of() {
         let _guards = lock_registries();
@@ -1186,35 +1179,62 @@ mod tests {
     /// Extra accounts that share the primary's transcripts through a symlink:
     /// a real account folder whose `projects` links to `~/.claude/projects`
     /// (the maintainer's setup), an account folder that is itself a link to
-    /// `~/.claude`, and a `projects` linked to one project folder inside
-    /// `~/.claude/projects`. No spelling collides with a primary root, but the
+    /// `~/.claude`, a `projects` linked to one project folder inside
+    /// `~/.claude/projects`, the first layout with `~/.claude/projects` itself
+    /// moved elsewhere through a link, and an account folder that is a link to
+    /// the home folder. No spelling collides with a primary root, but the
     /// engine resolves the exclusion, so before the canonical guard in
     /// `primary_exclusions` the primary window read 0 in each. With it, the
-    /// primary reads its own transcript; the extra card of the first two reads
-    /// the same shared transcript, since nothing in a transcript names its
-    /// account. Mutations: delete the canonical `retain` in
-    /// `primary_exclusions` (every case reads 0); drop the parent test
-    /// (`whole_folder` reads 0).
+    /// primary reads its own transcript; the extra card of the first two and
+    /// the relocated one reads the same shared transcript, since nothing in a
+    /// transcript names its account. Mutations (measured): delete the
+    /// canonical `retain` (`projects_link` reads 0); drop the containing
+    /// direction (`whole_folder` reads 0); drop the contained direction
+    /// (`projects_into_a_project` reads 0).
     #[cfg(unix)]
     #[test]
     fn an_extra_account_linked_to_the_primarys_transcripts_does_not_empty_the_primary() {
-        for shape in ["projects_link", "whole_folder", "projects_into_a_project"] {
+        for shape in [
+            "projects_link",
+            "whole_folder",
+            "projects_into_a_project",
+            "relocated_root",
+            "home_alias",
+        ] {
             let _guards = lock_registries();
             reset_registries();
             let dir = tempfile::tempdir().unwrap();
             let home = dir.path().to_path_buf();
-            write_session(&home.join(".claude"), "primary", PRIMARY_OUTPUT);
             let extra = home.join("claude-team");
-            let link_target = match shape {
-                "whole_folder" => None,
-                "projects_link" => Some(home.join(".claude/projects")),
-                _ => Some(home.join(".claude/projects/proj")),
-            };
-            match &link_target {
-                None => std::os::unix::fs::symlink(home.join(".claude"), &extra).unwrap(),
-                Some(target) => {
+            if shape == "relocated_root" {
+                write_session(&home.join("disk"), "primary", PRIMARY_OUTPUT);
+                std::fs::create_dir_all(home.join(".claude")).unwrap();
+                std::os::unix::fs::symlink(
+                    home.join("disk/projects"),
+                    home.join(".claude/projects"),
+                )
+                .unwrap();
+            } else {
+                write_session(&home.join(".claude"), "primary", PRIMARY_OUTPUT);
+            }
+            match shape {
+                "whole_folder" => std::os::unix::fs::symlink(home.join(".claude"), &extra).unwrap(),
+                "home_alias" => std::os::unix::fs::symlink(&home, &extra).unwrap(),
+                "projects_into_a_project" => {
                     std::fs::create_dir_all(&extra).unwrap();
-                    std::os::unix::fs::symlink(target, extra.join("projects")).unwrap();
+                    std::os::unix::fs::symlink(
+                        home.join(".claude/projects/proj"),
+                        extra.join("projects"),
+                    )
+                    .unwrap();
+                }
+                _ => {
+                    std::fs::create_dir_all(&extra).unwrap();
+                    std::os::unix::fs::symlink(
+                        home.join(".claude/projects"),
+                        extra.join("projects"),
+                    )
+                    .unwrap();
                 }
             }
             crate::extra_scan_paths::set_from_json(
@@ -1242,7 +1262,7 @@ mod tests {
                 PRIMARY_OUTPUT,
                 "{shape}: the primary window lost its own transcript: {primary}"
             );
-            if shape != "projects_into_a_project" {
+            if ["projects_link", "whole_folder", "relocated_root"].contains(&shape) {
                 assert_eq!(output_tokens(&shared), PRIMARY_OUTPUT, "{shape}: {shared}");
             }
             reset_registries();
@@ -1253,8 +1273,8 @@ mod tests {
     /// scan root outside `~/.claude` (Claude Desktop's folder) is not excluded
     /// from the primary window, while a genuine account next to it still is.
     /// This checks the exclusion list only; no Cowork transcript is scanned.
-    /// Mutation: drop the parent test in `primary_exclusions` (the alias is
-    /// listed).
+    /// Mutation (measured): drop the containing direction in
+    /// `primary_exclusions` (the alias is listed).
     #[cfg(unix)]
     #[test]
     fn an_alias_of_a_primary_roots_parent_is_not_excluded() {
@@ -1283,24 +1303,27 @@ mod tests {
     }
 
     /// `~/.claude` or one of its roots links into another folder `work`, which
-    /// is registered in both registries. (a) `~/.claude/projects` -> `work`:
-    /// the root lives in a real account, so `work` stays excluded; the primary
-    /// card keeps only its unlinked `~/.claude/transcripts` (500). (b)
-    /// `~/.claude` -> `work/shared`: every primary root resolves under the
-    /// kept `work`, so the whole primary card reads 0. (c) `~/.claude` ->
-    /// `work` (a dotfiles layout; `work` is the primary's own folder): `work`
-    /// is the resolved `~/.claude` and is dropped, so the primary keeps its
-    /// 1,000 and the account card reads the same shared 1,000. In (a) and (b)
-    /// the account card reads `work/transcripts` (7,000). Mutations (measured,
-    /// each failing a shape): no parent equality (c), no root test (c), the
-    /// root test without its inside-the-parent check (a: 8,500), a parent that
-    /// is merely contained (b: 1,000).
+    /// is registered in both registries. The primary window never walks the
+    /// registered roots and keeps the exclusions that do not overlap its own
+    /// resolved roots, so it counts exactly what its roots reach. (a)
+    /// `~/.claude/projects` -> `work`: `work` is the primary's projects folder,
+    /// so everything under it counts there (8,000), plus the unlinked
+    /// `~/.claude/transcripts` (500). (b) `~/.claude` -> `work/shared`: the
+    /// primary reads `work/shared/projects` (1,000) and not the account's
+    /// `work/transcripts` (7,000). (c) `~/.claude` -> `work` (a dotfiles layout;
+    /// `work` is the primary's own folder): both cards read the same 1,000.
+    /// Mutations (measured): drop the containing direction (b reads 0); drop
+    /// the contained direction (a reads 1,500).
     #[cfg(unix)]
     #[test]
-    fn a_primary_side_linked_into_an_account_keeps_both_registries_out() {
+    fn a_primary_side_link_counts_what_the_primarys_roots_reach() {
         for (shape, primary_output, account_output) in [
-            ("projects_to_account", 500, D_OUTPUT),
-            ("claude_to_account_subfolder", 0, D_OUTPUT),
+            (
+                "projects_to_account",
+                PRIMARY_OUTPUT + D_OUTPUT + 500,
+                D_OUTPUT,
+            ),
+            ("claude_to_account_subfolder", PRIMARY_OUTPUT, D_OUTPUT),
             (
                 "claude_to_its_dotfiles_target",
                 PRIMARY_OUTPUT,
@@ -1369,14 +1392,11 @@ mod tests {
 
     /// The reverse layout: the primary's `~/.claude/projects` is itself a link
     /// to one project folder (`shared`) inside a real extra account `work`
-    /// that also holds another project (`other`). The exclusions for `work`
-    /// and its roots only contain the primary root, so they are kept: the
-    /// primary card counts neither `other` (reachable through the registered
-    /// extra root `work/projects`) nor the linked `shared` (that account's, as
-    /// #537 decided for a linked file). Mutation (measured): also drop an
-    /// exclusion that contains a resolved primary root, without the check that
-    /// the root resolves inside its parent; the primary then reads 8,000
-    /// (`shared` + `other`).
+    /// that also holds another project (`other`). The primary card counts the
+    /// linked `shared`, which its own root reaches, and not `other`, which
+    /// only the account's registered root `work/projects` reaches; the account
+    /// card counts both. Mutation (measured): keep walking the registered
+    /// roots in the primary window (the primary reads 8,000).
     #[cfg(unix)]
     #[test]
     fn a_primary_root_linked_into_an_extra_account_keeps_the_account_out() {
@@ -1415,7 +1435,7 @@ mod tests {
 
         assert_eq!(
             output_tokens(&primary),
-            0,
+            PRIMARY_OUTPUT,
             "the primary counted the extra account's projects: {primary}"
         );
         assert_eq!(
