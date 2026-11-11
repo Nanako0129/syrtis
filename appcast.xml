@@ -3,6 +3,22 @@
     <channel>
         <title>TokenBar updates</title>
         <item>
+            <title>2.11.3</title>
+            <pubDate>Wed, 11 Nov 2026 01:50:11 +0000</pubDate>
+            <link>https://github.com/Nanako0129/syrtis/releases/tag/v2.11.3</link>
+            <sparkle:version>1819</sparkle:version>
+            <sparkle:shortVersionString>2.11.3</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
+            <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
+            <description><![CDATA[<b>Fixes:</b>
+<ul>
+<li>Cursor usage syncs for accounts on the new billing whose usage items carry a user id other than the sign-in's: Syrtis now accepts, besides the sign-in's own, one such id per sync that Cursor marks as a user. A second other id, a team, or an item without an owner still stops the sync with billing_v2_principal_mismatch. Tested against a stand-in server, not on an account on the new billing. Thanks @ohari5336.</li>
+<li>Gemini models appear under one name (gemini-4-argon-c and -trial as gemini-4-argon, the gemini-3.5-flash tiers as gemini-3.5-flash), and a tab that spans several clients shows one row per model and provider with each client's share on hover; a row whose cost is flagged as implausible stays separate. Prices, the cache and exports keep the original labels.</li>
+</ul>
+]]></description>
+            <enclosure url="https://github.com/Nanako0129/syrtis/releases/download/v2.11.3/Syrtis.app.tar.gz" length="14989155" type="application/octet-stream" sparkle:edSignature="yNtrW2oH/6pgsoDGG6QbDLTZZEDUkRpuPoc0/oW/9O9KTzXvG8mpHL2z+lO4n5F/qfIsXT+PfUbX2RZ0FJn7AA=="/>
+        </item>
+        <item>
             <title>2.11.2</title>
             <pubDate>Sat, 07 Nov 2026 09:13:26 +0000</pubDate>
             <link>https://github.com/Nanako0129/syrtis/releases/tag/v2.11.2</link>
@@ -108,21 +124,6 @@
 </ul>
 ]]></description>
             <enclosure url="https://github.com/Nanako0129/syrtis/releases/download/v2.10.0/Syrtis.app.tar.gz" length="14134407" type="application/octet-stream" sparkle:edSignature="Gi8AXXCLTgVizSbcEdJx9HoDICm6FIRinidtfUwIlS4fPur8tGJy5qwkhfcezP9BwjWYB8LIVuXt3kMVkZztBA=="/>
-        </item>
-        <item>
-            <title>2.9.1</title>
-            <pubDate>Mon, 19 Oct 2026 13:21:17 +0000</pubDate>
-            <link>https://github.com/Nanako0129/syrtis/releases/tag/v2.9.1</link>
-            <sparkle:version>1597</sparkle:version>
-            <sparkle:shortVersionString>2.9.1</sparkle:shortVersionString>
-            <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
-            <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
-            <description><![CDATA[<b>Fixes:</b>
-<ul>
-<li>v2.9.0 could quit unexpectedly while a gauge icon showed the window length letter. The letter is now drawn without the macOS text layout step that intermittently stopped Syrtis, and looks the same.</li>
-</ul>
-]]></description>
-            <enclosure url="https://github.com/Nanako0129/syrtis/releases/download/v2.9.1/Syrtis.app.tar.gz" length="14121962" type="application/octet-stream" sparkle:edSignature="RN6z65olV0Yt7/eNcMQDgU2Uzh0RoMR49XJXlV4U+gIdHHVTCYyXdQmsxS63FzF/kVgjiKEdeq2LUiJze92DBw=="/>
         </item>
         <item>
             <title>1.1.1</title>
