@@ -665,6 +665,7 @@
 "Turn Off" = "關閉";
 "Last synced %@" = "上次同步：%@";
 "Only part of your usage was downloaded. Syrtis will try again." = "只下載到部分用量，Syrtis 會再試一次。";
+"Only part of your usage was downloaded (%@). Syrtis will try again." = "只下載到部分用量（%@），Syrtis 會再試一次。";
 "Your Cursor login has expired. Open Cursor to refresh it." = "Cursor 的登入已過期，打開 Cursor 就會更新。";
 "Sign in to the Cursor app to sync your usage." = "在 Cursor App 登入後就能同步用量。";
 "Can't reach Cursor. Syrtis will try again." = "連不上 Cursor，Syrtis 會再試一次。";

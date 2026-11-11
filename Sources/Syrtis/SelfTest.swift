@@ -19408,9 +19408,31 @@ enum SelfTest {
                 CursorSync.statusLine(state: "error", lastSuccessMs: nil, reason: $0, now: now)
                     == CursorSync.Copy.error.localized
             }, "CURSOR-SYNC error without a valid reason code keeps the generic line")
+            for code in ["timeout", "budget_exhausted", "too_many_pages"] {
+                let partialCode = CursorSync.statusLine(state: "partial", lastSuccessMs: nil, reason: code, now: now)
+                expect(partialCode == CursorSync.Copy.partialWithReason.localized(code)
+                           && partialCode?.contains(code) == true,
+                       "CURSOR-SYNC partial with the core's \(code) shows the code (#520): \(partialCode ?? "nil")")
+            }
+            // The row the user reads: a core-shaped status whose headline is
+            // another profile's, decoded, then the partial profile's own row.
+            let rowStatus = try? JSONDecoder().decode(CursorSyncStatus.self, from: Data(#"""
+                {"state":"error","reason":"server_error","events":0,"lastSuccessMs":null,"changed":false,
+                 "profiles":[{"id":"default","state":"error","events":0,"lastSuccessMs":null,"reason":"server_error"},
+                             {"id":"p2","state":"partial","events":0,"lastSuccessMs":null,"reason":"budget_exhausted"}]}
+                """#.utf8))
+            let partialRow = rowStatus?.profiles?.last.flatMap {
+                CursorSync.profileRowLine(id: "p2", refused: [:], status: $0)
+            }
+            expect(partialRow == CursorSync.Copy.partialWithReason.localized("budget_exhausted"),
+                   "CURSOR-SYNC a partial profile row under another profile's headline keeps its own code: \(partialRow ?? "nil")")
+            expect(badCodes.allSatisfy {
+                CursorSync.statusLine(state: "partial", lastSuccessMs: nil, reason: $0, now: now)
+                    == CursorSync.Copy.partial.localized
+            }, "CURSOR-SYNC partial without a valid reason code keeps the generic line")
             expect(CursorSync.statusLine(state: "offline", lastSuccessMs: nil, reason: "http_status", now: now)
                        == CursorSync.Copy.offline.localized,
-                   "CURSOR-SYNC a reason does not change a non-error state's line")
+                   "CURSOR-SYNC a reason does not change the offline line")
             let ok = CursorSync.statusLine(state: "ok", lastSuccessMs: ms, now: now)
             expect(ok?.hasPrefix("Last synced ") == true && ok?.contains("1 hour ago") == true,
                    "CURSOR-SYNC status ok shows the relative time: \(ok ?? "nil")")
