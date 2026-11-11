@@ -127,13 +127,19 @@ fn registered_roots_under(dir: &str) -> Vec<PathBuf> {
 /// same shared transcripts (measured in the tests); what an alias of Desktop's
 /// folder or a variant's config reads on its own card was not exercised.
 ///
-/// An entry that contains a scan root only because the root itself links into
-/// a real extra account folder (`~/.claude/projects` -> `work/projects/shared`)
-/// is kept: the primary scan also walks the registered extra roots, so
-/// dropping `work` would count `work`'s other projects on the primary card.
-/// The linked root then reads 0 on the primary card, as a linked file does
+/// Canonical paths alone cannot tell which side holds the link, so an entry is
+/// dropped only when the link is on its own side: some component of the entry
+/// below the part it shares with that root's spelling is a symlink
+/// (`links_on_its_own`). When instead the primary's side links into a real
+/// extra account folder (`~/.claude/projects` -> `work/projects/shared` or
+/// `work`, or `~/.claude` -> `work/shared`), the account's entries are real
+/// folders and are kept: the primary scan also walks the registered extra
+/// roots, so dropping them would count the account's other transcripts on the
+/// primary card. The linked part then reads 0 on the primary card, as a
+/// linked file does
 /// (`a_primary_transcript_symlinked_into_an_extra_account_is_not_the_primarys`,
-/// `a_primary_root_linked_into_an_extra_account_keeps_the_account_out`).
+/// `a_primary_root_linked_into_an_extra_account_keeps_the_account_out`,
+/// `a_primary_side_linked_into_an_account_keeps_both_registries_out`).
 fn primary_exclusions(home: Option<&Path>) -> Vec<PathBuf> {
     let mut excluded: Vec<PathBuf> = crate::claude_config_dirs::snapshot()
         .into_iter()
@@ -152,19 +158,39 @@ fn primary_exclusions(home: Option<&Path>) -> Vec<PathBuf> {
         // A root with no parent (none exists today) skips the parent test
         // rather than falling back to the root, which would drop every account
         // folder containing it.
-        let roots: Vec<(PathBuf, Option<PathBuf>)> = primary
+        let roots: Vec<(&PathBuf, PathBuf, Option<PathBuf>)> = primary
             .roots()
             .iter()
-            .map(|root| (canonical(root), root.parent().map(canonical)))
+            .map(|root| (root, canonical(root), root.parent().map(canonical)))
             .collect();
         excluded.retain(|path| {
-            let path = canonical(path);
-            !roots.iter().any(|(root, parent)| {
-                path.starts_with(root) || parent.as_ref().is_some_and(|p| p.starts_with(&path))
+            let resolved = canonical(path);
+            !roots.iter().any(|(spelled, root, parent)| {
+                (resolved.starts_with(root)
+                    || parent.as_ref().is_some_and(|p| p.starts_with(&resolved)))
+                    && links_on_its_own(path, spelled)
             })
         });
     }
     excluded
+}
+
+/// Whether `path` reaches its target through a symlink of its own: a component
+/// of `path` below the leading components it shares with `other` is a symlink.
+/// Shared components (a symlinked prefix of the home folder, such as macOS's
+/// `/var`) lead both paths the same way and say nothing about which side links.
+fn links_on_its_own(path: &Path, other: &Path) -> bool {
+    let shared = path
+        .components()
+        .zip(other.components())
+        .take_while(|(a, b)| a == b)
+        .count();
+    let mut prefix = PathBuf::new();
+    path.components().enumerate().any(|(index, component)| {
+        prefix.push(component);
+        index >= shared
+            && std::fs::symlink_metadata(&prefix).is_ok_and(|meta| meta.file_type().is_symlink())
+    })
 }
 
 /// `path` with symlinks resolved, or as given when it cannot be resolved (a
@@ -1268,6 +1294,65 @@ mod tests {
         assert!(!excluded.contains(&alias), "{excluded:?}");
         assert!(excluded.contains(&genuine), "{excluded:?}");
         reset_registries();
+    }
+
+    /// The primary's side links into a real extra account `work`, with both
+    /// registries populated: (a) `~/.claude/projects` -> `work` itself, (b)
+    /// `~/.claude` -> `work/shared`. `work`, `work/projects` and
+    /// `work/transcripts` are real folders, so no link is on their side and
+    /// they stay excluded: the primary card does not count `work`'s
+    /// transcripts (here 7,000 under `work/transcripts`), and the linked part
+    /// reads 0 there, as a linked file does. Mutations: drop `links_on_its_own`
+    /// from the drop rule, or its shared-prefix skip (the primary counts
+    /// `work`'s transcripts, 8,000 instead of 0).
+    #[cfg(unix)]
+    #[test]
+    fn a_primary_side_linked_into_an_account_keeps_both_registries_out() {
+        for shape in ["projects_to_account", "claude_to_account_subfolder"] {
+            let _guards = lock_registries();
+            reset_registries();
+            let dir = tempfile::tempdir().unwrap();
+            let home = dir.path().to_path_buf();
+            let work = home.join("work");
+            let seed = |folder: PathBuf, id: &str, output: i64| {
+                std::fs::create_dir_all(&folder).unwrap();
+                std::fs::write(folder.join(format!("{id}.jsonl")), turn(id, output)).unwrap();
+            };
+            seed(work.join("transcripts/t"), "w", D_OUTPUT);
+            if shape == "projects_to_account" {
+                seed(work.join("p"), "a", PRIMARY_OUTPUT);
+                std::fs::create_dir_all(home.join(".claude")).unwrap();
+                std::os::unix::fs::symlink(&work, home.join(".claude/projects")).unwrap();
+            } else {
+                seed(work.join("shared/projects/p"), "a", PRIMARY_OUTPUT);
+                std::os::unix::fs::symlink(work.join("shared"), home.join(".claude")).unwrap();
+            }
+            crate::extra_scan_paths::set_from_json(
+                &serde_json::json!({ "claude": [
+                    work.join("projects").display().to_string(),
+                    work.join("transcripts").display().to_string(),
+                ] })
+                .to_string(),
+            )
+            .unwrap();
+            crate::claude_config_dirs::set_from_json(
+                &serde_json::json!([work.display().to_string()]).to_string(),
+            )
+            .unwrap();
+            let context = crate::LocalSourceContext {
+                home_dir: Some(home.clone()),
+                use_env_roots: false,
+            };
+
+            let primary = scan(&context, &PRIMARY);
+
+            assert_eq!(
+                output_tokens(&primary),
+                0,
+                "{shape}: the primary counted the account's transcripts: {primary}"
+            );
+            reset_registries();
+        }
     }
 
     /// The reverse layout: the primary's `~/.claude/projects` is itself a link
