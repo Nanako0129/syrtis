@@ -122,8 +122,10 @@ fn registered_roots_under(dir: &str) -> Vec<PathBuf> {
 /// window. Such an entry is dropped too, judged by canonical path: one that is
 /// a scan root or lies under one, or one that contains a scan root's own
 /// parent folder (`~/.claude` for its roots, Claude Desktop's folder, a
-/// cc-mirror variant's config). The shared transcripts are then counted on
-/// both cards, which beats a confidently zero primary.
+/// cc-mirror variant's config), so the primary keeps reading those roots. For
+/// an alias of `~/.claude` or of `~/.claude/projects` the extra card reads the
+/// same shared transcripts (measured in the tests); what an alias of Desktop's
+/// folder or a variant's config reads on its own card was not exercised.
 ///
 /// An entry that contains a scan root only because the root itself links into
 /// a real extra account folder (`~/.claude/projects` -> `work/projects/shared`)
@@ -147,21 +149,19 @@ fn primary_exclusions(home: Option<&Path>) -> Vec<PathBuf> {
         // Each scan root and its own parent, resolved. A folder inside `~/.claude`
         // but outside the scan roots, such as `~/.claude/accounts/work`, contains
         // neither and stays an account like any other.
-        let roots: Vec<(PathBuf, PathBuf)> = primary
+        // A root with no parent (none exists today) skips the parent test
+        // rather than falling back to the root, which would drop every account
+        // folder containing it.
+        let roots: Vec<(PathBuf, Option<PathBuf>)> = primary
             .roots()
             .iter()
-            .map(|root| {
-                let parent = root
-                    .parent()
-                    .map_or_else(|| root.clone(), Path::to_path_buf);
-                (canonical(root), canonical(&parent))
-            })
+            .map(|root| (canonical(root), root.parent().map(canonical)))
             .collect();
         excluded.retain(|path| {
             let path = canonical(path);
-            !roots
-                .iter()
-                .any(|(root, parent)| path.starts_with(root) || parent.starts_with(&path))
+            !roots.iter().any(|(root, parent)| {
+                path.starts_with(root) || parent.as_ref().is_some_and(|p| p.starts_with(&path))
+            })
         });
     }
     excluded
@@ -1240,6 +1240,7 @@ mod tests {
     /// An extra account folder that is a symlink to the parent of a primary
     /// scan root outside `~/.claude` (Claude Desktop's folder) is not excluded
     /// from the primary window, while a genuine account next to it still is.
+    /// This checks the exclusion list only; no Cowork transcript is scanned.
     /// Mutation: drop the parent test in `primary_exclusions` (the alias is
     /// listed).
     #[cfg(unix)]
