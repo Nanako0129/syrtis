@@ -123,21 +123,23 @@ fn registered_roots_under(dir: &str) -> Vec<PathBuf> {
 /// folder that is a symlink to `~/.claude`, the real target of a `~/.claude`
 /// that is itself a link) would still empty the primary window. Such an entry
 /// is dropped too, judged by canonical path: one whose resolved path contains
-/// a resolved scan root or lies under one. Dropping it can let in only what
-/// the engine reaches beyond the primary's roots on its own (a `.cc-mirror`
-/// variant, `TOKSCALE_EXTRA_DIRS`), because the primary window does not walk
-/// the registered extra roots (`account_options`). So each card counts what
-/// its own roots reach: transcripts shared through a link count on the
-/// primary card and on each card whose roots reach them, whichever side holds
-/// the link, and an account's transcripts that no primary root reaches stay
-/// out (measured in the tests named below). A transcript file linked on its
-/// own (#537) is unchanged: its exclusion overlaps no root. What an alias of
-/// Desktop's folder or a variant's config reads on its own card was not
-/// exercised
+/// a resolved scan root or lies under one. The primary window does not walk
+/// the registered extra roots (`account_options`), so a dropped entry no
+/// longer reaches the primary through them; the engine's own routes (a
+/// `.cc-mirror` variant, `TOKSCALE_EXTRA_DIRS`) still can, and a variant whose
+/// `configDir` names an account folder that contains a linked primary root
+/// would bring that account's other transcripts back in (not tested). So a
+/// folder linked onto or around a primary root counts on the primary card and
+/// on each card whose roots reach it, whichever side holds that link, and an
+/// account's transcripts that no primary root reaches stay out
 /// (`an_extra_account_linked_to_the_primarys_transcripts_does_not_empty_the_primary`,
 /// `a_primary_root_linked_into_an_extra_account_keeps_the_account_out`,
-/// `a_primary_side_link_counts_what_the_primarys_roots_reach`,
+/// `a_primary_side_link_counts_what_the_primarys_roots_reach`). A single
+/// transcript file linked from a primary root into an account stays the
+/// account's: its exclusion overlaps no root (#537,
 /// `a_primary_transcript_symlinked_into_an_extra_account_is_not_the_primarys`).
+/// What an alias of Desktop's folder or a variant's config reads on its own
+/// card was not exercised.
 fn primary_exclusions(home: Option<&Path>) -> Vec<PathBuf> {
     let mut excluded: Vec<PathBuf> = crate::claude_config_dirs::snapshot()
         .into_iter()
@@ -270,10 +272,10 @@ fn account_options(
         None => {
             let mut options = context.report_options(None, None);
             // The registered Claude roots are the extra accounts' by
-            // definition: the primary window never walks them, so an
-            // exclusion dropped below can only let in what the engine reaches
-            // on its own (the primary's roots, a `.cc-mirror` variant,
-            // `TOKSCALE_EXTRA_DIRS`), never an account's registered root.
+            // definition, so the primary window does not walk them. An
+            // exclusion dropped below then reaches the primary only through
+            // the engine's own routes (its roots, a `.cc-mirror` variant,
+            // `TOKSCALE_EXTRA_DIRS`); see `primary_exclusions`.
             options.scanner_settings.extra_scan_paths.remove(CLAUDE);
             let excluded = primary_exclusions(context.home_dir.as_deref());
             if !excluded.is_empty() {
