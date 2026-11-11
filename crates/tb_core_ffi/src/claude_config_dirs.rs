@@ -180,6 +180,11 @@ impl PrimaryRoots {
     pub(crate) fn collides(&self, path: &Path) -> bool {
         self.claude.starts_with(folded(path)) || self.roots.iter().any(|root| overlaps(path, root))
     }
+
+    /// The primary's scan roots as spelled (see `primary_scan_roots`).
+    pub(crate) fn roots(&self) -> &[PathBuf] {
+        &self.roots
+    }
 }
 
 /// Lower-cased for comparison. The default APFS volume is case-insensitive, so

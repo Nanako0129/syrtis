@@ -113,6 +113,15 @@ fn registered_roots_under(dir: &str) -> Vec<PathBuf> {
 /// refuse those directories, but the scan registry has no such rule and either
 /// registry alone was enough to empty the primary window (audit P1, 2026-11-03),
 /// so this is the guard that does not depend on both callers getting it right.
+///
+/// `collides` compares spelling only. The engine canonicalises an exclusion and
+/// matches each file both as found and canonicalised, so an entry that is
+/// another folder as spelled but resolves into a primary root (an extra
+/// account whose `projects` is a symlink to `~/.claude/projects`, or the whole
+/// account folder a symlink to `~/.claude`) would still empty the primary
+/// window. Such an entry is dropped too, by canonical path, as
+/// `nested_exclusions` does for an extra account: the shared transcripts are
+/// then counted on both cards, which beats a confidently zero primary.
 fn primary_exclusions(home: Option<&Path>) -> Vec<PathBuf> {
     let mut excluded: Vec<PathBuf> = crate::claude_config_dirs::snapshot()
         .into_iter()
@@ -125,8 +134,21 @@ fn primary_exclusions(home: Option<&Path>) -> Vec<PathBuf> {
         // Read once for the whole list, not once per path.
         let primary = crate::claude_config_dirs::PrimaryRoots::for_home(home);
         excluded.retain(|path| !primary.collides(path));
+        let roots: Vec<PathBuf> = primary.roots().iter().map(|root| canonical(root)).collect();
+        excluded.retain(|path| {
+            let path = canonical(path);
+            !roots
+                .iter()
+                .any(|root| root.starts_with(&path) || path.starts_with(root))
+        });
     }
     excluded
+}
+
+/// `path` with symlinks resolved, or as given when it cannot be resolved (a
+/// root that does not exist yet). Runs off the main thread, like every caller.
+fn canonical(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
 /// The other accounts nested under `dir`, which `dir`'s own window must not
@@ -165,7 +187,6 @@ fn nested_exclusions(dir: &str, own: &[PathBuf]) -> Vec<PathBuf> {
     // one that is nested only as spelled (`D/.claude` a symlink back to `D` or
     // above) would cover this account's own roots and empty its window. Such an
     // entry is dropped: counted twice beats confidently zero.
-    let canonical = |path: &Path| std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     let own: Vec<PathBuf> = own.iter().map(|root| canonical(root)).collect();
     excluded.retain(|path| {
         let path = canonical(path);
@@ -1126,6 +1147,72 @@ mod tests {
              the assertion above proves nothing: {unexcluded}"
         );
         reset_registries();
+    }
+
+    /// Extra accounts that share the primary's transcripts through a symlink:
+    /// a real account folder whose `projects` links to `~/.claude/projects`
+    /// (the maintainer's setup), an account folder that is itself a link to
+    /// `~/.claude`, and a `projects` linked to one project folder inside
+    /// `~/.claude/projects`. No spelling collides with a primary root, but the
+    /// engine resolves the exclusion, so before the canonical guard in
+    /// `primary_exclusions` the primary window read 0 in each. With it, the
+    /// primary reads its own transcript; the extra card of the first two reads
+    /// the same shared transcript, since nothing in a transcript names its
+    /// account. Mutations: delete the canonical `retain` in
+    /// `primary_exclusions` (every case reads 0); keep only one direction of the
+    /// overlap test (the first two or the third case reads 0).
+    #[cfg(unix)]
+    #[test]
+    fn an_extra_account_linked_to_the_primarys_transcripts_does_not_empty_the_primary() {
+        for shape in ["projects_link", "whole_folder", "projects_into_a_project"] {
+            let _guards = lock_registries();
+            reset_registries();
+            let dir = tempfile::tempdir().unwrap();
+            let home = dir.path().to_path_buf();
+            write_session(&home.join(".claude"), "primary", PRIMARY_OUTPUT);
+            let extra = home.join("claude-team");
+            let link_target = match shape {
+                "whole_folder" => None,
+                "projects_link" => Some(home.join(".claude/projects")),
+                _ => Some(home.join(".claude/projects/proj")),
+            };
+            match &link_target {
+                None => std::os::unix::fs::symlink(home.join(".claude"), &extra).unwrap(),
+                Some(target) => {
+                    std::fs::create_dir_all(&extra).unwrap();
+                    std::os::unix::fs::symlink(target, extra.join("projects")).unwrap();
+                }
+            }
+            crate::extra_scan_paths::set_from_json(
+                &serde_json::json!({ "claude": [
+                    extra.join("projects").display().to_string(),
+                    extra.join("transcripts").display().to_string(),
+                ] })
+                .to_string(),
+            )
+            .unwrap();
+            crate::claude_config_dirs::set_from_json(
+                &serde_json::json!([extra.display().to_string()]).to_string(),
+            )
+            .unwrap();
+            let context = crate::LocalSourceContext {
+                home_dir: Some(home.clone()),
+                use_env_roots: false,
+            };
+
+            let primary = scan(&context, &PRIMARY);
+            let shared = scan(&context, &Some(extra.display().to_string()));
+
+            assert_eq!(
+                output_tokens(&primary),
+                PRIMARY_OUTPUT,
+                "{shape}: the primary window lost its own transcript: {primary}"
+            );
+            if shape != "projects_into_a_project" {
+                assert_eq!(output_tokens(&shared), PRIMARY_OUTPUT, "{shape}: {shared}");
+            }
+            reset_registries();
+        }
     }
 
     /// A `.cc-mirror` variant under an extra account's directory may name a
