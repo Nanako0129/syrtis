@@ -195,6 +195,9 @@ enum CursorSync {
         static let turnOff = "Turn Off"
         static let lastSynced = "Last synced %@"
         static let partial = "Only part of your usage was downloaded. Syrtis will try again."
+        /// `partial` plus the core's fixed reason code (`%@`: `timeout`,
+        /// `budget_exhausted`, `too_many_pages`), so a screenshot tells them apart (#520).
+        static let partialWithReason = "Only part of your usage was downloaded (%@). Syrtis will try again."
         static let expired = "Your Cursor login has expired. Open Cursor to refresh it."
         static let notSignedIn = "Sign in to the Cursor app to sync your usage."
         static let offline = "Can't reach Cursor. Syrtis will try again."
@@ -287,7 +290,7 @@ enum CursorSync {
         static let billingV2PrincipalMismatch = "Cursor returned usage of another account, so Syrtis saved nothing (%@)."
 
         static var all: [String] {
-            [title, toggle, privacy, `continue`, cancel, turnOff, lastSynced, partial, expired, notSignedIn,
+            [title, toggle, privacy, `continue`, cancel, turnOff, lastSynced, partial, partialWithReason, expired, notSignedIn,
              offline, error, errorWithReason, cliPresent, syncNow, syncing, cliQuestion, useSyrtis, keepCLI, cleanupFailed,
              configRejected, staleCleanupFailed, defaultProfile, addProfile, duplicate, profilesPrivacy, cantAdd, cantRead,
              removeFolder, keychainConsent, keychainDenied, keychainUnlock, keychainAllowAccess, keychainDisclosure, allow,
@@ -377,8 +380,8 @@ enum CursorSync {
 
     /// Status line for a core state. nil where there is nothing to say
     /// (`disabled`, not yet synced, or `ok` with no recorded time).
-    /// For `error`, `reason` is shown only if it looks like one of the core's
-    /// fixed codes (`^[a-z_]{1,40}$`), so the line never carries free text.
+    /// For `partial` and `error`, `reason` is shown only if it looks like one of
+    /// the core's fixed codes (`^[a-z_]{1,40}$`), so the line never carries free text.
     static func statusLine(
         state: String?, lastSuccessMs: Int64?, reason: String? = nil, now: Date = Date()
     ) -> String? {
@@ -391,7 +394,9 @@ enum CursorSync {
             let when = formatter.localizedString(
                 for: Date(timeIntervalSince1970: Double(lastSuccessMs) / 1000), relativeTo: now)
             return Copy.lastSynced.localized(when)
-        case "partial": return Copy.partial.localized
+        case "partial":
+            if let code = fixedCode(reason) { return Copy.partialWithReason.localized(code) }
+            return Copy.partial.localized
         case "expired": return Copy.expired.localized
         case "notSignedIn": return Copy.notSignedIn.localized
         case "offline": return Copy.offline.localized
@@ -407,15 +412,20 @@ enum CursorSync {
                 return Copy.billingV2PrincipalMismatch.localized("billing_v2_principal_mismatch")
             default: break
             }
-            if let reason, (1...40).contains(reason.utf8.count),
-               reason.utf8.allSatisfy({ $0 == UInt8(ascii: "_") || (UInt8(ascii: "a")...UInt8(ascii: "z")).contains($0) }) {
-                return Copy.errorWithReason.localized(reason)
-            }
+            if let code = fixedCode(reason) { return Copy.errorWithReason.localized(code) }
             return Copy.error.localized
         case "cliPresent": return Copy.cliPresent.localized
         case configRejectedState: return Copy.configRejected.localized
         default: return nil
         }
+    }
+
+    /// `reason` when it looks like one of the core's fixed codes, else nil.
+    private static func fixedCode(_ reason: String?) -> String? {
+        guard let reason, (1...40).contains(reason.utf8.count),
+              reason.utf8.allSatisfy({ $0 == UInt8(ascii: "_") || (UInt8(ascii: "a")...UInt8(ascii: "z")).contains($0) })
+        else { return nil }
+        return reason
     }
 }
 

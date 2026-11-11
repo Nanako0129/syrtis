@@ -19408,6 +19408,14 @@ enum SelfTest {
                 CursorSync.statusLine(state: "error", lastSuccessMs: nil, reason: $0, now: now)
                     == CursorSync.Copy.error.localized
             }, "CURSOR-SYNC error without a valid reason code keeps the generic line")
+            let partialCode = CursorSync.statusLine(state: "partial", lastSuccessMs: nil, reason: "timeout", now: now)
+            expect(partialCode == CursorSync.Copy.partialWithReason.localized("timeout")
+                       && partialCode?.contains("timeout") == true,
+                   "CURSOR-SYNC partial with a reason code shows the code (#520): \(partialCode ?? "nil")")
+            expect(badCodes.allSatisfy {
+                CursorSync.statusLine(state: "partial", lastSuccessMs: nil, reason: $0, now: now)
+                    == CursorSync.Copy.partial.localized
+            }, "CURSOR-SYNC partial without a valid reason code keeps the generic line")
             expect(CursorSync.statusLine(state: "offline", lastSuccessMs: nil, reason: "http_status", now: now)
                        == CursorSync.Copy.offline.localized,
                    "CURSOR-SYNC a reason does not change a non-error state's line")
