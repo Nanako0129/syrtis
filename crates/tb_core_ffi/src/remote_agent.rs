@@ -185,11 +185,14 @@ impl RemoteAgent {
         let current = running.as_ref().ok_or("internal")?;
         let period = current.inputs.pricing_period;
         let status = status_of(current);
-        drop(running);
         // Without the monitor a later input change would never be applied,
-        // so an agent without one is not left running.
+        // so an agent without one is not left running. The lock stays held
+        // until the monitor has started or failed, so a failure stops the
+        // agent this call started and not one a concurrent start put there.
+        // The monitor sleeps a period before its first tick, so it does not
+        // wait on this lock.
         if self.spawn_monitor(period).is_err() {
-            drop(lock(&self.running).take());
+            *running = None;
             return Err("internal".into());
         }
         status
