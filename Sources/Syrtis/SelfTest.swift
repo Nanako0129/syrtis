@@ -1708,6 +1708,27 @@ enum SelfTest {
         expect(
             providerSplitTab.count == 2 && providerSplitTab.allSatisfy { $0.clientParts == nil },
             "a model from two providers stays two rows in a multi-client tab")
+        // One client reaches the model through two providers, another through
+        // one of them: each provider's row holds that provider's tokens from
+        // both clients, and the one-client tab still shows one joined row.
+        let twoProviders = tabReportOf([
+            tabRow("a", "nvidia", 10, cost: 1, estimate: 1), tabRow("a", "openai", 20, cost: 1, estimate: 1),
+            tabRow("b", "openai", 5, cost: 1, estimate: 1),
+        ])
+        let twoProviderTab = twoProviders.tabEntries(clientIds: ["a", "b"])
+        let openaiRow = twoProviderTab.first { $0.provider == "openai" }
+        let nvidiaRow = twoProviderTab.first { $0.provider == "nvidia" }
+        expect(
+            twoProviderTab.count == 2
+                && openaiRow?.total == 25
+                && openaiRow?.clientParts == [ClientPart(client: "a", total: 20), ClientPart(client: "b", total: 5)]
+                && nvidiaRow?.total == 10 && nvidiaRow?.clientParts == nil
+                && Set(twoProviderTab.map(\.rowID)) == ["*|m|nvidia", "*|m|openai"],
+            "a multi-client tab keeps each provider's tokens together across clients")
+        let ownTab = twoProviders.tabEntries(clientIds: ["a"])
+        expect(
+            ownTab.count == 1 && ownTab.first?.provider == "nvidia, openai" && ownTab.first?.total == 30,
+            "a one-client tab still joins that client's providers into one row")
         let flaggedTab = tabReportOf([
             tabRow("a", "p", 10, cost: 300, estimate: 1), tabRow("b", "p", 10, cost: 1, estimate: 100),
         ]).tabEntries(clientIds: ["a", "b"])
