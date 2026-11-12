@@ -1729,6 +1729,47 @@ enum SelfTest {
         expect(
             ownTab.count == 1 && ownTab.first?.provider == "nvidia, openai" && ownTab.first?.total == 30,
             "a one-client tab still joins that client's providers into one row")
+        // Read as models: the two provider rows of `m` count once, the provider
+        // labels are asked for on `m` only, and the favorite is the model
+        // whose rows cost the most together (m: 1.5 + 2.5 beats solo: 3), shown by
+        // its costliest row.
+        func namedRow(_ model: String, _ provider: String, cost: Double) -> String {
+            """
+            {"client":"a","model":"\(model)","provider":"\(provider)",
+             "input":1,"output":0,"cacheRead":0,"cacheWrite":0,"reasoning":0,
+             "total":1,"messageCount":1,"cost":\(cost),"msPer1kTokens":null,"costEstimate":\(cost)}
+            """
+        }
+        let asModels = tabReportOf([
+            namedRow("solo", "p", cost: 3), namedRow("m", "nvidia", cost: 1.5),
+            namedRow("m", "", cost: 2.5),
+            """
+            {"client":"b","model":"other","provider":"p","input":1,"output":0,"cacheRead":0,
+             "cacheWrite":0,"reasoning":0,"total":1,"messageCount":1,"cost":0.1,"msPer1kTokens":null}
+            """,
+        ]).tabEntries(clientIds: ["a", "b"])
+        expect(
+            asModels.count == 4 && asModels.modelCount == 3 && asModels.repeatedModels == ["m"]
+                && asModels.favoriteRow?.model == "m" && asModels.favoriteRow?.provider == ""
+                && asModels.favoriteRow?.providerLabel == "Unspecified provider"
+                && asModels.first { $0.provider == "nvidia" }?.providerLabel == "nvidia"
+                && [ModelReportEntry]().favoriteRow == nil && [ModelReportEntry]().modelCount == 0,
+            "a tab's rows count, label and rank by model, not by provider row")
+        // The cost check runs on each provider's row in a multi-client tab: the
+        // flagged provider stands alone; its client's own tab joins the two and
+        // reads 301 / 101.
+        let flaggedProvider = tabReportOf([
+            tabRow("a", "p1", 10, cost: 300, estimate: 1), tabRow("a", "p2", 10, cost: 1, estimate: 100),
+            tabRow("b", "p2", 10, cost: 1, estimate: 100),
+        ])
+        let flaggedProviderTab = flaggedProvider.tabEntries(clientIds: ["a", "b"])
+        expect(
+            flaggedProviderTab.count == 2
+                && flaggedProviderTab.first { $0.provider == "p1" }?.implausibleCostRatio != nil
+                && flaggedProviderTab.first { $0.provider == "p1" }?.clientParts == nil
+                && flaggedProviderTab.first { $0.provider == "p2" }?.total == 20
+                && flaggedProvider.tabEntries(clientIds: ["a"]).first?.implausibleCostRatio == nil,
+            "a flagged provider row stands alone in a multi-client tab")
         let flaggedTab = tabReportOf([
             tabRow("a", "p", 10, cost: 300, estimate: 1), tabRow("b", "p", 10, cost: 1, estimate: 100),
         ]).tabEntries(clientIds: ["a", "b"])

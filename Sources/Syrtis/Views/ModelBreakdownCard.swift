@@ -56,13 +56,15 @@ struct ModelBreakdownCard: View {
         let rows = (report?.tabEntries(clientIds: clientIds) ?? [])
             .sorted { $0.cost != $1.cost ? $0.cost > $1.cost : $0.total > $1.total }
         let totalCost = rows.reduce(0) { $0 + $1.cost }
+        let modelCount = rows.modelCount
+        let repeated = rows.repeatedModels
 
         DashCard(
             title,
             trailing: {
                 VStack(alignment: .trailing, spacing: 1) {
-                    Text((rows.count == 1 ? "%lld model · %@" : "%lld models · %@")
-                        .localized(rows.count, Format.usd(totalCost)))
+                    Text((modelCount == 1 ? "%lld model · %@" : "%lld models · %@")
+                        .localized(modelCount, Format.usd(totalCost)))
                         .foregroundStyle(.secondary)
                     if let updatedAt = report?.pricingUpdatedAt {
                         Text("Prices updated %@".localized(Format.relativeTime(updatedAt)))
@@ -88,7 +90,7 @@ struct ModelBreakdownCard: View {
                         expanded ? rows : Array(rows.prefix(Self.maxRows)),
                         id: \.self.rowID
                     ) { entry in
-                        row(entry)
+                        row(entry, showProvider: repeated.contains(entry.model))
                     }
                 }
                 .coordinateSpace(name: Self.rowsSpace)
@@ -144,7 +146,7 @@ struct ModelBreakdownCard: View {
         }
     }
 
-    private func row(_ entry: ModelReportEntry) -> some View {
+    private func row(_ entry: ModelReportEntry, showProvider: Bool) -> some View {
         let isHovered = hover?.entry.rowID == entry.rowID
         return HStack(spacing: 8) {
             Circle()
@@ -159,10 +161,20 @@ struct ModelBreakdownCard: View {
                     color: Color.primary.opacity(isHovered ? 0.65 : 0),
                     radius: isHovered ? 3 : 0)
             VStack(alignment: .leading, spacing: 3) {
-                Text(entry.model)
-                    .font(.caption)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
+                HStack(spacing: 6) {
+                    Text(entry.model)
+                        .font(.caption)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                    // The same model on another row: the provider tells them apart.
+                    if showProvider {
+                        Text(entry.providerLabel.localized)
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                            .layoutPriority(-1)
+                    }
+                }
                 segmentBar(entry, isHovered: isHovered)
             }
             Spacer(minLength: 8)

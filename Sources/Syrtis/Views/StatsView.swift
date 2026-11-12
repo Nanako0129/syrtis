@@ -26,8 +26,7 @@ struct StatsView: View {
 
     /// The same rows the tab's Models list shows, so the two agree.
     private var favorite: ModelReportEntry? {
-        (modelReport?.tabEntries(clientIds: clientIds) ?? [])
-            .max { $0.cost < $1.cost }
+        (modelReport?.tabEntries(clientIds: clientIds) ?? []).favoriteRow
     }
 
     var body: some View {

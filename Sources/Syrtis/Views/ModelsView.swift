@@ -38,6 +38,8 @@ struct ModelsView: View {
             .sorted { $0.cost != $1.cost ? $0.cost > $1.cost : $0.total > $1.total }
         let totalCost = rows.reduce(0) { $0 + $1.cost }
         let totalTokens = rows.reduce(Int64(0)) { $0.saturatingAdding($1.total) }
+        let modelCount = rows.modelCount
+        let repeated = rows.repeatedModels
 
         DashCard(
             "Models by cost",
@@ -45,9 +47,9 @@ struct ModelsView: View {
                 VStack(alignment: .trailing, spacing: 1) {
                     // Whole sentence per key, so a translation can add a
                     // measure word and reorder; only the plural form branches.
-                    Text((rows.count == 1 ? "%lld model · %@ · %@" : "%lld models · %@ · %@")
+                    Text((modelCount == 1 ? "%lld model · %@ · %@" : "%lld models · %@ · %@")
                         .localized(
-                            rows.count, Format.compactTokens(totalTokens),
+                            modelCount, Format.compactTokens(totalTokens),
                             Format.money(tokens: totalTokens, cost: totalCost)))
                         .foregroundStyle(.secondary)
                     if let updatedAt = report?.pricingUpdatedAt {
@@ -70,7 +72,7 @@ struct ModelsView: View {
             } else {
                 VStack(spacing: 10) {
                     ForEach(rows, id: \.rowID) { entry in
-                        row(entry, totalCost: totalCost)
+                        row(entry, totalCost: totalCost, showProvider: repeated.contains(entry.model))
                     }
                 }
                 .coordinateSpace(name: Self.rowsSpace)
@@ -98,7 +100,7 @@ struct ModelsView: View {
         }
     }
 
-    private func row(_ entry: ModelReportEntry, totalCost: Double) -> some View {
+    private func row(_ entry: ModelReportEntry, totalCost: Double, showProvider: Bool) -> some View {
         let share = totalCost > 0 ? entry.cost / totalCost * 100 : 0
         let isHovered = hover?.entry.rowID == entry.rowID
         return HStack(spacing: 8) {
@@ -119,6 +121,14 @@ struct ModelsView: View {
                         .font(.caption)
                         .lineLimit(1)
                         .truncationMode(.middle)
+                    // The same model on another row: the provider tells them apart.
+                    if showProvider {
+                        Text(entry.providerLabel.localized)
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                            .layoutPriority(-1)
+                    }
                     Text(String(format: "%.1f%%", share))
                         .font(.caption2.monospacedDigit())
                         .foregroundStyle(.tertiary)
