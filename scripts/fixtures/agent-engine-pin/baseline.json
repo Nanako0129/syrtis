@@ -40,5 +40,11 @@
   "name": "libc",
   "source": "registry+https://github.com/rust-lang/crates.io-index",
   "version": "0.2.189"
+ },
+ {
+  "checksum": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+  "name": "zz-extra",
+  "source": "registry+https://github.com/rust-lang/crates.io-index",
+  "version": "1.0.0"
  }
 ]

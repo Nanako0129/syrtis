@@ -1923,7 +1923,7 @@ pub extern "C" fn tb_cursor_sync(user_initiated: i32) -> *mut c_char {
 #[cfg(unix)]
 mod remote_ffi {
     use super::{c_char, CStr, PathBuf};
-    use crate::remote_agent::{app_inputs, ffi as run, AGENT};
+    use crate::remote_agent::{app_make_inputs, ffi as run, AGENT};
 
     /// # Safety
     /// `ptr` must be NULL or a valid NUL-terminated string.
@@ -1952,7 +1952,9 @@ mod remote_ffi {
     /// directory (created `0700` if missing) with the short root `a`. Already
     /// running with the same inputs: returns the status. Changed scan inputs:
     /// restarts with them, and the new inputs need the owner's scope approval.
-    /// Success data is the `tb_remote_status` object.
+    /// The same re-check runs every 5 minutes on its own (a hand edit of the
+    /// tokscale `settings.json` has no setter). Success data is the
+    /// `tb_remote_status` object.
     ///
     /// # Safety
     /// `home_override` must be NULL or a valid NUL-terminated UTF-8 string.
@@ -1960,7 +1962,7 @@ mod remote_ffi {
     pub unsafe extern "C" fn tb_remote_start(home_override: *const c_char) -> *mut c_char {
         run("tb_remote_start", || {
             let home = unsafe { optional_text(home_override) }?.map(PathBuf::from);
-            AGENT.start(|| app_inputs(home))
+            AGENT.start(app_make_inputs(home))
         })
     }
 

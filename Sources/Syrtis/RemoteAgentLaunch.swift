@@ -1,5 +1,8 @@
 import Foundation
+import os
 import TokenBarCore
+
+private let remoteAgentLog = Logger(subsystem: "com.nyanako.tokenbar", category: "remote-agent")
 
 /// When and where the embedded remote-usage agent starts. The agent itself
 /// (pairing, grants, sharing) lives in Rust (`remote_agent.rs`); this only
@@ -77,7 +80,30 @@ enum RemoteAgentLaunch {
 
     @MainActor private static func restartIfNeeded() {
         Task.detached(priority: .utility) {
-            _ = try? start(home: homeOverride())
+            do {
+                try start(home: homeOverride())
+            } catch {
+                logStartFailure(error)
+            }
         }
+    }
+
+    /// The Rust side answers every `tb_remote_*` failure with a fixed class
+    /// string (`remote_agent.rs`: `storage_class`, `agent_class`,
+    /// `control_class`, `code_class`, `client_class` and literals such as
+    /// `notRunning`, `homeRequired`, `panic`), never a path, token, Pair URL
+    /// or address, so the class is logged publicly. Anything that is not a
+    /// bare word, and any other error, gets a constant message instead.
+    nonisolated static func logStartFailure(_ error: Error) {
+        if case TBCoreError.bridge(let reason) = error, isClassString(reason) {
+            remoteAgentLog.error("agent start failed: \(reason, privacy: .public)")
+        } else {
+            remoteAgentLog.error("agent start failed")
+        }
+    }
+
+    /// A class string: ASCII letters only, at most 32 of them.
+    nonisolated static func isClassString(_ text: String) -> Bool {
+        !text.isEmpty && text.count <= 32 && text.allSatisfy { $0.isASCII && $0.isLetter }
     }
 }

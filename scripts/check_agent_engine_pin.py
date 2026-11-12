@@ -26,6 +26,7 @@ import argparse
 import json
 import subprocess
 import sys
+import tempfile
 import tomllib
 from pathlib import Path
 
@@ -84,33 +85,65 @@ def check(vendor_commit: str, agent_manifest: str, baseline: list[dict], lock_te
     known = {(b["name"], b["version"], b["source"], b["checksum"]) for b in baseline}
     try:
         direct = [resolve(packages, d) for d in agents[0].get("dependencies", [])]
-        seen: dict[tuple[str, str], dict] = {}
-        stack = [p for p in direct if p["name"] in AGENT_ROOTS]
-        if sorted({p["name"] for p in stack}) != sorted(AGENT_ROOTS):
-            errors.append(f"{AGENT}'s lock entry does not list every reviewed root {AGENT_ROOTS}")
+        # The whole direct set, not a filter: a dependency a later agent rev
+        # adds outside the reviewed roots would otherwise never be compared.
+        names = {p["name"] for p in direct}
+        expected = set(AGENT_ROOTS) | {ENGINE}
+        for name in sorted(names - expected):
+            errors.append(f"{AGENT} has an unexpected direct dependency {name}")
+        for name in sorted(expected - names):
+            errors.append(f"{AGENT} is missing the direct dependency {name}")
+        # Source is part of the identity: Cargo allows one name and version
+        # from two sources, and the second must not be skipped.
+        seen: dict[tuple[str, str, str | None], dict] = {}
+        stack = [p for p in direct if p["name"] != ENGINE]
         while stack:
             package = stack.pop()
-            key = (package["name"], package["version"])
+            key = (package["name"], package["version"], package.get("source"))
             if key in seen or package["name"] == ENGINE:
                 continue
             seen[key] = package
             stack.extend(resolve(packages, d) for d in package.get("dependencies", []))
     except ValueError as error:
         return errors + [str(error)]
-    for package in sorted(seen.values(), key=lambda p: (p["name"], p["version"])):
+    for package in sorted(seen.values(), key=lambda p: (p["name"], p["version"], p.get("source") or "")):
         entry = (package["name"], package["version"], package.get("source"), package.get("checksum"))
         if entry not in known:
             errors.append(f"{package['name']} {package['version']} is not in the agent's lock baseline")
     return errors
 
 
-def gather(root: Path) -> tuple[str, str, list[dict], str]:
+def checkout_head(submodule: Path) -> str | None:
+    """The submodule checkout's HEAD, or None when it is not checked out (no
+    `.git` entry: an empty directory)."""
+    if not (submodule / ".git").exists():
+        return None
+    return subprocess.run(
+        ["git", "-C", str(submodule), "rev-parse", "HEAD"],
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()
+
+
+def engine_commit(gitlink: str, head: str | None) -> tuple[str, list[str]]:
+    """The engine commit Cargo builds: the checkout's HEAD, which must equal
+    the staged gitlink (an unstaged checkout at another commit would be built
+    while the gitlink matched); the gitlink when nothing is checked out."""
+    if head is None:
+        print("note: vendor/tokscale-core is not checked out; using the staged gitlink")
+        return gitlink, []
+    if head != gitlink:
+        return head, [f"vendor/tokscale-core is checked out at {head}, the staged gitlink is {gitlink}"]
+    return gitlink, []
+
+
+def gather(root: Path) -> tuple[list[str], str, str, list[dict], str]:
     staged = subprocess.run(
         ["git", "-C", str(root), "ls-files", "-s", "vendor/tokscale-core"],
         check=True, capture_output=True, text=True,
     ).stdout.split()
     if len(staged) < 2 or staged[0] != "160000":
         raise SystemExit("vendor/tokscale-core is not a gitlink in the index")
+    commit, errors = engine_commit(staged[1], checkout_head(root / "vendor/tokscale-core"))
     metadata = json.loads(subprocess.run(
         ["cargo", "metadata", "--locked", "--format-version", "1"],
         cwd=root, check=True, capture_output=True, text=True,
@@ -120,7 +153,8 @@ def gather(root: Path) -> tuple[str, str, list[dict], str]:
         raise SystemExit(f"cargo metadata lists {len(agents)} {AGENT} packages")
     agent_dir = Path(agents[0]["manifest_path"]).parent
     return (
-        staged[1],
+        errors,
+        commit,
         (agent_dir / "Cargo.toml").read_text(),
         json.loads((agent_dir / BASELINE).read_text()),
         (root / "Cargo.lock").read_text(),
@@ -137,15 +171,39 @@ def self_test() -> int:
         ("another vendor commit fails", "0" * 40, "ok.lock", True),
         ("a second tokscale-core fails", pinned, "two-engines.lock", True),
         ("a dependency outside the baseline fails", pinned, "checksum-differs.lock", True),
+        ("an extra direct dependency fails", pinned, "extra-direct.lock", True),
+        ("a same name and version from another source fails", pinned, "two-sources.lock", True),
     ]
     failed = 0
-    for name, vendor, lock, should_fail in cases:
-        errors = check(vendor, manifest, baseline, (fixtures / lock).read_text())
+
+    def report(name: str, errors: list[str], should_fail: bool) -> None:
+        nonlocal failed
         if bool(errors) != should_fail:
             failed += 1
             print(f"FAIL {name}: {errors}")
         else:
             print(f"ok   {name}")
+
+    for name, vendor, lock, should_fail in cases:
+        report(name, check(vendor, manifest, baseline, (fixtures / lock).read_text()), should_fail)
+
+    # The submodule checkout against the gitlink, on a throwaway repository.
+    with tempfile.TemporaryDirectory() as temp:
+        repo = Path(temp) / "engine"
+        repo.mkdir()
+        git = ["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@example.invalid",
+               "-c", "commit.gpgsign=false", "-c", "core.hooksPath=/dev/null"]
+        subprocess.run(git + ["init", "-q"], check=True)
+        subprocess.run(git + ["commit", "-q", "--allow-empty", "-m", "a"], check=True)
+        head = checkout_head(repo)
+        report("a checkout at the gitlink passes", engine_commit(head, head)[1], False)
+        report("a checkout at another commit fails", engine_commit("0" * 40, head)[1], True)
+        empty = Path(temp) / "empty"
+        empty.mkdir()
+        not_checked_out = checkout_head(empty)
+        report("an empty submodule directory is not checked out", [] if not_checked_out is None else ["has HEAD"], False)
+        report("an empty submodule directory uses the gitlink",
+               [] if engine_commit("1" * 40, not_checked_out) == ("1" * 40, []) else ["wrong"], False)
     return 1 if failed else 0
 
 
@@ -156,7 +214,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.self_test:
         return self_test()
-    errors = check(*gather(args.root))
+    errors, *inputs = gather(args.root)
+    errors = errors + check(*inputs)
     for error in errors:
         print(f"error: {error}", file=sys.stderr)
     if not errors:

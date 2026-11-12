@@ -24,8 +24,11 @@ use std::{
     io::Write,
     os::unix::fs::{MetadataExt, OpenOptionsExt},
     path::{Path, PathBuf},
-    sync::{mpsc, Arc, LazyLock, Mutex, MutexGuard, PoisonError},
-    thread::{self, JoinHandle},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, LazyLock, Mutex, MutexGuard, PoisonError,
+    },
+    thread,
     time::Duration,
 };
 
@@ -50,8 +53,10 @@ pub(crate) type Reply = Result<Value, String>;
 
 /// The engine's pricing files (`RemotePricingSnapshot::from_cache_root`).
 pub(crate) const PRICING_FILES: [&str; 2] = ["pricing-litellm.json", "pricing-openrouter.json"];
-/// How often a newer app pricing file is copied again. The app's pricing
-/// refresh has no FFI event to hook, so the copy polls mtimes.
+/// The monitor period: how often the scan inputs are recomputed (a changed
+/// digest restarts the agent) and a newer app pricing file is copied again.
+/// Neither the app's pricing refresh nor a hand edit of the tokscale
+/// `settings.json` has an FFI event to hook, so both are polled.
 pub(crate) const PRICING_PERIOD: Duration = Duration::from_secs(300);
 /// The secure root below an override home. Short on purpose: the frozen
 /// suffix below a `/tmp` or `.build` home overflows the 104-byte `sun_path`
@@ -61,8 +66,7 @@ pub(crate) const OVERRIDE_SUFFIX: &[&str] = &["a"];
 const BUSY_RETRIES: u32 = 100;
 const BUSY_PAUSE: Duration = Duration::from_millis(20);
 
-/// Everything an agent is started with. Built under the [`RemoteAgent`] lock
-/// so two starts cannot apply an older snapshot after a newer one.
+/// Everything an agent is started with.
 pub(crate) struct Inputs {
     pub home: PathBuf,
     pub state_suffix: &'static [&'static str],
@@ -75,12 +79,17 @@ pub(crate) struct Inputs {
     pub clock: Arc<dyn Clock>,
 }
 
+/// Builds the inputs from their sources, now. The same function serves the
+/// start call and every monitor period, so both read the inputs the same
+/// way. Always called under the [`RemoteAgent`] lock, so an older snapshot
+/// cannot be applied after a newer one.
+pub(crate) type MakeInputs = Arc<dyn Fn() -> Result<Inputs, String> + Send + Sync>;
+
 struct Running {
-    // Field order is drop order: the pricing thread ends before the agent.
-    _pricing: PricingSync,
     agent: Agent,
     inputs: Inputs,
     digest: String,
+    make: MakeInputs,
     /// Process-wide start counter; a restart gets a new one. Tests read it
     /// to tell a restart from a no-op.
     #[cfg(test)]
@@ -96,15 +105,17 @@ struct Claims {
     attempts: ClaimAttempts,
 }
 
-/// One embedded agent and the receiver's claims in progress.
+/// One embedded agent, the receiver's claims in progress, and the monitor
+/// thread (started with the first agent, ended when this is dropped).
 #[derive(Default)]
 pub(crate) struct RemoteAgent {
     running: Mutex<Option<Running>>,
     claims: Mutex<Claims>,
+    monitor: AtomicBool,
 }
 
 /// The process's agent, behind the `tb_remote_*` entry points.
-pub(crate) static AGENT: LazyLock<RemoteAgent> = LazyLock::new(RemoteAgent::default);
+pub(crate) static AGENT: LazyLock<Arc<RemoteAgent>> = LazyLock::new(Default::default);
 
 /// An entry point body: the existing `guarded` boundary, with any panic
 /// inside the agent answered by the fixed class `panic` (no panic text,
@@ -119,7 +130,7 @@ pub(crate) fn ffi(name: &str, body: impl FnOnce() -> Reply) -> *mut c_char {
 }
 
 #[cfg(test)]
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::AtomicU64;
 #[cfg(test)]
 static EPOCH: AtomicU64 = AtomicU64::new(0);
 
@@ -127,45 +138,83 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-impl RemoteAgent {
-    /// Starts the agent with the inputs `make_inputs` builds now. Already
-    /// running with the same home and the same owner-inputs digest: nothing
-    /// happens. Different: the agent is stopped and started with the new
-    /// inputs, so a scan root the owner removed is no longer shared (the new
-    /// digest has no approved scope until the owner approves it again).
-    /// Returns the status.
-    pub(crate) fn start(&self, make_inputs: impl FnOnce() -> Result<Inputs, String>) -> Reply {
-        let mut running = lock(&self.running);
-        let inputs = make_inputs()?;
-        if let Some(current) = running.as_ref() {
-            let same_root = current.inputs.home == inputs.home
-                && current.inputs.state_suffix == inputs.state_suffix;
-            let digest = digest_for(&inputs, current.agent.source().source_cache_dir());
-            if same_root && digest.as_deref() == Some(current.digest.as_str()) {
-                return status_of(current);
-            }
+/// Makes `running` an agent over the inputs `make` builds now. Running with
+/// the same home and the same owner-inputs digest: kept (with `make` as its
+/// source from now on). Otherwise the old agent is stopped and one is started
+/// over the new inputs, so a scan input the owner removed is no longer
+/// shared (the new digest has no approved scope until the owner approves it
+/// again). An error from `make` leaves `running` as it was; an error after
+/// that leaves it empty.
+fn ensure(running: &mut Option<Running>, make: MakeInputs) -> Result<(), String> {
+    let inputs = make()?;
+    if let Some(current) = running.as_mut() {
+        let same_root = current.inputs.home == inputs.home
+            && current.inputs.state_suffix == inputs.state_suffix;
+        let digest = digest_for(&inputs, current.agent.source().source_cache_dir());
+        if same_root && digest.as_deref() == Some(current.digest.as_str()) {
+            current.make = make;
+            return Ok(());
         }
-        // Drop (stop) the old agent before the new one takes the owner lock.
-        *running = None;
-        let agent = start_agent(&inputs)?;
-        let digest = digest_for(&inputs, agent.source().source_cache_dir())
-            .ok_or_else(|| "invalid".to_string())?;
-        let destination = agent.pricing_dir().to_path_buf();
-        sync_pricing(&inputs.pricing_source, &destination);
-        let pricing = PricingSync::spawn(
-            inputs.pricing_source.clone(),
-            destination,
-            inputs.pricing_period,
-        );
-        let current = running.insert(Running {
-            _pricing: pricing,
-            agent,
-            inputs,
-            digest,
-            #[cfg(test)]
-            epoch: EPOCH.fetch_add(1, Ordering::Relaxed) + 1,
-        });
-        status_of(current)
+    }
+    // Drop (stop) the old agent before the new one takes the owner lock.
+    *running = None;
+    let agent = start_agent(&inputs)?;
+    let digest = digest_for(&inputs, agent.source().source_cache_dir())
+        .ok_or_else(|| "invalid".to_string())?;
+    sync_pricing(&inputs.pricing_source, agent.pricing_dir());
+    *running = Some(Running {
+        agent,
+        inputs,
+        digest,
+        make,
+        #[cfg(test)]
+        epoch: EPOCH.fetch_add(1, Ordering::Relaxed) + 1,
+    });
+    Ok(())
+}
+
+impl RemoteAgent {
+    /// Starts the agent over the inputs `make` builds (see [`ensure`]), then
+    /// the monitor if it does not run yet. Returns the status.
+    pub(crate) fn start(self: &Arc<Self>, make: MakeInputs) -> Reply {
+        let mut running = lock(&self.running);
+        ensure(&mut running, make)?;
+        let current = running.as_ref().ok_or("internal")?;
+        let period = current.inputs.pricing_period;
+        let status = status_of(current);
+        drop(running);
+        self.spawn_monitor(period);
+        status
+    }
+
+    /// One thread per `RemoteAgent`, holding it weakly: each period it runs
+    /// [`tick`](Self::tick); once the `RemoteAgent` is gone it ends.
+    fn spawn_monitor(self: &Arc<Self>, period: Duration) {
+        if self.monitor.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let agent = Arc::downgrade(self);
+        let spawned = thread::Builder::new()
+            .name("tb-remote-monitor".into())
+            .spawn(move || loop {
+                thread::sleep(period);
+                match agent.upgrade() {
+                    Some(agent) => agent.tick(),
+                    None => break,
+                }
+            });
+        if spawned.is_err() {
+            self.monitor.store(false, Ordering::SeqCst);
+        }
+    }
+
+    /// One monitor period: the scope re-check, then the pricing copy.
+    fn tick(&self) {
+        let mut running = lock(&self.running);
+        recheck(&mut running);
+        if let Some(current) = running.as_ref() {
+            sync_pricing(&current.inputs.pricing_source, current.agent.pricing_dir());
+        }
     }
 
     /// `Runtime::stop` (by dropping the agent). Stopped already: the same
@@ -663,41 +712,20 @@ fn client_class(error: ClientError) -> String {
     .into()
 }
 
+/// The monitor's re-check: the running agent's own `make` again, exactly as
+/// a start call. Same digest: nothing happens. Changed: restarted over the
+/// new inputs. Inputs that cannot be built any more: stopped, so a scope
+/// that can no longer be read is not served.
+fn recheck(running: &mut Option<Running>) {
+    let Some(make) = running.as_ref().map(|current| Arc::clone(&current.make)) else {
+        return;
+    };
+    if ensure(running, make).is_err() {
+        *running = None;
+    }
+}
+
 // ------------------------------------------------------------- pricing ---
-
-/// The periodic pricing copy; dropping it ends and joins the thread.
-struct PricingSync {
-    stop: Option<mpsc::Sender<()>>,
-    thread: Option<JoinHandle<()>>,
-}
-
-impl PricingSync {
-    fn spawn(source: PathBuf, destination: PathBuf, period: Duration) -> Self {
-        let (stop, wake) = mpsc::channel::<()>();
-        let thread = thread::Builder::new()
-            .name("tb-remote-pricing".into())
-            .spawn(move || {
-                while let Err(mpsc::RecvTimeoutError::Timeout) = wake.recv_timeout(period) {
-                    sync_pricing(&source, &destination);
-                }
-            })
-            .ok();
-        Self {
-            stop: Some(stop),
-            thread,
-        }
-    }
-}
-
-impl Drop for PricingSync {
-    fn drop(&mut self) {
-        // Disconnecting the channel wakes the thread and ends its loop.
-        drop(self.stop.take());
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
-        }
-    }
-}
 
 /// Copies each pricing file whose source is newer than its copy (or has no
 /// copy yet). A missing source is skipped; a failed copy is retried next
@@ -734,15 +762,47 @@ fn copy_atomic(source: &Path, directory: &Path, name: &str) -> std::io::Result<(
 
 // ---------------------------------------------------------- app inputs ---
 
-/// The start inputs of the app, read now: the home and its config and data
-/// directories, the app's scanner settings (`LocalSourceContext`: registry,
-/// OpenCode DBs, Cursor takeover) and the app's pricing cache.
+/// Where the inputs come from: the scanner-settings context (registry,
+/// OpenCode DBs, Cursor takeover), the pricing copy source, the monitor
+/// period and the clock. The app passes [`Sources::app`]; tests pass
+/// fixtures.
+pub(crate) struct Sources {
+    pub context: crate::LocalSourceContext,
+    pub pricing_source: PathBuf,
+    pub period: Duration,
+    pub clock: Arc<dyn Clock>,
+}
+
+impl Sources {
+    /// The app's own: `LocalSourceContext::current()` and the engine's
+    /// pricing cache.
+    pub(crate) fn app() -> Self {
+        Self {
+            context: crate::LocalSourceContext::current(),
+            pricing_source: tokscale_core::pricing::cache::get_cache_dir(),
+            period: PRICING_PERIOD,
+            clock: Arc::new(syrtis_agent::pairing::SystemClock),
+        }
+    }
+}
+
+/// The app's [`MakeInputs`] for `tb_remote_start`.
+pub(crate) fn app_make_inputs(home_override: Option<PathBuf>) -> MakeInputs {
+    let sources = Sources::app();
+    Arc::new(move || inputs_from(home_override.as_deref(), &sources))
+}
+
+/// The inputs from `sources`, read now: the home and its config and data
+/// directories, `context.scanner_settings()`, and the pricing source.
 /// `home_override` `None` is the directory-service home and the frozen root;
 /// a test build refuses it (`homeRequired`), so no test opens the real root.
-pub(crate) fn app_inputs(home_override: Option<PathBuf>) -> Result<Inputs, String> {
+pub(crate) fn inputs_from(
+    home_override: Option<&Path>,
+    sources: &Sources,
+) -> Result<Inputs, String> {
     let (home, state_suffix, config_dir, data_dir) = match home_override {
         Some(home) => {
-            prepare_override_home(&home)?;
+            prepare_override_home(home)?;
             // The platform directories, moved below the override home.
             let below = |dir: Option<PathBuf>| -> Result<PathBuf, String> {
                 dir.zip(dirs::home_dir())
@@ -753,7 +813,7 @@ pub(crate) fn app_inputs(home_override: Option<PathBuf>) -> Result<Inputs, Strin
                     .ok_or_else(|| "unsupported".into())
             };
             let (config, data) = (below(dirs::config_dir())?, below(dirs::data_dir())?);
-            (home, OVERRIDE_SUFFIX, config, data)
+            (home.to_path_buf(), OVERRIDE_SUFFIX, config, data)
         }
         None => product_roots()?,
     };
@@ -762,10 +822,10 @@ pub(crate) fn app_inputs(home_override: Option<PathBuf>) -> Result<Inputs, Strin
         state_suffix,
         config_dir,
         data_dir,
-        settings: crate::LocalSourceContext::current().scanner_settings(),
-        pricing_source: tokscale_core::pricing::cache::get_cache_dir(),
-        pricing_period: PRICING_PERIOD,
-        clock: Arc::new(syrtis_agent::pairing::SystemClock),
+        settings: sources.context.scanner_settings(),
+        pricing_source: sources.pricing_source.clone(),
+        pricing_period: sources.period,
+        clock: Arc::clone(&sources.clock),
     })
 }
 
@@ -828,9 +888,16 @@ pub(crate) fn prepare_override_home(home: &Path) -> Result<(), String> {
 mod tests {
     //! Every agent here lives in a short temp home below `/tmp` that the test
     //! creates and removes by its exact path, so the control socket path fits
-    //! `sun_path`. Nothing opens the real agent root (`app_inputs(None)` is
-    //! `homeRequired` in a test build) or scans the real home: the engine
-    //! home is the temp home, and the only extra root is one the test makes.
+    //! `sun_path`. Nothing opens the real agent root (`inputs_from(None, _)`
+    //! is `homeRequired` in a test build).
+    //!
+    //! Every input comes from the temp home or from fixtures the test writes.
+    //! The direct tests build `Inputs` themselves. The tests that go through
+    //! the app's own sources (`Sources::app`, `LocalSourceContext`) run in an
+    //! env-cleared child process ([`in_child`]) whose `HOME` and
+    //! `TOKSCALE_CONFIG_DIR` are inside a temp root, so the OpenCode
+    //! `settings.json`, `OPENCODE_DB`, the Cursor and extra-root registries
+    //! (empty in a new process) and the pricing cache are all fixtures.
 
     use super::*;
     use std::{
@@ -906,26 +973,97 @@ mod tests {
         }
     }
 
-    fn inputs(home: &TempHome, clock: &Arc<TestClock>, settings: ScannerSettings) -> Inputs {
+    const PERIOD: Duration = Duration::from_millis(100);
+
+    fn inputs(home: &Path, clock: &Arc<TestClock>, settings: ScannerSettings) -> Inputs {
         Inputs {
-            home: home.0.clone(),
+            home: home.to_path_buf(),
             state_suffix: OVERRIDE_SUFFIX,
-            config_dir: home.0.join(".config"),
-            data_dir: home.0.join(".local/share"),
+            config_dir: home.join(".config"),
+            data_dir: home.join(".local/share"),
             settings,
-            pricing_source: home.0.join("pricing-src"),
-            pricing_period: Duration::from_millis(100),
+            pricing_source: home.join("pricing-src"),
+            pricing_period: PERIOD,
             clock: Arc::clone(clock) as Arc<dyn Clock>,
         }
     }
 
+    /// Starts `agent` over fixed inputs below `home`.
+    fn start_at(
+        agent: &Arc<RemoteAgent>,
+        home: &Path,
+        clock: &Arc<TestClock>,
+        settings: ScannerSettings,
+    ) -> Value {
+        let (home, clock) = (home.to_path_buf(), Arc::clone(clock));
+        agent
+            .start(Arc::new(move || {
+                Ok(inputs(&home, &clock, settings.clone()))
+            }))
+            .unwrap()
+    }
+
     fn start(
-        agent: &RemoteAgent,
+        agent: &Arc<RemoteAgent>,
         home: &TempHome,
         clock: &Arc<TestClock>,
         settings: ScannerSettings,
     ) -> Value {
-        agent.start(|| Ok(inputs(home, clock, settings))).unwrap()
+        start_at(agent, &home.0, clock, settings)
+    }
+
+    const CHILD_ROOT: &str = "TB_REMOTE_AGENT_CHILD_ROOT";
+
+    /// In a child started by [`in_child`]: its temp root.
+    fn child_root() -> Option<PathBuf> {
+        std::env::var_os(CHILD_ROOT).map(PathBuf::from)
+    }
+
+    /// True in the child. In the parent, re-runs `test` in an env-cleared
+    /// child whose `HOME` is `<root>/home` and `TOKSCALE_CONFIG_DIR` is
+    /// `<root>/config` (`<root>` a temp home this removes), asserts that it
+    /// passed, and returns false.
+    fn in_child(test: &str) -> bool {
+        if child_root().is_some() {
+            return true;
+        }
+        let root = TempHome::new();
+        fs::create_dir(root.0.join("home")).unwrap();
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                &format!("remote_agent::tests::{test}"),
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env_clear()
+            .env(CHILD_ROOT, &root.0)
+            .env("HOME", root.0.join("home"))
+            .env("TOKSCALE_CONFIG_DIR", root.0.join("config"))
+            .env("TOKSCALE_PRICING_CACHE_ONLY", "1")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success() && stdout.contains("1 passed"),
+            "child failed: {}\n{stdout}\n{}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        false
+    }
+
+    /// `<root>/config/settings.json` listing `paths` as OpenCode DBs.
+    fn write_settings(root: &Path, paths: &[&Path]) {
+        let config = root.join("config");
+        fs::create_dir_all(&config).unwrap();
+        let body = json!({"scanner": {"opencodeDbPaths": paths}});
+        fs::write(config.join("settings.json"), body.to_string()).unwrap();
+    }
+
+    fn touch_file(path: &Path) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, b"x").unwrap();
     }
 
     fn free_port() -> u16 {
@@ -979,7 +1117,10 @@ mod tests {
     fn two_agents_pair_a_changed_scope_is_refused_and_revoke_ends_the_grant() {
         let clock = TestClock::new();
         let (producer_home, receiver_home) = (TempHome::new(), TempHome::new());
-        let (producer, receiver) = (RemoteAgent::default(), RemoteAgent::default());
+        let (producer, receiver) = (
+            Arc::new(RemoteAgent::default()),
+            Arc::new(RemoteAgent::default()),
+        );
         start(
             &producer,
             &producer_home,
@@ -1087,7 +1228,7 @@ mod tests {
     fn listen_configure_moves_the_listener_off_the_old_port() {
         let clock = TestClock::new();
         let home = TempHome::new();
-        let agent = RemoteAgent::default();
+        let agent = Arc::new(RemoteAgent::default());
         start(&agent, &home, &clock, ScannerSettings::default());
         let (old, new) = (free_port(), free_port());
         let status = agent.listen_configure("127.0.0.1", old, None).unwrap();
@@ -1114,7 +1255,7 @@ mod tests {
         for name in PRICING_FILES {
             fs::write(source.join(name), format!("{{\"{name}\":1}}")).unwrap();
         }
-        let agent = RemoteAgent::default();
+        let agent = Arc::new(RemoteAgent::default());
         start(&agent, &home, &clock, ScannerSettings::default());
         let destination = lock(&agent.running)
             .as_ref()
@@ -1180,6 +1321,9 @@ mod tests {
     /// class string without a path.
     #[test]
     fn ffi_lifecycle_disclosure_scope_approval_and_errors() {
+        if !in_child("ffi_lifecycle_disclosure_scope_approval_and_errors") {
+            return;
+        }
         let _registry = lock(&crate::extra_scan_paths::TEST_LOCK);
         crate::extra_scan_paths::reset_for_test();
         let ffi = crate::remote_ffi::tb_remote_start;
@@ -1274,5 +1418,150 @@ mod tests {
             json!({"ok": false, "err": "notRunning"})
         );
         crate::extra_scan_paths::reset_for_test();
+    }
+
+    /// Every string in `value`.
+    fn strings<'a>(value: &'a Value, out: &mut Vec<&'a str>) {
+        match value {
+            Value::String(text) => out.push(text),
+            Value::Array(items) => items.iter().for_each(|v| strings(v, out)),
+            Value::Object(map) => map.values().for_each(|v| strings(v, out)),
+            _ => {}
+        }
+    }
+
+    /// Review fix 1, the regression check for hermetic inputs: through the C
+    /// entry and the app's own sources, a sentinel OpenCode DB planted in the
+    /// fixture `settings.json` is exactly the disclosed DB list, no disclosed
+    /// path lies outside the temp root, and the pricing copy comes from the
+    /// fixture cache.
+    #[test]
+    fn ffi_disclosure_holds_only_fixture_inputs() {
+        if !in_child("ffi_disclosure_holds_only_fixture_inputs") {
+            return;
+        }
+        let root = child_root().unwrap();
+        let sentinel = root.join("sentinel/opencode.db");
+        touch_file(&sentinel);
+        write_settings(&root, &[&sentinel]);
+        let cache = root.join("config/cache");
+        fs::create_dir_all(&cache).unwrap();
+        for name in PRICING_FILES {
+            fs::write(cache.join(name), format!("fixture {name}")).unwrap();
+        }
+
+        let home = c(root.join("o").to_str().unwrap());
+        let started = take(unsafe { crate::remote_ffi::tb_remote_start(home.as_ptr()) });
+        assert_eq!(started["ok"], true, "{started}");
+        let disclosure = take(crate::remote_ffi::tb_remote_scope_disclosure())["data"].clone();
+        assert_eq!(disclosure["opencodeDbPaths"], json!([sentinel]));
+        let mut all = Vec::new();
+        strings(&disclosure, &mut all);
+        let outside: Vec<_> = all
+            .into_iter()
+            .filter(|text| text.starts_with('/') && !Path::new(text).starts_with(&root))
+            .collect();
+        assert!(
+            outside.is_empty(),
+            "paths outside the temp root: {outside:?}"
+        );
+        let copied = lock(&AGENT.running)
+            .as_ref()
+            .unwrap()
+            .agent
+            .pricing_dir()
+            .to_path_buf();
+        for name in PRICING_FILES {
+            assert_eq!(
+                fs::read_to_string(copied.join(name)).unwrap(),
+                format!("fixture {name}")
+            );
+        }
+        take(crate::remote_ffi::tb_remote_stop());
+    }
+
+    /// Review fix 2: a hand edit of the OpenCode list in `settings.json` (no
+    /// setter calls start) restarts the agent within the monitor period;
+    /// the scope then reads unapproved and the old grant's report request is
+    /// refused. An unchanged file restarts nothing.
+    #[test]
+    fn a_hand_edit_of_the_opencode_list_restarts_within_one_period() {
+        if !in_child("a_hand_edit_of_the_opencode_list_restarts_within_one_period") {
+            return;
+        }
+        let root = child_root().unwrap();
+        let clock = TestClock::new();
+        let db = root.join("dbs/opencode.db");
+        touch_file(&db);
+        write_settings(&root, &[&db]);
+        let sources = Sources {
+            context: crate::LocalSourceContext::for_home(root.join("home")),
+            pricing_source: root.join("config/cache"),
+            period: PERIOD,
+            clock: Arc::clone(&clock) as Arc<dyn Clock>,
+        };
+        let producer_home = root.join("p");
+        let make: MakeInputs = Arc::new(move || inputs_from(Some(&producer_home), &sources));
+        let producer = Arc::new(RemoteAgent::default());
+        producer.start(make).unwrap();
+        let disclosure = producer.scope_disclosure().unwrap();
+        assert_eq!(disclosure["opencodeDbPaths"], json!([db]));
+        producer
+            .listen_configure("127.0.0.1", free_port(), None)
+            .unwrap();
+        producer
+            .scope_approve(disclosure["ownerInputsSha256"].as_str().unwrap())
+            .unwrap();
+        producer.sharing_set(true).unwrap();
+
+        let receiver = Arc::new(RemoteAgent::default());
+        fs::create_dir(root.join("r")).unwrap();
+        start_at(
+            &receiver,
+            &root.join("r"),
+            &clock,
+            ScannerSettings::default(),
+        );
+        let offer = producer.offer_create(600).unwrap();
+        let claim = receiver
+            .pair_claim(offer["pairUrl"].as_str().unwrap())
+            .unwrap();
+        let pending = producer.pending_list().unwrap()[0]["pendingId"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        producer.decide(true, &pending, 1).unwrap();
+        let paired = receiver
+            .pair_poll(claim["handle"].as_u64().unwrap())
+            .unwrap();
+        let producer_static =
+            decode_fixed_hex::<32>(paired["producerStatic"].as_str().unwrap()).unwrap();
+        clock.advance(61);
+        assert_eq!(pull(&receiver, &producer_static), Ok(()));
+
+        // Unchanged file: several periods, the same agent.
+        let before = epoch(&producer);
+        thread::sleep(PERIOD * 5);
+        assert_eq!(epoch(&producer), before, "an unchanged input restarted");
+        assert_eq!(producer.status().unwrap()["scopeApproved"], true);
+
+        // The owner removes the DB by hand.
+        write_settings(&root, &[]);
+        let deadline = Instant::now() + PERIOD * 20;
+        while epoch(&producer) == before {
+            assert!(Instant::now() < deadline, "the edit was not picked up");
+            thread::sleep(PERIOD / 4);
+        }
+        assert_eq!(producer.status().unwrap()["scopeApproved"], false);
+        assert_eq!(
+            producer.scope_disclosure().unwrap()["opencodeDbPaths"],
+            json!([])
+        );
+        clock.advance(61);
+        assert_eq!(
+            pull(&receiver, &producer_static),
+            Err(PullError::Fetch(FetchError::Internal)),
+            "the old grant must not read the scope the owner removed"
+        );
     }
 }
