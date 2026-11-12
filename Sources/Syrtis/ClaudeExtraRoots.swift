@@ -583,7 +583,10 @@ enum ClaudeExtraRoots {
         setConfigDirs: @escaping @Sendable (String) -> Bool = realSetConfigDirs,
         onConfigDirsSet: (@Sendable @MainActor () -> Void)? = nil,
         setScanPaths: @escaping @Sendable (String) -> ExtraScanPathsResult? = {
-            try? TBCore.setExtraScanPaths(json: $0)
+            let result = try? TBCore.setExtraScanPaths(json: $0)
+            // The agent snapshots its scan inputs: restart it on new roots.
+            if result != nil { RemoteAgentLaunch.inputsChanged() }
+            return result
         },
         then completion: (@Sendable @MainActor (ExtraScanPathsResult?) -> Void)?,
         quotaSideDone: (@Sendable @MainActor () -> Void)? = nil

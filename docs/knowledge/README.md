@@ -4,7 +4,7 @@ id: kb-index
 kind: index
 scope: repository
 read_when: before any Syrtis task or handoff
-last_verified: 2026-11-08
+last_verified: 2026-11-12
 sources: ["README.md", "CONTRIBUTING.md", "AGENTS.md", "Makefile", "Package.swift", ".github/workflows/ci.yml", ".github/workflows/ci-release.yml", ".github/workflows/pages.yml", ".github/workflows/release.yml", ".github/workflows/update-install-count.yml"]
 ---
 
@@ -38,6 +38,7 @@ sources: ["README.md", "CONTRIBUTING.md", "AGENTS.md", "Makefile", "Package.swif
 | 測試、fixture、cache、跨語言契約 | [`verification.md`](verification.md) | [`architecture.md`](architecture.md) |
 | 效能／正確性 before-after 量測、對拍 oracle | [`measurement.md`](measurement.md) | [`history/dashboard-load-performance.md`](history/dashboard-load-performance.md) |
 | Provider quota pace／historical calculation | [`plans/provider-quota-pace.md`](plans/provider-quota-pace.md) | [`plans/codex-historical-pace-v2.md`](plans/codex-historical-pace-v2.md)、[`architecture.md`](architecture.md)、[`verification.md`](verification.md) |
+| 內嵌 remote-usage agent、`tb_remote_*` C ABI、agent 依賴 pin | [`remote-agent.md`](remote-agent.md) | [`architecture.md`](architecture.md)、[`verification.md`](verification.md) |
 | tokscale engine change 或 consumer pin | [`vendor-tokscale.md`](vendor-tokscale.md) | [`vendor/README.md`](../../vendor/README.md) |
 | Sparkle、appcast、Homebrew、Pages | [`release.md`](release.md) | [`workflow.md`](workflow.md) |
 | 維護期優先順序 | [`current-state.md`](current-state.md) | [`history/README.md`](history/README.md) |
@@ -59,6 +60,7 @@ docs/knowledge/
 ├── workflow.md
 ├── verification.md
 ├── measurement.md
+├── remote-agent.md
 ├── vendor-tokscale.md
 ├── release.md
 ├── communication.md

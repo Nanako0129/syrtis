@@ -40,6 +40,10 @@ dirs = "5"
 rayon = "1.10"
 # Read Cursor's local login store without creating or modifying the database.
 rusqlite = { version = "0.32", features = ["bundled"] }
+# The remote-usage agent (pairing, grants, Noise transport, caches), embedded
+# by `remote_agent.rs`. Exact rev; its tokscale-core is the vendored one
+# through the workspace `[patch]`.
+syrtis-agent = { git = "https://github.com/Nanako0129/Syrtis-Agent", rev = "f424877dad0ff6490a0b9e011806604a0ae695d8" }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 security-framework = "3.7"

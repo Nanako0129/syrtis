@@ -659,6 +659,103 @@ public enum TBCore {
         try unwrap(tb_cursor_sync(explicit ? 1 : 0))
     }
 
+    // MARK: Remote agent (`tb_remote_*`, ctb.h). Every call blocks: off the
+    // main thread. Errors are `TBCoreError.bridge(<class>)`.
+
+    private static func withOptionalCString<R>(
+        _ text: String?, _ body: (UnsafePointer<CChar>?) -> R
+    ) -> R {
+        guard let text else { return body(nil) }
+        return text.withCString { body($0) }
+    }
+
+    private static func remoteNothing(_ raw: UnsafeMutablePointer<CChar>?) throws {
+        let _: RemoteNothing? = try unwrapOptional(raw)
+    }
+
+    /// `homeOverride` nil: the real agent root. Use `RemoteAgentLaunch`.
+    @discardableResult
+    public static func remoteStart(homeOverride: String?) throws -> RemoteAgentStatus {
+        try unwrap(withOptionalCString(homeOverride) { tb_remote_start($0) })
+    }
+
+    @discardableResult
+    public static func remoteStop() throws -> RemoteAgentStatus {
+        try unwrap(tb_remote_stop())
+    }
+
+    public static func remoteStatus() throws -> RemoteAgentStatus {
+        try unwrap(tb_remote_status())
+    }
+
+    public static func remoteSetSharing(_ enabled: Bool) throws {
+        try remoteNothing(tb_remote_sharing_set(enabled ? 1 : 0))
+    }
+
+    @discardableResult
+    public static func remoteListenConfigure(
+        host: String, port: Int, nodeLabel: String?
+    ) throws -> RemoteAgentStatus {
+        guard let port = Int32(exactly: port) else { throw TBCoreError.bridge("invalid") }
+        return try unwrap(host.withCString { host in
+            withOptionalCString(nodeLabel) { tb_remote_listen_configure(host, port, $0) }
+        })
+    }
+
+    public static func remoteScopeDisclosure() throws -> RemoteScopeDisclosure {
+        try unwrap(tb_remote_scope_disclosure())
+    }
+
+    /// Pass the `ownerInputsSha256` of the disclosure the owner saw.
+    public static func remoteScopeApprove(ownerInputsSha256: String) throws {
+        try remoteNothing(ownerInputsSha256.withCString { tb_remote_scope_approve($0) })
+    }
+
+    public static func remoteOfferCreate(ttlSeconds: Int64) throws -> RemoteOffer {
+        try unwrap(tb_remote_offer_create(ttlSeconds))
+    }
+
+    public static func remoteOfferCancel(offerId: String) throws {
+        try remoteNothing(offerId.withCString { tb_remote_offer_cancel($0) })
+    }
+
+    public static func remotePendingList() throws -> [RemotePending] {
+        try unwrap(tb_remote_pending_list())
+    }
+
+    public static func remoteApprove(pendingId: String, sasGeneration: Int64 = 1) throws {
+        try remoteNothing(pendingId.withCString { tb_remote_approve($0, sasGeneration) })
+    }
+
+    public static func remoteReject(pendingId: String, sasGeneration: Int64 = 1) throws {
+        try remoteNothing(pendingId.withCString { tb_remote_reject($0, sasGeneration) })
+    }
+
+    public static func remoteGrants() throws -> [RemoteGrant] {
+        try unwrap(tb_remote_grants())
+    }
+
+    public static func remoteRevoke(grantId: String) throws {
+        try remoteNothing(grantId.withCString { tb_remote_revoke($0) })
+    }
+
+    public static func remotePairClaim(pairUrl: String) throws -> RemoteClaim {
+        try unwrap(pairUrl.withCString { tb_remote_pair_claim($0) })
+    }
+
+    /// Blocks up to 960 s waiting for the producer's approval.
+    public static func remotePairPoll(handle: Int64) throws -> RemotePaired {
+        try unwrap(tb_remote_pair_poll(handle))
+    }
+
+    public static func remotePeers() throws -> [RemotePeer] {
+        try unwrap(tb_remote_peers())
+    }
+
+    public static func remotePeerRemove(producerStatic: String) throws {
+        try remoteNothing(producerStatic.withCString { tb_remote_peer_remove($0) })
+    }
+
     /// OAuth quota cards for codex/claude/antigravity/copilot/grok/grok-bot. Network-bound;
     /// per-provider failures are reported in each snapshot's `error`.
     public static func agentUsage() throws -> AgentUsagePayload {

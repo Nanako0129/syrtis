@@ -353,6 +353,55 @@ char *tb_set_cursor_sync(const char *json);
 // `token_sealed_unreadable` and `token_sealed_unsupported`.
 char *tb_cursor_sync(int32_t user_initiated);
 
+// The embedded remote-usage agent (syrtis-agent). macOS and Linux only; the
+// Windows port does not export these yet. `err` is a fixed class string
+// (notRunning, invalid, unauthorized, expired, busy, unsafeState, internal,
+// unsupported, control, pathTooLong, unsafeSocket, homeRequired, panic, and
+// for pairing selfPairing, invalidOffer, offerUnusable, lostAttempt,
+// incompatible, rejected, revoked, aborted, pollLimit, transport); never a
+// path, token, Pair URL or address. Every call blocks; call off the main
+// thread.
+//
+// tb_remote_start: home_override NULL = the directory-service home and the
+// frozen agent root; otherwise that absolute directory (created 0700) with a
+// short root. Already running with the same scan inputs: no restart. Changed
+// inputs: restart, and the new inputs need tb_remote_scope_approve. Data: the
+// status object below.
+char *tb_remote_start(const char *home_override);
+// Data {"running":false}.
+char *tb_remote_stop(void);
+// {"running":false}, or {running, sharingEnabled, scopeApproved, listening,
+// identityFingerprint, bindHost?, bindPort?, nodeLabel?, activeGrantCount,
+// activeOfferCount, pendingCount, lastScanAt?, scanStatus, sourceFamilies}.
+char *tb_remote_status(void);
+// Data null. Enabling while on = invalid; the enable gate = busy.
+char *tb_remote_sharing_set(int32_t enabled);
+// node_label NULL = none. Data: the status.
+char *tb_remote_listen_configure(const char *host, int32_t port, const char *node_label);
+// {home, configDir, dataDir, extraScanPaths:{client:[path]},
+// excludedScanPaths:{client:[path]}, opencodeDbPaths:[path], clients:[id],
+// ownerInputsSha256, envRootsSet, envRoots:[{client, variable}]}.
+char *tb_remote_scope_disclosure(void);
+// invalid unless the digest is the running agent's. Data null.
+char *tb_remote_scope_approve(const char *owner_inputs_sha256);
+// {expiresAt, offerId, pairUrl}. The Pair URL is a secret: never log it.
+char *tb_remote_offer_create(int64_t ttl_seconds);
+char *tb_remote_offer_cancel(const char *offer_id);
+// [{expiresAt, pendingId, sasCode}].
+char *tb_remote_pending_list(void);
+char *tb_remote_approve(const char *pending_id, int64_t sas_generation);
+char *tb_remote_reject(const char *pending_id, int64_t sas_generation);
+// [{grantId, peerFingerprint, createdAt, expiresAt, state}].
+char *tb_remote_grants(void);
+char *tb_remote_revoke(const char *grant_id);
+// Receiver. {handle, sas, expiresAt, producerFingerprint}.
+char *tb_remote_pair_claim(const char *pair_url);
+// Blocks up to 960 s. {producerStatic, fingerprint, expiresAt}.
+char *tb_remote_pair_poll(int64_t handle);
+// [{producerStatic, fingerprint, nodeLabel?, createdAt, expiresAt, state}].
+char *tb_remote_peers(void);
+char *tb_remote_peer_remove(const char *producer_static);
+
 // Release a string returned by any tb_* entry point.
 void tb_free(char *p);
 

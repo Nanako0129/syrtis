@@ -126,6 +126,18 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         if: steps.scope.outputs.docs_only != 'true'
 
+      # The embedded syrtis-agent and the app must share one engine commit
+      # (the vendor gitlink equals the agent's pinned tokscale-core rev), the
+      # lock must hold one tokscale-core, and the agent's crypto dependency
+      # closure must equal the agent's reviewed lock baseline. Self-test first,
+      # so a script that cannot fail is caught here.
+      - name: Agent engine pin
+        if: steps.scope.outputs.docs_only != 'true'
+        run: |
+          set -euo pipefail
+          python3 scripts/check_agent_engine_pin.py --self-test
+          python3 scripts/check_agent_engine_pin.py
+
       # Most PRs never touch Rust, yet rebuilt the staticlib every run: the
       # dependency cache hits, but the two workspace crates are path
       # dependencies it does not keep, and tb_core_ffi's fat LTO alone was 99 s

@@ -22633,6 +22633,73 @@ enum SelfTest {
                        && scratch.persistentDomain(forName: suite)?["registered-only"] == nil,
                    "DEFAULTS-SNAPSHOT restore puts back deleted and changed keys, removes ones that did not exist, and never stores a registered default")
         }
+        // SA-3a: where the embedded agent keeps its root, and the start path.
+        do {
+            let official = BuildIdentity.shipping(
+                arguments: ["Syrtis"], bundleIdentifier: "com.nyanako.tokenbar",
+                shortVersion: "9.9.9", buildNumber: "1")
+            let flagged = BuildIdentity.shipping(
+                arguments: ["Syrtis", "--selftest"], bundleIdentifier: "com.nyanako.tokenbar",
+                shortVersion: "9.9.9", buildNumber: "1")
+            let temporary = BuildIdentity.shipping(
+                arguments: ["Syrtis"], bundleIdentifier: "com.nyanako.tokenbar.selftest",
+                shortVersion: "9.9.9", buildNumber: "1")
+            let bare = BuildIdentity.shipping(
+                arguments: ["Syrtis"], bundleIdentifier: nil, shortVersion: nil, buildNumber: nil)
+            expect(RemoteAgentLaunch.homeOverride(
+                       shipping: bare, debugBuild: false, bundleIdentifier: nil, uid: 501)
+                       == "/tmp/syrtis-agent-dev-501/bare",
+                   "SA3A a bare executable gets the /tmp development agent root")
+            expect(RemoteAgentLaunch.homeOverride(
+                       shipping: flagged, debugBuild: false,
+                       bundleIdentifier: "com.nyanako.tokenbar", uid: 501)
+                       == "/tmp/syrtis-agent-dev-501/com.nyanako.tokenbar",
+                   "SA3A --selftest on the official bundle gets the development agent root")
+            expect(RemoteAgentLaunch.homeOverride(
+                       shipping: temporary, debugBuild: false,
+                       bundleIdentifier: "com.nyanako.tokenbar.selftest", uid: 501)
+                       == "/tmp/syrtis-agent-dev-501/com.nyanako.tokenbar.selftest",
+                   "SA3A a temporary bundle id gets the development agent root")
+            expect(official != nil
+                       && RemoteAgentLaunch.homeOverride(
+                           shipping: official, debugBuild: false,
+                           bundleIdentifier: "com.nyanako.tokenbar", uid: 501) == nil,
+                   "SA3A only the shipping bundle in a release build gets the real agent root")
+            expect(RemoteAgentLaunch.homeOverride(
+                       shipping: official, debugBuild: true,
+                       bundleIdentifier: "com.nyanako.tokenbar", uid: 501) != nil,
+                   "SA3A a DEBUG build of the shipping bundle still gets the development root")
+            expect(RemoteAgentLaunch.homeOverride() != nil,
+                   "SA3A this selftest process gets the development agent root")
+            expect(RemoteAgentLaunch.directoryName("../x") == ".._x"
+                       && RemoteAgentLaunch.directoryName("..") == "bare"
+                       && RemoteAgentLaunch.directoryName("") == "bare",
+                   "SA3A the bundle id becomes one safe path component")
+
+            // The app's start path, with a directory of its own so a `make run`
+            // in another terminal (also bare) cannot hold the same root. A nil
+            // override is never passed here: that would be the real root.
+            let realRoot = FileManager.default.homeDirectoryForCurrentUser
+                .appendingPathComponent("Library/Application Support/com.nyanako.syrtis.agent").path
+            func realRootStamp() -> String {
+                guard let attributes = try? FileManager.default.attributesOfItem(atPath: realRoot)
+                else { return "absent" }
+                return String(describing: attributes[.modificationDate])
+            }
+            let realBefore = realRootStamp()
+            let home = RemoteAgentLaunch.homeOverride(bundleIdentifier: "selftest-\(getpid())")
+            let status = home.flatMap { try? RemoteAgentLaunch.start(home: $0) }
+            expect(status?.running == true && status?.sharingEnabled == false
+                       && status?.listening == false && status?.scopeApproved == false,
+                   "SA3A the selftest starts the agent through the app's start path: running, not sharing, no listener, no approved scope")
+            RemoteAgentLaunch.stop()
+            expect((try? TBCore.remoteStatus())?.running == false,
+                   "SA3A stop leaves the agent not running")
+            if let home { try? FileManager.default.removeItem(atPath: home) }
+            expect(realRootStamp() == realBefore,
+                   "SA3A the real agent root is untouched by the selftest (absent or same mtime)")
+        }
+
         accountsDefaults.restore()
 
         if failures > 0 {

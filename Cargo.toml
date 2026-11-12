@@ -2,6 +2,14 @@
 resolver = "2"
 members = ["crates/tb_core_ffi", "vendor/tokscale-core"]
 
+# One engine in the binary: `syrtis-agent` depends on tokscale-core by git
+# rev, the app by path. This points that git source at the vendored checkout,
+# so both use the same crate. `scripts/check_agent_engine_pin.py` checks that
+# the vendor gitlink equals the rev the agent pins, so the patch never swaps
+# in an engine the agent was not reviewed against.
+[patch."https://github.com/Nanako0129/tokscale-core"]
+tokscale-core = { path = "vendor/tokscale-core" }
+
 [profile.release]
 lto = true
 strip = "debuginfo"

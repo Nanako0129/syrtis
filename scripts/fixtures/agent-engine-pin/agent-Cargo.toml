@@ -1,0 +1,9 @@
+[package]
+name = "syrtis-agent"
+version = "0.1.0"
+
+[dependencies]
+serde = { version = "=1.0.229" }
+
+[target.'cfg(unix)'.dependencies]
+tokscale-core = { git = "https://github.com/Nanako0129/tokscale-core", rev = "e156d67caa9708458fd2030f379d3c2a77ff05bf" }

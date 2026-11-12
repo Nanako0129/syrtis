@@ -140,6 +140,8 @@ enum CursorSync {
     /// The real core calls; tests inject spies in their place.
     static let coreSetConfig: SetConfig = { json in
         guard let result = try? TBCore.setCursorSync(json: json) else { return nil }
+        // The Cursor takeover is a scan input of the embedded agent.
+        RemoteAgentLaunch.inputsChanged()
         return Push(
             cleanupFailed: result.cleanupFailed,
             rejected: Dictionary(
