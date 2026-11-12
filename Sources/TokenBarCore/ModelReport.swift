@@ -141,12 +141,18 @@ public extension ModelReport {
     /// merged: summed with a healthy row of the same model its ratio would
     /// drop under the threshold and the warning would vanish while the
     /// inflated cost stayed on screen.
+    ///
+    /// The multi-client fold reads the engine's rows, not `modelLevelEntries`:
+    /// that joins one client's providers into one row ("nvidia, openai"),
+    /// whose totals belong to neither provider and which no other client's
+    /// row for either provider would join. So a client that reaches one
+    /// model through two providers is two rows in a multi-client tab and one
+    /// in its own tab, and the cost check runs on each provider's row there.
     func tabEntries(clientIds: [String]) -> [ModelReportEntry] {
         let allow = Set(clientIds)
-        let perClient = modelLevelEntries.filter { allow.contains($0.client) }
-        guard allow.count > 1 else { return perClient }
+        guard allow.count > 1 else { return modelLevelEntries.filter { allow.contains($0.client) } }
 
-        return Self.fold(perClient) { entry in
+        return Self.fold(entries.filter { allow.contains($0.client) }) { entry in
             entry.implausibleCostRatio == nil ? "\(entry.model)\u{0}\(entry.provider)" : nil
         }.map { group in
             var row = group.row
