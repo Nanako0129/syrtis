@@ -4708,6 +4708,104 @@ fn v2_one_user_principal_other_than_the_cookie_user() {
     }
 }
 
+/// S7 (#559): the walk's one other id is pinned for the whole walk, and the
+/// cookie's own id in between never releases the pin: other id A, then a
+/// cookie-id item, then another id B on a later page or in a later window
+/// is refused with nothing written. Every item is checked, written or not:
+/// a `grok-bot` item (never written, D3) carrying a `team` principal or a
+/// second other id, and a `hasTokenMeters: false` item (never written)
+/// carrying a `team` principal, are refused. Mutations: in `walk`,
+/// `Owner::Cookie => true` -> `Owner::Cookie => { other = None; true }`;
+/// run the S7 loop only over items whose `product` is `cursor`.
+#[test]
+fn v2_the_principal_pin_holds_across_the_cookie_id_and_every_item_is_checked() {
+    let _guard = lock();
+    let as_user = |id: &str, ms: i64, user: &str| {
+        let mut item = item(id, ms);
+        item["principal"]["id"] = user.into();
+        item
+    };
+    let unwritten = |id: &str, change: &dyn Fn(&mut serde_json::Value)| {
+        let mut item = item(id, month_start_ms(0) + 2);
+        change(&mut item);
+        item
+    };
+    let grok = |i: &mut serde_json::Value| i["product"] = "grok-bot".into();
+    let meterless = |i: &mut serde_json::Value| i["hasTokenMeters"] = false.into();
+    let team = |i: &mut serde_json::Value| i["principal"]["type"] = "team".into();
+    let cases: Vec<(&str, Vec<Reply>)> = vec![
+        (
+            "A, cookie, B on later pages",
+            vec![
+                v2_page(&[as_user("a", month_start_ms(0), OTHER_USER)], Some("n1")),
+                v2_page(&[item("c", month_start_ms(0) + 1)], Some("n2")),
+                v2_page(&[as_user("b", month_start_ms(0) + 2, THIRD_USER)], None),
+            ],
+        ),
+        (
+            "A, cookie, B in a later window",
+            vec![
+                v2_page(&[as_user("a", month_start_ms(0), OTHER_USER)], Some("n1")),
+                v2_page(&[item("c", month_start_ms(0) + 1)], None),
+                v2_page(&[as_user("b", month_start_ms(1) + HOUR, THIRD_USER)], None),
+            ],
+        ),
+        (
+            "a grok-bot item on a team principal",
+            vec![v2_page(
+                &[
+                    item("fine", month_start_ms(0)),
+                    unwritten("g", &|i| {
+                        grok(i);
+                        team(i);
+                        i["principal"]["id"] = OTHER_USER.into();
+                    }),
+                ],
+                None,
+            )],
+        ),
+        (
+            "a grok-bot item on a second other id",
+            vec![v2_page(
+                &[
+                    as_user("a", month_start_ms(0), OTHER_USER),
+                    unwritten("g", &|i| {
+                        grok(i);
+                        i["principal"]["id"] = THIRD_USER.into();
+                    }),
+                ],
+                None,
+            )],
+        ),
+        (
+            "a meterless item on a team principal",
+            vec![v2_page(
+                &[
+                    item("fine", month_start_ms(0)),
+                    unwritten("m", &|i| {
+                        meterless(i);
+                        team(i);
+                        i["principal"]["id"] = OTHER_USER.into();
+                    }),
+                ],
+                None,
+            )],
+        ),
+    ];
+    for (case, pages) in cases {
+        let f = fixture();
+        let mut replies = vec![old_migrated()];
+        replies.extend(pages);
+        replies.extend((0..12).map(|_| v2_empty()));
+        let (url, _) = serve(replies);
+        let status = sync_status(&f, &url, &registry(true, &f.dir));
+        assert_eq!(status["state"], "error", "{case}: {status}");
+        assert_eq!(status["reason"], "billing_v2_principal_mismatch", "{case}");
+        assert!(!expected_file(&f.dir).exists(), "{case}");
+        assert!(!sidecar_path(&f.dir).exists(), "{case}");
+    }
+}
+
 /// S8: an unparseable `eventTime` is dropped; a future newest old row
 /// clamps the cutover to now. Mutations: (drop) `let ms =
 /// timestamp_ms(&item.event_time?)?;` -> `let ms =
@@ -4846,9 +4944,9 @@ fn v2_items_map_to_engine_rows() {
 
 /// Design 4: a successful old walk after V2 commits brings the full old
 /// history back: the sidecar goes and the live file is the old rows alone.
-/// Mutation (both, since either deletion alone suffices): delete `let _ =
-/// std::fs::remove_file(dir.join(sidecar_name(stem)));` in `commit_file`,
-/// and delete `|| is_sidecar_name(name)` from `is_ours`.
+/// Mutation: in `commit_file`, `remove_usage_files(dir, &[&final_name],
+/// true)` -> `remove_usage_files(dir, &[&final_name, &sidecar_name(stem)],
+/// true)`.
 #[test]
 fn an_old_success_after_v2_deletes_the_sidecar() {
     let f = fixture();
@@ -4863,6 +4961,66 @@ fn an_old_success_after_v2_deletes_the_sidecar() {
         "the sidecar outlived an old success"
     );
     assert_eq!(live_rows(&f.dir).len(), 1);
+}
+
+/// An old walk whose live write fails (the live file is immutable, so the
+/// rename over it is refused) leaves the V2 sidecar in place, so the next V2
+/// round still trusts it: frozen rows and cutover unchanged, no V2 row
+/// frozen as old history. Mutation: in `commit_file`, put `let _ =
+/// std::fs::remove_file(dir.join(sidecar_name(stem)));` before
+/// `write_atomic` (the earlier order).
+#[cfg(target_os = "macos")]
+#[test]
+fn a_failed_old_commit_keeps_the_v2_sidecar() {
+    let f = fixture();
+    assert_eq!(first_v2_round(&f).stop.state, State::Ok);
+    let side = std::fs::read(sidecar_path(&f.dir)).unwrap();
+    let live = std::fs::read(expected_file(&f.dir)).unwrap();
+    let flag = |flag: &str| {
+        let done = std::process::Command::new("/usr/bin/chflags")
+            .arg(flag)
+            .arg(expected_file(&f.dir))
+            .status()
+            .unwrap();
+        assert!(done.success(), "chflags {flag}");
+    };
+    let cutover = v2_cutover();
+    flag("uchg");
+    let (outcome, _) = run_v2(
+        &f,
+        vec![old_page(&[
+            old_row("a", month_start_ms(1) + HOUR),
+            old_row("b", cutover),
+            old_row("c", cutover + 3 * HOUR),
+        ])],
+        v2_limits(false),
+    );
+    flag("nouchg");
+    assert_eq!(outcome, stop(State::Error, Some("write_failed")));
+    assert_eq!(
+        std::fs::read(sidecar_path(&f.dir)).ok(),
+        Some(side),
+        "the sidecar went before the live write"
+    );
+    // Control: the live file is the V2 one still, with no temp left beside.
+    assert_eq!(std::fs::read(expected_file(&f.dir)).unwrap(), live);
+    assert_eq!(names_in(&f.dir).len(), 2, "{:?}", names_in(&f.dir));
+    let (outcome, _) = run_v2(
+        &f,
+        vec![
+            old_migrated(),
+            v2_page(&[item("v-current", month_start_ms(0))], None),
+            v2_page(&[item("v-after", cutover + HOUR)], None),
+        ],
+        v2_limits(false),
+    );
+    assert_eq!(outcome.stop.state, State::Ok);
+    let history = sidecar_json(&f.dir);
+    assert_eq!(
+        history["cutoverMs"], cutover,
+        "V2 rows were frozen as old history"
+    );
+    assert_eq!(history["frozen"].as_array().unwrap().len(), 2);
 }
 
 // --- Billing V2, review round 2 ------------------------------------------------
