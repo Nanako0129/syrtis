@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -113,13 +114,25 @@ def check(vendor_commit: str, agent_manifest: str, baseline: list[dict], lock_te
     return errors
 
 
+# Git honours these over `-C`: exported by a caller (a hook, another tool),
+# they would point every call below at some other repository.
+GIT_LOCATION_VARS = ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR",
+                     "GIT_OBJECT_DIRECTORY", "GIT_NAMESPACE")
+
+
+def git(args: list[str], **kwargs) -> subprocess.CompletedProcess:
+    """`git` with the location variables removed from its environment."""
+    env = {k: v for k, v in os.environ.items() if k not in GIT_LOCATION_VARS}
+    return subprocess.run(["git", *args], env=env, **kwargs)
+
+
 def checkout_head(submodule: Path) -> str | None:
     """The submodule checkout's HEAD, or None when it is not checked out (no
     `.git` entry: an empty directory)."""
     if not (submodule / ".git").exists():
         return None
-    return subprocess.run(
-        ["git", "-C", str(submodule), "rev-parse", "HEAD"],
+    return git(
+        ["-C", str(submodule), "rev-parse", "HEAD"],
         check=True, capture_output=True, text=True,
     ).stdout.strip()
 
@@ -137,8 +150,8 @@ def engine_commit(gitlink: str, head: str | None) -> tuple[str, list[str]]:
 
 
 def gather(root: Path) -> tuple[list[str], str, str, list[dict], str]:
-    staged = subprocess.run(
-        ["git", "-C", str(root), "ls-files", "-s", "vendor/tokscale-core"],
+    staged = git(
+        ["-C", str(root), "ls-files", "-s", "vendor/tokscale-core"],
         check=True, capture_output=True, text=True,
     ).stdout.split()
     if len(staged) < 2 or staged[0] != "160000":
@@ -191,11 +204,24 @@ def self_test() -> int:
     with tempfile.TemporaryDirectory() as temp:
         repo = Path(temp) / "engine"
         repo.mkdir()
-        git = ["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@example.invalid",
+        # A bogus GIT_DIR in this process's environment must change nothing:
+        # without the scrub, init and commit would go to it instead of `repo`.
+        bogus = Path(temp) / "bogus-git-dir"
+        saved = os.environ.get("GIT_DIR")
+        os.environ["GIT_DIR"] = str(bogus)
+        args = ["-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@example.invalid",
                "-c", "commit.gpgsign=false", "-c", "core.hooksPath=/dev/null"]
-        subprocess.run(git + ["init", "-q"], check=True)
-        subprocess.run(git + ["commit", "-q", "--allow-empty", "-m", "a"], check=True)
-        head = checkout_head(repo)
+        try:
+            git(args + ["init", "-q"], check=True)
+            git(args + ["commit", "-q", "--allow-empty", "-m", "a"], check=True)
+            head = checkout_head(repo)
+        finally:
+            if saved is None:
+                del os.environ["GIT_DIR"]
+            else:
+                os.environ["GIT_DIR"] = saved
+        report("a bogus GIT_DIR is ignored", [] if (repo / ".git").is_dir() and not bogus.exists()
+               and head == checkout_head(repo) else ["git followed GIT_DIR"], False)
         report("a checkout at the gitlink passes", engine_commit(head, head)[1], False)
         report("a checkout at another commit fails", engine_commit("0" * 40, head)[1], True)
         empty = Path(temp) / "empty"

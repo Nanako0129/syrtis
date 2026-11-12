@@ -2099,7 +2099,9 @@ mod remote_ffi {
     }
 
     /// Blocking (up to the frozen 960 s poll window): never on the main
-    /// thread. Data `{producerStatic, fingerprint, expiresAt}`.
+    /// thread. Data `{producerStatic, fingerprint, expiresAt}`; `identityChanged`
+    /// when the agent was restarted on another identity meanwhile (nothing is
+    /// written).
     #[no_mangle]
     pub extern "C" fn tb_remote_pair_poll(handle: i64) -> *mut c_char {
         run("tb_remote_pair_poll", || {

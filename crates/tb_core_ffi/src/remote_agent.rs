@@ -112,6 +112,9 @@ pub(crate) struct RemoteAgent {
     running: Mutex<Option<Running>>,
     claims: Mutex<Claims>,
     monitor: AtomicBool,
+    /// Test seam: the next monitor spawn fails as if the OS refused a thread.
+    #[cfg(test)]
+    fail_monitor_spawn: AtomicBool,
 }
 
 /// The process's agent, behind the `tb_remote_*` entry points.
@@ -183,15 +186,27 @@ impl RemoteAgent {
         let period = current.inputs.pricing_period;
         let status = status_of(current);
         drop(running);
-        self.spawn_monitor(period);
+        // Without the monitor a later input change would never be applied,
+        // so an agent without one is not left running.
+        if self.spawn_monitor(period).is_err() {
+            drop(lock(&self.running).take());
+            return Err("internal".into());
+        }
         status
     }
 
     /// One thread per `RemoteAgent`, holding it weakly: each period it runs
-    /// [`tick`](Self::tick); once the `RemoteAgent` is gone it ends.
-    fn spawn_monitor(self: &Arc<Self>, period: Duration) {
+    /// [`tick`](Self::tick); once the `RemoteAgent` is gone it ends. Already
+    /// running: `Ok`. The thread could not be spawned: `Err`, and the next
+    /// start tries again.
+    fn spawn_monitor(self: &Arc<Self>, period: Duration) -> Result<(), ()> {
         if self.monitor.swap(true, Ordering::SeqCst) {
-            return;
+            return Ok(());
+        }
+        #[cfg(test)]
+        if self.fail_monitor_spawn.swap(false, Ordering::SeqCst) {
+            self.monitor.store(false, Ordering::SeqCst);
+            return Err(());
         }
         let agent = Arc::downgrade(self);
         let spawned = thread::Builder::new()
@@ -205,7 +220,9 @@ impl RemoteAgent {
             });
         if spawned.is_err() {
             self.monitor.store(false, Ordering::SeqCst);
+            return Err(());
         }
+        Ok(())
     }
 
     /// One monitor period: the scope re-check, then the pricing copy.
@@ -466,6 +483,19 @@ impl RemoteAgent {
         lock(&self.claims).open.remove(&handle);
         let confirmed = result.map_err(client_class)?;
         self.with(|current| {
+            // The agent may have been restarted on another home while this
+            // waited: the grant belongs to the identity that claimed it, and
+            // goes into no other agent's peer store.
+            let identity = current
+                .agent
+                .runtime()
+                .store()
+                .state()
+                .and_then(|state| state.identity_public())
+                .map_err(storage_class)?;
+            if identity != confirmed.initiator_static {
+                return Err("identityChanged".into());
+            }
             let now_ms = current
                 .inputs
                 .clock
@@ -961,8 +991,11 @@ mod tests {
                 std::process::id(),
                 NEXT.fetch_add(1, Ordering::Relaxed)
             ));
-            fs::create_dir(&path).unwrap();
-            fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+            // Exclusive and 0700 from the start: an existing path (another
+            // user's plant) fails the test instead of being written through.
+            std::os::unix::fs::DirBuilderExt::mode(&mut fs::DirBuilder::new(), 0o700)
+                .create(&path)
+                .unwrap();
             Self(path)
         }
     }
@@ -976,6 +1009,10 @@ mod tests {
     const PERIOD: Duration = Duration::from_millis(100);
 
     fn inputs(home: &Path, clock: &Arc<TestClock>, settings: ScannerSettings) -> Inputs {
+        inputs_with(home, Arc::clone(clock) as Arc<dyn Clock>, settings)
+    }
+
+    fn inputs_with(home: &Path, clock: Arc<dyn Clock>, settings: ScannerSettings) -> Inputs {
         Inputs {
             home: home.to_path_buf(),
             state_suffix: OVERRIDE_SUFFIX,
@@ -984,7 +1021,7 @@ mod tests {
             settings,
             pricing_source: home.join("pricing-src"),
             pricing_period: PERIOD,
-            clock: Arc::clone(clock) as Arc<dyn Clock>,
+            clock,
         }
     }
 
@@ -1562,6 +1599,131 @@ mod tests {
             pull(&receiver, &producer_static),
             Err(PullError::Fetch(FetchError::Internal)),
             "the old grant must not read the scope the owner removed"
+        );
+    }
+
+    /// Review fix: a monitor that cannot be spawned leaves no agent running
+    /// (a later input change would never be applied) and start answers a
+    /// fixed class; the next start spawns it.
+    #[test]
+    fn a_monitor_that_cannot_start_stops_the_agent() {
+        let clock = TestClock::new();
+        let home = TempHome::new();
+        let agent = Arc::new(RemoteAgent::default());
+        agent.fail_monitor_spawn.store(true, Ordering::SeqCst);
+        let (path, time) = (home.0.clone(), Arc::clone(&clock));
+        assert_eq!(
+            agent.start(Arc::new(move || Ok(inputs(
+                &path,
+                &time,
+                ScannerSettings::default()
+            )))),
+            Err("internal".into())
+        );
+        assert_eq!(agent.status(), Ok(json!({"running": false})));
+        assert_eq!(
+            start(&agent, &home, &clock, ScannerSettings::default())["running"],
+            true
+        );
+        assert!(agent.monitor.load(Ordering::SeqCst));
+    }
+
+    /// A clock whose next `sleep`, once armed, signals and then waits to be
+    /// released: holds `pair_poll` inside its wait.
+    struct GateClock {
+        inner: Arc<TestClock>,
+        armed: AtomicBool,
+        entered: Mutex<std::sync::mpsc::Sender<()>>,
+        release: Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+
+    impl Clock for GateClock {
+        fn monotonic(&self) -> Duration {
+            self.inner.monotonic()
+        }
+        fn os_now_seconds(&self) -> Result<i64, StorageError> {
+            self.inner.os_now_seconds()
+        }
+        fn sleep(&self, duration: Duration) {
+            if self.armed.swap(false, Ordering::SeqCst) {
+                let _ = lock(&self.entered).send(());
+                let _ = lock(&self.release).recv();
+            }
+            self.inner.sleep(duration);
+        }
+    }
+
+    /// Review fix: the receiver is restarted on another home while
+    /// `pair_poll` waits; the completed grant belongs to the identity that
+    /// claimed it, so the poll answers `identityChanged` and the new home's
+    /// peer store gets nothing.
+    #[test]
+    fn a_poll_that_ends_after_a_restart_on_another_home_writes_nothing() {
+        let clock = TestClock::new();
+        let (producer_home, first, second) = (TempHome::new(), TempHome::new(), TempHome::new());
+        let producer = Arc::new(RemoteAgent::default());
+        start(
+            &producer,
+            &producer_home,
+            &clock,
+            ScannerSettings::default(),
+        );
+        producer
+            .listen_configure("127.0.0.1", free_port(), None)
+            .unwrap();
+        producer.sharing_set(true).unwrap();
+
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let gate = Arc::new(GateClock {
+            inner: Arc::clone(&clock),
+            armed: AtomicBool::new(false),
+            entered: Mutex::new(entered_tx),
+            release: Mutex::new(release_rx),
+        });
+        let receiver = Arc::new(RemoteAgent::default());
+        let on = |home: &TempHome| -> MakeInputs {
+            let (home, gate) = (home.0.clone(), Arc::clone(&gate));
+            Arc::new(move || {
+                Ok(inputs_with(
+                    &home,
+                    Arc::clone(&gate) as Arc<dyn Clock>,
+                    ScannerSettings::default(),
+                ))
+            })
+        };
+        receiver.start(on(&first)).unwrap();
+        let first_identity = receiver.status().unwrap()["identityFingerprint"].clone();
+
+        let offer = producer.offer_create(600).unwrap();
+        let claim = receiver
+            .pair_claim(offer["pairUrl"].as_str().unwrap())
+            .unwrap();
+        let pending = producer.pending_list().unwrap()[0]["pendingId"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        producer.decide(true, &pending, 1).unwrap();
+
+        gate.armed.store(true, Ordering::SeqCst);
+        let polling = Arc::clone(&receiver);
+        let handle = claim["handle"].as_u64().unwrap();
+        let poll = thread::spawn(move || polling.pair_poll(handle));
+        entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the poll did not reach its wait");
+        receiver.start(on(&second)).unwrap();
+        assert_ne!(
+            receiver.status().unwrap()["identityFingerprint"],
+            first_identity
+        );
+        release_tx.send(()).unwrap();
+
+        assert_eq!(poll.join().unwrap(), Err("identityChanged".into()));
+        assert_eq!(
+            receiver.peers(),
+            Ok(json!([])),
+            "the second home got the grant"
         );
     }
 }

@@ -22709,16 +22709,24 @@ enum SelfTest {
             let sentinel = fixture + "/sentinel/opencode.db"
             let home = RemoteAgentLaunch.homeOverride(bundleIdentifier: "selftest-\(getpid())")
             var child: [String: Any]?
-            if let home, let executable = Bundle.main.executableURL {
-                let manager = FileManager.default
-                try? manager.createDirectory(
-                    atPath: fixture + "/home", withIntermediateDirectories: true,
-                    attributes: [.posixPermissions: 0o700])
-                try? manager.createDirectory(
-                    atPath: fixture + "/sentinel", withIntermediateDirectories: true)
+            let manager = FileManager.default
+            // The root is created exclusively and 0700 before anything is
+            // written beneath it: a path another user planted in /tmp (with a
+            // `config` or `sentinel` link into this user's directories) makes
+            // the case fail instead of being written through. Only a root
+            // this run created is removed afterwards.
+            let fixtureCreated = (try? manager.createDirectory(
+                atPath: fixture, withIntermediateDirectories: false,
+                attributes: [.posixPermissions: 0o700])) != nil
+            expect(fixtureCreated,
+                   "SA3A the fixture root is created exclusively (0700) before anything is written beneath it")
+            if fixtureCreated, let home, let executable = Bundle.main.executableURL {
+                for directory in ["/home", "/sentinel", "/config"] {
+                    try? manager.createDirectory(
+                        atPath: fixture + directory, withIntermediateDirectories: false,
+                        attributes: [.posixPermissions: 0o700])
+                }
                 manager.createFile(atPath: sentinel, contents: Data("x".utf8))
-                try? manager.createDirectory(
-                    atPath: fixture + "/config", withIntermediateDirectories: true)
                 let settings = try? JSONSerialization.data(
                     withJSONObject: ["scanner": ["opencodeDbPaths": [sentinel]]])
                 manager.createFile(atPath: fixture + "/config/settings.json", contents: settings)
@@ -22754,7 +22762,7 @@ enum SelfTest {
                        }) == true,
                    "SA3A no disclosed path lies outside the fixture root or the agent home")
             if let home { try? FileManager.default.removeItem(atPath: home) }
-            try? FileManager.default.removeItem(atPath: fixture)
+            if fixtureCreated { try? FileManager.default.removeItem(atPath: fixture) }
             expect(realRootStamp() == realBefore,
                    "SA3A the real agent root is untouched by the selftest (absent or same mtime)")
         }

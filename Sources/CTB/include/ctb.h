@@ -358,7 +358,8 @@ char *tb_cursor_sync(int32_t user_initiated);
 // (notRunning, invalid, unauthorized, expired, busy, unsafeState, internal,
 // unsupported, control, pathTooLong, unsafeSocket, homeRequired, panic, and
 // for pairing selfPairing, invalidOffer, offerUnusable, lostAttempt,
-// incompatible, rejected, revoked, aborted, pollLimit, transport); never a
+// incompatible, rejected, revoked, aborted, pollLimit, transport,
+// identityChanged); never a
 // path, token, Pair URL or address. Every call blocks; call off the main
 // thread.
 //
@@ -396,7 +397,8 @@ char *tb_remote_grants(void);
 char *tb_remote_revoke(const char *grant_id);
 // Receiver. {handle, sas, expiresAt, producerFingerprint}.
 char *tb_remote_pair_claim(const char *pair_url);
-// Blocks up to 960 s. {producerStatic, fingerprint, expiresAt}.
+// Blocks up to 960 s. {producerStatic, fingerprint, expiresAt}. identityChanged:
+// the agent was restarted on another identity meanwhile; nothing was written.
 char *tb_remote_pair_poll(int64_t handle);
 // [{producerStatic, fingerprint, nodeLabel?, createdAt, expiresAt, state}].
 char *tb_remote_peers(void);
