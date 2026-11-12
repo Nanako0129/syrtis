@@ -917,13 +917,6 @@ fn commit_file(
 ) -> Result<Committed, Stop> {
     let failed = || Stop::error("write_failed");
     let _lock = lock_dir(dir, still_wanted)?;
-    // An old walk brings the full old history back, so this stem's Billing
-    // V2 sidecar goes, before the live file is replaced. Best effort: the old
-    // walk's commit never fails on it, and a sidecar that outlives this
-    // commit no longer matches the live file's SHA-256: it is stale, and the
-    // next V2 commit freezes this file afresh (`commit_v2`). A non-file at
-    // that name never gets here (`run` refuses the round first).
-    let _ = std::fs::remove_file(dir.join(sidecar_name(stem)));
     let payload = serde_json::to_vec(&UsageFile {
         total_usage_events_count: events.len(),
         usage_events_display: events,
@@ -931,6 +924,15 @@ fn commit_file(
     .map_err(|_| failed())?;
     let final_name = live_name(stem);
     let changed = write_atomic(dir, &final_name, &payload)?;
+    // An old walk brings the full old history back, so this stem's Billing
+    // V2 sidecar is not kept: the pass below deletes it, only once the live
+    // file holds the old walk's rows. A failed live write returns above and
+    // leaves the V2 live file and its sidecar a matching pair, so the next V2
+    // round does not freeze V2 rows as old history. A sidecar that outlives
+    // this commit (reported as a cleanup failure) no longer matches the live
+    // file's SHA-256: it is stale, and the next V2 commit freezes this file
+    // afresh (`commit_v2`). A non-file at that name never gets here (`run`
+    // refuses the round first).
     let removal = remove_usage_files(dir, &[&final_name], true);
     Ok(Committed {
         changed: changed || removal.usage > 0,
