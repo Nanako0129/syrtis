@@ -94,7 +94,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // stall startup. Losing that race costs one scan: the extra roots join
         // the next one. Freezing the menu bar until a dead network mount times
         // out costs considerably more.
-        ExtraScanRoots.apply()
+        //
+        // The embedded agent starts once that registry is installed, so its
+        // scan-input snapshot includes the extra roots.
+        ExtraScanRoots.apply(then: { _ in RemoteAgentLaunch.launch() })
 
         // Same split for the same reason: the Keychain consent registry is
         // also an in-memory RwLock that starts empty, so Swift re-applies the
@@ -524,6 +527,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             _ = cleared.wait(timeout: .now() + 0.3)
         }
 
+        // Stop the embedded agent (its threads, listener and control socket).
+        // Bounded like the Discord clear above: a management call in flight
+        // can hold the agent for its own deadline, and the process exiting
+        // releases the root's lock anyway; every state write is atomic.
+        let agentStopped = DispatchSemaphore(value: 0)
+        DispatchQueue.global(qos: .userInitiated).async {
+            RemoteAgentLaunch.stop()
+            agentStopped.signal()
+        }
+        _ = agentStopped.wait(timeout: .now() + 2)
     }
 
     /// Re-derive every menu-bar surface from the cached data and the current

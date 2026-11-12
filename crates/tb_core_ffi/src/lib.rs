@@ -41,6 +41,8 @@ mod window_usage;
 mod model_report;
 #[cfg(test)]
 mod opencode_db_acceptance;
+#[cfg(unix)]
+mod remote_agent;
 mod opencode_integrations;
 mod usage_graph;
 mod usage_tail;
@@ -1908,6 +1910,220 @@ pub extern "C" fn tb_cursor_sync(user_initiated: i32) -> *mut c_char {
         }
         envelope(Ok(status))
     })
+}
+
+/// The embedded remote-usage agent (`remote_agent.rs`). macOS and Linux only:
+/// the agent's control socket and secure root have no Windows implementation
+/// yet. Every entry returns the usual envelope; `err` is a fixed class string
+/// (`notRunning`, `invalid`, `unauthorized`, `expired`, `busy`, `unsafeState`,
+/// `internal`, `unsupported`, `control`, `pathTooLong`, `unsafeSocket`,
+/// `homeRequired`, the pairing classes of `pair_claim`/`pair_poll`, or
+/// `panic`), never a path, token, Pair URL or address. A panic returns `panic`
+/// without its text.
+#[cfg(unix)]
+mod remote_ffi {
+    use super::{c_char, CStr, PathBuf};
+    use crate::remote_agent::{app_make_inputs, ffi as run, AGENT};
+
+    /// # Safety
+    /// `ptr` must be NULL or a valid NUL-terminated string.
+    unsafe fn text<'a>(ptr: *const c_char) -> Result<&'a str, String> {
+        if ptr.is_null() {
+            return Err("invalid".into());
+        }
+        unsafe { CStr::from_ptr(ptr) }
+            .to_str()
+            .map_err(|_| "invalid".into())
+    }
+
+    /// # Safety
+    /// As [`text`]; NULL is `None`.
+    unsafe fn optional_text<'a>(ptr: *const c_char) -> Result<Option<&'a str>, String> {
+        if ptr.is_null() {
+            Ok(None)
+        } else {
+            unsafe { text(ptr) }.map(Some)
+        }
+    }
+
+    /// Start the agent (sharing stays as stored: off on a new root, no
+    /// listener unless a `bindHost` is stored). `home_override` NULL: the
+    /// directory-service home and the frozen root; otherwise that absolute
+    /// directory (created `0700` if missing) with the short root `a`. Already
+    /// running with the same inputs: returns the status. Changed scan inputs:
+    /// restarts with them, and the new inputs need the owner's scope approval.
+    /// The same re-check runs every 5 minutes on its own (a hand edit of the
+    /// tokscale `settings.json` has no setter). Success data is the
+    /// `tb_remote_status` object.
+    ///
+    /// # Safety
+    /// `home_override` must be NULL or a valid NUL-terminated UTF-8 string.
+    #[no_mangle]
+    pub unsafe extern "C" fn tb_remote_start(home_override: *const c_char) -> *mut c_char {
+        run("tb_remote_start", || {
+            let home = unsafe { optional_text(home_override) }?.map(PathBuf::from);
+            AGENT.start(app_make_inputs(home))
+        })
+    }
+
+    /// Stop the agent. Data `{"running":false}`.
+    #[no_mangle]
+    pub extern "C" fn tb_remote_stop() -> *mut c_char {
+        run("tb_remote_stop", || AGENT.stop())
+    }
+
+    /// `{"running":false}`, or control `status` (`activeGrantCount`,
+    /// `activeOfferCount`, `pendingCount`, `bindHost`, `bindPort`, `nodeLabel`,
+    /// `sharingEnabled`, `lastScanAt`, `scanStatus`, `sourceFamilies`) plus
+    /// `running`, `scopeApproved`, `listening` and `identityFingerprint`.
+    #[no_mangle]
+    pub extern "C" fn tb_remote_status() -> *mut c_char {
+        run("tb_remote_status", || AGENT.status())
+    }
+
+    /// Sharing on (non-zero) or off. Data `null`.
+    #[no_mangle]
+    pub extern "C" fn tb_remote_sharing_set(enabled: i32) -> *mut c_char {
+        run("tb_remote_sharing_set", || AGENT.sharing_set(enabled != 0))
+    }
+
+    /// Listen address and node label (NULL: none). Data: the status.
+    ///
+    /// # Safety
+    /// `host` must be a valid NUL-terminated UTF-8 string; `node_label` NULL
+    /// or one.
+    #[no_mangle]
+    pub unsafe extern "C" fn tb_remote_listen_configure(
+        host: *const c_char,
+        port: i32,
+        node_label: *const c_char,
+    ) -> *mut c_char {
+        run("tb_remote_listen_configure", || {
+            let host = unsafe { text(host) }?;
+            let label = unsafe { optional_text(node_label) }?.map(str::to_owned);
+            let port = u16::try_from(port).map_err(|_| "invalid")?;
+            AGENT.listen_configure(host, port, label)
+        })
+    }
+
+    /// The scanned inputs and their `ownerInputsSha256` (see
+    /// `RemoteAgent::scope_disclosure`).
+    #[no_mangle]
+    pub extern "C" fn tb_remote_scope_disclosure() -> *mut c_char {
+        run("tb_remote_scope_disclosure", || AGENT.scope_disclosure())
+    }
+
+    /// Approve the disclosed scope; `invalid` unless the digest is the running
+    /// agent's. Data `null`.
+    ///
+    /// # Safety
+    /// `owner_inputs_sha256` must be a valid NUL-terminated UTF-8 string.
+    #[no_mangle]
+    pub unsafe extern "C" fn tb_remote_scope_approve(
+        owner_inputs_sha256: *const c_char,
+    ) -> *mut c_char {
+        run("tb_remote_scope_approve", || {
+            AGENT.scope_approve(unsafe { text(owner_inputs_sha256) }?)
+        })
+    }
+
+    /// Data `{expiresAt, offerId, pairUrl}`. The Pair URL is a secret.
+    #[no_mangle]
+    pub extern "C" fn tb_remote_offer_create(ttl_seconds: i64) -> *mut c_char {
+        run("tb_remote_offer_create", || AGENT.offer_create(ttl_seconds))
+    }
+
+    /// # Safety
+    /// `offer_id` must be a valid NUL-terminated UTF-8 string.
+    #[no_mangle]
+    pub unsafe extern "C" fn tb_remote_offer_cancel(offer_id: *const c_char) -> *mut c_char {
+        run("tb_remote_offer_cancel", || {
+            AGENT.offer_cancel(unsafe { text(offer_id) }?)
+        })
+    }
+
+    /// Data `[{expiresAt, pendingId, sasCode}]`.
+    #[no_mangle]
+    pub extern "C" fn tb_remote_pending_list() -> *mut c_char {
+        run("tb_remote_pending_list", || AGENT.pending_list())
+    }
+
+    /// # Safety
+    /// `pending_id` must be a valid NUL-terminated UTF-8 string.
+    #[no_mangle]
+    pub unsafe extern "C" fn tb_remote_approve(
+        pending_id: *const c_char,
+        sas_generation: i64,
+    ) -> *mut c_char {
+        run("tb_remote_approve", || {
+            AGENT.decide(true, unsafe { text(pending_id) }?, sas_generation)
+        })
+    }
+
+    /// # Safety
+    /// `pending_id` must be a valid NUL-terminated UTF-8 string.
+    #[no_mangle]
+    pub unsafe extern "C" fn tb_remote_reject(
+        pending_id: *const c_char,
+        sas_generation: i64,
+    ) -> *mut c_char {
+        run("tb_remote_reject", || {
+            AGENT.decide(false, unsafe { text(pending_id) }?, sas_generation)
+        })
+    }
+
+    /// Data `[{grantId, peerFingerprint, createdAt, expiresAt, state}]`.
+    #[no_mangle]
+    pub extern "C" fn tb_remote_grants() -> *mut c_char {
+        run("tb_remote_grants", || AGENT.grants())
+    }
+
+    /// # Safety
+    /// `grant_id` must be a valid NUL-terminated UTF-8 string.
+    #[no_mangle]
+    pub unsafe extern "C" fn tb_remote_revoke(grant_id: *const c_char) -> *mut c_char {
+        run("tb_remote_revoke", || {
+            AGENT.revoke(unsafe { text(grant_id) }?)
+        })
+    }
+
+    /// Data `{handle, sas, expiresAt, producerFingerprint}`.
+    ///
+    /// # Safety
+    /// `pair_url` must be a valid NUL-terminated UTF-8 string.
+    #[no_mangle]
+    pub unsafe extern "C" fn tb_remote_pair_claim(pair_url: *const c_char) -> *mut c_char {
+        run("tb_remote_pair_claim", || {
+            AGENT.pair_claim(unsafe { text(pair_url) }?)
+        })
+    }
+
+    /// Blocking (up to the frozen 960 s poll window): never on the main
+    /// thread. Data `{producerStatic, fingerprint, expiresAt}`; `identityChanged`
+    /// when the agent was restarted on another identity meanwhile (nothing is
+    /// written).
+    #[no_mangle]
+    pub extern "C" fn tb_remote_pair_poll(handle: i64) -> *mut c_char {
+        run("tb_remote_pair_poll", || {
+            AGENT.pair_poll(u64::try_from(handle).map_err(|_| "invalid")?)
+        })
+    }
+
+    /// Data `[{producerStatic, fingerprint, nodeLabel, createdAt, expiresAt,
+    /// state}]`.
+    #[no_mangle]
+    pub extern "C" fn tb_remote_peers() -> *mut c_char {
+        run("tb_remote_peers", || AGENT.peers())
+    }
+
+    /// # Safety
+    /// `producer_static` must be a valid NUL-terminated UTF-8 string.
+    #[no_mangle]
+    pub unsafe extern "C" fn tb_remote_peer_remove(producer_static: *const c_char) -> *mut c_char {
+        run("tb_remote_peer_remove", || {
+            AGENT.peer_remove(unsafe { text(producer_static) }?)
+        })
+    }
 }
 
 /// Release a string returned by any tb_* entry point.

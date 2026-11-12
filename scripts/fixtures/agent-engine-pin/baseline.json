@@ -1,0 +1,50 @@
+[
+ {
+  "checksum": "0000000000000000000000000000000000000000000000000000000000000001",
+  "name": "snow",
+  "source": "registry+https://github.com/rust-lang/crates.io-index",
+  "version": "0.10.0"
+ },
+ {
+  "checksum": "0000000000000000000000000000000000000000000000000000000000000002",
+  "name": "hmac",
+  "source": "registry+https://github.com/rust-lang/crates.io-index",
+  "version": "0.12.1"
+ },
+ {
+  "checksum": "0000000000000000000000000000000000000000000000000000000000000003",
+  "name": "sha2",
+  "source": "registry+https://github.com/rust-lang/crates.io-index",
+  "version": "0.10.9"
+ },
+ {
+  "checksum": "0000000000000000000000000000000000000000000000000000000000000004",
+  "name": "serde",
+  "source": "registry+https://github.com/rust-lang/crates.io-index",
+  "version": "1.0.229"
+ },
+ {
+  "checksum": "0000000000000000000000000000000000000000000000000000000000000005",
+  "name": "serde_json",
+  "source": "registry+https://github.com/rust-lang/crates.io-index",
+  "version": "1.0.151"
+ },
+ {
+  "checksum": "0000000000000000000000000000000000000000000000000000000000000006",
+  "name": "unicode-normalization",
+  "source": "registry+https://github.com/rust-lang/crates.io-index",
+  "version": "0.1.25"
+ },
+ {
+  "checksum": "0000000000000000000000000000000000000000000000000000000000000007",
+  "name": "libc",
+  "source": "registry+https://github.com/rust-lang/crates.io-index",
+  "version": "0.2.189"
+ },
+ {
+  "checksum": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+  "name": "zz-extra",
+  "source": "registry+https://github.com/rust-lang/crates.io-index",
+  "version": "1.0.0"
+ }
+]

@@ -1,0 +1,67 @@
+version = 4
+
+[[package]]
+name = "syrtis-agent"
+version = "0.1.0"
+source = "git+https://github.com/Nanako0129/Syrtis-Agent?rev=f00#f00"
+dependencies = [
+ "hmac",
+ "libc",
+ "serde",
+ "serde_json",
+ "sha2",
+ "snow",
+ "tokscale-core 3.0.0 (git+https://github.com/Nanako0129/tokscale-core?rev=e156#e156)",
+ "unicode-normalization",
+]
+
+[[package]]
+name = "snow"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0000000000000000000000000000000000000000000000000000000000000001"
+
+[[package]]
+name = "hmac"
+version = "0.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0000000000000000000000000000000000000000000000000000000000000002"
+
+[[package]]
+name = "sha2"
+version = "0.10.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0000000000000000000000000000000000000000000000000000000000000003"
+
+[[package]]
+name = "serde"
+version = "1.0.229"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0000000000000000000000000000000000000000000000000000000000000004"
+
+[[package]]
+name = "serde_json"
+version = "1.0.151"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0000000000000000000000000000000000000000000000000000000000000005"
+
+[[package]]
+name = "unicode-normalization"
+version = "0.1.25"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0000000000000000000000000000000000000000000000000000000000000006"
+
+[[package]]
+name = "libc"
+version = "0.2.189"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0000000000000000000000000000000000000000000000000000000000000007"
+
+[[package]]
+name = "tokscale-core"
+version = "3.0.0"
+
+[[package]]
+name = "tokscale-core"
+version = "3.0.0"
+source = "git+https://github.com/Nanako0129/tokscale-core?rev=e156#e156"

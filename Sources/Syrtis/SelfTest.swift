@@ -984,7 +984,13 @@ private struct DashboardModelTestObservation: Sendable {
 }
 
 enum SelfTest {
+    /// Set only in the SA3A child below: the agent home it starts at.
+    static let remoteAgentChildKey = "SYRTIS_SELFTEST_REMOTE_AGENT_HOME"
+
     @MainActor static func run() -> Never {
+        if let home = ProcessInfo.processInfo.environment[remoteAgentChildKey] {
+            runRemoteAgentChild(home: home)
+        }
         var failures = 0
         // Put back at the end, whatever the checks below delete (MA-46).
         let accountsDefaults = DefaultsSnapshot(keys: DefaultsSnapshot.accountsKeys)
@@ -22633,6 +22639,134 @@ enum SelfTest {
                        && scratch.persistentDomain(forName: suite)?["registered-only"] == nil,
                    "DEFAULTS-SNAPSHOT restore puts back deleted and changed keys, removes ones that did not exist, and never stores a registered default")
         }
+        // SA-3a: where the embedded agent keeps its root, and the start path.
+        do {
+            let official = BuildIdentity.shipping(
+                arguments: ["Syrtis"], bundleIdentifier: "com.nyanako.tokenbar",
+                shortVersion: "9.9.9", buildNumber: "1")
+            let flagged = BuildIdentity.shipping(
+                arguments: ["Syrtis", "--selftest"], bundleIdentifier: "com.nyanako.tokenbar",
+                shortVersion: "9.9.9", buildNumber: "1")
+            let temporary = BuildIdentity.shipping(
+                arguments: ["Syrtis"], bundleIdentifier: "com.nyanako.tokenbar.selftest",
+                shortVersion: "9.9.9", buildNumber: "1")
+            let bare = BuildIdentity.shipping(
+                arguments: ["Syrtis"], bundleIdentifier: nil, shortVersion: nil, buildNumber: nil)
+            expect(RemoteAgentLaunch.homeOverride(
+                       shipping: bare, debugBuild: false, bundleIdentifier: nil, uid: 501)
+                       == "/tmp/syrtis-agent-dev-501/bare",
+                   "SA3A a bare executable gets the /tmp development agent root")
+            expect(RemoteAgentLaunch.homeOverride(
+                       shipping: flagged, debugBuild: false,
+                       bundleIdentifier: "com.nyanako.tokenbar", uid: 501)
+                       == "/tmp/syrtis-agent-dev-501/com.nyanako.tokenbar",
+                   "SA3A --selftest on the official bundle gets the development agent root")
+            expect(RemoteAgentLaunch.homeOverride(
+                       shipping: temporary, debugBuild: false,
+                       bundleIdentifier: "com.nyanako.tokenbar.selftest", uid: 501)
+                       == "/tmp/syrtis-agent-dev-501/com.nyanako.tokenbar.selftest",
+                   "SA3A a temporary bundle id gets the development agent root")
+            expect(official != nil
+                       && RemoteAgentLaunch.homeOverride(
+                           shipping: official, debugBuild: false,
+                           bundleIdentifier: "com.nyanako.tokenbar", uid: 501) == nil,
+                   "SA3A only the shipping bundle in a release build gets the real agent root")
+            expect(RemoteAgentLaunch.homeOverride(
+                       shipping: official, debugBuild: true,
+                       bundleIdentifier: "com.nyanako.tokenbar", uid: 501) != nil,
+                   "SA3A a DEBUG build of the shipping bundle still gets the development root")
+            expect(RemoteAgentLaunch.homeOverride() != nil,
+                   "SA3A this selftest process gets the development agent root")
+            expect(RemoteAgentLaunch.directoryName("../x") == ".._x"
+                       && RemoteAgentLaunch.directoryName("..") == "bare"
+                       && RemoteAgentLaunch.directoryName("") == "bare",
+                   "SA3A the bundle id becomes one safe path component")
+            expect(RemoteAgentLaunch.isClassString("unsafeState")
+                       && !RemoteAgentLaunch.isClassString("/tmp/x")
+                       && !RemoteAgentLaunch.isClassString("tb_remote_start panicked: x")
+                       && !RemoteAgentLaunch.isClassString(""),
+                   "SA3A only a bare class string from a failed start is logged publicly")
+
+            // The app's start path, run in an env-cleared child of this binary:
+            // its HOME and TOKSCALE_CONFIG_DIR are inside a temp root, so the
+            // scan inputs it resolves (the tokscale settings.json OpenCode list,
+            // OPENCODE_DB, the Cursor and extra-root registries, the pricing
+            // cache) are fixtures, never this user's. A sentinel OpenCode DB in
+            // the fixture settings.json must be exactly the disclosed list, and
+            // no disclosed path may lie outside the temp root or the agent home.
+            // The agent home gets a directory of its own so a `make run` in
+            // another terminal (also bare) cannot hold the same root. A nil
+            // override is never passed: that would be the real root.
+            let realRoot = FileManager.default.homeDirectoryForCurrentUser
+                .appendingPathComponent("Library/Application Support/com.nyanako.syrtis.agent").path
+            func realRootStamp() -> String {
+                guard let attributes = try? FileManager.default.attributesOfItem(atPath: realRoot)
+                else { return "absent" }
+                return String(describing: attributes[.modificationDate])
+            }
+            let realBefore = realRootStamp()
+            let fixture = "/tmp/sa3a-selftest-\(getpid())"
+            let sentinel = fixture + "/sentinel/opencode.db"
+            let home = RemoteAgentLaunch.homeOverride(bundleIdentifier: "selftest-\(getpid())")
+            var child: [String: Any]?
+            let manager = FileManager.default
+            // The root is created exclusively and 0700 before anything is
+            // written beneath it: a path another user planted in /tmp (with a
+            // `config` or `sentinel` link into this user's directories) makes
+            // the case fail instead of being written through. Only a root
+            // this run created is removed afterwards.
+            let fixtureCreated = (try? manager.createDirectory(
+                atPath: fixture, withIntermediateDirectories: false,
+                attributes: [.posixPermissions: 0o700])) != nil
+            expect(fixtureCreated,
+                   "SA3A the fixture root is created exclusively (0700) before anything is written beneath it")
+            if fixtureCreated, let home, let executable = Bundle.main.executableURL {
+                for directory in ["/home", "/sentinel", "/config"] {
+                    try? manager.createDirectory(
+                        atPath: fixture + directory, withIntermediateDirectories: false,
+                        attributes: [.posixPermissions: 0o700])
+                }
+                manager.createFile(atPath: sentinel, contents: Data("x".utf8))
+                let settings = try? JSONSerialization.data(
+                    withJSONObject: ["scanner": ["opencodeDbPaths": [sentinel]]])
+                manager.createFile(atPath: fixture + "/config/settings.json", contents: settings)
+                let process = Process()
+                process.executableURL = executable
+                process.arguments = ["--selftest", "-AppleLanguages", "(en)"]
+                process.environment = [
+                    "HOME": fixture + "/home",
+                    "TOKSCALE_CONFIG_DIR": fixture + "/config",
+                    remoteAgentChildKey: home,
+                ]
+                let output = Pipe()
+                process.standardOutput = output
+                if (try? process.run()) != nil {
+                    let data = output.fileHandleForReading.readDataToEndOfFile()
+                    process.waitUntilExit()
+                    let last = String(decoding: data, as: UTF8.self)
+                        .split(separator: "\n").last.map(String.init) ?? ""
+                    child = (try? JSONSerialization.jsonObject(with: Data(last.utf8))) as? [String: Any]
+                }
+            }
+            expect(child?["running"] as? Bool == true && child?["sharingEnabled"] as? Bool == false
+                       && child?["listening"] as? Bool == false
+                       && child?["scopeApproved"] as? Bool == false,
+                   "SA3A the selftest starts the agent through the app's start path: running, not sharing, no listener, no approved scope")
+            expect(child?["stopped"] as? Bool == true, "SA3A stop leaves the agent not running")
+            expect(child?["opencodeDbPaths"] as? [String] == [sentinel],
+                   "SA3A the child's scan inputs come from the fixture settings.json, not this user's")
+            let paths = child?["paths"] as? [String]
+            expect(paths?.isEmpty == false
+                       && paths?.allSatisfy({ path in
+                           [fixture, home ?? fixture].contains { path.hasPrefix($0 + "/") || path == $0 }
+                       }) == true,
+                   "SA3A no disclosed path lies outside the fixture root or the agent home")
+            if let home { try? FileManager.default.removeItem(atPath: home) }
+            if fixtureCreated { try? FileManager.default.removeItem(atPath: fixture) }
+            expect(realRootStamp() == realBefore,
+                   "SA3A the real agent root is untouched by the selftest (absent or same mtime)")
+        }
+
         accountsDefaults.restore()
 
         if failures > 0 {
@@ -22640,6 +22774,36 @@ enum SelfTest {
             exit(1)
         }
         print("selftest passed")
+        exit(0)
+    }
+
+    /// The SA3A child: starts the agent at `home` through the app's start
+    /// path, prints one JSON line (the status, the disclosed OpenCode list and
+    /// every disclosed path), stops it and exits. Runs before anything else in
+    /// the selftest, in the environment its parent gave it.
+    @MainActor static func runRemoteAgentChild(home: String) -> Never {
+        let status = try? RemoteAgentLaunch.start(home: home)
+        let disclosure = try? TBCore.remoteScopeDisclosure()
+        RemoteAgentLaunch.stop()
+        let stopped = (try? TBCore.remoteStatus())?.running == false
+        var paths: [String] = []
+        if let disclosure {
+            paths = [disclosure.home, disclosure.configDir, disclosure.dataDir]
+                + disclosure.opencodeDbPaths
+                + disclosure.extraScanPaths.values.flatMap { $0 }
+                + disclosure.excludedScanPaths.values.flatMap { $0 }
+        }
+        let line: [String: Any] = [
+            "running": status?.running as Any,
+            "sharingEnabled": status?.sharingEnabled as Any,
+            "listening": status?.listening as Any,
+            "scopeApproved": status?.scopeApproved as Any,
+            "stopped": stopped,
+            "opencodeDbPaths": disclosure?.opencodeDbPaths as Any,
+            "paths": paths,
+        ]
+        let data = (try? JSONSerialization.data(withJSONObject: line)) ?? Data("{}".utf8)
+        print(String(decoding: data, as: UTF8.self))
         exit(0)
     }
 }
