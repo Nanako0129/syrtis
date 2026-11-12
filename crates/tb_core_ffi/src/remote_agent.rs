@@ -18,7 +18,7 @@
 //! [`RemoteAgent`]; tests build their own instances.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     ffi::c_char,
     fs,
     io::Write,
@@ -26,7 +26,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc, LazyLock, Mutex, MutexGuard, PoisonError,
+        Arc, LazyLock, Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard,
     },
     thread,
     time::Duration,
@@ -36,11 +36,13 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use syrtis_agent::{
     agent::{Agent, AgentConfig, AgentError, ScannerSettings},
+    cache_store::CachedBody,
     control::{self, Client, Command, ControlError},
     noise::StaticKey,
-    pairing::{ClaimAttempts, Claimed, ClientError, Clock, PairingClient, PeerCode},
+    pairing::{ClaimAttempts, Claimed, ClientError, Clock, GrantStatus, PairingClient, PeerCode},
     peer_store::{PeerRecord, PeerState},
-    runtime::{Options, RuntimeError},
+    report_peer::{FetchError, Fetched, ReportQuery},
+    runtime::{Options, PullError, RuntimeError},
     secure_fs::StorageError,
     security::{
         clock_status, decode_fixed_hex, hex_encode, GrantState, MemoryLedger, SecurityError,
@@ -81,15 +83,17 @@ pub(crate) struct Inputs {
 
 /// Builds the inputs from their sources, now. The same function serves the
 /// start call and every monitor period, so both read the inputs the same
-/// way. Always called under the [`RemoteAgent`] lock, so an older snapshot
-/// cannot be applied after a newer one.
+/// way. A restart builds them under the [`RemoteAgent`] write lock, so an
+/// older snapshot cannot be applied after a newer one.
 pub(crate) type MakeInputs = Arc<dyn Fn() -> Result<Inputs, String> + Send + Sync>;
 
 struct Running {
     agent: Agent,
     inputs: Inputs,
     digest: String,
-    make: MakeInputs,
+    /// Replaced by a start with unchanged inputs, which holds only the read
+    /// lock.
+    make: Mutex<MakeInputs>,
     /// Process-wide start counter; a restart gets a new one. Tests read it
     /// to tell a restart from a no-op.
     #[cfg(test)]
@@ -109,9 +113,26 @@ struct Claims {
 /// thread (started with the first agent, ended when this is dropped).
 #[derive(Default)]
 pub(crate) struct RemoteAgent {
-    running: Mutex<Option<Running>>,
+    /// Read: every call that uses the running agent, including a producer
+    /// pull for `remote_pages`, which holds it for the whole fetch. Write:
+    /// only what replaces or removes the agent (a start or monitor period
+    /// whose inputs changed, `stop`). A pull begun on one agent therefore ends
+    /// before that agent is replaced, so it never writes into the next one;
+    /// the cost is that a restart or stop waits for an in-flight fetch (at
+    /// most `FETCH_DEADLINE`), and calls made while it waits queue behind it.
+    running: RwLock<Option<Running>>,
+    /// Serializes `listen_configure`, which sends the frozen listen command,
+    /// reads the stored address back and writes it again with the label.
+    /// Under the shared `running` lock two such calls could interleave and
+    /// leave the stored address different from the bound one. A separate
+    /// mutex, so the call does not wait behind a producer pull.
+    configuring: Mutex<()>,
     claims: Mutex<Claims>,
     monitor: AtomicBool,
+    /// Unix seconds of the last fresh pull, by producer and query
+    /// ([`last_success_key`]). This process only: after a restart of the
+    /// process a cached body has no known age.
+    last_success: Mutex<HashMap<String, i64>>,
     /// Test seam: the next monitor spawn fails as if the OS refused a thread.
     #[cfg(test)]
     fail_monitor_spawn: AtomicBool,
@@ -141,6 +162,23 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+fn read<T>(lock: &RwLock<T>) -> RwLockReadGuard<'_, T> {
+    lock.read().unwrap_or_else(PoisonError::into_inner)
+}
+
+fn write<T>(lock: &RwLock<T>) -> RwLockWriteGuard<'_, T> {
+    lock.write().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// The running agent already serves these inputs: the same root and the same
+/// owner-inputs digest.
+fn unchanged(current: &Running, inputs: &Inputs) -> bool {
+    current.inputs.home == inputs.home
+        && current.inputs.state_suffix == inputs.state_suffix
+        && digest_for(inputs, current.agent.source().source_cache_dir()).as_deref()
+            == Some(current.digest.as_str())
+}
+
 /// Makes `running` an agent over the inputs `make` builds now. Running with
 /// the same home and the same owner-inputs digest: kept (with `make` as its
 /// source from now on). Otherwise the old agent is stopped and one is started
@@ -151,11 +189,8 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 fn ensure(running: &mut Option<Running>, make: MakeInputs) -> Result<(), String> {
     let inputs = make()?;
     if let Some(current) = running.as_mut() {
-        let same_root = current.inputs.home == inputs.home
-            && current.inputs.state_suffix == inputs.state_suffix;
-        let digest = digest_for(&inputs, current.agent.source().source_cache_dir());
-        if same_root && digest.as_deref() == Some(current.digest.as_str()) {
-            current.make = make;
+        if unchanged(current, &inputs) {
+            *lock(&current.make) = make;
             return Ok(());
         }
     }
@@ -169,7 +204,7 @@ fn ensure(running: &mut Option<Running>, make: MakeInputs) -> Result<(), String>
         agent,
         inputs,
         digest,
-        make,
+        make: Mutex::new(make),
         #[cfg(test)]
         epoch: EPOCH.fetch_add(1, Ordering::Relaxed) + 1,
     });
@@ -180,7 +215,21 @@ impl RemoteAgent {
     /// Starts the agent over the inputs `make` builds (see [`ensure`]), then
     /// the monitor if it does not run yet. Returns the status.
     pub(crate) fn start(self: &Arc<Self>, make: MakeInputs) -> Reply {
-        let mut running = lock(&self.running);
+        // Unchanged inputs need no restart: answered under the read lock, so
+        // a repeated start does not wait behind an in-flight pull. A running
+        // agent always has its monitor (a start that cannot spawn one stops
+        // the agent it started).
+        {
+            let running = read(&self.running);
+            if let Some(current) = running.as_ref() {
+                let inputs = make()?;
+                if unchanged(current, &inputs) {
+                    *lock(&current.make) = make;
+                    return status_of(current);
+                }
+            }
+        }
+        let mut running = write(&self.running);
         ensure(&mut running, make)?;
         let current = running.as_ref().ok_or("internal")?;
         let period = current.inputs.pricing_period;
@@ -228,27 +277,47 @@ impl RemoteAgent {
         Ok(())
     }
 
-    /// One monitor period: the scope re-check, then the pricing copy.
+    /// One monitor period: the scope re-check, then the pricing copy. Only a
+    /// changed (or unreadable) input takes the write lock; an unchanged one
+    /// is checked under the read lock, beside any pull in flight.
     fn tick(&self) {
-        let mut running = lock(&self.running);
-        recheck(&mut running);
-        if let Some(current) = running.as_ref() {
-            sync_pricing(&current.inputs.pricing_source, current.agent.pricing_dir());
+        let restart = {
+            let running = read(&self.running);
+            let Some(current) = running.as_ref() else {
+                return;
+            };
+            let make = Arc::clone(&lock(&current.make));
+            match make() {
+                Ok(inputs) if unchanged(current, &inputs) => {
+                    sync_pricing(&current.inputs.pricing_source, current.agent.pricing_dir());
+                    false
+                }
+                _ => true,
+            }
+        };
+        if restart {
+            let mut running = write(&self.running);
+            recheck(&mut running);
+            if let Some(current) = running.as_ref() {
+                sync_pricing(&current.inputs.pricing_source, current.agent.pricing_dir());
+            }
         }
     }
 
     /// `Runtime::stop` (by dropping the agent). Stopped already: the same
     /// answer.
     pub(crate) fn stop(&self) -> Reply {
-        let old = lock(&self.running).take();
+        let old = write(&self.running).take();
         drop(old);
         Ok(json!({"running": false}))
     }
 
-    /// Control `status` plus `running`, `scopeApproved`, `listening` and the
-    /// identity's short fingerprint; `{"running":false}` when stopped.
+    /// Control `status` (its `scopeApproved` is the agent's own
+    /// `Agent::scope_approved`, through the control server's provider) plus
+    /// `running`, `listening` and the identity's short fingerprint;
+    /// `{"running":false}` when stopped.
     pub(crate) fn status(&self) -> Reply {
-        match lock(&self.running).as_ref() {
+        match read(&self.running).as_ref() {
             Some(current) => status_of(current),
             None => Ok(json!({"running": false})),
         }
@@ -278,6 +347,10 @@ impl RemoteAgent {
         {
             return Err("invalid".into());
         }
+        let _one_at_a_time = self
+            .configuring
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         self.with(|current| {
             call(
                 current,
@@ -565,11 +638,151 @@ impl RemoteAgent {
     }
 
     fn with<T>(&self, body: impl FnOnce(&Running) -> Result<T, String>) -> Result<T, String> {
-        match lock(&self.running).as_ref() {
+        match read(&self.running).as_ref() {
             Some(current) => body(current),
             None => Err("notRunning".into()),
         }
     }
+
+    // ------------------------------------------- for `remote_pages` ---
+
+    /// Receiver: every record of `peers.json`. `notRunning`, or the storage
+    /// class when the file cannot be read.
+    pub(crate) fn peer_records(&self) -> Result<Vec<PeerRecord>, String> {
+        self.with(|current| {
+            current
+                .agent
+                .runtime()
+                .peers()
+                .peers()
+                .map_err(storage_class)
+        })
+    }
+
+    /// `Runtime::pull` of one producer, under the agent's read lock for the
+    /// whole fetch: other calls go on beside it, and a restart (write lock)
+    /// waits until it ends, so it never writes into a newer agent. A fresh pull stamps [`last_success_at`]. A refusal
+    /// with error code 2 (`CheckGrantStatus`) asks Grant status once and
+    /// stores the answer (`revoked` / `expired`: `PeerStore::set_state`;
+    /// `active`: `PeerStore::update_grant`); the pull is not retried. `None`:
+    /// no agent runs.
+    pub(crate) fn pull_peer(
+        &self,
+        producer: &[u8; 32],
+        query: &ReportQuery,
+    ) -> Option<Result<Fetched, PullError>> {
+        let running = read(&self.running);
+        let current = running.as_ref()?;
+        let result = current.agent.runtime().pull(producer, query);
+        match &result {
+            Ok(_) => {
+                if let Ok(now) = current.inputs.clock.os_now_seconds() {
+                    lock(&self.last_success).insert(last_success_key(producer, query), now);
+                }
+            }
+            Err(PullError::Fetch(FetchError::CheckGrantStatus)) => check_grant(current, producer),
+            Err(_) => {}
+        }
+        Some(result)
+    }
+
+    /// `Runtime::last_good` of one producer; `None` for no agent, no body or
+    /// a storage error.
+    pub(crate) fn last_good_peer(
+        &self,
+        producer: &[u8; 32],
+        query: &ReportQuery,
+    ) -> Option<CachedBody> {
+        let running = read(&self.running);
+        let current = running.as_ref()?;
+        current
+            .agent
+            .runtime()
+            .last_good(producer, query)
+            .ok()
+            .flatten()
+    }
+
+    /// Test access to the running agent (its peer store and identity).
+    #[cfg(test)]
+    pub(crate) fn with_agent<T>(&self, body: impl FnOnce(&Agent) -> T) -> Option<T> {
+        read(&self.running)
+            .as_ref()
+            .map(|current| body(&current.agent))
+    }
+
+    /// The Unix seconds of the last fresh [`pull_peer`] of this query from
+    /// this producer in this process.
+    pub(crate) fn last_success_at(&self, producer: &[u8; 32], query: &ReportQuery) -> Option<i64> {
+        lock(&self.last_success)
+            .get(&last_success_key(producer, query))
+            .copied()
+    }
+}
+
+fn last_success_key(producer: &[u8; 32], query: &ReportQuery) -> String {
+    format!(
+        "{}\0{}\0{}\0{}\0{}\0{}",
+        hex_encode(producer),
+        u16::from(query.endpoint),
+        query.start_date,
+        query.end_date_exclusive,
+        query.timezone,
+        query.clients.join("\0")
+    )
+}
+
+/// Deferred item (4): one Grant status request for the producer's record,
+/// built from that record (host, port, responder static), and the answer
+/// stored. Any failure changes nothing.
+fn check_grant(current: &Running, producer: &[u8; 32]) {
+    let runtime = current.agent.runtime();
+    let Some(record) = runtime.peers().peers().ok().and_then(|peers| {
+        peers
+            .into_iter()
+            .find(|peer| peer.responder_static == *producer)
+    }) else {
+        return;
+    };
+    let Ok(identity) = runtime
+        .store()
+        .state()
+        .and_then(|state| StaticKey::from_state(&state))
+    else {
+        return;
+    };
+    let ledger = MemoryLedger::default();
+    let client = PairingClient {
+        identity: &identity,
+        ledger: &ledger,
+        clock: &*current.inputs.clock,
+    };
+    // Grant status reads only the host, port and responder static.
+    let claimed = Claimed {
+        offer_id: [0; 16],
+        responder_static: record.responder_static,
+        host: record.host.clone(),
+        port: record.port,
+        pending_id: record.pending_id,
+        sas: String::new(),
+        expires_at_ms: record.expires_at_ms,
+        claimed_at: Duration::ZERO,
+    };
+    let Ok(answer) = client.grant_status(&claimed, record.grant_id) else {
+        return;
+    };
+    let peers = runtime.peers();
+    let _ = match answer.state {
+        GrantStatus::Revoked => peers.set_state(producer, &record.grant_id, PeerState::Revoked),
+        GrantStatus::Expired => peers.set_state(producer, &record.grant_id, PeerState::Expired),
+        GrantStatus::Active => peers.update_grant(
+            producer,
+            &record.grant_id,
+            answer.auth_epoch,
+            answer.source_scope_generation,
+            answer.expires_at_ms,
+        ),
+    };
 }
 
 fn start_agent(inputs: &Inputs) -> Result<Agent, String> {
@@ -621,10 +834,6 @@ fn status_of(current: &Running) -> Reply {
         .map_err(storage_class)?;
     let object = data.as_object_mut().ok_or("internal")?;
     object.insert("running".into(), Value::Bool(true));
-    object.insert(
-        "scopeApproved".into(),
-        Value::Bool(current.agent.scope_approved()),
-    );
     object.insert(
         "listening".into(),
         Value::Bool(runtime.listener_addr().is_some()),
@@ -750,7 +959,10 @@ fn client_class(error: ClientError) -> String {
 /// new inputs. Inputs that cannot be built any more: stopped, so a scope
 /// that can no longer be read is not served.
 fn recheck(running: &mut Option<Running>) {
-    let Some(make) = running.as_ref().map(|current| Arc::clone(&current.make)) else {
+    let Some(make) = running
+        .as_ref()
+        .map(|current| Arc::clone(&lock(&current.make)))
+    else {
         return;
     };
     if ensure(running, make).is_err() {
@@ -940,11 +1152,7 @@ mod tests {
         sync::atomic::{AtomicI64, AtomicUsize},
         time::{Instant, SystemTime, UNIX_EPOCH},
     };
-    use syrtis_agent::{
-        report::Endpoint,
-        report_peer::{FetchError, ReportQuery},
-        runtime::PullError,
-    };
+    use syrtis_agent::report::Endpoint;
 
     /// Injected time from the real wall clock; `sleep` advances it, so the
     /// receiver's poll and the grant's rate tokens do not wait.
@@ -1119,7 +1327,7 @@ mod tests {
     }
 
     fn epoch(agent: &RemoteAgent) -> u64 {
-        lock(&agent.running).as_ref().unwrap().epoch
+        read(&agent.running).as_ref().unwrap().epoch
     }
 
     fn pull(receiver: &RemoteAgent, producer: &[u8; 32]) -> Result<(), PullError> {
@@ -1130,7 +1338,7 @@ mod tests {
             timezone: "UTC".into(),
             clients: Vec::new(),
         };
-        let running = lock(&receiver.running);
+        let running = read(&receiver.running);
         running
             .as_ref()
             .unwrap()
@@ -1297,7 +1505,7 @@ mod tests {
         }
         let agent = Arc::new(RemoteAgent::default());
         start(&agent, &home, &clock, ScannerSettings::default());
-        let destination = lock(&agent.running)
+        let destination = read(&agent.running)
             .as_ref()
             .unwrap()
             .agent
@@ -1349,7 +1557,7 @@ mod tests {
     }
 
     fn global_epoch() -> u64 {
-        lock(&AGENT.running).as_ref().unwrap().epoch
+        read(&AGENT.running).as_ref().unwrap().epoch
     }
 
     /// Acceptance (2), (2b), (3) and the input-change rule through the C entry
@@ -1505,7 +1713,7 @@ mod tests {
             outside.is_empty(),
             "paths outside the temp root: {outside:?}"
         );
-        let copied = lock(&AGENT.running)
+        let copied = read(&AGENT.running)
             .as_ref()
             .unwrap()
             .agent

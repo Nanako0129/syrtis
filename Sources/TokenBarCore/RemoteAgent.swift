@@ -102,3 +102,65 @@ public struct RemotePeer: Decodable, Equatable, Sendable {
 
 /// The `null` data of the commands that answer nothing.
 public struct RemoteNothing: Decodable, Sendable {}
+
+// MARK: Device-aware pages (`tb_*_devices`)
+
+/// Which sources a device-aware page folds: this Mac and paired producers
+/// (`producerStatic` of `tb_remote_peers`, 64 lowercase hex).
+public struct DeviceSelection: Encodable, Equatable, Sendable {
+    public let local: Bool
+    public let peers: [String]
+
+    public init(local: Bool, peers: [String]) {
+        self.local = local
+        self.peers = peers
+    }
+}
+
+/// `cached`: the local part and each producer's last good body, no
+/// connection. `refresh`: each selected producer is pulled.
+public enum DeviceFetchMode: String, Sendable {
+    case cached
+    case refresh
+}
+
+/// One `devices` row. `id` is `local`, `peers` (the peer store could not be
+/// read) or a producer's 16-hex fingerprint; `state` is one of `local`,
+/// `fresh`, `lastGood`, `stale`, `unavailable`, `refused`, `invalidReply`,
+/// `incompatible`; `lastSuccessAt` is Unix seconds of the last fresh pull in
+/// this app run.
+public struct RemoteDevice: Decodable, Equatable, Sendable {
+    public let id: String
+    public let label: String?
+    public let state: String
+    public let lastSuccessAt: Int64?
+}
+
+/// A page payload with paired devices folded in by the core, and the device
+/// rows. Deliberately not the page's own type (`UsagePayload`,
+/// `ModelReport`, …): data that may hold another machine's usage must never
+/// reach `SnapshotStore` or replace the local payload the tray and the
+/// snapshot use.
+public struct DeviceAwarePayload<Payload: Decodable & Sendable>: Decodable, Sendable {
+    public let payload: Payload
+    public let devices: [RemoteDevice]
+    /// Two or more sources: synced history may be counted more than once.
+    public let duplicateWarning: Bool
+    /// Some sum reached its integer limit and was capped.
+    public let saturated: Bool
+    /// All time: producers answered only the last 370 days.
+    public let remoteRangeLimited: Bool
+
+    private enum CodingKeys: String, CodingKey {
+        case devices, duplicateWarning, saturated, remoteRangeLimited
+    }
+
+    public init(from decoder: Decoder) throws {
+        payload = try Payload(from: decoder)
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        devices = try container.decode([RemoteDevice].self, forKey: .devices)
+        duplicateWarning = try container.decode(Bool.self, forKey: .duplicateWarning)
+        saturated = try container.decode(Bool.self, forKey: .saturated)
+        remoteRangeLimited = try container.decode(Bool.self, forKey: .remoteRangeLimited)
+    }
+}

@@ -110,6 +110,15 @@ struct TokenContributionData {
 /// pricing with a graceful offline fallback, and `PricingService` is a process
 /// -wide `OnceCell`, so the network fetch happens at most once per launch.
 pub(crate) fn run(context: &crate::LocalSourceContext, year: &str) -> Result<Value, String> {
+    to_payload(compute(context, year)?)
+}
+
+/// The engine's graph for `year`, before mapping (split out of [`run`] so
+/// `remote_pages` can add remote records to it).
+pub(crate) fn compute(
+    context: &crate::LocalSourceContext,
+    year: &str,
+) -> Result<tokscale_core::GraphResult, String> {
     let year = normalize_year(year)?;
     let options = context.report_options(year, None);
 
@@ -117,13 +126,16 @@ pub(crate) fn run(context: &crate::LocalSourceContext, year: &str) -> Result<Val
         .enable_all()
         .build()
         .map_err(|e| format!("build runtime: {}", e))?;
-    let graph = runtime.block_on(tokscale_core::generate_local_graph_report(options))?;
+    runtime.block_on(tokscale_core::generate_local_graph_report(options))
+}
 
+/// The payload of an engine graph: [`map_graph`], serialized.
+pub(crate) fn to_payload(graph: tokscale_core::GraphResult) -> Result<Value, String> {
     let payload = map_graph(graph);
     serde_json::to_value(payload).map_err(|e| format!("serialize usage graph: {}", e))
 }
 
-fn normalize_year(year: &str) -> Result<Option<String>, String> {
+pub(crate) fn normalize_year(year: &str) -> Result<Option<String>, String> {
     let trimmed = year.trim();
     if trimmed.is_empty() {
         return Ok(None);

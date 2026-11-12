@@ -404,6 +404,28 @@ char *tb_remote_pair_poll(int64_t handle);
 char *tb_remote_peers(void);
 char *tb_remote_peer_remove(const char *producer_static);
 
+// The four dashboard payloads with paired producers' usage folded in (macOS
+// and Linux only). devices_json = {"local": bool, "peers": ["<64 hex
+// producerStatic>", ...]} (at least one source, at most 16 peers, none
+// twice); timezone = IANA id of the zone the local rows are computed in
+// (this process's own zone; the core cannot check it, and another zone would
+// merge two zones' hour slots and dates); mode = "cached"
+// (no connection) or "refresh". Data = the existing payload plus
+// devices:[{id ("local" or the 16-hex fingerprint), label (host:port or null),
+// state (local|fresh|lastGood|stale|unavailable|refused|invalidReply|
+// incompatible), lastSuccessAt (Unix s or null)}] (an unreadable peer store
+// adds {id:"peers", state:"unavailable"}), duplicateWarning, saturated,
+// remoteRangeLimited. Local only: the existing data plus those keys.
+// Must never be written to the dashboard snapshot.
+char *tb_graph_devices(const char *year, const char *devices_json, const char *timezone,
+                       const char *mode);
+char *tb_model_report_devices(const char *year, const char *devices_json,
+                              const char *timezone, const char *mode);
+char *tb_hourly_report_devices(const char *year, const char *clients, const char *devices_json,
+                               const char *timezone, const char *mode);
+char *tb_agents_report_devices(const char *year, const char *clients, const char *devices_json,
+                               const char *timezone, const char *mode);
+
 // Release a string returned by any tb_* entry point.
 void tb_free(char *p);
 

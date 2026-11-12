@@ -43,6 +43,8 @@ mod model_report;
 mod opencode_db_acceptance;
 #[cfg(unix)]
 mod remote_agent;
+#[cfg(unix)]
+mod remote_pages;
 mod opencode_integrations;
 mod usage_graph;
 mod usage_tail;
@@ -1910,6 +1912,131 @@ pub extern "C" fn tb_cursor_sync(user_initiated: i32) -> *mut c_char {
         }
         envelope(Ok(status))
     })
+}
+
+/// The four dashboard payloads with the usage of paired producers folded in
+/// (`remote_pages`). Each takes, besides the existing arguments,
+/// `devices_json` (`{"local": bool, "peers": ["<64 hex producer static>", …]}`,
+/// at least one source, at most 16 peers, none twice), `timezone` (an IANA
+/// identifier, which must be the zone the local rows are computed in, this
+/// process's own: it is not checked, because the IANA name of that zone is
+/// not known here; one the engine's bundled tzdb does not accept makes every
+/// producer `incompatible` and nothing is sent) and `mode` (`cached`: the
+/// local part and each producer's last good body, no connection; `refresh`:
+/// each selected producer is pulled). Success data is the existing payload
+/// plus `devices` (`[{id, label, state, lastSuccessAt}]`), `duplicateWarning`,
+/// `saturated` and `remoteRangeLimited`. With only `local` selected the data
+/// is the existing entry point's, byte for byte, plus those four keys.
+/// Malformed `devices_json` or `mode`: `invalid`. A panic is `panic`.
+#[cfg(unix)]
+mod remote_pages_ffi {
+    use super::{c_char, clients_from, year_from, CStr, LocalSourceContext};
+    use crate::remote_agent::{ffi as run, AGENT};
+    use crate::remote_pages::{self, parse_mode, parse_selection, Call};
+
+    /// # Safety
+    /// `ptr` must be NULL or a valid NUL-terminated string.
+    unsafe fn text<'a>(ptr: *const c_char) -> Result<&'a str, String> {
+        if ptr.is_null() {
+            return Err("invalid".into());
+        }
+        unsafe { CStr::from_ptr(ptr) }
+            .to_str()
+            .map_err(|_| "invalid".into())
+    }
+
+    /// # Safety
+    /// Every pointer must be NULL or a valid NUL-terminated string.
+    unsafe fn page(
+        name: &str,
+        year: *const c_char,
+        clients: *const c_char,
+        devices_json: *const c_char,
+        timezone: *const c_char,
+        mode: *const c_char,
+        body: fn(&Call<'_>) -> Result<serde_json::Value, String>,
+    ) -> *mut c_char {
+        run(name, || {
+            let year = unsafe { year_from(year) }?;
+            let clients = unsafe { clients_from(clients) }?;
+            let selection = parse_selection(unsafe { text(devices_json) }?)?;
+            let timezone = unsafe { text(timezone) }?;
+            let mode = parse_mode(unsafe { text(mode) }?)?;
+            let context = LocalSourceContext::current();
+            body(&Call {
+                agent: &AGENT,
+                context: &context,
+                year: &year,
+                clients,
+                selection,
+                timezone,
+                mode,
+                today: remote_pages::today(),
+            })
+        })
+    }
+
+    /// `tb_graph` with devices.
+    ///
+    /// # Safety
+    /// Each argument must be NULL or a valid NUL-terminated string; only
+    /// `year` may be NULL.
+    #[no_mangle]
+    pub unsafe extern "C" fn tb_graph_devices(
+        year: *const c_char,
+        devices_json: *const c_char,
+        timezone: *const c_char,
+        mode: *const c_char,
+    ) -> *mut c_char {
+        let none = std::ptr::null();
+        unsafe { page("tb_graph_devices", year, none, devices_json, timezone, mode, remote_pages::graph) }
+    }
+
+    /// `tb_model_report` with devices.
+    ///
+    /// # Safety
+    /// As [`tb_graph_devices`].
+    #[no_mangle]
+    pub unsafe extern "C" fn tb_model_report_devices(
+        year: *const c_char,
+        devices_json: *const c_char,
+        timezone: *const c_char,
+        mode: *const c_char,
+    ) -> *mut c_char {
+        let none = std::ptr::null();
+        unsafe { page("tb_model_report_devices", year, none, devices_json, timezone, mode, remote_pages::models) }
+    }
+
+    /// `tb_hourly_report` with devices; `clients` also filters each producer
+    /// (applied on the producer).
+    ///
+    /// # Safety
+    /// As [`tb_graph_devices`]; `clients` may be NULL.
+    #[no_mangle]
+    pub unsafe extern "C" fn tb_hourly_report_devices(
+        year: *const c_char,
+        clients: *const c_char,
+        devices_json: *const c_char,
+        timezone: *const c_char,
+        mode: *const c_char,
+    ) -> *mut c_char {
+        unsafe { page("tb_hourly_report_devices", year, clients, devices_json, timezone, mode, remote_pages::hourly) }
+    }
+
+    /// `tb_agents_report` with devices; `clients` also filters each producer.
+    ///
+    /// # Safety
+    /// As [`tb_hourly_report_devices`].
+    #[no_mangle]
+    pub unsafe extern "C" fn tb_agents_report_devices(
+        year: *const c_char,
+        clients: *const c_char,
+        devices_json: *const c_char,
+        timezone: *const c_char,
+        mode: *const c_char,
+    ) -> *mut c_char {
+        unsafe { page("tb_agents_report_devices", year, clients, devices_json, timezone, mode, remote_pages::agents) }
+    }
 }
 
 /// The embedded remote-usage agent (`remote_agent.rs`). macOS and Linux only:
