@@ -18,7 +18,7 @@
 //! [`RemoteAgent`]; tests build their own instances.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     ffi::c_char,
     fs,
     io::Write,
@@ -36,11 +36,13 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use syrtis_agent::{
     agent::{Agent, AgentConfig, AgentError, ScannerSettings},
+    cache_store::CachedBody,
     control::{self, Client, Command, ControlError},
     noise::StaticKey,
-    pairing::{ClaimAttempts, Claimed, ClientError, Clock, PairingClient, PeerCode},
+    pairing::{ClaimAttempts, Claimed, ClientError, Clock, GrantStatus, PairingClient, PeerCode},
     peer_store::{PeerRecord, PeerState},
-    runtime::{Options, RuntimeError},
+    report_peer::{FetchError, Fetched, ReportQuery},
+    runtime::{Options, PullError, RuntimeError},
     secure_fs::StorageError,
     security::{
         clock_status, decode_fixed_hex, hex_encode, GrantState, MemoryLedger, SecurityError,
@@ -112,6 +114,10 @@ pub(crate) struct RemoteAgent {
     running: Mutex<Option<Running>>,
     claims: Mutex<Claims>,
     monitor: AtomicBool,
+    /// Unix seconds of the last fresh pull, by producer and query
+    /// ([`last_success_key`]). This process only: after a restart of the
+    /// process a cached body has no known age.
+    last_success: Mutex<HashMap<String, i64>>,
     /// Test seam: the next monitor spawn fails as if the OS refused a thread.
     #[cfg(test)]
     fail_monitor_spawn: AtomicBool,
@@ -245,8 +251,10 @@ impl RemoteAgent {
         Ok(json!({"running": false}))
     }
 
-    /// Control `status` plus `running`, `scopeApproved`, `listening` and the
-    /// identity's short fingerprint; `{"running":false}` when stopped.
+    /// Control `status` (its `scopeApproved` is the agent's own
+    /// `Agent::scope_approved`, through the control server's provider) plus
+    /// `running`, `listening` and the identity's short fingerprint;
+    /// `{"running":false}` when stopped.
     pub(crate) fn status(&self) -> Reply {
         match lock(&self.running).as_ref() {
             Some(current) => status_of(current),
@@ -570,6 +578,146 @@ impl RemoteAgent {
             None => Err("notRunning".into()),
         }
     }
+
+    // ------------------------------------------- for `remote_pages` ---
+
+    /// Receiver: every record of `peers.json`. `notRunning`, or the storage
+    /// class when the file cannot be read.
+    pub(crate) fn peer_records(&self) -> Result<Vec<PeerRecord>, String> {
+        self.with(|current| {
+            current
+                .agent
+                .runtime()
+                .peers()
+                .peers()
+                .map_err(storage_class)
+        })
+    }
+
+    /// `Runtime::pull` of one producer, under the agent lock (a restart
+    /// cannot drop the agent mid-pull; a management call waits for at most
+    /// this one fetch). A fresh pull stamps [`last_success_at`]. A refusal
+    /// with error code 2 (`CheckGrantStatus`) asks Grant status once and
+    /// stores the answer (`revoked` / `expired`: `PeerStore::set_state`;
+    /// `active`: `PeerStore::update_grant`); the pull is not retried. `None`:
+    /// no agent runs.
+    pub(crate) fn pull_peer(
+        &self,
+        producer: &[u8; 32],
+        query: &ReportQuery,
+    ) -> Option<Result<Fetched, PullError>> {
+        let running = lock(&self.running);
+        let current = running.as_ref()?;
+        let result = current.agent.runtime().pull(producer, query);
+        match &result {
+            Ok(_) => {
+                if let Ok(now) = current.inputs.clock.os_now_seconds() {
+                    lock(&self.last_success).insert(last_success_key(producer, query), now);
+                }
+            }
+            Err(PullError::Fetch(FetchError::CheckGrantStatus)) => check_grant(current, producer),
+            Err(_) => {}
+        }
+        Some(result)
+    }
+
+    /// `Runtime::last_good` of one producer; `None` for no agent, no body or
+    /// a storage error.
+    pub(crate) fn last_good_peer(
+        &self,
+        producer: &[u8; 32],
+        query: &ReportQuery,
+    ) -> Option<CachedBody> {
+        let running = lock(&self.running);
+        let current = running.as_ref()?;
+        current
+            .agent
+            .runtime()
+            .last_good(producer, query)
+            .ok()
+            .flatten()
+    }
+
+    /// Test access to the running agent (its peer store and identity).
+    #[cfg(test)]
+    pub(crate) fn with_agent<T>(&self, body: impl FnOnce(&Agent) -> T) -> Option<T> {
+        lock(&self.running)
+            .as_ref()
+            .map(|current| body(&current.agent))
+    }
+
+    /// The Unix seconds of the last fresh [`pull_peer`] of this query from
+    /// this producer in this process.
+    pub(crate) fn last_success_at(&self, producer: &[u8; 32], query: &ReportQuery) -> Option<i64> {
+        lock(&self.last_success)
+            .get(&last_success_key(producer, query))
+            .copied()
+    }
+}
+
+fn last_success_key(producer: &[u8; 32], query: &ReportQuery) -> String {
+    format!(
+        "{}\0{}\0{}\0{}\0{}\0{}",
+        hex_encode(producer),
+        u16::from(query.endpoint),
+        query.start_date,
+        query.end_date_exclusive,
+        query.timezone,
+        query.clients.join("\0")
+    )
+}
+
+/// Deferred item (4): one Grant status request for the producer's record,
+/// built from that record (host, port, responder static), and the answer
+/// stored. Any failure changes nothing.
+fn check_grant(current: &Running, producer: &[u8; 32]) {
+    let runtime = current.agent.runtime();
+    let Some(record) = runtime.peers().peers().ok().and_then(|peers| {
+        peers
+            .into_iter()
+            .find(|peer| peer.responder_static == *producer)
+    }) else {
+        return;
+    };
+    let Ok(identity) = runtime
+        .store()
+        .state()
+        .and_then(|state| StaticKey::from_state(&state))
+    else {
+        return;
+    };
+    let ledger = MemoryLedger::default();
+    let client = PairingClient {
+        identity: &identity,
+        ledger: &ledger,
+        clock: &*current.inputs.clock,
+    };
+    // Grant status reads only the host, port and responder static.
+    let claimed = Claimed {
+        offer_id: [0; 16],
+        responder_static: record.responder_static,
+        host: record.host.clone(),
+        port: record.port,
+        pending_id: record.pending_id,
+        sas: String::new(),
+        expires_at_ms: record.expires_at_ms,
+        claimed_at: Duration::ZERO,
+    };
+    let Ok(answer) = client.grant_status(&claimed, record.grant_id) else {
+        return;
+    };
+    let peers = runtime.peers();
+    let _ = match answer.state {
+        GrantStatus::Revoked => peers.set_state(producer, &record.grant_id, PeerState::Revoked),
+        GrantStatus::Expired => peers.set_state(producer, &record.grant_id, PeerState::Expired),
+        GrantStatus::Active => peers.update_grant(
+            producer,
+            &record.grant_id,
+            answer.auth_epoch,
+            answer.source_scope_generation,
+            answer.expires_at_ms,
+        ),
+    };
 }
 
 fn start_agent(inputs: &Inputs) -> Result<Agent, String> {
@@ -621,10 +769,6 @@ fn status_of(current: &Running) -> Reply {
         .map_err(storage_class)?;
     let object = data.as_object_mut().ok_or("internal")?;
     object.insert("running".into(), Value::Bool(true));
-    object.insert(
-        "scopeApproved".into(),
-        Value::Bool(current.agent.scope_approved()),
-    );
     object.insert(
         "listening".into(),
         Value::Bool(runtime.listener_addr().is_some()),
@@ -940,11 +1084,7 @@ mod tests {
         sync::atomic::{AtomicI64, AtomicUsize},
         time::{Instant, SystemTime, UNIX_EPOCH},
     };
-    use syrtis_agent::{
-        report::Endpoint,
-        report_peer::{FetchError, ReportQuery},
-        runtime::PullError,
-    };
+    use syrtis_agent::report::Endpoint;
 
     /// Injected time from the real wall clock; `sleep` advances it, so the
     /// receiver's poll and the grant's rate tokens do not wait.

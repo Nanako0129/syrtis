@@ -22765,6 +22765,47 @@ enum SelfTest {
             if fixtureCreated { try? FileManager.default.removeItem(atPath: fixture) }
             expect(realRootStamp() == realBefore,
                    "SA3A the real agent root is untouched by the selftest (absent or same mtime)")
+
+            // SA-3b: the device-aware pages, run in the same child.
+            expect(child?["sa3bGraph"] as? [String] == ["local", "unavailable"]
+                       && child?["sa3bDuplicate"] as? Bool == true
+                       && child?["sa3bRangeLimited"] as? Bool == true,
+                   "SA3B a page with this Mac and an unpaired device decodes: local row, the device unavailable, duplicate warning, all time limited")
+            expect(child?["sa3bPages"] as? Int == 4,
+                   "SA3B the graph, models, hourly and agents device payloads all decode")
+            expect(child?["sa3bLocalOnly"] as? [String] == ["local"]
+                       && child?["sa3bLocalOnlyDuplicate"] as? Bool == false,
+                   "SA3B only this Mac: one local row, no duplicate warning")
+            expect(child?["sa3bSnapshotSame"] as? Bool == true,
+                   "SA3B the dashboard snapshot directory and its files keep their size and modification time across device-aware calls (metadata only)")
+        }
+        // SA-3b: a model row with a remote part carries no estimate, so the
+        // implausible-cost check has no denominator; a local row still has one.
+        do {
+            let body = Data(#"""
+                {"ok":true,"data":{"entries":[
+                {"client":"opencode","model":"m","provider":"p","input":1,"output":0,"cacheRead":0,
+                 "cacheWrite":0,"reasoning":0,"total":1,"messageCount":1,"cost":5000,
+                 "msPer1kTokens":null,"costEstimate":null},
+                {"client":"opencode","model":"n","provider":"p","input":1,"output":0,"cacheRead":0,
+                 "cacheWrite":0,"reasoning":0,"total":1,"messageCount":1,"cost":5000,
+                 "msPer1kTokens":null,"costEstimate":1}],
+                "totalInput":2,"totalOutput":0,"totalCacheRead":0,"totalCacheWrite":0,
+                "totalMessages":2,"totalCost":10000,"pricingUpdatedAt":null,
+                "devices":[{"id":"local","label":null,"state":"local","lastSuccessAt":null},
+                {"id":"0123456789abcdef","label":"10.0.0.2:47000","state":"stale","lastSuccessAt":null}],
+                "duplicateWarning":true,"saturated":false,"remoteRangeLimited":false}}
+                """#.utf8)
+            let page: DeviceAwarePayload<ModelReport>? = try? TBCore.decodeEnvelope(body)
+            let merged = page?.payload.entries.first { $0.model == "m" }
+            let local = page?.payload.entries.first { $0.model == "n" }
+            expect(merged != nil && merged?.implausibleCostRatio == nil
+                       && local?.implausibleCostRatio != nil,
+                   "SA3B a model row holding a remote part has no implausible-cost ratio (control: a local row with an estimate has one)")
+            expect(page?.devices.map(\.state) == ["local", "stale"]
+                       && page?.devices.last?.label == "10.0.0.2:47000"
+                       && page?.devices.last?.lastSuccessAt == nil,
+                   "SA3B the devices rows decode with their state, label and unknown last success")
         }
 
         accountsDefaults.restore()
@@ -22784,6 +22825,36 @@ enum SelfTest {
     @MainActor static func runRemoteAgentChild(home: String) -> Never {
         let status = try? RemoteAgentLaunch.start(home: home)
         let disclosure = try? TBCore.remoteScopeDisclosure()
+        // SA-3b: the device-aware pages with this Mac and a device that was
+        // never paired (cached: no connection). The snapshot directory is the
+        // user's own Caches directory (Foundation does not follow `HOME`), so
+        // only its metadata is compared, never a file's contents: the
+        // directory's and every entry's existence, size and modification
+        // time, before and after the calls.
+        let unpaired = String(repeating: "11", count: 32)
+        let both = DeviceSelection(local: true, peers: [unpaired])
+        func snapshotStamp() -> String {
+            guard let directory = SnapshotStore.defaultDirectory()?.path else { return "unresolved" }
+            let manager = FileManager.default
+            func stamp(_ path: String) -> String {
+                guard let attributes = try? manager.attributesOfItem(atPath: path) else { return "absent" }
+                return "\(String(describing: attributes[.size]))|\(String(describing: attributes[.modificationDate]))"
+            }
+            let entries = ((try? manager.contentsOfDirectory(atPath: directory)) ?? []).sorted()
+            return ([stamp(directory)] + entries.map { "\($0)=" + stamp(directory + "/" + $0) })
+                .joined(separator: ";")
+        }
+        let snapshotBefore = snapshotStamp()
+        let graph = try? TBCore.graphDevices(selection: both, mode: .cached)
+        let pages = [
+            graph != nil,
+            (try? TBCore.modelReportDevices(selection: both, mode: .cached)) != nil,
+            (try? TBCore.hourlyReportDevices(selection: both, mode: .cached)) != nil,
+            (try? TBCore.agentsReportDevices(selection: both, mode: .cached)) != nil,
+        ].filter { $0 }.count
+        let localOnly = try? TBCore.graphDevices(
+            year: "2025", selection: DeviceSelection(local: true, peers: []), mode: .refresh)
+        let snapshotSame = snapshotBefore != "unresolved" && snapshotStamp() == snapshotBefore
         RemoteAgentLaunch.stop()
         let stopped = (try? TBCore.remoteStatus())?.running == false
         var paths: [String] = []
@@ -22801,6 +22872,13 @@ enum SelfTest {
             "stopped": stopped,
             "opencodeDbPaths": disclosure?.opencodeDbPaths as Any,
             "paths": paths,
+            "sa3bGraph": graph?.devices.map(\.state) as Any,
+            "sa3bDuplicate": graph?.duplicateWarning as Any,
+            "sa3bRangeLimited": graph?.remoteRangeLimited as Any,
+            "sa3bPages": pages,
+            "sa3bLocalOnly": localOnly?.devices.map(\.state) as Any,
+            "sa3bLocalOnlyDuplicate": localOnly?.duplicateWarning as Any,
+            "sa3bSnapshotSame": snapshotSame,
         ]
         let data = (try? JSONSerialization.data(withJSONObject: line)) ?? Data("{}".utf8)
         print(String(decoding: data, as: UTF8.self))

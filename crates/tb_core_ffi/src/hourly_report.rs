@@ -30,7 +30,7 @@ struct HourlyEntry {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct HourlyReportData {
+pub(crate) struct HourlyReportData {
     entries: Vec<HourlyEntry>,
     total_cost: f64,
 }
@@ -45,6 +45,17 @@ pub(crate) fn run(
     year: &str,
     clients: Option<Vec<String>>,
 ) -> Result<Value, String> {
+    let data = map_report(compute(context, year, clients)?);
+    serde_json::to_value(data).map_err(|e| format!("serialize hourly report: {}", e))
+}
+
+/// The engine's report, before mapping (split out of [`run`] so
+/// `remote_pages` can add remote records to it).
+pub(crate) fn compute(
+    context: &crate::LocalSourceContext,
+    year: &str,
+    clients: Option<Vec<String>>,
+) -> Result<tokscale_core::HourlyReport, String> {
     let year = normalize_year(year)?;
     let options = context.report_options(year, clients);
 
@@ -52,10 +63,7 @@ pub(crate) fn run(
         .enable_all()
         .build()
         .map_err(|e| format!("build runtime: {}", e))?;
-    let report = runtime.block_on(tokscale_core::get_hourly_report(options))?;
-
-    let data = map_report(report);
-    serde_json::to_value(data).map_err(|e| format!("serialize hourly report: {}", e))
+    runtime.block_on(tokscale_core::get_hourly_report(options))
 }
 
 fn normalize_year(year: &str) -> Result<Option<String>, String> {
@@ -70,7 +78,7 @@ fn normalize_year(year: &str) -> Result<Option<String>, String> {
     }
 }
 
-fn map_report(report: tokscale_core::HourlyReport) -> HourlyReportData {
+pub(crate) fn map_report(report: tokscale_core::HourlyReport) -> HourlyReportData {
     HourlyReportData {
         entries: report
             .entries

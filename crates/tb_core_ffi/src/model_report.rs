@@ -13,7 +13,7 @@ use serde_json::Value;
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct ModelEntry {
+pub(crate) struct ModelEntry {
     client: String,
     model: String,
     provider: String,
@@ -37,13 +37,13 @@ struct ModelEntry {
     /// 100x combined with a larger healthy one is a merged 1.1x, not 100x. So
     /// this ships the estimate and the comparison happens after the fold, in
     /// `ModelReportEntry.implausibleCostRatio`.
-    cost_estimate: Option<f64>,
+    pub(crate) cost_estimate: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct ModelReportData {
-    entries: Vec<ModelEntry>,
+pub(crate) struct ModelReportData {
+    pub(crate) entries: Vec<ModelEntry>,
     total_input: i64,
     total_output: i64,
     total_cache_read: i64,
@@ -75,14 +75,7 @@ fn model_report_options(
 
 /// Build the per-model report for `year` (empty string = all time).
 pub(crate) fn run(context: &crate::LocalSourceContext, year: &str) -> Result<Value, String> {
-    let year = normalize_year(year)?;
-    let options = model_report_options(context, year);
-
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| format!("build runtime: {}", e))?;
-    let report = runtime.block_on(tokscale_core::get_model_report(options))?;
+    let report = compute(context, year)?;
 
     // Read-only, no network: `get_model_report` has already refreshed and
     // written this cache on its own path, and a cold cache (first ever run,
@@ -92,6 +85,22 @@ pub(crate) fn run(context: &crate::LocalSourceContext, year: &str) -> Result<Val
 
     let data = map_report(report, pricing.as_ref());
     serde_json::to_value(data).map_err(|e| format!("serialize model report: {}", e))
+}
+
+/// The engine's report, before mapping (split out of [`run`] so
+/// `remote_pages` can add remote records to it).
+pub(crate) fn compute(
+    context: &crate::LocalSourceContext,
+    year: &str,
+) -> Result<tokscale_core::ModelReport, String> {
+    let year = normalize_year(year)?;
+    let options = model_report_options(context, year);
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("build runtime: {}", e))?;
+    runtime.block_on(tokscale_core::get_model_report(options))
 }
 
 /// What the local pricing table would charge for this row's tokens, or `None`
@@ -183,7 +192,7 @@ fn normalize_year(year: &str) -> Result<Option<String>, String> {
     }
 }
 
-fn map_report(
+pub(crate) fn map_report(
     report: tokscale_core::ModelReport,
     pricing: Option<&tokscale_core::pricing::PricingService>,
 ) -> ModelReportData {

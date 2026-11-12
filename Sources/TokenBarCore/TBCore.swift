@@ -756,6 +756,57 @@ public enum TBCore {
         try remoteNothing(producerStatic.withCString { tb_remote_peer_remove($0) })
     }
 
+    // MARK: Device-aware pages (`tb_*_devices`, ctb.h). Every call blocks
+    // (`refresh` up to one fetch deadline per selected producer): off the
+    // main thread. The result is a `DeviceAwarePayload`, never the page's
+    // own type, so it cannot reach `SnapshotStore`.
+
+    private static func withDevices<R>(
+        _ selection: DeviceSelection, _ timeZone: String, _ mode: DeviceFetchMode,
+        _ body: (UnsafePointer<CChar>, UnsafePointer<CChar>, UnsafePointer<CChar>) -> R
+    ) throws -> R {
+        let json = String(decoding: try JSONEncoder().encode(selection), as: UTF8.self)
+        return json.withCString { devices in
+            timeZone.withCString { zone in mode.rawValue.withCString { body(devices, zone, $0) } }
+        }
+    }
+
+    public static func graphDevices(
+        year: String? = nil, selection: DeviceSelection,
+        timeZone: String = TimeZone.current.identifier, mode: DeviceFetchMode
+    ) throws -> DeviceAwarePayload<UsagePayload> {
+        try unwrap(try withDevices(selection, timeZone, mode) { devices, zone, mode in
+            withYear(year) { tb_graph_devices($0, devices, zone, mode) }
+        })
+    }
+
+    public static func modelReportDevices(
+        year: String? = nil, selection: DeviceSelection,
+        timeZone: String = TimeZone.current.identifier, mode: DeviceFetchMode
+    ) throws -> DeviceAwarePayload<ModelReport> {
+        try unwrap(try withDevices(selection, timeZone, mode) { devices, zone, mode in
+            withYear(year) { tb_model_report_devices($0, devices, zone, mode) }
+        })
+    }
+
+    public static func hourlyReportDevices(
+        year: String? = nil, clients: [String]? = nil, selection: DeviceSelection,
+        timeZone: String = TimeZone.current.identifier, mode: DeviceFetchMode
+    ) throws -> DeviceAwarePayload<HourlyReport> {
+        try unwrap(try withDevices(selection, timeZone, mode) { devices, zone, mode in
+            withYearAndClients(year, clients) { tb_hourly_report_devices($0, $1, devices, zone, mode) }
+        })
+    }
+
+    public static func agentsReportDevices(
+        year: String? = nil, clients: [String]? = nil, selection: DeviceSelection,
+        timeZone: String = TimeZone.current.identifier, mode: DeviceFetchMode
+    ) throws -> DeviceAwarePayload<AgentsReport> {
+        try unwrap(try withDevices(selection, timeZone, mode) { devices, zone, mode in
+            withYearAndClients(year, clients) { tb_agents_report_devices($0, $1, devices, zone, mode) }
+        })
+    }
+
     /// OAuth quota cards for codex/claude/antigravity/copilot/grok/grok-bot. Network-bound;
     /// per-provider failures are reported in each snapshot's `error`.
     public static func agentUsage() throws -> AgentUsagePayload {
