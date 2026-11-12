@@ -62,11 +62,14 @@ public extension ModelReportEntry {
     /// pricing table — so a unit error upstream reaches the row unchallenged.
     /// This is the only thing standing between that and the number on screen.
     ///
-    /// Computed here rather than in Rust because it must be evaluated AFTER
-    /// `modelLevelEntries` folds the provider-split rows together: one
+    /// Computed here rather than in Rust because it describes the row a view
+    /// shows, and the views fold the engine's rows first. A one-client tab
+    /// shows `modelLevelEntries`, which joins a model's providers: one
     /// component at 100x merged with a larger healthy row is a merged 1.1x,
     /// and describing the merged cost with the component's ratio would be
-    /// materially false.
+    /// materially false. A multi-client tab shows one row per model and
+    /// provider (`tabEntries`), so there the ratio is each provider row's
+    /// own, and a flagged row is kept out of any merge.
     ///
     /// One-directional. Rows measured on real data run 0.1-0.3x of the
     /// estimate (the table prices dearer than OpenCode actually bills), and a
@@ -77,6 +80,49 @@ public extension ModelReportEntry {
         let ratio = cost / costEstimate
         return ratio > CostPlausibility.threshold ? ratio : nil
     }
+}
+
+/// A tab's model rows read as models. A multi-client tab keeps one row per
+/// model and provider (`ModelReport.tabEntries`), so one model can be on
+/// several rows: counts, the favorite and the labels go through these so a
+/// provider split never reads as another model.
+public extension Array where Element == ModelReportEntry {
+    /// How many models the rows cover (not how many rows).
+    var modelCount: Int { Set(map(\.model)).count }
+
+    /// Models on more than one row; their rows need the provider beside the
+    /// name to be told apart.
+    var repeatedModels: Set<String> {
+        var seen: Set<String> = []
+        var repeated: Set<String> = []
+        for entry in self where !seen.insert(entry.model).inserted {
+            repeated.insert(entry.model)
+        }
+        return repeated
+    }
+
+    /// The costliest row of the model whose rows cost the most together, so
+    /// a model split across providers is compared as one model. Ties go to
+    /// the earlier row.
+    var favoriteRow: ModelReportEntry? {
+        var costs: [String: Double] = [:]
+        for entry in self { costs[entry.model, default: 0] += entry.cost }
+        var best: ModelReportEntry?
+        for entry in self {
+            guard let current = best else { best = entry; continue }
+            let (mine, theirs) = (costs[entry.model] ?? 0, costs[current.model] ?? 0)
+            if mine > theirs || (entry.model == current.model && entry.cost > current.cost) {
+                best = entry
+            }
+        }
+        return best
+    }
+}
+
+public extension ModelReportEntry {
+    /// The provider as a row label: the engine's name, or the fixed English
+    /// key for a row that has none (localize it at the view).
+    var providerLabel: String { provider.isEmpty ? "Unspecified provider" : provider }
 }
 
 /// Where a self-reported cost stops being expensive and starts being broken.
