@@ -609,6 +609,8 @@ impl RemoteAgent {
                             "producerStatic": hex_encode(&peer.responder_static),
                             "fingerprint": fingerprint(&peer.responder_static),
                             "nodeLabel": peer.node_label,
+                            "host": peer.host,
+                            "port": peer.port,
                             "createdAt": peer.created_at_ms,
                             "expiresAt": peer.expires_at_ms,
                             "state": match peer.state {
@@ -1468,6 +1470,48 @@ mod tests {
             pull(&receiver, &producer_static),
             Err(PullError::Fetch(FetchError::Revoked))
         );
+    }
+
+    /// `SA-3c` acceptance (5): each `peers` row carries the record's `host`
+    /// and `port` (the Devices page shows `host:port`).
+    #[test]
+    fn peers_rows_carry_the_record_host_and_port() {
+        let clock = TestClock::new();
+        let home = TempHome::new();
+        let agent = Arc::new(RemoteAgent::default());
+        start(&agent, &home, &clock, ScannerSettings::default());
+        agent
+            .with(|current| {
+                let runtime = current.agent.runtime();
+                let identity = runtime
+                    .store()
+                    .state()
+                    .and_then(|state| state.identity_public())
+                    .map_err(storage_class)?;
+                runtime
+                    .peers()
+                    .upsert(PeerRecord {
+                        auth_epoch: 1,
+                        created_at_ms: 1,
+                        expires_at_ms: i64::MAX / 2,
+                        grant_id: [7; 16],
+                        host: "192.0.2.10".into(),
+                        initiator_static: identity,
+                        node_label: Some("desk".into()),
+                        pending_id: [7; 16],
+                        port: 48_123,
+                        responder_static: [9; 32],
+                        source_scope_generation: 1,
+                        state: PeerState::Active,
+                    })
+                    .map_err(storage_class)
+            })
+            .unwrap();
+        let peers = agent.peers().unwrap();
+        let row = &peers.as_array().unwrap()[0];
+        assert_eq!(row["host"], "192.0.2.10");
+        assert_eq!(row["port"], 48_123);
+        assert_eq!(row["nodeLabel"], "desk");
     }
 
     /// Acceptance (3c): the address goes through the frozen command; after a

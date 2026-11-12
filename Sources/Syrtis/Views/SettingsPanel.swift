@@ -11,6 +11,7 @@ struct SettingsPanel: View {
         case dashboard = "Dashboard"
         case usageAttribution = "Usage attribution"
         case accounts = "Accounts"
+        case devices = "Devices"
         case general = "General"
         case about = "About"
 
@@ -24,6 +25,7 @@ struct SettingsPanel: View {
             case .dashboard: "chart.bar.xaxis"
             case .usageAttribution: "arrow.triangle.branch"
             case .accounts: "person.2"
+            case .devices: "laptopcomputer.and.iphone"
             case .general: "gearshape"
             case .about: "info.circle"
             }
@@ -244,6 +246,8 @@ struct SettingsPanel: View {
                 usageAttributionPage()
             case .accounts:
                 accountsPage()
+            case .devices:
+                DevicesSettingsView(panel: self)
             case .general:
                 generalPage()
             case .about:
@@ -1796,7 +1800,7 @@ struct SettingsPanel: View {
 
     // MARK: - Building blocks
 
-    private func section(_ label: String, @ViewBuilder content: () -> some View) -> some View {
+    func section(_ label: String, @ViewBuilder content: () -> some View) -> some View {
         VStack(alignment: .leading, spacing: 6) {
             Text(label.localized.uppercased())
                 .font(.caption2.weight(.semibold))
@@ -1807,7 +1811,7 @@ struct SettingsPanel: View {
 
     /// `section` with a one-line description under the header and the long
     /// explanation behind an ⓘ popover. State notices stay in `content`.
-    private func infoSection(
+    func infoSection(
         _ label: String, summary: String,
         @ViewBuilder details: () -> some View,
         @ViewBuilder content: () -> some View
@@ -1824,7 +1828,7 @@ struct SettingsPanel: View {
         }
     }
 
-    private func row(_ label: String, @ViewBuilder trailing: () -> some View) -> some View {
+    func row(_ label: String, @ViewBuilder trailing: () -> some View) -> some View {
         HStack {
             Text(label.localized)
                 .font(.caption)
@@ -1861,7 +1865,7 @@ struct SettingsPanel: View {
             })
     }
 
-    private func toggleRow(_ label: String, isOn: Binding<Bool>) -> some View {
+    func toggleRow(_ label: String, isOn: Binding<Bool>) -> some View {
         row(label) {
             Toggle("", isOn: isOn)
                 .toggleStyle(.switch)
@@ -1870,7 +1874,7 @@ struct SettingsPanel: View {
         }
     }
 
-    private func radioGroup(
+    func radioGroup(
         selection: Binding<String>, options: [(value: String, label: String)]
     ) -> some View {
         VStack(spacing: 1) {
@@ -1907,7 +1911,7 @@ struct SettingsPanel: View {
         .buttonStyle(.plain)
     }
 
-    private func hint(_ text: String) -> some View {
+    func hint(_ text: String) -> some View {
         Text(text.localized)
             .font(.caption2)
             .foregroundStyle(.tertiary)

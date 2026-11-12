@@ -95,6 +95,9 @@ public struct RemotePeer: Decodable, Equatable, Sendable {
     public let producerStatic: String
     public let fingerprint: String
     public let nodeLabel: String?
+    /// The producer's address, from the offer this receiver claimed.
+    public let host: String
+    public let port: Int
     public let createdAt: Int64
     public let expiresAt: Int64
     public let state: String

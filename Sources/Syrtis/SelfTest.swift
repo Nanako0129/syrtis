@@ -17857,8 +17857,8 @@ enum SelfTest {
         // functions with no seam, and a source-text scan would not be a guard.
         expect(
             SettingsPanel.Page.allCases.map(\.rawValue)
-                == ["Menu bar", "Dashboard", "Usage attribution", "Accounts", "General", "About"],
-            "ACCOUNTS-PAGE sidebar order: Accounts sits between Usage attribution and General")
+                == ["Menu bar", "Dashboard", "Usage attribution", "Accounts", "Devices", "General", "About"],
+            "ACCOUNTS-PAGE sidebar order: Accounts sits after Usage attribution; SA3C Devices sits between Accounts and General")
         let accountsCopyKeys = AccountsCopy.translated
         var accountsCopyMissing: [String] = []
         for key in accountsCopyKeys {
@@ -22808,6 +22808,192 @@ enum SelfTest {
                    "SA3B the devices rows decode with their state, label and unknown last success")
         }
 
+        // SA-3c: the Devices page's model, driven by a fake client and a fake
+        // pasteboard (never the agent, never NSPasteboard.general).
+        do {
+            /// Runs the main run loop until `condition` holds or 5 s pass.
+            func pumpUntil(_ condition: () -> Bool) -> Bool {
+                let deadline = Date(timeIntervalSinceNow: 5)
+                while !condition(), Date() < deadline {
+                    RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.005))
+                }
+                return condition()
+            }
+            func run(_ body: @escaping @MainActor @Sendable () async -> Void) {
+                _ = awaitMainActorValue { await body(); return true }
+            }
+
+            // (1) Every Devices string is translated (English is the key).
+            var devicesMissing: [String] = []
+            for key in DevicesCopy.all {
+                for locale in ["zh-Hant", "zh-Hans"] {
+                    let value = AppLanguage.localizedString(key, locale: locale, bundle: .tokenBarResources)
+                    if value == nil || value == key { devicesMissing.append("\(locale): \(key.prefix(24))") }
+                }
+            }
+            expect(devicesMissing.isEmpty,
+                   "SA3C every Devices copy key resolves to a translation in zh-Hant and zh-Hans: \(devicesMissing)")
+
+            // (1) The state machine.
+            let fake = SA3CFakeClient()
+            let board = SA3CFakePasteboard()
+            let model = DevicesModel(client: fake, pasteboard: board)
+            fake.set { $0.running = false }
+            run { await model.refresh() }
+            expect(model.showsRetry && model.startFailure == nil && !model.canToggleSharing,
+                   "SA3C agent not running: the page shows Retry and the not-running line")
+            fake.set { $0.startError = "busy" }
+            run { await model.retryStart() }
+            expect(model.showsRetry && model.startFailure == DevicesCopy.startBusy,
+                   "SA3C a failed Retry shows its class's fixed line (busy)")
+            fake.set { $0.running = true; $0.startError = nil }
+            run { await model.retryStart() }
+            expect(!model.showsRetry && model.startFailure == nil && !model.scopeApproved
+                       && !model.canToggleSharing,
+                   "SA3C running, scope not approved: the sharing switch is unavailable")
+            run { await model.approveScope() }
+            expect(model.scopeApproved && model.canToggleSharing
+                       && fake.get(\.approveCalls) == [SA3CFakeClient.digestA],
+                   "SA3C after approving the disclosed digest the sharing switch can be turned on")
+            fake.set { $0.sharingError = "busy" }
+            run { await model.setSharing(true) }
+            expect(model.sharingError == DevicesCopy.sharingBusy && !model.sharingOn,
+                   "SA3C turning sharing on while an earlier invitation is open shows the busy line")
+            fake.set { $0.sharingError = nil }
+            run { await model.setSharing(true) }
+            expect(model.sharingError == nil && model.sharingOn,
+                   "SA3C turning sharing on succeeds once the core allows it")
+            expect(DevicesCopy.sharingFailure("invalid") == DevicesCopy.sharingAlreadyOn
+                       && DevicesCopy.sharingFailure("x") == DevicesCopy.genericFailure
+                       && DevicesCopy.startFailure("unsafeState") == DevicesCopy.startUnsafe
+                       && DevicesCopy.startFailure("homeRequired") == DevicesCopy.startFailed
+                       && DevicesCopy.offerFailure("unauthorized") == DevicesCopy.offerNeedsSharing
+                       && DevicesCopy.offerFailure("invalid") == DevicesCopy.offerNeedsAddress
+                       && DevicesCopy.linkFailure("expired") == DevicesCopy.invitationExpired
+                       && DevicesCopy.linkFailure("rejected") == DevicesCopy.declined
+                       && DevicesCopy.linkFailure("transport") == DevicesCopy.unreachableDevice
+                       && DevicesCopy.linkFailure("identityChanged") == DevicesCopy.identityChanged
+                       && DevicesCopy.linkFailure("invalidOffer") == DevicesCopy.invalidInvitation
+                       && DevicesCopy.linkFailure("selfPairing") == DevicesCopy.ownInvitation
+                       && DevicesCopy.linkFailure("offerUnusable") == DevicesCopy.unusableInvitation
+                       && DevicesCopy.linkFailure("panic") == DevicesCopy.linkFailed,
+                   "SA3C each error class maps to its fixed copy key, anything else to the generic line")
+            expect(model.unreachable, "SA3C no listen address: the page says other devices can't reach this Mac")
+            run { await model.applyListen(host: "127.0.0.1", port: 47_000, nodeLabel: "desk") }
+            expect(!model.unreachable && model.status?.nodeLabel == "desk",
+                   "SA3C an applied address that listens clears the unreachable line")
+            fake.set { $0.listening = false }
+            run { await model.refresh() }
+            expect(model.unreachable, "SA3C an address that does not listen is unreachable too")
+            run { await model.applyListen(host: "127.0.0.1", port: 80, nodeLabel: "") }
+            expect(model.listenError == DevicesCopy.portRangeLine,
+                   "SA3C a port below 1024 is refused with the port-range line")
+            run { await model.applyListen(host: "127.0.0.1", port: 47_000, nodeLabel: String(repeating: "a", count: 129)) }
+            expect(model.listenError == DevicesCopy.nameTooLong,
+                   "SA3C a device name over 128 bytes is refused with the name line")
+
+            // (3) Scope approval is bound to the disclosure shown.
+            let scopeFake = SA3CFakeClient()
+            let scopeModel = DevicesModel(client: scopeFake, pasteboard: SA3CFakePasteboard())
+            run { await scopeModel.refresh() }
+            let shownDigest = scopeModel.disclosure?.ownerInputsSha256
+            scopeFake.set { $0.digest = SA3CFakeClient.digestB }
+            run { await scopeModel.approveScope() }
+            expect(shownDigest == SA3CFakeClient.digestA
+                       && scopeFake.get(\.approveCalls) == [SA3CFakeClient.digestA]
+                       && scopeModel.scopeNotice == DevicesCopy.scopeChanged
+                       && scopeModel.disclosure?.ownerInputsSha256 == SA3CFakeClient.digestB
+                       && !scopeModel.scopeApproved,
+                   "SA3C an approval answered invalid sent the shown digest once, reloads the disclosure and is not resent")
+
+            // (2) The Pair URL stays in the model's one field.
+            run { await model.createOffer() }
+            let url = model.offer?.pairUrl ?? ""
+            let defaultsText = UserDefaults.standard.dictionaryRepresentation().values
+                .map { String(describing: $0) }
+            expect(!url.isEmpty
+                       && !String(describing: model).contains(url)
+                       && !String(reflecting: model).contains(url)
+                       && !String(describing: model.offer as Any).contains(url)
+                       && !String(reflecting: model.offer as Any).contains(url)
+                       && !defaultsText.contains { $0.contains(url) },
+                   "SA3C after creating an invitation no description, debugDescription or UserDefaults value holds the Pair URL")
+            model.copyOffer()
+            expect(board.text == url && board.marked, "SA3C Copy writes the Pair URL marked concealed and transient")
+            if let offer = model.offer { model.expireOfferIfDue(nowMs: offer.expiresAt - 1) }
+            expect(model.offer != nil, "SA3C an invitation is kept until it expires (control)")
+            let expired = model.offer?.offerId
+            if let offer = model.offer { model.expireOfferIfDue(nowMs: offer.expiresAt) }
+            expect(model.offer == nil && board.text == nil
+                       && pumpUntil { fake.get(\.cancelledOffers) == [expired ?? "-"] },
+                   "SA3C on expiry the Pair URL field is empty, the pasteboard still holding it is cleared and the offer is cancelled once")
+            run { await model.createOffer() }
+            model.copyOffer()
+            board.changeCount += 1  // someone copied something else since
+            board.text = "other"
+            let left = model.offer?.offerId
+            model.pageDisappeared()
+            expect(model.offer == nil && board.text == "other"
+                       && pumpUntil { fake.get(\.cancelledOffers).last == left && fake.get(\.cancelledOffers).count == 2 },
+                   "SA3C when the page disappears the Pair URL field is empty and the offer is cancelled; a pasteboard changed since is left alone")
+
+            // (2b) A wait that ends after the page left is shown on return.
+            run { await model.link(pairUrl: "syrtis-selftest-invitation") }
+            if case .waiting = model.pairing {} else { expect(false, "SA3C a claim starts the wait") }
+            model.pageDisappeared()
+            fake.releasePoll(.success(SA3CFakeClient.producerA))
+            expect(pumpUntil { model.pairing == .linked(fingerprint: SA3CFakeClient.fingerprintA) }
+                       && model.peers.contains { $0.producerStatic == SA3CFakeClient.producerA },
+                   "SA3C a wait that succeeds after leaving the page shows Linked and the device on return")
+            // Cancelled, then the poll succeeds: removed at once, never listed.
+            model.dismissPairingResult()
+            run { await model.link(pairUrl: "syrtis-selftest-invitation") }
+            model.cancelWait()
+            fake.releasePoll(.success(SA3CFakeClient.producerB))
+            expect(pumpUntil { fake.get(\.removedPeers) == [SA3CFakeClient.producerB] }
+                       && pumpUntil { !model.peers.contains { $0.producerStatic == SA3CFakeClient.producerB } }
+                       && model.pairing == .idle,
+                   "SA3C a cancelled wait whose poll then succeeds removes that device once and does not list it")
+            run { await model.link(pairUrl: String(repeating: "x", count: DevicesModel.pairUrlMaxLength + 1)) }
+            expect(model.pairing == .failed(DevicesCopy.invalidInvitation) && fake.get(\.claims) == 2,
+                   "SA3C a pasted invitation over 16,384 bytes is refused without a claim")
+
+            // (2c) Approve sends the pendingId of the row whose SAS was shown.
+            fake.set { $0.pending = [SA3CFakeClient.request("p-shown", sas: "1111-2222")] }
+            run { await model.refresh() }
+            let shownRow = model.pending.first
+            fake.set { $0.pending.insert(SA3CFakeClient.request("p-new", sas: "3333-4444"), at: 0) }
+            run { await model.refresh() }
+            if let shownRow { run { await model.decide(shownRow, approve: true) } }
+            expect(model.pending.map(\.pendingId) == ["p-new", "p-shown"]
+                       && fake.get(\.approvedIds) == ["p-shown"],
+                   "SA3C a request inserted above the shown row: Approve on the shown row sends that row's pendingId")
+            if let shownRow { run { await model.decide(shownRow, approve: false) } }
+            expect(fake.get(\.rejected) == ["p-shown"], "SA3C Reject sends the shown row's pendingId")
+
+            // (4) The listen menu.
+            let choices = ListenAddress.choices(from: [
+                "0.0.0.0", "::", "192.168.1.20", "fe80::1%en0", "fe80::2", "127.0.0.1", "::1",
+                "10.0.0.2", "192.168.1.20", "2001:db8::5",
+            ])
+            let local = ListenAddress.choices(from: ListenAddress.interfaceAddresses())
+            expect(choices == ["127.0.0.1", "192.168.1.20", "10.0.0.2", "2001:db8::5"]
+                       && local.first == ListenAddress.localOnly
+                       && !local.contains("0.0.0.0") && !local.contains("::"),
+                   "SA3C the listen menu is this Mac only plus real addresses; never 0.0.0.0 or ::")
+            expect(ListenAddress.mayBePublic("8.8.8.8") && ListenAddress.mayBePublic("2001:db8::5")
+                       && !ListenAddress.mayBePublic("192.168.1.20") && !ListenAddress.mayBePublic("10.0.0.2")
+                       && !ListenAddress.mayBePublic("172.16.0.1") && !ListenAddress.mayBePublic("100.100.1.1")
+                       && !ListenAddress.mayBePublic("fd00::1") && !ListenAddress.mayBePublic("127.0.0.1"),
+                   "SA3C a public IPv4 or global IPv6 address gets the internet note; private ones do not")
+
+            // (5, Swift side) peers rows carry host and port.
+            let peer = model.peers.first
+            expect(peer?.host == "192.0.2.10" && peer?.port == 47_001
+                       && peer.map(DevicesSettingsView.address) == "192.0.2.10:47001",
+                   "SA3C a peers row decodes host and port and shows host:port")
+        }
+
         accountsDefaults.restore()
 
         if failures > 0 {
@@ -23022,4 +23208,166 @@ func withTemporaryHome<T>(_ home: URL, _ body: () -> T) -> T {
         if let saved { setenv("HOME", saved, 1) } else { unsetenv("HOME") }
     }
     return body()
+}
+
+
+// MARK: - SA-3c fakes
+
+/// The Devices page's client in the selftest: answers from fields, records
+/// every call. Never reaches the agent.
+final class SA3CFakeClient: DevicesRemoteClient, @unchecked Sendable {
+    static let digestA = String(repeating: "a", count: 64)
+    static let digestB = String(repeating: "b", count: 64)
+    static let producerA = String(repeating: "1", count: 64)
+    static let producerB = String(repeating: "2", count: 64)
+    static let fingerprintA = String(repeating: "1", count: 16)
+
+    struct State {
+        var running = true
+        var startError: String?
+        var sharing = false
+        var sharingError: String?
+        var approved = false
+        var digest = SA3CFakeClient.digestA
+        var bindHost: String?
+        var listening = false
+        var nodeLabel: String?
+        var approveCalls: [String] = []
+        var pending: [RemotePending] = []
+        var approvedIds: [String] = []
+        var rejected: [String] = []
+        var cancelledOffers: [String] = []
+        var offers = 0
+        var claims = 0
+        var peers: [String] = []
+        var removedPeers: [String] = []
+    }
+
+    private let lock = NSLock()
+    private var state = State()
+    private let pollGate = DispatchSemaphore(value: 0)
+    private var pollResult: Result<String, Error>?
+
+    func set(_ change: (inout State) -> Void) { lock.withLock { change(&state) } }
+    func get<T>(_ key: KeyPath<State, T>) -> T { lock.withLock { state[keyPath: key] } }
+
+    /// Ends the one waiting `pairPoll`: success carries the producer static.
+    func releasePoll(_ result: Result<String, Error>) {
+        lock.withLock { pollResult = result }
+        pollGate.signal()
+    }
+
+    static func request(_ id: String, sas: String) -> RemotePending {
+        decode(#"{"expiresAt":4102444800000,"pendingId":"\#(id)","sasCode":"\#(sas)"}"#)
+    }
+
+    private static func decode<T: Decodable>(_ json: String) -> T {
+        try! JSONDecoder().decode(T.self, from: Data(json.utf8))
+    }
+
+    private func fail(_ reason: String?) throws {
+        if let reason { throw TBCoreError.bridge(reason) }
+    }
+
+    func start() throws -> RemoteAgentStatus {
+        try fail(get(\.startError))
+        return try status()
+    }
+
+    func status() throws -> RemoteAgentStatus {
+        let s = lock.withLock { state }
+        guard s.running else { return Self.decode(#"{"running":false}"#) }
+        let object: [String: Any] = [
+            "running": true, "sharingEnabled": s.sharing, "scopeApproved": s.approved,
+            "listening": s.listening, "identityFingerprint": "00000000000000ff",
+            "bindHost": s.bindHost as Any, "bindPort": 47_000, "nodeLabel": s.nodeLabel as Any,
+        ]
+        let data = try JSONSerialization.data(withJSONObject: object.compactMapValues { $0 is NSNull ? nil : $0 })
+        return try JSONDecoder().decode(RemoteAgentStatus.self, from: data)
+    }
+
+    func setSharing(_ enabled: Bool) throws {
+        try fail(get(\.sharingError))
+        set { $0.sharing = enabled }
+    }
+
+    func listenConfigure(host: String, port: Int, nodeLabel: String?) throws -> RemoteAgentStatus {
+        set { $0.bindHost = host; $0.listening = true; $0.nodeLabel = nodeLabel }
+        return try status()
+    }
+
+    func scopeDisclosure() throws -> RemoteScopeDisclosure {
+        Self.decode(#"""
+            {"home":"/fixture/home","configDir":"/fixture/config","dataDir":"/fixture/data",
+             "extraScanPaths":{},"excludedScanPaths":{},"opencodeDbPaths":[],"clients":["claude"],
+             "ownerInputsSha256":"\#(get(\.digest))","envRootsSet":false,"envRoots":[]}
+            """#)
+    }
+
+    func scopeApprove(ownerInputsSha256: String) throws {
+        let current = get(\.digest)
+        set { $0.approveCalls.append(ownerInputsSha256) }
+        guard ownerInputsSha256 == current else { throw TBCoreError.bridge("invalid") }
+        set { $0.approved = true }
+    }
+
+    func offerCreate(ttlSeconds: Int64) throws -> RemoteOffer {
+        let n = lock.withLock { state.offers += 1; return state.offers }
+        return Self.decode(#"""
+            {"expiresAt":4102444800000,"offerId":"offer-\#(n)","pairUrl":"syrtis-selftest-pair-url-\#(n)-\#(UUID().uuidString)"}
+            """#)
+    }
+
+    func offerCancel(offerId: String) throws { set { $0.cancelledOffers.append(offerId) } }
+    func pendingList() throws -> [RemotePending] { get(\.pending) }
+    func approve(pendingId: String) throws { set { $0.approvedIds.append(pendingId) } }
+    func reject(pendingId: String) throws { set { $0.rejected.append(pendingId) } }
+    func grants() throws -> [RemoteGrant] { [] }
+    func revoke(grantId: String) throws {}
+
+    func pairClaim(pairUrl: String) throws -> RemoteClaim {
+        let n = lock.withLock { state.claims += 1; return state.claims }
+        return Self.decode(#"{"handle":\#(n),"sas":"5555-6666","expiresAt":4102444800000,"producerFingerprint":"\#(Self.fingerprintA)"}"#)
+    }
+
+    func pairPoll(handle: Int64) throws -> RemotePaired {
+        pollGate.wait()
+        let result = lock.withLock { pollResult }
+        let producer = try result?.get() ?? ""
+        set { $0.peers.append(producer) }  // as the core writes peers.json on success
+        return Self.decode(#"{"producerStatic":"\#(producer)","fingerprint":"\#(producer.prefix(16))","expiresAt":4102444800000}"#)
+    }
+
+    func peers() throws -> [RemotePeer] {
+        get(\.peers).map { producer in
+            Self.decode(#"""
+                {"producerStatic":"\#(producer)","fingerprint":"\#(producer.prefix(16))","nodeLabel":null,
+                 "host":"192.0.2.10","port":47001,"createdAt":1,"expiresAt":4102444800000,"state":"active"}
+                """#)
+        }
+    }
+
+    func peerRemove(producerStatic: String) throws {
+        set { $0.removedPeers.append(producerStatic); $0.peers.removeAll { $0 == producerStatic } }
+    }
+}
+
+/// The pasteboard in the selftest: a field, never NSPasteboard.general.
+@MainActor
+final class SA3CFakePasteboard: DevicesPasteboard {
+    var changeCount = 0
+    var text: String?
+    var marked = false
+
+    func writeSecret(_ text: String) -> Int {
+        changeCount += 1
+        self.text = text
+        marked = true
+        return changeCount
+    }
+
+    func clear() {
+        changeCount += 1
+        text = nil
+    }
 }
