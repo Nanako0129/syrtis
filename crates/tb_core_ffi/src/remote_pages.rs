@@ -313,6 +313,10 @@ fn decode(endpoint: Endpoint, body: &[u8]) -> Option<Report> {
     }
 }
 
+/// The largest UTC offset an hourly record may carry: 14 hours, the widest
+/// offset any zone in the IANA database uses (UTC+14:00).
+const UTC_OFFSET_MAX_SECONDS: u32 = 14 * 3_600;
+
 /// Why a producer's part was left out before `combine`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Refusal {
@@ -462,7 +466,11 @@ fn admit(
                 .zip(day_ms(&query.end_date_exclusive))
                 .ok_or(Refusal::OutOfRange)?;
             let inside = |record: &HourlyRecord| {
-                local_ms(record).is_some_and(|local| (window.0..window.1).contains(&local))
+                // The offset is checked on its own too: the frozen validation
+                // does not bound it, and a bucket from another year plus an
+                // offset of a year would otherwise land inside the range.
+                record.utc_offset_seconds.unsigned_abs() <= UTC_OFFSET_MAX_SECONDS
+                    && local_ms(record).is_some_and(|local| (window.0..window.1).contains(&local))
                     && hour_slot(record).is_some()
             };
             if !records.iter().all(inside) {
@@ -1818,6 +1826,31 @@ mod tests {
     /// that producer's numbers into the owner's older local slots; the
     /// producer is left out whole, the local slots and the other producer are
     /// unchanged.
+    #[test]
+    fn an_out_of_range_bucket_moved_into_range_by_its_offset_is_left_out() {
+        let hourly = ReportQuery {
+            endpoint: Endpoint::Hourly,
+            ..graph_query()
+        };
+        let year = 365 * 86_400;
+        let five_last_year = day_ms("2024-03-10").unwrap() + 5 * 3_600_000;
+        assert_eq!(
+            hour_slot(&hourly_record(five_last_year, year, 1)).unwrap(),
+            "2025-03-10 05:00",
+            "control: bucket plus offset lands inside the asked year"
+        );
+        let moved = Records::Hourly(vec![hourly_record(five_last_year, year, 1_000)]);
+        let five = day_ms("2025-03-10").unwrap() + 5 * 3_600_000;
+        let widest = Records::Hourly(vec![hourly_record(five, 14 * 3_600, 1)]);
+        let remote = assemble(&hourly, vec![pulled(1, moved), pulled(2, widest)]);
+        let rows: Vec<_> = remote
+            .devices
+            .iter()
+            .map(|d| d["state"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(rows, ["invalidReply", "fresh"]);
+    }
+
     #[test]
     fn an_in_range_bucket_with_an_offset_of_a_year_is_left_out() {
         let hourly = ReportQuery {

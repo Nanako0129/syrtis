@@ -121,6 +121,12 @@ pub(crate) struct RemoteAgent {
     /// the cost is that a restart or stop waits for an in-flight fetch (at
     /// most `FETCH_DEADLINE`), and calls made while it waits queue behind it.
     running: RwLock<Option<Running>>,
+    /// Serializes `listen_configure`, which sends the frozen listen command,
+    /// reads the stored address back and writes it again with the label.
+    /// Under the shared `running` lock two such calls could interleave and
+    /// leave the stored address different from the bound one. A separate
+    /// mutex, so the call does not wait behind a producer pull.
+    configuring: Mutex<()>,
     claims: Mutex<Claims>,
     monitor: AtomicBool,
     /// Unix seconds of the last fresh pull, by producer and query
@@ -341,6 +347,10 @@ impl RemoteAgent {
         {
             return Err("invalid".into());
         }
+        let _one_at_a_time = self
+            .configuring
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         self.with(|current| {
             call(
                 current,
