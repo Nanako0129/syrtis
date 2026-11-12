@@ -759,13 +759,17 @@ public enum TBCore {
     // MARK: Device-aware pages (`tb_*_devices`, ctb.h). Every call blocks
     // (`refresh` up to one fetch deadline per selected producer): off the
     // main thread. The result is a `DeviceAwarePayload`, never the page's
-    // own type, so it cannot reach `SnapshotStore`.
+    // own type, so it cannot reach `SnapshotStore`. The timezone is always
+    // this process's (`TimeZone.current`), the one the core computes the
+    // local rows in: another zone would put remote hour slots and dates of
+    // that zone beside local ones of this zone, and the core cannot check.
 
     private static func withDevices<R>(
-        _ selection: DeviceSelection, _ timeZone: String, _ mode: DeviceFetchMode,
+        _ selection: DeviceSelection, _ mode: DeviceFetchMode,
         _ body: (UnsafePointer<CChar>, UnsafePointer<CChar>, UnsafePointer<CChar>) -> R
     ) throws -> R {
         let json = String(decoding: try JSONEncoder().encode(selection), as: UTF8.self)
+        let timeZone = TimeZone.current.identifier
         return json.withCString { devices in
             timeZone.withCString { zone in mode.rawValue.withCString { body(devices, zone, $0) } }
         }
@@ -773,36 +777,36 @@ public enum TBCore {
 
     public static func graphDevices(
         year: String? = nil, selection: DeviceSelection,
-        timeZone: String = TimeZone.current.identifier, mode: DeviceFetchMode
+        mode: DeviceFetchMode
     ) throws -> DeviceAwarePayload<UsagePayload> {
-        try unwrap(try withDevices(selection, timeZone, mode) { devices, zone, mode in
+        try unwrap(try withDevices(selection, mode) { devices, zone, mode in
             withYear(year) { tb_graph_devices($0, devices, zone, mode) }
         })
     }
 
     public static func modelReportDevices(
         year: String? = nil, selection: DeviceSelection,
-        timeZone: String = TimeZone.current.identifier, mode: DeviceFetchMode
+        mode: DeviceFetchMode
     ) throws -> DeviceAwarePayload<ModelReport> {
-        try unwrap(try withDevices(selection, timeZone, mode) { devices, zone, mode in
+        try unwrap(try withDevices(selection, mode) { devices, zone, mode in
             withYear(year) { tb_model_report_devices($0, devices, zone, mode) }
         })
     }
 
     public static func hourlyReportDevices(
         year: String? = nil, clients: [String]? = nil, selection: DeviceSelection,
-        timeZone: String = TimeZone.current.identifier, mode: DeviceFetchMode
+        mode: DeviceFetchMode
     ) throws -> DeviceAwarePayload<HourlyReport> {
-        try unwrap(try withDevices(selection, timeZone, mode) { devices, zone, mode in
+        try unwrap(try withDevices(selection, mode) { devices, zone, mode in
             withYearAndClients(year, clients) { tb_hourly_report_devices($0, $1, devices, zone, mode) }
         })
     }
 
     public static func agentsReportDevices(
         year: String? = nil, clients: [String]? = nil, selection: DeviceSelection,
-        timeZone: String = TimeZone.current.identifier, mode: DeviceFetchMode
+        mode: DeviceFetchMode
     ) throws -> DeviceAwarePayload<AgentsReport> {
-        try unwrap(try withDevices(selection, timeZone, mode) { devices, zone, mode in
+        try unwrap(try withDevices(selection, mode) { devices, zone, mode in
             withYearAndClients(year, clients) { tb_agents_report_devices($0, $1, devices, zone, mode) }
         })
     }

@@ -26,7 +26,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc, LazyLock, Mutex, MutexGuard, PoisonError,
+        Arc, LazyLock, Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard,
     },
     thread,
     time::Duration,
@@ -83,15 +83,17 @@ pub(crate) struct Inputs {
 
 /// Builds the inputs from their sources, now. The same function serves the
 /// start call and every monitor period, so both read the inputs the same
-/// way. Always called under the [`RemoteAgent`] lock, so an older snapshot
-/// cannot be applied after a newer one.
+/// way. A restart builds them under the [`RemoteAgent`] write lock, so an
+/// older snapshot cannot be applied after a newer one.
 pub(crate) type MakeInputs = Arc<dyn Fn() -> Result<Inputs, String> + Send + Sync>;
 
 struct Running {
     agent: Agent,
     inputs: Inputs,
     digest: String,
-    make: MakeInputs,
+    /// Replaced by a start with unchanged inputs, which holds only the read
+    /// lock.
+    make: Mutex<MakeInputs>,
     /// Process-wide start counter; a restart gets a new one. Tests read it
     /// to tell a restart from a no-op.
     #[cfg(test)]
@@ -111,7 +113,14 @@ struct Claims {
 /// thread (started with the first agent, ended when this is dropped).
 #[derive(Default)]
 pub(crate) struct RemoteAgent {
-    running: Mutex<Option<Running>>,
+    /// Read: every call that uses the running agent, including a producer
+    /// pull for `remote_pages`, which holds it for the whole fetch. Write:
+    /// only what replaces or removes the agent (a start or monitor period
+    /// whose inputs changed, `stop`). A pull begun on one agent therefore ends
+    /// before that agent is replaced, so it never writes into the next one;
+    /// the cost is that a restart or stop waits for an in-flight fetch (at
+    /// most `FETCH_DEADLINE`), and calls made while it waits queue behind it.
+    running: RwLock<Option<Running>>,
     claims: Mutex<Claims>,
     monitor: AtomicBool,
     /// Unix seconds of the last fresh pull, by producer and query
@@ -147,6 +156,23 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+fn read<T>(lock: &RwLock<T>) -> RwLockReadGuard<'_, T> {
+    lock.read().unwrap_or_else(PoisonError::into_inner)
+}
+
+fn write<T>(lock: &RwLock<T>) -> RwLockWriteGuard<'_, T> {
+    lock.write().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// The running agent already serves these inputs: the same root and the same
+/// owner-inputs digest.
+fn unchanged(current: &Running, inputs: &Inputs) -> bool {
+    current.inputs.home == inputs.home
+        && current.inputs.state_suffix == inputs.state_suffix
+        && digest_for(inputs, current.agent.source().source_cache_dir()).as_deref()
+            == Some(current.digest.as_str())
+}
+
 /// Makes `running` an agent over the inputs `make` builds now. Running with
 /// the same home and the same owner-inputs digest: kept (with `make` as its
 /// source from now on). Otherwise the old agent is stopped and one is started
@@ -157,11 +183,8 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 fn ensure(running: &mut Option<Running>, make: MakeInputs) -> Result<(), String> {
     let inputs = make()?;
     if let Some(current) = running.as_mut() {
-        let same_root = current.inputs.home == inputs.home
-            && current.inputs.state_suffix == inputs.state_suffix;
-        let digest = digest_for(&inputs, current.agent.source().source_cache_dir());
-        if same_root && digest.as_deref() == Some(current.digest.as_str()) {
-            current.make = make;
+        if unchanged(current, &inputs) {
+            *lock(&current.make) = make;
             return Ok(());
         }
     }
@@ -175,7 +198,7 @@ fn ensure(running: &mut Option<Running>, make: MakeInputs) -> Result<(), String>
         agent,
         inputs,
         digest,
-        make,
+        make: Mutex::new(make),
         #[cfg(test)]
         epoch: EPOCH.fetch_add(1, Ordering::Relaxed) + 1,
     });
@@ -186,7 +209,21 @@ impl RemoteAgent {
     /// Starts the agent over the inputs `make` builds (see [`ensure`]), then
     /// the monitor if it does not run yet. Returns the status.
     pub(crate) fn start(self: &Arc<Self>, make: MakeInputs) -> Reply {
-        let mut running = lock(&self.running);
+        // Unchanged inputs need no restart: answered under the read lock, so
+        // a repeated start does not wait behind an in-flight pull. A running
+        // agent always has its monitor (a start that cannot spawn one stops
+        // the agent it started).
+        {
+            let running = read(&self.running);
+            if let Some(current) = running.as_ref() {
+                let inputs = make()?;
+                if unchanged(current, &inputs) {
+                    *lock(&current.make) = make;
+                    return status_of(current);
+                }
+            }
+        }
+        let mut running = write(&self.running);
         ensure(&mut running, make)?;
         let current = running.as_ref().ok_or("internal")?;
         let period = current.inputs.pricing_period;
@@ -234,19 +271,37 @@ impl RemoteAgent {
         Ok(())
     }
 
-    /// One monitor period: the scope re-check, then the pricing copy.
+    /// One monitor period: the scope re-check, then the pricing copy. Only a
+    /// changed (or unreadable) input takes the write lock; an unchanged one
+    /// is checked under the read lock, beside any pull in flight.
     fn tick(&self) {
-        let mut running = lock(&self.running);
-        recheck(&mut running);
-        if let Some(current) = running.as_ref() {
-            sync_pricing(&current.inputs.pricing_source, current.agent.pricing_dir());
+        let restart = {
+            let running = read(&self.running);
+            let Some(current) = running.as_ref() else {
+                return;
+            };
+            let make = Arc::clone(&lock(&current.make));
+            match make() {
+                Ok(inputs) if unchanged(current, &inputs) => {
+                    sync_pricing(&current.inputs.pricing_source, current.agent.pricing_dir());
+                    false
+                }
+                _ => true,
+            }
+        };
+        if restart {
+            let mut running = write(&self.running);
+            recheck(&mut running);
+            if let Some(current) = running.as_ref() {
+                sync_pricing(&current.inputs.pricing_source, current.agent.pricing_dir());
+            }
         }
     }
 
     /// `Runtime::stop` (by dropping the agent). Stopped already: the same
     /// answer.
     pub(crate) fn stop(&self) -> Reply {
-        let old = lock(&self.running).take();
+        let old = write(&self.running).take();
         drop(old);
         Ok(json!({"running": false}))
     }
@@ -256,7 +311,7 @@ impl RemoteAgent {
     /// `running`, `listening` and the identity's short fingerprint;
     /// `{"running":false}` when stopped.
     pub(crate) fn status(&self) -> Reply {
-        match lock(&self.running).as_ref() {
+        match read(&self.running).as_ref() {
             Some(current) => status_of(current),
             None => Ok(json!({"running": false})),
         }
@@ -573,7 +628,7 @@ impl RemoteAgent {
     }
 
     fn with<T>(&self, body: impl FnOnce(&Running) -> Result<T, String>) -> Result<T, String> {
-        match lock(&self.running).as_ref() {
+        match read(&self.running).as_ref() {
             Some(current) => body(current),
             None => Err("notRunning".into()),
         }
@@ -594,9 +649,9 @@ impl RemoteAgent {
         })
     }
 
-    /// `Runtime::pull` of one producer, under the agent lock (a restart
-    /// cannot drop the agent mid-pull; a management call waits for at most
-    /// this one fetch). A fresh pull stamps [`last_success_at`]. A refusal
+    /// `Runtime::pull` of one producer, under the agent's read lock for the
+    /// whole fetch: other calls go on beside it, and a restart (write lock)
+    /// waits until it ends, so it never writes into a newer agent. A fresh pull stamps [`last_success_at`]. A refusal
     /// with error code 2 (`CheckGrantStatus`) asks Grant status once and
     /// stores the answer (`revoked` / `expired`: `PeerStore::set_state`;
     /// `active`: `PeerStore::update_grant`); the pull is not retried. `None`:
@@ -606,7 +661,7 @@ impl RemoteAgent {
         producer: &[u8; 32],
         query: &ReportQuery,
     ) -> Option<Result<Fetched, PullError>> {
-        let running = lock(&self.running);
+        let running = read(&self.running);
         let current = running.as_ref()?;
         let result = current.agent.runtime().pull(producer, query);
         match &result {
@@ -628,7 +683,7 @@ impl RemoteAgent {
         producer: &[u8; 32],
         query: &ReportQuery,
     ) -> Option<CachedBody> {
-        let running = lock(&self.running);
+        let running = read(&self.running);
         let current = running.as_ref()?;
         current
             .agent
@@ -641,7 +696,7 @@ impl RemoteAgent {
     /// Test access to the running agent (its peer store and identity).
     #[cfg(test)]
     pub(crate) fn with_agent<T>(&self, body: impl FnOnce(&Agent) -> T) -> Option<T> {
-        lock(&self.running)
+        read(&self.running)
             .as_ref()
             .map(|current| body(&current.agent))
     }
@@ -894,7 +949,10 @@ fn client_class(error: ClientError) -> String {
 /// new inputs. Inputs that cannot be built any more: stopped, so a scope
 /// that can no longer be read is not served.
 fn recheck(running: &mut Option<Running>) {
-    let Some(make) = running.as_ref().map(|current| Arc::clone(&current.make)) else {
+    let Some(make) = running
+        .as_ref()
+        .map(|current| Arc::clone(&lock(&current.make)))
+    else {
         return;
     };
     if ensure(running, make).is_err() {
@@ -1259,7 +1317,7 @@ mod tests {
     }
 
     fn epoch(agent: &RemoteAgent) -> u64 {
-        lock(&agent.running).as_ref().unwrap().epoch
+        read(&agent.running).as_ref().unwrap().epoch
     }
 
     fn pull(receiver: &RemoteAgent, producer: &[u8; 32]) -> Result<(), PullError> {
@@ -1270,7 +1328,7 @@ mod tests {
             timezone: "UTC".into(),
             clients: Vec::new(),
         };
-        let running = lock(&receiver.running);
+        let running = read(&receiver.running);
         running
             .as_ref()
             .unwrap()
@@ -1437,7 +1495,7 @@ mod tests {
         }
         let agent = Arc::new(RemoteAgent::default());
         start(&agent, &home, &clock, ScannerSettings::default());
-        let destination = lock(&agent.running)
+        let destination = read(&agent.running)
             .as_ref()
             .unwrap()
             .agent
@@ -1489,7 +1547,7 @@ mod tests {
     }
 
     fn global_epoch() -> u64 {
-        lock(&AGENT.running).as_ref().unwrap().epoch
+        read(&AGENT.running).as_ref().unwrap().epoch
     }
 
     /// Acceptance (2), (2b), (3) and the input-change rule through the C entry
@@ -1645,7 +1703,7 @@ mod tests {
             outside.is_empty(),
             "paths outside the temp root: {outside:?}"
         );
-        let copied = lock(&AGENT.running)
+        let copied = read(&AGENT.running)
             .as_ref()
             .unwrap()
             .agent

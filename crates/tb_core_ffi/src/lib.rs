@@ -1918,7 +1918,9 @@ pub extern "C" fn tb_cursor_sync(user_initiated: i32) -> *mut c_char {
 /// (`remote_pages`). Each takes, besides the existing arguments,
 /// `devices_json` (`{"local": bool, "peers": ["<64 hex producer static>", …]}`,
 /// at least one source, at most 16 peers, none twice), `timezone` (an IANA
-/// identifier; one the engine's bundled tzdb does not accept makes every
+/// identifier, which must be the zone the local rows are computed in, this
+/// process's own: it is not checked, because the IANA name of that zone is
+/// not known here; one the engine's bundled tzdb does not accept makes every
 /// producer `incompatible` and nothing is sent) and `mode` (`cached`: the
 /// local part and each producer's last good body, no connection; `refresh`:
 /// each selected producer is pulled). Success data is the existing payload

@@ -407,7 +407,9 @@ char *tb_remote_peer_remove(const char *producer_static);
 // The four dashboard payloads with paired producers' usage folded in (macOS
 // and Linux only). devices_json = {"local": bool, "peers": ["<64 hex
 // producerStatic>", ...]} (at least one source, at most 16 peers, none
-// twice); timezone = IANA id (TimeZone.current.identifier); mode = "cached"
+// twice); timezone = IANA id of the zone the local rows are computed in
+// (this process's own zone; the core cannot check it, and another zone would
+// merge two zones' hour slots and dates); mode = "cached"
 // (no connection) or "refresh". Data = the existing payload plus
 // devices:[{id ("local" or the 16-hex fingerprint), label (host:port or null),
 // state (local|fresh|lastGood|stale|unavailable|refused|invalidReply|

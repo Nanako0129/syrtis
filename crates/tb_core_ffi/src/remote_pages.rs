@@ -21,7 +21,7 @@
 //! reaches `GRAPH_CACHE` or any snapshot.
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeSet, HashMap},
     sync::{LazyLock, Mutex, PoisonError},
     time::Duration,
 };
@@ -51,11 +51,8 @@ pub(crate) const PEER_RECORDS_MAX: usize = 32_768;
 /// Most records all selected producers together may contribute; the producer
 /// whose part would pass it is left out whole.
 pub(crate) const TOTAL_RECORDS_MAX: usize = 131_072;
-/// The widest UTC offset either side of a date, so an hour bucket of a day in
-/// range is never refused for its offset.
-const OFFSET_SLACK_MS: i64 = 14 * 3_600_000;
 
-/// One remote fold at a time: the four pages queue here rather than compete
+/// One `refresh` at a time: the four pages queue here rather than compete
 /// for the runtime's two fetch slots.
 static SERIAL: Mutex<()> = Mutex::new(());
 /// The memory charged for decoding cached bodies and for holding each
@@ -209,7 +206,8 @@ pub(crate) fn local_device() -> Value {
 }
 
 /// Pulls (or reads the last good body of) every selected producer, one at a
-/// time under [`SERIAL`], then [`assemble`].
+/// time, then [`assemble`]. Only `refresh` takes [`SERIAL`]: a `cached` call
+/// connects to nothing and must not wait behind a pull.
 pub(crate) fn gather(
     agent: &RemoteAgent,
     peers: &[[u8; 32]],
@@ -223,7 +221,8 @@ pub(crate) fn gather(
             saturated: false,
         };
     }
-    let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+    let _serial =
+        (mode == Mode::Refresh).then(|| SERIAL.lock().unwrap_or_else(PoisonError::into_inner));
     let records = agent.peer_records();
     let accepted = query_accepted(query);
     let mut pulled = Vec::with_capacity(peers.len());
@@ -430,9 +429,19 @@ pub(crate) fn state_of(status: Option<PartStatus>, last_success: Option<i64>) ->
 
 /// One producer's records against the request (the frozen record validation
 /// does not check them against it): every graph date in
-/// `[startDate, endDateExclusive)`, every hour bucket inside that range's
-/// milliseconds widened by [`OFFSET_SLACK_MS`] each side and convertible to
-/// a local hour; then the record limits; then a reservation for holding them.
+/// `[startDate, endDateExclusive)`; every hour bucket's local wall time
+/// ([`local_ms`], the time its slot is built from) inside that range's
+/// milliseconds, so a producer cannot move its numbers into slots of another
+/// date with an offset (the frozen validation does not bound
+/// `utcOffsetSeconds`); then the record limits; then a reservation for
+/// holding them.
+///
+/// No slack is needed: the engine buckets a message by its local date in
+/// the query timezone, keeps it only when that date is in the range, and
+/// takes as the bucket start an instant whose local date and hour are the
+/// message's and whose offset is the one it reports (`bucket_start` in
+/// `tokscale-core/src/remote_report.rs`), so a correct record's local wall
+/// time is on a requested date.
 fn admit(
     query: &ReportQuery,
     records: &Records,
@@ -450,14 +459,10 @@ fn admit(
         }
         Records::Hourly(records) => {
             let window = day_ms(&query.start_date)
-                .and_then(|start| start.checked_sub(OFFSET_SLACK_MS))
-                .zip(
-                    day_ms(&query.end_date_exclusive)
-                        .and_then(|end| end.checked_add(OFFSET_SLACK_MS)),
-                )
+                .zip(day_ms(&query.end_date_exclusive))
                 .ok_or(Refusal::OutOfRange)?;
             let inside = |record: &HourlyRecord| {
-                (window.0..window.1).contains(&record.bucket_start_unix_ms)
+                local_ms(record).is_some_and(|local| (window.0..window.1).contains(&local))
                     && hour_slot(record).is_some()
             };
             if !records.iter().all(inside) {
@@ -530,14 +535,20 @@ fn held_bytes(records: &Records) -> usize {
 /// timezone, so their sum is the local wall time. Checked: `None` on any
 /// overflow.
 pub(crate) fn hour_slot(record: &HourlyRecord) -> Option<String> {
-    let offset_ms = i64::from(record.utc_offset_seconds).checked_mul(1_000)?;
-    let local = record.bucket_start_unix_ms.checked_add(offset_ms)?;
+    let local = local_ms(record)?;
     Some(
         DateTime::from_timestamp_millis(local)?
             .naive_utc()
             .format("%Y-%m-%d %H:00")
             .to_string(),
     )
+}
+
+/// `bucketStartUnixMs + utcOffsetSeconds`: the bucket's local wall time as
+/// if it were UTC, in milliseconds. Checked: `None` on any overflow.
+fn local_ms(record: &HourlyRecord) -> Option<i64> {
+    let offset_ms = i64::from(record.utc_offset_seconds).checked_mul(1_000)?;
+    record.bucket_start_unix_ms.checked_add(offset_ms)
 }
 
 // --------------------------------------------------------- arithmetic ---
@@ -638,6 +649,20 @@ pub(crate) fn fold_graph(
         .enumerate()
         .map(|(at, day)| (day.date.clone(), at))
         .collect();
+    // (day, client, model, provider) -> row, so a day with many rows is not
+    // scanned once per record.
+    let mut rows: HashMap<(usize, String, String, String), usize> = HashMap::new();
+    for (at, day) in days.iter().enumerate() {
+        for (row, entry) in day.clients.iter().enumerate() {
+            rows.entry((
+                at,
+                entry.client.clone(),
+                entry.model_id.clone(),
+                entry.provider_id.clone(),
+            ))
+            .or_insert(row);
+        }
+    }
     for record in records {
         let at = *index.entry(record.date.clone()).or_insert_with(|| {
             days.push(tokscale_core::DailyContribution {
@@ -653,11 +678,16 @@ pub(crate) fn fold_graph(
         });
         let day = &mut days[at];
         let (model, provider) = (text(&record.model), text(&record.provider));
-        let row = match day.clients.iter().position(|row| {
-            row.client == record.client && row.model_id == model && row.provider_id == provider
-        }) {
-            Some(row) => row,
+        let key = (
+            at,
+            record.client.clone(),
+            model.to_owned(),
+            provider.to_owned(),
+        );
+        let row = match rows.get(&key) {
+            Some(row) => *row,
             None => {
+                rows.insert(key, day.clients.len());
                 day.clients.push(tokscale_core::ClientContribution {
                     client: record.client.clone(),
                     model_id: model.to_owned(),
@@ -743,13 +773,19 @@ pub(crate) fn fold_models(
         .drain(..)
         .map(|entry| (entry, false))
         .collect();
+    let mut index: HashMap<(String, String, String), usize> = HashMap::new();
+    for (at, (row, _)) in rows.iter().enumerate() {
+        index
+            .entry((row.client.clone(), row.model.clone(), row.provider.clone()))
+            .or_insert(at);
+    }
     for record in records {
         let (model, provider) = (text(&record.model), text(&record.provider));
-        let at = match rows.iter().position(|(row, _)| {
-            row.client == record.client && row.model == model && row.provider == provider
-        }) {
-            Some(at) => at,
+        let key = (record.client.clone(), model.to_owned(), provider.to_owned());
+        let at = match index.get(&key) {
+            Some(at) => *at,
             None => {
+                index.insert(key, rows.len());
                 rows.push((
                     tokscale_core::ModelUsage {
                         client: record.client.clone(),
@@ -835,15 +871,21 @@ pub(crate) fn fold_hourly(
     saturated: &mut bool,
 ) {
     let entries = &mut report.entries;
-    let mut touched = vec![false; entries.len()];
+    let mut index: HashMap<String, usize> = HashMap::new();
+    for (at, entry) in entries.iter().enumerate() {
+        index.entry(entry.hour.clone()).or_insert(at);
+    }
+    // The clients and models of each touched slot, written out once, sorted.
+    let mut sets: HashMap<usize, (BTreeSet<String>, BTreeSet<String>)> = HashMap::new();
     for record in records {
         // `admit` refused any record without a slot.
         let Some(hour) = hour_slot(record) else {
             continue;
         };
-        let at = match entries.iter().position(|entry| entry.hour == hour) {
-            Some(at) => at,
+        let at = match index.get(&hour) {
+            Some(at) => *at,
             None => {
+                index.insert(hour.clone(), entries.len());
                 entries.push(tokscale_core::HourlyUsage {
                     hour,
                     clients: Vec::new(),
@@ -857,11 +899,9 @@ pub(crate) fn fold_hourly(
                     reasoning: 0,
                     cost: 0.0,
                 });
-                touched.push(false);
                 entries.len() - 1
             }
         };
-        touched[at] = true;
         let entry = &mut entries[at];
         add_i64(&mut entry.input, record.input_tokens, saturated);
         add_i64(&mut entry.output, record.output_tokens, saturated);
@@ -871,20 +911,20 @@ pub(crate) fn fold_hourly(
         add_i32(&mut entry.message_count, record.message_count, saturated);
         add_i32(&mut entry.turn_count, record.turn_count, saturated);
         entry.cost += usd(record.cost_nano_usd);
-        if !entry.clients.contains(&record.client) {
-            entry.clients.push(record.client.clone());
-        }
+        let (clients, models) = sets.entry(at).or_insert_with(|| {
+            (
+                entry.clients.iter().cloned().collect(),
+                entry.models.iter().cloned().collect(),
+            )
+        });
+        clients.insert(record.client.clone());
         if let Some(model) = &record.model {
-            if !entry.models.contains(model) {
-                entry.models.push(model.clone());
-            }
+            models.insert(model.clone());
         }
     }
-    for (entry, touched) in entries.iter_mut().zip(touched) {
-        if touched {
-            entry.clients.sort();
-            entry.models.sort();
-        }
+    for (at, (clients, models)) in sets {
+        entries[at].clients = clients.into_iter().collect();
+        entries[at].models = models.into_iter().collect();
     }
     entries.sort_by(|a, b| a.hour.cmp(&b.hour));
     report.total_cost = entries.iter().map(|e| e.cost).sum::<f64>() + 0.0;
@@ -901,10 +941,18 @@ pub(crate) fn fold_agents(
     saturated: &mut bool,
 ) {
     let entries = &mut report.entries;
+    let mut index: HashMap<String, usize> = HashMap::new();
+    for (at, entry) in entries.iter().enumerate() {
+        index.entry(entry.agent.clone()).or_insert(at);
+    }
+    // The clients of each entry that gained one, written out once, sorted (an
+    // entry that gained none keeps its order, as before).
+    let mut sets: HashMap<usize, BTreeSet<String>> = HashMap::new();
     for record in records {
-        let at = match entries.iter().position(|entry| entry.agent == record.agent) {
-            Some(at) => at,
+        let at = match index.get(&record.agent) {
+            Some(at) => *at,
             None => {
+                index.insert(record.agent.clone(), entries.len());
                 entries.push(tokscale_core::AgentReportEntry {
                     agent: record.agent.clone(),
                     clients: Vec::new(),
@@ -927,10 +975,18 @@ pub(crate) fn fold_agents(
         add_i64(&mut entry.reasoning, record.reasoning_tokens, saturated);
         add_i32(&mut entry.messages, record.message_count, saturated);
         entry.cost += usd(record.cost_nano_usd);
-        if !entry.clients.contains(&record.client) {
-            entry.clients.push(record.client.clone());
-            entry.clients.sort();
+        let known = sets.get(&at).map_or_else(
+            || entry.clients.contains(&record.client),
+            |set| set.contains(&record.client),
+        );
+        if !known {
+            sets.entry(at)
+                .or_insert_with(|| entry.clients.iter().cloned().collect())
+                .insert(record.client.clone());
         }
+    }
+    for (at, clients) in sets {
+        entries[at].clients = clients.into_iter().collect();
     }
     let total = |e: &tokscale_core::AgentReportEntry| {
         e.input
@@ -1318,6 +1374,13 @@ mod tests {
             .output()
             .unwrap();
         let stdout = String::from_utf8_lossy(&out.stdout);
+        // Measurements the child printed, passed on.
+        for line in stdout
+            .lines()
+            .filter_map(|line| line.find("SA3B-").map(|at| &line[at..]))
+        {
+            println!("{line}");
+        }
         assert!(
             out.status.success() && stdout.contains("1 passed"),
             "child failed: {}\n{stdout}\n{}",
@@ -1425,7 +1488,17 @@ mod tests {
     /// A usable record in `receiver`'s peer store for a producer that does
     /// not exist, at `port`; `created_at_ms` as given.
     fn fake_peer(receiver: &RemoteAgent, key: u8, port: u16, created_at_ms: i64) -> [u8; 32] {
-        let responder = [key; 32];
+        fake_peer_as(receiver, [key; 32], key, port, created_at_ms)
+    }
+
+    /// [`fake_peer`] with a given responder static.
+    fn fake_peer_as(
+        receiver: &RemoteAgent,
+        responder: [u8; 32],
+        key: u8,
+        port: u16,
+        created_at_ms: i64,
+    ) -> [u8; 32] {
         receiver
             .with_agent(|agent| {
                 let identity = agent
@@ -1709,13 +1782,15 @@ mod tests {
         let ok = Records::Hourly(vec![hourly_record(march, 0, 1)]);
         let extreme = Records::Hourly(vec![hourly_record(i64::MAX - 1, 3_600, 1)]);
         let early = Records::Hourly(vec![hourly_record(
-            day_ms("2025-01-01").unwrap() - OFFSET_SLACK_MS - 1,
+            day_ms("2025-01-01").unwrap() - 3_600_000,
             0,
             1,
         )]);
+        // 2025-12-31 23:00 at UTC-8: the bucket itself is past the range end,
+        // its local wall time is not.
         let edge = Records::Hourly(vec![hourly_record(
-            day_ms("2026-01-01").unwrap() + OFFSET_SLACK_MS - 3_600_000,
-            -3_600,
+            day_ms("2026-01-01").unwrap() + 7 * 3_600_000,
+            -28_800,
             1,
         )]);
         let remote = assemble(
@@ -1737,6 +1812,61 @@ mod tests {
             panic!()
         };
         assert_eq!(kept.len(), 2);
+    }
+
+    /// Review fix 1: a bucket inside the range with an offset of a year moves
+    /// that producer's numbers into the owner's older local slots; the
+    /// producer is left out whole, the local slots and the other producer are
+    /// unchanged.
+    #[test]
+    fn an_in_range_bucket_with_an_offset_of_a_year_is_left_out() {
+        let hourly = ReportQuery {
+            endpoint: Endpoint::Hourly,
+            ..graph_query()
+        };
+        let five = day_ms("2025-03-10").unwrap() + 5 * 3_600_000;
+        let shifted = Records::Hourly(vec![hourly_record(five, -365 * 86_400, 1_000)]);
+        assert_eq!(
+            hour_slot(&hourly_record(five, -365 * 86_400, 1)).unwrap(),
+            "2024-03-10 05:00",
+            "control: the offset alone moves the slot a year back"
+        );
+        let honest = Records::Hourly(vec![hourly_record(five, 0, 1)]);
+        let remote = assemble(&hourly, vec![pulled(1, shifted), pulled(2, honest)]);
+        let rows: Vec<_> = remote
+            .devices
+            .iter()
+            .map(|d| d["state"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(rows, ["invalidReply", "fresh"]);
+        let Some(Records::Hourly(kept)) = remote.records else {
+            panic!()
+        };
+        let slot = |hour: &str, input| tokscale_core::HourlyUsage {
+            hour: hour.into(),
+            clients: vec!["codex".into()],
+            models: vec![],
+            input,
+            output: 0,
+            cache_read: 0,
+            cache_write: 0,
+            message_count: 1,
+            turn_count: 0,
+            reasoning: 0,
+            cost: 0.0,
+        };
+        let mut local = tokscale_core::HourlyReport {
+            entries: vec![slot("2024-03-10 05:00", 100), slot("2025-03-10 05:00", 5)],
+            total_cost: 0.0,
+            processing_time_ms: 0,
+        };
+        fold_hourly(&mut local, &kept, &mut false);
+        let inputs: Vec<_> = local
+            .entries
+            .iter()
+            .map(|e| (e.hour.as_str(), e.input))
+            .collect();
+        assert_eq!(inputs, [("2024-03-10 05:00", 100), ("2025-03-10 05:00", 6)]);
     }
 
     /// Acceptance (9b): the record limits leave the producer out whole.
@@ -2022,6 +2152,120 @@ mod tests {
         assert_eq!((main.input, main.messages), (15, 3));
         assert_eq!(main.clients, ["claude", "codex"]);
         assert_eq!(agents.total_messages, 5);
+    }
+
+    /// Review fix 3: one producer's 32,768 distinct records under one day,
+    /// one model key space, one hour slot and one agent fold in time that
+    /// grows about linearly. Bound: each page under `FOLD_BOUND`; the timings
+    /// are printed (`SA3B-FOLD`).
+    #[test]
+    fn folds_of_32768_distinct_records_are_not_quadratic() {
+        const FOLD_BOUND: Duration = Duration::from_secs(2);
+        let n = PEER_RECORDS_MAX;
+        let client = |i: usize| format!("c{i:06}");
+        let graph_records: Vec<_> = (0..n)
+            .map(|i| {
+                let mut r = graph_record("2025-03-10", 1, 0);
+                r.client = client(i);
+                r
+            })
+            .collect();
+        let model_records: Vec<_> = (0..n)
+            .map(|i| {
+                let mut r = models_record("m", 1, 0);
+                r.client = client(i);
+                r
+            })
+            .collect();
+        let bucket = day_ms("2025-03-10").unwrap();
+        let hourly_records: Vec<_> = (0..n)
+            .map(|i| {
+                let mut r = hourly_record(bucket, 0, 1);
+                r.client = client(i);
+                r.model = Some(format!("m{i:06}"));
+                r
+            })
+            .collect();
+        let agent_records: Vec<_> = (0..n)
+            .map(|i| AgentsRecord {
+                agent: "Main".into(),
+                client: client(i),
+                model: None,
+                provider: None,
+                input_tokens: 1,
+                output_tokens: 0,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
+                reasoning_tokens: 0,
+                total_tokens: 1,
+                message_count: 1,
+                turn_count: 0,
+                cost_nano_usd: 0,
+            })
+            .collect();
+        let mut saturated = false;
+        let started = std::time::Instant::now();
+        let mut graph = empty_graph();
+        fold_graph(&mut graph, &graph_records, &mut saturated);
+        let graph_time = started.elapsed();
+        let started = std::time::Instant::now();
+        let mut models = tokscale_core::ModelReport {
+            entries: Vec::new(),
+            total_input: 0,
+            total_output: 0,
+            total_cache_read: 0,
+            total_cache_write: 0,
+            total_messages: 0,
+            total_cost: 0.0,
+            processing_time_ms: 0,
+        };
+        fold_models(&mut models, &model_records, &mut saturated);
+        let models_time = started.elapsed();
+        let started = std::time::Instant::now();
+        let mut hourly = tokscale_core::HourlyReport {
+            entries: Vec::new(),
+            total_cost: 0.0,
+            processing_time_ms: 0,
+        };
+        fold_hourly(&mut hourly, &hourly_records, &mut saturated);
+        let hourly_time = started.elapsed();
+        let started = std::time::Instant::now();
+        let mut agents = tokscale_core::AgentReport {
+            entries: Vec::new(),
+            total_cost: 0.0,
+            total_messages: 0,
+            processing_time_ms: 0,
+        };
+        fold_agents(&mut agents, &agent_records, &mut saturated);
+        let agents_time = started.elapsed();
+        println!(
+            "SA3B-FOLD graph={graph_time:?} models={models_time:?} hourly={hourly_time:?} agents={agents_time:?}"
+        );
+        // Control: every record reached its page.
+        assert_eq!(graph.contributions[0].clients.len(), n);
+        assert_eq!(models.entries.len(), n);
+        assert_eq!(
+            (
+                hourly.entries.len(),
+                hourly.entries[0].clients.len(),
+                hourly.entries[0].models.len()
+            ),
+            (1, n, n)
+        );
+        assert_eq!(
+            (agents.entries.len(), agents.entries[0].clients.len()),
+            (1, n)
+        );
+        assert!(hourly.entries[0].clients.windows(2).all(|w| w[0] < w[1]));
+        assert!(agents.entries[0].clients.windows(2).all(|w| w[0] < w[1]));
+        for (page, time) in [
+            ("graph", graph_time),
+            ("models", models_time),
+            ("hourly", hourly_time),
+            ("agents", agents_time),
+        ] {
+            assert!(time < FOLD_BOUND, "{page} fold took {time:?}");
+        }
     }
 
     // ------------------------------------------------------ integration ---
@@ -2424,6 +2668,89 @@ mod tests {
         );
         assert_eq!(day(&stale, "2025-03-10")["tokenBreakdown"]["input"], 1000);
         drop(a);
+    }
+
+    /// Review fix 2: a producer that completes the handshake and then never
+    /// answers holds a `refresh` in its fetch. Meanwhile a `cached` call for
+    /// the same page and a management call (`peer_remove`) both return
+    /// within `BOUND`; the refresh is still waiting when they do.
+    #[test]
+    fn a_silent_producer_blocks_neither_cached_calls_nor_management() {
+        if !in_child("a_silent_producer_blocks_neither_cached_calls_nor_management") {
+            return;
+        }
+        const BOUND: Duration = Duration::from_secs(2);
+        let root = child_root().unwrap();
+        let clock = TestClock::new();
+        let r_home = root.join("r");
+        fs::create_dir_all(&r_home).unwrap();
+        let receiver = agent_at(&r_home, &clock);
+        let key = syrtis_agent::noise::StaticKey::generate().unwrap();
+        let silent = *key.public();
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (handshook, handshake) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let session = syrtis_agent::noise::accept(stream, &key);
+            handshook.send(session.is_ok()).unwrap();
+            let _ = released.recv_timeout(Duration::from_secs(60));
+            drop(session);
+        });
+        fake_peer_as(&receiver, silent, 0x51, port, 1);
+        let other = fake_peer(&receiver, 0x52, free_port(), 1);
+
+        let pulling = Arc::clone(&receiver);
+        let refresh = std::thread::spawn(move || {
+            let context = crate::LocalSourceContext::current();
+            graph(&call(
+                &pulling,
+                &context,
+                false,
+                &[silent],
+                "UTC",
+                Mode::Refresh,
+            ))
+            .unwrap()
+        });
+        assert!(
+            handshake.recv_timeout(Duration::from_secs(10)).unwrap(),
+            "the refresh did not complete the handshake"
+        );
+        let context = crate::LocalSourceContext::current();
+        let started = std::time::Instant::now();
+        let cached = graph(&call(
+            &receiver,
+            &context,
+            false,
+            &[silent],
+            "UTC",
+            Mode::Cached,
+        ))
+        .unwrap();
+        let cached_time = started.elapsed();
+        let started = std::time::Instant::now();
+        receiver.peer_remove(&hex_encode(&other)).unwrap();
+        let remove_time = started.elapsed();
+        let still_waiting = !refresh.is_finished();
+        release.send(()).unwrap();
+        server.join().unwrap();
+        let refreshed = refresh.join().unwrap();
+        println!("SA3B-LOCK cached={cached_time:?} remove={remove_time:?}");
+        assert!(still_waiting, "control: the refresh had already ended");
+        assert_eq!(
+            states(&cached),
+            [(fingerprint(&silent), "unavailable".into())]
+        );
+        assert!(cached_time < BOUND, "cached call took {cached_time:?}");
+        assert!(remove_time < BOUND, "peer_remove took {remove_time:?}");
+        assert!(receiver
+            .peer_records()
+            .unwrap()
+            .iter()
+            .all(|r| r.responder_static != other));
+        assert_ne!(states(&refreshed)[0].1, "fresh");
     }
 
     /// Deferred items (3) and (9d): a record superseded by a newer one at the
