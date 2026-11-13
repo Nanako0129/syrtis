@@ -751,6 +751,7 @@
 "Device name" = "设备名称";
 "Listen on" = "监听地址";
 "This Mac only (127.0.0.1)" = "仅限这台 Mac（127.0.0.1）";
+"Choose an address" = "选择地址";
 "Port" = "端口";
 "Apply" = "应用";
 "Other devices can't reach this Mac." = "其他设备连不到这台 Mac。";
