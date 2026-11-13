@@ -470,7 +470,20 @@ impl RemoteAgent {
                             "peerFingerprint": fingerprint(&grant.initiator_static),
                             "createdAt": grant.created_at_ms,
                             "expiresAt": grant.expires_at_ms,
+                            // A stored `Active` grant stops authorizing when
+                            // a scope approval moves the generation and
+                            // raises the deny floor (`security::authorize`);
+                            // the record itself is not rewritten. Listed as
+                            // `active` it would show a device that can no
+                            // longer read as one that can.
                             "state": match grant.state {
+                                GrantState::Active
+                                    if grant.auth_epoch <= state.reference.deny_floor
+                                        || grant.source_scope_generation
+                                            != state.reference.source_scope_generation =>
+                                {
+                                    "superseded"
+                                }
                                 GrantState::Active => "active",
                                 GrantState::Revoked => "revoked",
                                 GrantState::Expired => "expired",
@@ -1462,6 +1475,17 @@ mod tests {
             claude_root(&producer_home),
         );
         assert_eq!(epoch(&producer), same, "unchanged inputs must not restart");
+
+        // Approving the new scope moves the generation: the grant made under
+        // the old one can never read again, and the list says so instead of
+        // still calling it active.
+        assert_eq!(producer.grants().unwrap()[0]["state"], "active");
+        let digest = producer.scope_disclosure().unwrap()["ownerInputsSha256"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        producer.scope_approve(&digest).unwrap();
+        assert_eq!(producer.grants().unwrap()[0]["state"], "superseded");
 
         producer.revoke(grant["grantId"].as_str().unwrap()).unwrap();
         assert_eq!(producer.grants().unwrap()[0]["state"], "revoked");

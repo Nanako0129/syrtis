@@ -91,7 +91,7 @@ flowchart LR
 | `tb_remote_offer_create(ttl_seconds)` | `{expiresAt, offerId, pairUrl}` |
 | `tb_remote_offer_cancel(offer_id)`、`tb_remote_approve`／`tb_remote_reject(pending_id, sas_generation)`、`tb_remote_revoke(grant_id)` | control 命令的資料（`null`） |
 | `tb_remote_pending_list()` | `[{expiresAt, pendingId, sasCode}]` |
-| `tb_remote_grants()` | `[{grantId, peerFingerprint, createdAt, expiresAt, state}]` |
+| `tb_remote_grants()` | `[{grantId, peerFingerprint, createdAt, expiresAt, state}]`；`state`＝`active`／`revoked`／`expired`／`superseded`（紀錄仍是 active，但之後的掃描範圍核准把 generation 往前推、deny floor 提高，它已不能授權；Devices 頁只列 `active`，所以這種裝置不再顯示為可存取） |
 | `tb_remote_pair_claim(pair_url)` | `{handle, sas, expiresAt, producerFingerprint}` |
 | `tb_remote_pair_poll(handle)` | `{producerStatic, fingerprint, expiresAt}`；最多阻塞凍結的 960 秒 poll window，成功時寫入 `peers.json`。等待期間 agent 若換到另一個 identity 重啟 → `identityChanged`，什麼都不寫 |
 | `tb_remote_peers()` | `[{producerStatic, fingerprint, nodeLabel, host, port, createdAt, expiresAt, state}]`；`host`／`port` 是配對時領取的邀請上的位址 |
