@@ -392,7 +392,9 @@ char *tb_remote_offer_cancel(const char *offer_id);
 char *tb_remote_pending_list(void);
 char *tb_remote_approve(const char *pending_id, int64_t sas_generation);
 char *tb_remote_reject(const char *pending_id, int64_t sas_generation);
-// [{grantId, peerFingerprint, createdAt, expiresAt, state}].
+// [{grantId, peerFingerprint, createdAt, expiresAt, state}]; state is active,
+// revoked, expired, or superseded (stored active, but a later scope approval
+// ended its authorization).
 char *tb_remote_grants(void);
 char *tb_remote_revoke(const char *grant_id);
 // Receiver. {handle, sas, expiresAt, producerFingerprint}.
