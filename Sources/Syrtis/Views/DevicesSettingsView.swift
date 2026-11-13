@@ -253,8 +253,7 @@ struct DevicesSettingsView: View {
                 pathList(DevicesCopy.openCodeDatabases, disclosure.opencodeDbPaths)
                 pathList(DevicesCopy.clients, [disclosure.clients.joined(separator: ", ")])
                 if disclosure.envRootsSet {
-                    notice(DevicesCopy.envRoots.localized(
-                        disclosure.envRoots.map(\.variable).joined(separator: ", ")))
+                    notice(DevicesCopy.envRoots.localized(Self.variableNames(disclosure.envRoots)))
                 }
             }
             if model.scopeApproved {
@@ -376,6 +375,14 @@ struct DevicesSettingsView: View {
 
     static func address(_ peer: RemotePeer) -> String {
         peer.host.contains(":") ? "[\(peer.host)]:\(peer.port)" : "\(peer.host):\(peer.port)"
+    }
+
+    /// Each variable once, in the order given: several clients can follow
+    /// the same variable (all of tokscale's own roots follow
+    /// `TOKSCALE_CONFIG_DIR`), and the notice listed it once per client.
+    static func variableNames(_ roots: [RemoteScopeDisclosure.EnvRoot]) -> String {
+        var seen = Set<String>()
+        return roots.map(\.variable).filter { seen.insert($0).inserted }.joined(separator: ", ")
     }
 
     static func flatten(_ paths: [String: [String]]) -> [String] {
