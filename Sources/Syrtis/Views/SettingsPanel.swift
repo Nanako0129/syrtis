@@ -152,6 +152,12 @@ struct SettingsPanel: View {
     @AppStorage(CursorSync.enabledKey) private var cursorSyncOn = true
     @AppStorage(CursorSync.takeoverKey) private var cursorTakeover = false
     @AppStorage(CursorSync.noticeKey) private var cursorNoticeAck = false
+    /// The Factory API key is never held in a preference: the field's text
+    /// lives only in view state until Save hands it to the Keychain.
+    @State private var factoryKeyInput = ""
+    @State private var factoryKeyStatus: FactoryAPIKey.Status = .absent
+    @State private var factoryKeyBusy = false
+    @State private var factoryKeyMessage: String?
     /// 0 = auto (≈60% of the screen). The popover's drag handle writes the
     /// same key, so the two stay in sync.
     @AppStorage(PopoverChrome.heightKey) private var popoverHeight = 0.0
@@ -1095,6 +1101,78 @@ struct SettingsPanel: View {
         dshExtraRootsSection()
 
         cursorSyncSection()
+
+        factoryAPIKeySection()
+    }
+
+    /// The Factory API key the Droid quota card reads (`agent_factory.rs`).
+    /// Stored in the login Keychain through `/usr/bin/security`
+    /// (`FactoryAPIKey`); the field is cleared as soon as Save succeeds.
+    @ViewBuilder
+    private func factoryAPIKeySection() -> some View {
+        infoSection(
+            AccountsCopy.factory, summary: AccountsCopy.factorySummary,
+            details: { ForEach(AccountsCopy.factoryDetails, id: \.self) { hint($0) } }
+        ) {
+            if factoryKeyStatus == .present {
+                row(AccountsCopy.factoryKeySaved) {
+                    Button(AccountsCopy.factoryRemove.localized) { removeFactoryKey() }
+                        .controlSize(.small)
+                        .disabled(factoryKeyBusy)
+                }
+            } else {
+                HStack(spacing: 6) {
+                    SecureField(AccountsCopy.factoryPlaceholder.localized, text: $factoryKeyInput)
+                        .textFieldStyle(.roundedBorder)
+                        .controlSize(.small)
+                        .onSubmit { saveFactoryKey() }
+                    Button(AccountsCopy.factorySave.localized) { saveFactoryKey() }
+                        .controlSize(.small)
+                        .disabled(factoryKeyBusy || !FactoryAPIKey.isWellFormed(factoryKeyInput))
+                }
+                .padding(.horizontal, 10)
+                .padding(.vertical, 7)
+                if !factoryKeyInput.isEmpty && !FactoryAPIKey.isWellFormed(factoryKeyInput) {
+                    hint(AccountsCopy.factoryMalformed)
+                }
+            }
+            if let message = factoryKeyMessage {
+                hint(message)
+            }
+        }
+        .task { await reloadFactoryKeyStatus() }
+    }
+
+    private func reloadFactoryKeyStatus() async {
+        let status = await FactoryAPIKey.loadStatus()
+        factoryKeyStatus = status
+        factoryKeyMessage = status == .unreadable ? AccountsCopy.factoryUnreadable : nil
+    }
+
+    private func saveFactoryKey() {
+        guard !factoryKeyBusy, FactoryAPIKey.isWellFormed(factoryKeyInput) else { return }
+        let key = factoryKeyInput
+        factoryKeyBusy = true
+        Task {
+            let saved = await FactoryAPIKey.store(key)
+            if saved { factoryKeyInput = "" }
+            await reloadFactoryKeyStatus()
+            if !saved { factoryKeyMessage = AccountsCopy.factorySaveFailed }
+            factoryKeyBusy = false
+            await FactoryAPIKey.refreshQuota()
+        }
+    }
+
+    private func removeFactoryKey() {
+        guard !factoryKeyBusy else { return }
+        factoryKeyBusy = true
+        Task {
+            let removed = await FactoryAPIKey.clear()
+            await reloadFactoryKeyStatus()
+            if !removed { factoryKeyMessage = AccountsCopy.factoryRemoveFailed }
+            factoryKeyBusy = false
+            await FactoryAPIKey.refreshQuota()
+        }
     }
 
     /// A second (or further) Claude account isolated with `CLAUDE_CONFIG_DIR`
@@ -1976,6 +2054,27 @@ enum AccountsCopy {
     // Strings the Accounts page draws itself, kept here so `translated`
     // (and the SelfTest check over it) covers every one.
     static let folderMissing = "Folder not found. Kept in case the drive is disconnected or the path needs fixing."
+
+    /// Factory (Droid quota). The details state where the key is stored, that
+    /// it is not logged, where it is sent, and how much it can do — checked
+    /// against `FactoryAPIKey` and `agent_factory.rs`.
+    static let factory = "Factory"
+    static let factorySummary = "A Factory API key shows Droid's plan limits."
+    static let factoryDetails = [
+        "Create an API key in Factory's settings (app.factory.ai/settings/api-keys) and paste it here. Syrtis stores it in your login Keychain as Syrtis Factory API Key and doesn't log it.",
+        "To show the limits, Syrtis sends the key to api.factory.ai, the same request Droid makes when it starts. The key can act as your Factory account, so delete it in Factory's settings when you no longer need it.",
+    ]
+    static let factoryPlaceholder = "Paste API key"
+    static let factorySave = "Save"
+    static let factoryKeySaved = "API key saved"
+    static let factoryRemove = "Remove"
+    static let factoryMalformed = "This doesn't look like a Factory API key."
+    static let factorySaveFailed = "Syrtis couldn't save the key to the Keychain."
+    static let factoryRemoveFailed = "Syrtis couldn't remove the key from the Keychain."
+    static let factoryUnreadable = "Syrtis couldn't check the Keychain for a saved key."
+    static let factoryCopy = [factorySummary, factoryPlaceholder, factorySave, factoryKeySaved, factoryRemove,
+                              factoryMalformed, factorySaveFailed, factoryRemoveFailed, factoryUnreadable]
+        + factoryDetails
     static let addConfigDir = "Add config dir…"
     static let addFolder = "Add folder…"
     static let addPrompt = "Add"
@@ -2048,7 +2147,7 @@ enum AccountsCopy {
                              addFolder, addPrompt, removeHelp, unreadableFolders, rejectedPaths, capturing,
                              captureCurrent, autoPaused, autoUnavailable]
         + claudeDetails + refusalSentences + piDetails + antigravityDetails + antigravityConfirm
-        + antigravityMessages + CursorSync.Copy.all
+        + antigravityMessages + CursorSync.Copy.all + factoryCopy
 }
 
 /// ⓘ next to a section header; the popover holds the long explanation.

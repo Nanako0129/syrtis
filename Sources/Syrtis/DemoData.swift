@@ -498,7 +498,52 @@ enum DemoData {
                     "windows": windows,
                 ] as [String: Any]
             }
-            // The `opencode` client carries the OpenCode Go subscription quota:
+            // The `droid` client carries the Factory subscription quota: a
+            // Standard and a Core tier, each with five-hour, weekly and monthly
+            // windows (`agent_factory.rs`). The five-hour and weekly windows carry
+            // a contract duration; the monthly one follows the billing cycle, so
+            // pace learns it, as the real adapter reports.
+            if id == "droid" {
+                func monthlyWindow(cardId: String, label: String, used: Double) -> [String: Any] {
+                    [
+                        "cardId": cardId,
+                        "label": label,
+                        "usedPercent": used,
+                        "remainingPercent": 100 - used,
+                        "resetsAt": formatter.string(
+                            from: now.addingTimeInterval(TimeInterval(monthlyDuration / 2))),
+                        "resetText": "in 14d 6h",
+                        "paceStatus": [
+                            "state": "learningDuration",
+                            "windowKey": cardId,
+                            "durationSource": "observed",
+                            "completeCycles": 0,
+                        ],
+                    ]
+                }
+                windows = [
+                    learningHistoryWindow(
+                        cardId: "standard.five_hour.v1", label: "Standard 5h", used: 24,
+                        duration: sessionDuration),
+                    learningHistoryWindow(
+                        cardId: "standard.weekly.v1", label: "Standard Weekly", used: 12,
+                        duration: weeklyDuration),
+                    monthlyWindow(cardId: "standard.monthly.v1", label: "Standard Monthly", used: 17),
+                    learningHistoryWindow(
+                        cardId: "core.five_hour.v1", label: "Core 5h", used: 6,
+                        duration: sessionDuration),
+                    learningHistoryWindow(
+                        cardId: "core.weekly.v1", label: "Core Weekly", used: 40,
+                        duration: weeklyDuration),
+                    monthlyWindow(cardId: "core.monthly.v1", label: "Core Monthly", used: 68),
+                ]
+                return [
+                    "clientId": id,
+                    "source": "fixture",
+                    "updatedAt": updated,
+                    "windows": windows,
+                ] as [String: Any]
+            }            // The `opencode` client carries the OpenCode Go subscription quota:
             // rolling/weekly/monthly percent windows (ported from mana.bar).
             // Give it those three so the demo card matches the real provider
             // shape instead of the generic session/weekly fixture.
