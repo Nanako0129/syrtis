@@ -17,7 +17,7 @@ enum DeviceOverlayCopy {
     static let failedNoData = "Couldn't load usage from the selected devices."
     static let keptLast = "Couldn't update from the selected devices. Showing the last data received."
     static let modelsHidden = "Model details aren't available yet for the selected devices."
-    static let lastGood = "%@ didn't respond. Showing older data (last updated %@)."
+    static let lastGood = "%@: no new data this time. Showing older data (last updated %@)."
     static let stale = "%@: showing older data. The time of its last update isn't known."
     static let unavailable = "%@ has no data to show."
     static let refused = "%@ refused the request. Check Devices in Settings."
@@ -52,31 +52,42 @@ enum DeviceOverlayCopy {
         device.label ?? (device.id == "peers" ? otherDevices.localized : device.id)
     }
 
+    /// Least data first: a device that is `unavailable` on one page and
+    /// `lastGood` on another gets the `unavailable` line only.
+    private static let severity = ["unavailable", "refused", "incompatible", "invalidReply", "stale", "lastGood"]
+
     /// The lines under a lens for pages the core answered: one per device
-    /// that is neither this Mac nor fresh, then the three flags. Deduplicated
-    /// so Stats, which shows two pages, does not say a thing twice.
+    /// that is neither this Mac nor fresh (its worst state across the pages;
+    /// Stats shows two), then each flag at most once.
     static func lines(
         _ pages: [(devices: [RemoteDevice], duplicate: Bool, saturated: Bool, rangeLimited: Bool)],
         now: Date = Date()
     ) -> [String] {
-        var out: [String] = []
-        func add(_ line: String) { if !out.contains(line) { out.append(line) } }
-        for page in pages {
-            for device in page.devices {
-                guard let template = template(forState: device.state) else { continue }
-                let name = name(of: device)
-                if device.state == "lastGood", let at = device.lastSuccessAt, at >= 0 {
-                    add(template.localized(name, Format.relativeTime(UInt64(at), now: now)))
-                } else if device.state == "lastGood" {
-                    add(stale.localized(name))
-                } else {
-                    add(template.localized(name))
-                }
+        var worst: [(id: String, device: RemoteDevice)] = []
+        for device in pages.flatMap(\.devices) where template(forState: device.state) != nil {
+            // A state this build does not know is shown as `unavailable`.
+            func rank(_ d: RemoteDevice) -> Int { severity.firstIndex(of: d.state) ?? 0 }
+            if let i = worst.firstIndex(where: { $0.id == device.id }) {
+                if rank(device) < rank(worst[i].device) { worst[i].device = device }
+            } else {
+                worst.append((device.id, device))
             }
-            if page.duplicate { add(duplicate.localized) }
-            if page.saturated { add(saturated.localized) }
-            if page.rangeLimited { add(rangeLimited.localized) }
         }
+        var out: [String] = []
+        for (_, device) in worst {
+            let template = template(forState: device.state)!
+            let name = name(of: device)
+            if device.state == "lastGood", let at = device.lastSuccessAt, at >= 0 {
+                out.append(template.localized(name, Format.relativeTime(UInt64(at), now: now)))
+            } else if device.state == "lastGood" {
+                out.append(stale.localized(name))
+            } else {
+                out.append(template.localized(name))
+            }
+        }
+        if pages.contains(where: \.duplicate) { out.append(duplicate.localized) }
+        if pages.contains(where: \.saturated) { out.append(saturated.localized) }
+        if pages.contains(where: \.rangeLimited) { out.append(rangeLimited.localized) }
         return out
     }
 }

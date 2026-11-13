@@ -2972,6 +2972,11 @@ private enum DeviceOverlayResult: Sendable {
     /// lens asks for two pages per refresh, so a faster poll would only be
     /// answered with last-good data and a refusal.
     static let remotePollSeconds: Double = 300
+    /// One delayed retry after a refresh that left a selected device without
+    /// new data. A producer refills one request per 60 s, so a request spent
+    /// in a burst is available again a little over a minute later; the 5 s
+    /// margin covers the refill granularity. Seam: a test shortens it.
+    static var retryDelaySeconds: Double = 65
     /// The core refuses more than 16 producers in one call.
     static let maxSelectedPeers = 16
     private static let order: [DeviceOverlayKind] = [.graph, .models, .hourly, .agents]
@@ -2994,6 +2999,8 @@ private enum DeviceOverlayResult: Sendable {
     private(set) var modelsColors = ModelColorMap(report: nil)
 
     @ObservationIgnored private var wanted: [DeviceOverlayKind: DeviceOverlayKey] = [:]
+    /// The one delayed retry this model may have pending.
+    @ObservationIgnored private var retryTask: Task<Void, Never>?
     /// The overlay's own memo for a client slice of `graphStats`; not
     /// `DashboardModel.stats(selecting:)`'s, which keys on `generatedAt` and
     /// would collide with the local payload's.
@@ -3215,6 +3222,7 @@ private enum DeviceOverlayResult: Sendable {
     private struct PendingRefresh {
         weak var owner: DeviceOverlayState?
         var keys: [DeviceOverlayKey]
+        var isRetry = false
     }
     private static var refreshInFlight = false
     private static var pendingRefresh: PendingRefresh?
@@ -3228,19 +3236,46 @@ private enum DeviceOverlayResult: Sendable {
         pendingRefresh = nil
     }
 
-    private func scheduleRefresh(_ keys: [DeviceOverlayKey]) {
+    private func scheduleRefresh(_ keys: [DeviceOverlayKey], isRetry: Bool = false) {
         if Self.refreshInFlight {
-            Self.pendingRefresh = PendingRefresh(owner: self, keys: keys)
+            Self.pendingRefresh = PendingRefresh(owner: self, keys: keys, isRetry: isRetry)
             return
         }
-        startRefresh(keys)
+        startRefresh(keys, isRetry: isRetry)
     }
 
-    private func startRefresh(_ keys: [DeviceOverlayKey]) {
+    private func startRefresh(_ keys: [DeviceOverlayKey], isRetry: Bool = false) {
         Self.refreshInFlight = true
         Task {
             for key in keys { await self.runOnce(key, .refresh) }
+            // A retry never schedules another: the 300 s poll covers that.
+            if !isRetry, self.leftWithoutNewData(keys) { self.scheduleRetry(keys) }
             Self.finishRefresh()
+        }
+    }
+
+    /// Whether any selected device, on a page just refreshed for `keys`, is in
+    /// a "no answer" state. Refused, invalid and incompatible are not: asking
+    /// again cannot change them.
+    private func leftWithoutNewData(_ keys: [DeviceOverlayKey]) -> Bool {
+        keys.contains { key in
+            let devices: [RemoteDevice]?
+            switch key.kind {
+            case .graph: devices = graph?.key == key && graph?.failed == false ? graph?.data?.devices : nil
+            case .models: devices = models?.key == key && models?.failed == false ? models?.data?.devices : nil
+            case .hourly: devices = hourly?.key == key && hourly?.failed == false ? hourly?.data?.devices : nil
+            case .agents: devices = agents?.key == key && agents?.failed == false ? agents?.data?.devices : nil
+            }
+            return devices?.contains { ["lastGood", "stale", "unavailable"].contains($0.state) } == true
+        }
+    }
+
+    private func scheduleRetry(_ keys: [DeviceOverlayKey]) {
+        retryTask?.cancel()
+        retryTask = Task {
+            try? await Task.sleep(for: .seconds(Self.retryDelaySeconds))
+            guard !Task.isCancelled, keys.allSatisfy({ self.wanted[$0.kind] == $0 }) else { return }
+            self.scheduleRefresh(keys, isRetry: true)
         }
     }
 
@@ -3249,7 +3284,7 @@ private enum DeviceOverlayResult: Sendable {
         guard let next = pendingRefresh else { return }
         pendingRefresh = nil
         if let owner = next.owner, next.keys.allSatisfy({ owner.wanted[$0.kind] == $0 }) {
-            owner.startRefresh(next.keys)
+            owner.startRefresh(next.keys, isRetry: next.isRetry)
         }
     }
 

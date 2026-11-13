@@ -23274,6 +23274,66 @@ enum SelfTest {
                    "SA3D (10) the catch-up is the newest request (2019, not the first queued) and its response landed")
             overlay.togglePeer(peerA)
 
+            // (retry) One delayed retry when a selected device answered with no
+            // new data. The delay is shortened; the 65 s is a producer's refill.
+            DeviceOverlayState.retryDelaySeconds = 0.3
+            let fakeRetry = SA3DFakeSource()
+            fakeRetry.set { $0.peers = .success([peer(peerA)]); $0.remoteState = "unavailable" }
+            let overlayRetry = makeModel(fakeRetry, freshSuite()).deviceOverlay
+            overlayRetry.refreshPeers()
+            _ = pump { overlayRetry.selectablePeers.count == 1 }
+            overlayRetry.togglePeer(peerA)
+            DeviceOverlayState.resetSingleFlightForTesting()
+            fakeRetry.set { $0.calls = []; $0.refreshStarted = 0 }
+            overlayRetry.ensure(view: .hourly, year: "2013", clients: nil)
+            expect(pump { fakeRetry.get(\.refreshStarted) == 1 } && settled(),
+                   "SA3D (retry) the first refresh runs")
+            pump(for: 0.1)
+            expect(fakeRetry.get(\.refreshStarted) == 1,
+                   "SA3D (retry) the retry does not start before its delay")
+            expect(pump { fakeRetry.get(\.refreshStarted) == 2 } && settled(),
+                   "SA3D (retry) an unavailable device gets exactly one more refresh after the delay")
+            pump(for: 0.9)
+            let refreshesRetry = fakeRetry.get(\.calls).filter { $0.mode == .refresh }
+            expect(fakeRetry.get(\.refreshStarted) == 2 && refreshesRetry.count == 2
+                       && refreshesRetry[0] == refreshesRetry[1],
+                   "SA3D (retry) the retry asks for the same keys and its own unavailable result starts no third refresh")
+            fakeRetry.set { $0.refreshStarted = 0 }
+            overlayRetry.manualRefresh()
+            expect(pump { fakeRetry.get(\.refreshStarted) == 1 } && settled(), "SA3D (retry) a manual refresh runs")
+            overlayRetry.popoverClosed()
+            pump(for: 0.9)
+            expect(fakeRetry.get(\.refreshStarted) == 1,
+                   "SA3D (retry) closing the popover before the delay cancels the retry")
+            for state in ["fresh", "refused"] {
+                fakeRetry.set { $0.remoteState = state; $0.refreshStarted = 0 }
+                overlayRetry.ensure(view: .hourly, year: "2013", clients: nil)
+                expect(pump { fakeRetry.get(\.refreshStarted) == 1 } && settled(),
+                       "SA3D (retry) refresh with a \(state) device runs")
+                pump(for: 0.9)
+                expect(fakeRetry.get(\.refreshStarted) == 1, "SA3D (retry) a \(state) device is not retried")
+            }
+            overlayRetry.popoverClosed()
+            DeviceOverlayState.retryDelaySeconds = 65
+
+            // (one line) One line per device and each flag once, across Stats' two pages.
+            let statsDevices: (String) -> [RemoteDevice] = { state in
+                try! JSONDecoder().decode([RemoteDevice].self, from: Data(#"""
+                    [{"id":"local","label":null,"state":"local","lastSuccessAt":null},
+                     {"id":"aaaaaaaaaaaaaaaa","label":"10.0.0.2:47000","state":"\#(state)","lastSuccessAt":1700000000}]
+                    """#.utf8))
+            }
+            for pages in [["lastGood", "unavailable"], ["unavailable", "lastGood"]] {
+                let merged = DeviceOverlayCopy.lines(pages.map { (statsDevices($0), true, true, true) })
+                expect(merged.count == 4
+                           && merged.first == DeviceOverlayCopy.unavailable.localized("10.0.0.2:47000")
+                           && merged.filter { $0.contains("10.0.0.2:47000") }.count == 1
+                           && merged.filter { $0 == DeviceOverlayCopy.duplicate.localized }.count == 1
+                           && merged.filter { $0 == DeviceOverlayCopy.saturated.localized }.count == 1
+                           && merged.filter { $0 == DeviceOverlayCopy.rangeLimited.localized }.count == 1,
+                       "SA3D (one line) \(pages) gives one device line (the unavailable one) and each flag once")
+            }
+
             // (6) Pruning follows a SUCCESSFUL list only.
             let suite6 = freshSuite()
             suite6.set(try? JSONEncoder().encode(StoredDeviceSelection(local: true, peers: [peerA, peerB])),
@@ -23342,6 +23402,11 @@ enum SelfTest {
             }
             expect(copyMissing.isEmpty,
                    "SA3D (8) every device-overlay copy key resolves to a zh-Hant and zh-Hans value different from the key: \(copyMissing)")
+            expect(DeviceOverlayCopy.lastGood == "%@: no new data this time. Showing older data (last updated %@)."
+                       && AppLanguage.localizedString(DeviceOverlayCopy.lastGood, locale: "zh-Hant", bundle: .tokenBarResources)?.contains("沒有取得新資料") == true
+                       && AppLanguage.localizedString(DeviceOverlayCopy.lastGood, locale: "zh-Hans", bundle: .tokenBarResources)?.contains("没有取得新数据") == true
+                       && AppLanguage.localizedString("%@ didn't respond. Showing older data (last updated %@).", locale: "zh-Hant", bundle: .tokenBarResources) == nil,
+                   "SA3D (8) the lastGood line says no new data, not that the device did not respond, and the old key is gone")
             let states = ["lastGood", "stale", "unavailable", "refused", "invalidReply", "incompatible"]
             let templates = states.compactMap { DeviceOverlayCopy.template(forState: $0) }
             expect(templates.count == states.count && Set(templates).count == states.count

@@ -826,7 +826,7 @@
 "Couldn't load usage from the selected devices." = "無法從所選裝置載入用量。";
 "Couldn't update from the selected devices. Showing the last data received." = "無法從所選裝置更新，顯示的是最後收到的資料。";
 "Model details aren't available yet for the selected devices." = "所選裝置的模型明細尚未取得。";
-"%@ didn't respond. Showing older data (last updated %@)." = "%1$@ 沒有回應。顯示的是舊資料（上次更新：%2$@）。";
+"%@: no new data this time. Showing older data (last updated %@)." = "%1$@：這次沒有取得新資料，顯示的是舊資料（上次更新：%2$@）。";
 "%@: showing older data. The time of its last update isn't known." = "%@：顯示的是舊資料，不知道上次更新的時間。";
 "%@ has no data to show." = "%@ 沒有可顯示的資料。";
 "%@ refused the request. Check Devices in Settings." = "%@ 拒絕了這個請求。請到「設定」的「裝置」查看。";
