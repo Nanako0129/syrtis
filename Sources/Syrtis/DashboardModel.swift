@@ -3369,20 +3369,30 @@ extension DeviceOverlayResult {
     private func store(_ result: Result<DeviceOverlayResult, Error>, for key: DeviceOverlayKey, mode: DeviceFetchMode) {
         switch result {
         case .success(let value):
-            // A cached answer never replaces what the slot already holds for
-            // this key: a refresh may have stored (or failed) while the
-            // cached call ran.
-            guard mode == .refresh || currentKey(of: key.kind) != key else { return }
+            // A cached answer never replaces a page the slot already holds for
+            // this key: a refresh may have stored one while the cached call
+            // ran. A slot a failed refresh left without a page takes the
+            // cached page and stays marked failed.
+            let held = currentKey(of: key.kind) == key
+            let hasPage: Bool
+            switch key.kind {
+            case .graph: hasPage = graph?.data != nil
+            case .models: hasPage = models?.data != nil
+            case .hourly: hasPage = hourly?.data != nil
+            case .agents: hasPage = agents?.data != nil
+            }
+            guard mode == .refresh || !(held && hasPage) else { return }
+            let failed = mode == .cached && held
             switch value {
             case .graph(let page):
-                graph = .init(key: key, data: page, failed: false)
+                graph = .init(key: key, data: page, failed: failed)
                 graphStats = UsageStats(payload: page.payload, selectedClients: Set(page.payload.summary.clients))
                 statsMemo = nil
             case .models(let page):
-                models = .init(key: key, data: page, failed: false)
+                models = .init(key: key, data: page, failed: failed)
                 modelsColors = ModelColorMap(report: page.payload)
-            case .hourly(let page): hourly = .init(key: key, data: page, failed: false)
-            case .agents(let page): agents = .init(key: key, data: page, failed: false)
+            case .hourly(let page): hourly = .init(key: key, data: page, failed: failed)
+            case .agents(let page): agents = .init(key: key, data: page, failed: failed)
             }
         case .failure:
             guard mode == .refresh else { return }
