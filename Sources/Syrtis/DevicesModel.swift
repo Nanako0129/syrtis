@@ -104,27 +104,42 @@ enum ListenAddress {
     static let localOnly = "127.0.0.1"
 
     /// `localOnly` first, then each usable address once, in interface order,
-    /// then `keeping` (the address already configured) if it is not listed.
-    /// Offered: IPv4 (not unspecified, not loopback) and Tailscale's IPv6
-    /// range. Other IPv6 addresses are left out: a Mac carries many
-    /// (privacy addresses that rotate within a day or so), so they made the
-    /// list very long, and a peer bound to a rotating address loses it.
-    static func choices(from addresses: [String], keeping: String = "") -> [String] {
+    /// then each of `keeping` (the configured address, the current selection)
+    /// that is not listed yet. Never an unspecified or loopback address, from
+    /// either source.
+    ///
+    /// Offered from the interfaces: IPv4, and IPv6 unique-local addresses
+    /// (`fc00::/7`: Tailscale, other overlays, a LAN's own prefix). Global
+    /// IPv6 is not offered: a Mac carries many such addresses, most of them
+    /// privacy addresses that rotate, and this list cannot tell those from a
+    /// stable one without each address's interface flags. A global address
+    /// that is already configured stays through `keeping`.
+    /// ponytail: no way to pick a new global IPv6 address; read
+    /// `IN6_IFF_TEMPORARY` per address if someone needs it.
+    static func choices(from addresses: [String], keeping: [String] = []) -> [String] {
         var seen: Set<String> = [localOnly]
         var out = [localOnly]
-        for address in addresses where !address.contains("%") {
-            guard let bytes = bytes(address), !isUnspecified(bytes), !isLoopback(bytes),
-                  bytes.count == 4 || isTailscaleV6(bytes), seen.insert(address).inserted
+        func usable(_ address: String) -> [UInt8]? {
+            guard !address.contains("%"), let bytes = bytes(address),
+                  !isUnspecified(bytes), !isLoopback(bytes)
+            else { return nil }
+            return bytes
+        }
+        for address in addresses {
+            guard let bytes = usable(address), bytes.count == 4 || isUniqueLocalV6(bytes),
+                  seen.insert(address).inserted
             else { continue }
             out.append(address)
         }
-        if !keeping.isEmpty, bytes(keeping) != nil, seen.insert(keeping).inserted { out.append(keeping) }
+        for address in keeping where usable(address) != nil && seen.insert(address).inserted {
+            out.append(address)
+        }
         return out
     }
 
-    /// Tailscale's IPv6 range, `fd7a:115c:a1e0::/48`.
-    private static func isTailscaleV6(_ bytes: [UInt8]) -> Bool {
-        bytes.count == 16 && bytes.prefix(6) == [0xfd, 0x7a, 0x11, 0x5c, 0xa1, 0xe0]
+    /// IPv6 unique-local, `fc00::/7`.
+    private static func isUniqueLocalV6(_ bytes: [UInt8]) -> Bool {
+        bytes.count == 16 && bytes[0] & 0xFE == 0xFC
     }
 
     /// A public IPv4 address or a global IPv6 one (2000::/3): it may be

@@ -23067,17 +23067,25 @@ enum SelfTest {
             let choices = ListenAddress.choices(from: [
                 "0.0.0.0", "::", "192.168.1.20", "fe80::1%en0", "fe80::2", "127.0.0.1", "::1",
                 "10.0.0.2", "192.168.1.20", "2001:db8::5", "fd7a:115c:a1e0::1f3b:e46f", "100.76.1.2",
+                "fd96:4fe:ccd9::7",
             ])
             let local = ListenAddress.choices(from: ListenAddress.interfaceAddresses())
-            expect(ListenAddress.choices(from: ["192.168.1.20", "2001:db8::5"], keeping: "2001:db8::9")
+            expect(ListenAddress.choices(from: ["192.168.1.20", "2001:db8::5"], keeping: ["2001:db8::9", "192.168.1.20"])
                        == ["127.0.0.1", "192.168.1.20", "2001:db8::9"]
-                       && ListenAddress.choices(from: ["192.168.1.20"], keeping: "192.168.1.20")
-                       == ["127.0.0.1", "192.168.1.20"],
-                   "SA3C an address already configured stays in the menu even when it is not offered")
-            expect(choices == ["127.0.0.1", "192.168.1.20", "10.0.0.2", "fd7a:115c:a1e0::1f3b:e46f", "100.76.1.2"]
+                       && ListenAddress.choices(from: ["192.168.1.20"], keeping: ["2001:db8::9", "10.0.0.7"])
+                       == ["127.0.0.1", "192.168.1.20", "2001:db8::9", "10.0.0.7"],
+                   "SA3C the configured address and the current selection stay in the menu even when they are not offered")
+            expect(ListenAddress.choices(
+                       from: [], keeping: ["", "0.0.0.0", "::", "::1", "localhost", "fe80::1%en0", "127.0.0.1"])
+                       == ["127.0.0.1"],
+                   "SA3C nothing kept is unspecified, loopback, zoned or not an address")
+            expect(choices == [
+                       "127.0.0.1", "192.168.1.20", "10.0.0.2", "fd7a:115c:a1e0::1f3b:e46f", "100.76.1.2",
+                       "fd96:4fe:ccd9::7",
+                   ]
                        && local.first == ListenAddress.localOnly
                        && !local.contains("0.0.0.0") && !local.contains("::"),
-                   "SA3C the listen menu is this Mac only plus IPv4 and Tailscale IPv6 addresses; never 0.0.0.0, :: or other IPv6")
+                   "SA3C the listen menu is this Mac only plus IPv4 and unique-local IPv6; never 0.0.0.0, ::, link-local or global IPv6")
             expect(ListenAddress.mayBePublic("8.8.8.8") && ListenAddress.mayBePublic("2001:db8::5")
                        && !ListenAddress.mayBePublic("192.168.1.20") && !ListenAddress.mayBePublic("10.0.0.2")
                        && !ListenAddress.mayBePublic("172.16.0.1") && !ListenAddress.mayBePublic("100.100.1.1")
