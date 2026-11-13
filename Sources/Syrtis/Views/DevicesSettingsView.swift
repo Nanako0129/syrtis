@@ -11,6 +11,8 @@ struct DevicesSettingsView: View {
         /// 354 pt wide (`SettingsWindowView`), so this leaves room for the
         /// row's label.
         static let fieldWidth: CGFloat = 170
+        /// Wide enough for an IPv4 address or a short IPv6 one; longer ones truncate.
+        static let addressMenuWidth: CGFloat = 230
         /// A SAS code is compared digit by digit with the other screen:
         /// monospaced and one step above the caption text around it.
         static let sasFont = Font.system(.callout, design: .monospaced).weight(.semibold)
@@ -134,10 +136,14 @@ struct DevicesSettingsView: View {
         }
         // A menu, not a radio list: one row however many addresses the Mac has.
         panel.row(DevicesCopy.listenOn) {
+            // The configured address stays listed while another one is being
+            // tried, and a selection the list cannot offer (nothing set yet,
+            // or a stored value that is not an address) shows as "choose".
+            let offered = ListenAddress.choices(
+                from: addresses, keeping: [model.status?.bindHost ?? "", host])
             Picker(DevicesCopy.listenOn.localized, selection: $host) {
-                // Nothing is configured yet: say so, instead of an empty menu.
-                if host.isEmpty { Text(DevicesCopy.chooseAddress.localized).tag("") }
-                ForEach(ListenAddress.choices(from: addresses, keeping: host), id: \.self) { address in
+                if !offered.contains(host) { Text(DevicesCopy.chooseAddress.localized).tag(host) }
+                ForEach(offered, id: \.self) { address in
                     if address == ListenAddress.localOnly {
                         Text(DevicesCopy.localOnlyLabel.localized).tag(address)
                     } else {
@@ -147,7 +153,8 @@ struct DevicesSettingsView: View {
             }
             .labelsHidden()
             .pickerStyle(.menu)
-            .fixedSize()
+            // A full-length IPv6 address must not widen the row past the column.
+            .frame(maxWidth: Layout.addressMenuWidth, alignment: .trailing)
         }
         panel.row(DevicesCopy.port) {
             TextField("", text: $portText)
@@ -160,7 +167,9 @@ struct DevicesSettingsView: View {
             Task { await model.applyListen(host: host, port: port, nodeLabel: name) }
         }
         .controlSize(.small)
-        .disabled(host.isEmpty)
+        // Only an address the menu offers can be applied.
+        .disabled(!ListenAddress.choices(
+            from: addresses, keeping: [model.status?.bindHost ?? "", host]).contains(host))
         .padding(.horizontal, 10)
         if model.unreachable { notice(DevicesCopy.unreachableLine) }
         if ListenAddress.mayBePublic(host) { notice(DevicesCopy.publicAddress) }
