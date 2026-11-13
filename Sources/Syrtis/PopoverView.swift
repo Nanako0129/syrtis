@@ -194,6 +194,20 @@ struct PopoverView: View {
         activeTab == ClientTray.overviewTab ? displayUsageClients : ClientRegistry.tabSlice(activeTab)
     }
 
+    private func expandColors() { Task { await model.ensureModelColors() } }
+
+    /// The tab the lens is drawn for when it is a single client's (the same
+    /// test `lensContent` makes for `singleClient`).
+    private var overlaySingleClient: String? {
+        (activeTab != ClientTray.overviewTab && displayClients.contains(activeTab)) ? activeTab : nil
+    }
+
+    /// The `clients` argument of the overlay's Hourly and Agents calls.
+    private var overlayClients: [String]? {
+        DeviceOverlayState.clientsArgument(
+            singleClient: overlaySingleClient, hidden: ClientRegistry.parseIdSet(hiddenRaw))
+    }
+
     /// Daily/Monthly request turns only for visible canonical clients, keeping
     /// the incoming display order and never passing an empty all-client filter.
     private var turnClientIds: [String] {
@@ -293,6 +307,19 @@ struct PopoverView: View {
         .task(id: "\(activeViewRaw)|\(model.year ?? "")|\(lazyClientIds.joined(separator: ","))") {
             await model.ensureData(for: activeView.wrappedValue, clients: lazyClientIds)
         }
+        // SA-3d: the selected devices' pages for the lens on screen. Keyed on
+        // everything the request depends on, including the selection; it only
+        // starts the loads (each on its own thread), so cancelling it with a
+        // changed key cancels nothing in flight, and a response for an old
+        // key is dropped by the overlay itself. The scan-roots generation is
+        // in the key because this Mac's share of a page depends on the roots:
+        // a change asks for a refresh of the pages on screen.
+        .task(id: "\(activeViewRaw)|\(model.year ?? "")|\(overlayClients?.joined(separator: ",") ?? "-")|\(model.deviceOverlay.signature)|\(extraRootsGeneration)") {
+            model.deviceOverlay.ensure(
+                view: effectiveView, year: model.year, clients: overlayClients)
+        }
+        .task { model.deviceOverlay.refreshPeers() }
+        .task { await model.deviceOverlay.pollLoop() }
         // Model report, keyed on the COMMITTED slice rather than the requested
         // one. Before any payload lands the key is empty, so this fires as a
         // no-op; it re-fires the moment apply() commits, which is what keeps
@@ -424,7 +451,10 @@ struct PopoverView: View {
             }
             routeMemory.record(clientId: activeTab, view: activeViewRaw)
         }
-        .onDisappear { removeKeyMonitors() }
+        .onDisappear {
+            removeKeyMonitors()
+            model.deviceOverlay.popoverClosed()
+        }
         // Reset a stale persisted tab whenever the displayed client set changes,
         // so a saved client id that no longer exists (or that the user just hid)
         // can't strand the dashboard on an empty slice with no visible tab row
@@ -503,6 +533,11 @@ struct PopoverView: View {
             Spacer()
             liveRateBadge
             yearMenu
+            DeviceSelectionMenu(
+                overlay: model.deviceOverlay,
+                rangeLimited: model.deviceOverlay.rangeLimited(
+                    for: effectiveView, year: model.year, clients: overlayClients),
+                lensHasOverlay: !DeviceOverlayState.kinds(for: effectiveView).isEmpty)
             if GlassTintSlider.glassAvailable {
                 quickSettingsButton
             }
@@ -758,7 +793,18 @@ struct PopoverView: View {
             // re-aggregate UsageStats on every body eval.
             let activeStats = model.stats(selecting: Set(clientIds)) ?? stats
             let turnClientIds = Self.supportedTurnClients(clientIds)
+            // SA-3d: only the four lazy-or-graph lenses have a device overlay.
+            let overlayActive = model.deviceOverlay.includesRemote
+                && !DeviceOverlayState.kinds(for: effectiveView).isEmpty
             switch effectiveView {
+            case _ where overlayActive:
+                // SA-3d: the core's merged pages for the selected devices. Only
+                // read here; none of it goes to the model's own properties.
+                DeviceOverlayLens(
+                    overlay: model.deviceOverlay, view: effectiveView,
+                    singleClient: singleClient, hiddenRaw: hiddenRaw, orderRaw: orderRaw,
+                    year: model.year, localColors: model.colors,
+                    onExpand: expandColors)
             case .overview:
                 VStack(spacing: 0) {  // onboarding containers carry their own gap
                     // Only on the global tab: a single client's usage is

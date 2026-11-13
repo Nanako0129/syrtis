@@ -23099,6 +23099,702 @@ enum SelfTest {
                    "SA3C a peers row decodes host and port and shows host:port")
         }
 
+        // SA-3d: device selection on the dashboard. A fake source records the
+        // device calls; nothing here reaches the agent, a socket or the
+        // real preferences (a test suite holds the selection).
+        do {
+            let peerA = String(repeating: "a", count: 64)
+            let peerB = String(repeating: "b", count: 64)
+            let suiteName = "tokenbar.selftest.sa3d.\(getpid())"
+            func freshSuite() -> UserDefaults {
+                let suite = UserDefaults(suiteName: suiteName)!
+                suite.removePersistentDomain(forName: suiteName)
+                return suite
+            }
+            func peer(_ id: String, state: String = "active") -> RemotePeer {
+                try! JSONDecoder().decode(RemotePeer.self, from: Data(#"""
+                    {"producerStatic":"\#(id)","fingerprint":"\#(id.prefix(16))","nodeLabel":null,
+                     "host":"10.0.0.2","port":47000,"createdAt":1,"expiresAt":4102444800000,"state":"\#(state)"}
+                    """#.utf8))
+            }
+            func pump(_ condition: () -> Bool) -> Bool {
+                let deadline = Date(timeIntervalSinceNow: 5)
+                while !condition(), Date() < deadline {
+                    RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.005))
+                }
+                return condition()
+            }
+            func pump(for seconds: TimeInterval) {
+                RunLoop.current.run(until: Date(timeIntervalSinceNow: seconds))
+            }
+            func settled() -> Bool { pump { !DeviceOverlayState.refreshInFlightForTesting } }
+            func run(_ body: @escaping @MainActor @Sendable () async -> Void) {
+                _ = awaitMainActorValue { await body(); return true }
+            }
+            func makeModel(
+                _ source: SA3DFakeSource, _ suite: UserDefaults, snapshots: Bool = false
+            ) -> DashboardModel {
+                DashboardModel(
+                    cachesSnapshot: snapshots, source: source, initialYear: nil,
+                    buildIdentity: nil, deviceDefaults: suite)
+            }
+            func storedSelection(_ suite: UserDefaults) -> StoredDeviceSelection? {
+                suite.data(forKey: DeviceOverlayState.selectionKey)
+                    .flatMap { try? JSONDecoder().decode(StoredDeviceSelection.self, from: $0) }
+            }
+            // Retries stay armed-but-asleep in every case that does not test
+            // them: the delay is far beyond the run, so no result depends on speed.
+            DeviceOverlayState.retryDelaySeconds = 1e9
+            DeviceOverlayState.resetSingleFlightForTesting()
+
+            // (1) Only this Mac: no device call, whatever the lens. The demo
+            // source lists no devices and answers no device call.
+            let fake = SA3DFakeSource()
+            fake.set { $0.peers = .success([peer(peerA)]) }
+            let suite = freshSuite()
+            let model = makeModel(fake, suite)
+            let overlay = model.deviceOverlay
+            overlay.refreshPeers()
+            expect(pump { overlay.selectablePeers.count == 1 },
+                   "SA3D the peer list is read and one active device can be chosen")
+            for view in [AppView.stats, .daily, .models, .hourly, .agents] {
+                overlay.ensure(view: view, year: nil, clients: nil)
+            }
+            overlay.pollOnce()
+            overlay.manualRefresh()
+            pump(for: 0.4)
+            expect(fake.get(\.calls).isEmpty && !overlay.includesRemote && overlay.graph == nil,
+                   "SA3D (1) the default selection makes no device call on any lens, poll or refresh")
+            let demoSource = DemoUsageDataSource()
+            let demo = DashboardModel(
+                source: demoSource, initialYear: nil, buildIdentity: nil, deviceDefaults: freshSuite())
+            demo.deviceOverlay.refreshPeers()
+            demo.deviceOverlay.ensure(view: .stats, year: nil, clients: nil)
+            pump(for: 0.3)
+            expect((try? demoSource.remotePeers())?.isEmpty == true
+                       && (try? demoSource.graphDevices(
+                           year: nil, selection: DeviceSelection(local: true, peers: [peerA]),
+                           mode: .cached)) == nil
+                       && demo.deviceOverlay.selectablePeers.isEmpty && !demo.deviceOverlay.includesRemote
+                       && demo.deviceOverlay.graph == nil,
+                   "SA3D (1) the demo source lists no devices, answers no device call and the demo model shows no menu or overlay")
+
+            // (2) A remote device chosen: the right selection, year and
+            // clients; with no overlay yet, `cached` first, then `refresh`.
+            overlay.togglePeer(peerA)
+            expect(overlay.stored == StoredDeviceSelection(local: true, peers: [peerA])
+                       && storedSelection(suite) == overlay.stored,
+                   "SA3D choosing a device keeps this Mac and is saved")
+            fake.set { $0.calls = [] }
+            overlay.ensure(view: .hourly, year: "2025", clients: ["codex", "claude"])
+            expect(pump { fake.get(\.calls).count == 2 } && settled(),
+                   "SA3D (2) the hourly lens makes a cached and a refresh call")
+            expect(fake.get(\.calls) == [
+                SA3DFakeSource.Call(kind: "hourly", mode: .cached, year: "2025",
+                                    clients: ["claude", "codex"], local: true, peers: [peerA]),
+                SA3DFakeSource.Call(kind: "hourly", mode: .refresh, year: "2025",
+                                    clients: ["claude", "codex"], local: true, peers: [peerA]),
+            ], "SA3D (2) the calls carry the selection, year and clients, cached before refresh")
+            fake.set { $0.calls = [] }
+            overlay.ensure(view: .stats, year: nil, clients: nil)
+            expect(pump { fake.get(\.calls).count == 4 } && settled()
+                       && fake.get(\.calls).map({ "\($0.kind)-\($0.mode.rawValue)" })
+                           == ["graph-cached", "models-cached", "graph-refresh", "models-refresh"]
+                       && fake.get(\.calls).allSatisfy { $0.year == nil && $0.clients == nil },
+                   "SA3D (2) Stats asks for the graph and models pages, each cached then refreshed, without clients")
+            fake.set { $0.calls = [] }
+            overlay.ensure(view: .stats, year: nil, clients: nil)
+            expect(pump { fake.get(\.calls).count == 2 } && settled()
+                       && fake.get(\.calls).allSatisfy { $0.mode == .refresh },
+                   "SA3D (2) a page that already has an overlay for its key is only refreshed")
+
+            // (9) A failed refresh keeps the last overlay and says so; with
+            // nothing to keep it says that.
+            let keptKey = overlay.hourly?.key
+            fake.set { $0.failRefresh = true }
+            overlay.ensure(view: .hourly, year: "2025", clients: ["codex", "claude"])
+            expect(pump { overlay.hourly?.failed == true } && settled()
+                       && overlay.hourly?.data != nil && overlay.hourly?.key == keptKey,
+                   "SA3D (9) a failed refresh keeps the previous overlay for the key and marks it failed")
+            fake.set { $0.failRefresh = false; $0.failAll = true }
+            overlay.ensure(view: .hourly, year: "1990", clients: nil)
+            expect(pump { overlay.hourly?.key.year == "1990" && overlay.hourly?.failed == true } && settled()
+                       && overlay.hourly?.data == nil,
+                   "SA3D (9) a failure with no earlier answer leaves no data and a failed slot")
+            fake.set { $0.failAll = false }
+
+            // (4) A response for a key that is no longer wanted is dropped.
+            fake.set { $0.calls = []; $0.refreshStarted = 0; $0.holdRefresh = true }
+            overlay.ensure(view: .hourly, year: "2025", clients: nil)
+            expect(pump { fake.get(\.refreshStarted) == 1 },
+                   "SA3D (4) the first refresh is under way")
+            overlay.ensure(view: .hourly, year: "2024", clients: nil)
+            // The 2024 cached page lands first; then the 2025 refresh ends
+            // while the 2024 refresh (held again) has not answered: the slot
+            // must keep the 2024 page, not take the 2025 refresh that has
+            // just come back.
+            expect(pump { overlay.hourly?.key.year == "2024" },
+                   "SA3D (4) the 2024 cached page is shown while the 2025 refresh is still out")
+            fake.release()
+            expect(pump { fake.get(\.refreshStarted) == 2 },
+                   "SA3D (4) the newer key is refreshed once the old one ends")
+            pump(for: 0.2)
+            expect(overlay.hourly?.key.year == "2024"
+                       && overlay.hourly?.data?.payload.entries.first?.models == ["cached-2024"],
+                   "SA3D (4) the stale 2025 response was discarded: the slot holds the 2024 page, not the 2025 refresh")
+            fake.set { $0.holdRefresh = false }
+            fake.release()
+            expect(settled() && overlay.hourly?.data?.payload.entries.first?.models == ["refresh-2024"],
+                   "SA3D (4) the 2024 refresh then lands")
+
+            // (5) Back to this Mac only: every overlay is cleared and saved.
+            overlay.togglePeer(peerA)
+            expect(!overlay.includesRemote && overlay.graph == nil && overlay.models == nil
+                       && overlay.hourly == nil && overlay.agents == nil
+                       && storedSelection(suite) == StoredDeviceSelection(local: true, peers: []),
+                   "SA3D (5) choosing this Mac alone clears all four overlays")
+
+            // (10) Single flight: while one refresh is held, polls, lens
+            // changes, selection changes and a second model start nothing;
+            // the newest request runs once afterwards.
+            overlay.togglePeer(peerA)
+            let second = makeModel(fake, suite)
+            second.deviceOverlay.refreshPeers()
+            _ = pump { second.deviceOverlay.includesRemote }
+            fake.set { $0.calls = []; $0.refreshStarted = 0; $0.holdRefresh = true }
+            DeviceOverlayState.resetSingleFlightForTesting()
+            overlay.ensure(view: .agents, year: "2022", clients: nil)
+            expect(pump { fake.get(\.refreshStarted) == 1 },
+                   "SA3D (10) one refresh is held in flight")
+            overlay.ensure(view: .agents, year: "2021", clients: nil)
+            pump(for: 0.15)
+            overlay.ensure(view: .agents, year: "2020", clients: nil)
+            pump(for: 0.15)
+            overlay.pollOnce()
+            overlay.manualRefresh()
+            second.deviceOverlay.ensure(view: .agents, year: "2019", clients: nil)
+            pump(for: 0.15)
+            second.deviceOverlay.pollOnce()
+            pump(for: 0.3)
+            expect(fake.get(\.refreshStarted) == 1,
+                   "SA3D (10) triggers during a refresh start no second refresh")
+            fake.set { $0.holdRefresh = false }
+            fake.release()
+            expect(pump { fake.get(\.refreshStarted) == 2 } && settled(), "SA3D (10) the newest request ran")
+            pump(for: 0.4)
+            expect(fake.get(\.refreshStarted) == 2,
+                   "SA3D (10) at most two refreshes begin: one in flight and one catch-up")
+            expect(fake.get(\.calls).filter { $0.mode == .refresh }.map(\.year) == ["2022", "2019"]
+                       && second.deviceOverlay.agents?.key.year == "2019"
+                       && second.deviceOverlay.agents?.data?.payload.entries.first?.agent == "refresh-2019",
+                   "SA3D (10) the catch-up is the newest request (2019, not the first queued) and its response landed")
+            overlay.togglePeer(peerA)
+
+            // (retry) One delayed retry when a selected device answered with no
+            // new data. The delay is shortened; the 65 s is a producer's refill.
+            DeviceOverlayState.retryDelaySeconds = 0.6
+            let fakeRetry = SA3DFakeSource()
+            fakeRetry.set { $0.peers = .success([peer(peerA)]); $0.remoteState = "unavailable" }
+            let overlayRetry = makeModel(fakeRetry, freshSuite()).deviceOverlay
+            overlayRetry.refreshPeers()
+            _ = pump { overlayRetry.selectablePeers.count == 1 }
+            overlayRetry.togglePeer(peerA)
+            DeviceOverlayState.resetSingleFlightForTesting()
+            fakeRetry.set { $0.calls = []; $0.refreshStarted = 0 }
+            overlayRetry.ensure(view: .hourly, year: "2013", clients: nil)
+            expect(pump { fakeRetry.get(\.refreshStarted) == 1 } && settled(),
+                   "SA3D (retry) the first refresh runs")
+            expect(overlayRetry.retryPendingForTesting,
+                   "SA3D (retry) a retry is armed after the refresh left a device without data")
+            pump(for: 0.1)
+            expect(fakeRetry.get(\.refreshStarted) == 1,
+                   "SA3D (retry) the retry does not start before its delay")
+            expect(pump { fakeRetry.get(\.refreshStarted) == 2 } && settled(),
+                   "SA3D (retry) an unavailable device gets exactly one more refresh after the delay")
+            pump(for: 0.9)
+            let refreshesRetry = fakeRetry.get(\.calls).filter { $0.mode == .refresh }
+            expect(fakeRetry.get(\.refreshStarted) == 2 && refreshesRetry.count == 2
+                       && refreshesRetry[0] == refreshesRetry[1],
+                   "SA3D (retry) the retry asks for the same keys and its own unavailable result starts no third refresh")
+            fakeRetry.set { $0.refreshStarted = 0 }
+            overlayRetry.manualRefresh()
+            expect(pump { fakeRetry.get(\.refreshStarted) == 1 } && settled(), "SA3D (retry) a manual refresh runs")
+            overlayRetry.popoverClosed()
+            pump(for: 0.9)
+            expect(fakeRetry.get(\.refreshStarted) == 1,
+                   "SA3D (retry) closing the popover before the delay cancels the retry")
+            for state in ["fresh", "refused"] {
+                fakeRetry.set { $0.remoteState = state; $0.refreshStarted = 0 }
+                overlayRetry.ensure(view: .hourly, year: "2013", clients: nil)
+                expect(pump { fakeRetry.get(\.refreshStarted) == 1 } && settled(),
+                       "SA3D (retry) refresh with a \(state) device runs")
+                pump(for: 0.9)
+                expect(fakeRetry.get(\.refreshStarted) == 1, "SA3D (retry) a \(state) device is not retried")
+            }
+            overlayRetry.popoverClosed()
+
+            // (retry 1) A later refresh of the same key that comes back fresh
+            // cancels the pending retry.
+            fakeRetry.set { $0.remoteState = "unavailable"; $0.refreshStarted = 0; $0.calls = [] }
+            overlayRetry.ensure(view: .hourly, year: "2013", clients: nil)
+            expect(pump { fakeRetry.get(\.refreshStarted) == 1 } && settled() && overlayRetry.retryPendingForTesting,
+                   "SA3D (retry 1) an unavailable refresh arms a retry")
+            fakeRetry.set { $0.remoteState = "fresh" }
+            overlayRetry.manualRefresh()
+            expect(pump { fakeRetry.get(\.refreshStarted) == 2 } && settled() && !overlayRetry.retryPendingForTesting,
+                   "SA3D (retry 1) a fresh refresh of the same key cancels the pending retry")
+            pump(for: 1.0)
+            expect(fakeRetry.get(\.refreshStarted) == 2,
+                   "SA3D (retry 1) and no call is made when the delay passes")
+            overlayRetry.popoverClosed()
+
+            // (retry 2) Stats, graph fresh and models unavailable: the retry
+            // asks for models only.
+            fakeRetry.set {
+                $0.remoteState = "fresh"; $0.remoteStateByKind = ["models": "unavailable"]
+                $0.refreshStarted = 0; $0.calls = []
+            }
+            overlayRetry.ensure(view: .stats, year: nil, clients: nil)
+            expect(pump { fakeRetry.get(\.refreshStarted) == 3 } && settled(),
+                   "SA3D (retry 2) the first Stats refresh asks for both pages, then the retry for one")
+            pump(for: 0.2)
+            expect(fakeRetry.get(\.calls).filter { $0.mode == .refresh }.map(\.kind) == ["graph", "models", "models"],
+                   "SA3D (retry 2) the retry asks only for the page that came back without new data")
+            overlayRetry.popoverClosed()
+            fakeRetry.set { $0.remoteStateByKind = [:] }
+
+            // (retry 3) A poll never arms a retry.
+            fakeRetry.set { $0.remoteState = "fresh"; $0.refreshStarted = 0 }
+            let overlayPoll = makeModel(fakeRetry, freshSuite()).deviceOverlay
+            overlayPoll.refreshPeers()
+            _ = pump { overlayPoll.selectablePeers.count == 1 }
+            overlayPoll.togglePeer(peerA)
+            overlayPoll.ensure(view: .hourly, year: "2012", clients: nil)
+            expect(pump { fakeRetry.get(\.refreshStarted) == 1 } && settled(),
+                   "SA3D (retry 3) the lens refresh runs")
+            fakeRetry.set { $0.remoteState = "unavailable" }
+            overlayPoll.pollOnce()
+            expect(pump { fakeRetry.get(\.refreshStarted) == 2 } && settled() && !overlayPoll.retryPendingForTesting,
+                   "SA3D (retry 3) a poll refresh that leaves a device unavailable arms no retry")
+            pump(for: 1.0)
+            expect(fakeRetry.get(\.refreshStarted) == 2, "SA3D (retry 3) and nothing follows it")
+            overlayPoll.popoverClosed()
+
+            // (retry 4) A refresh whose result was dropped decides nothing,
+            // even though the slot still holds an older unavailable page.
+            fakeRetry.set { $0.remoteState = "unavailable"; $0.refreshStarted = 0; $0.holdRefresh = true }
+            let overlayDrop = makeModel(fakeRetry, freshSuite()).deviceOverlay
+            overlayDrop.refreshPeers()
+            _ = pump { overlayDrop.selectablePeers.count == 1 }
+            overlayDrop.togglePeer(peerA)
+            overlayDrop.ensure(view: .hourly, year: "2011", clients: nil)
+            expect(pump { fakeRetry.get(\.refreshStarted) == 1 } && overlayDrop.hourly?.data != nil,
+                   "SA3D (retry 4) the cached page is in the slot while the refresh is held")
+            overlayDrop.popoverClosed()
+            fakeRetry.set { $0.holdRefresh = false }
+            fakeRetry.release()
+            expect(settled() && !overlayDrop.retryPendingForTesting,
+                   "SA3D (retry 4) a refresh whose result was dropped arms no retry")
+            pump(for: 1.0)
+            expect(fakeRetry.get(\.refreshStarted) == 1, "SA3D (retry 4) and no call follows")
+
+            // (retry 5) A retry that fires during another refresh does not
+            // replace a user's pending request.
+            fakeRetry.set { $0.remoteState = "unavailable"; $0.refreshStarted = 0; $0.calls = [] }
+            DeviceOverlayState.resetSingleFlightForTesting()
+            DeviceOverlayState.retryDelaySeconds = 0.6
+            overlayRetry.ensure(view: .hourly, year: "2013", clients: nil)
+            expect(pump { fakeRetry.get(\.refreshStarted) == 1 } && settled() && overlayRetry.retryPendingForTesting,
+                   "SA3D (retry 5) the first model has a retry armed")
+            let overlayUser = makeModel(fakeRetry, freshSuite()).deviceOverlay
+            overlayUser.refreshPeers()
+            _ = pump { overlayUser.selectablePeers.count == 1 }
+            overlayUser.togglePeer(peerA)
+            fakeRetry.set { $0.refreshStarted = 0; $0.holdRefresh = true }
+            overlayUser.ensure(view: .agents, year: "2014", clients: nil)
+            expect(pump { fakeRetry.get(\.refreshStarted) == 1 }, "SA3D (retry 5) another refresh is held in flight")
+            overlayUser.manualRefresh()
+            pump(for: 0.9)  // the first model's retry fires here and must not replace the manual request
+            fakeRetry.set { $0.holdRefresh = false }
+            fakeRetry.release()
+            expect(pump { fakeRetry.get(\.refreshStarted) == 2 } && settled(),
+                   "SA3D (retry 5) the pending request runs after the held one")
+            expect(fakeRetry.get(\.calls).filter { $0.mode == .refresh }.map(\.kind) == ["hourly", "agents", "agents"]
+                       && overlayUser.retryPendingForTesting,
+                   "SA3D (retry 5) it is the user's request (agents), run as a non-retry that arms its own retry")
+            overlayUser.popoverClosed()
+            overlayRetry.popoverClosed()
+            DeviceOverlayState.resetSingleFlightForTesting()
+            DeviceOverlayState.retryDelaySeconds = 1e9
+
+            // (one line) One line per device and each flag once, across Stats' two pages.
+            let statsDevices: (String) -> [RemoteDevice] = { state in
+                try! JSONDecoder().decode([RemoteDevice].self, from: Data(#"""
+                    [{"id":"local","label":null,"state":"local","lastSuccessAt":null},
+                     {"id":"aaaaaaaaaaaaaaaa","label":"10.0.0.2:47000","state":"\#(state)","lastSuccessAt":1700000000}]
+                    """#.utf8))
+            }
+            let twins = try! JSONDecoder().decode([RemoteDevice].self, from: Data(#"""
+                [{"id":"aaaaaaaaaaaaaaaa","label":"10.0.0.2:47000","state":"unavailable","lastSuccessAt":null},
+                 {"id":"bbbbbbbbbbbbbbbb","label":"10.0.0.2:47000","state":"unavailable","lastSuccessAt":null}]
+                """#.utf8))
+            expect(DeviceOverlayCopy.lines([(twins, false, false, false)]).count == 1,
+                   "SA3D (one line) two devices with the same label and state give one line")
+            for pages in [["lastGood", "unavailable"], ["unavailable", "lastGood"]] {
+                let merged = DeviceOverlayCopy.lines(pages.map { (statsDevices($0), true, true, true) })
+                expect(merged.count == 2
+                           && merged.first == DeviceOverlayCopy.unavailable.localized("10.0.0.2:47000")
+                           && merged.filter { $0.contains("10.0.0.2:47000") }.count == 1
+                           && merged.filter { $0 == DeviceOverlayCopy.saturated.localized }.count == 1
+                           && !merged.contains(DeviceOverlayCopy.duplicate.localized)
+                           && !merged.contains(DeviceOverlayCopy.rangeLimited.localized),
+                       "SA3D (one line) \(pages) gives one device line (the unavailable one) and the saturated line once, no duplicate or range line")
+            }
+
+            // (6) Pruning follows a SUCCESSFUL list only.
+            let suite6 = freshSuite()
+            suite6.set(try? JSONEncoder().encode(StoredDeviceSelection(local: true, peers: [peerA, peerB])),
+                       forKey: DeviceOverlayState.selectionKey)
+            let fake6 = SA3DFakeSource()
+            fake6.set { $0.peers = .success([peer(peerA)]) }
+            let overlay6 = makeModel(fake6, suite6).deviceOverlay
+            overlay6.refreshPeers()
+            expect(pump { overlay6.selectablePeers.count == 1 }
+                       && overlay6.stored.peers == [peerA]
+                       && storedSelection(suite6)?.peers == [peerA],
+                   "SA3D (6) a successful list without a stored device drops it from the stored selection")
+            fake6.set { $0.peers = .failure(SA3DFakeSource.Failure()) }
+            overlay6.refreshPeers()
+            expect(pump { overlay6.selectablePeers.isEmpty }
+                       && overlay6.stored.peers == [peerA] && storedSelection(suite6)?.peers == [peerA],
+                   "SA3D (6) a failed list hides the menu and leaves the stored selection alone")
+            fake6.set { $0.calls = [] }
+            overlay6.ensure(view: .hourly, year: nil, clients: nil)
+            pump(for: 0.3)
+            expect(fake6.get(\.calls).isEmpty && !overlay6.includesRemote,
+                   "SA3D (6) with the list unreadable only this Mac's path runs: no device call")
+            fake6.set { $0.peers = .success([peer(peerA)]) }
+            overlay6.refreshPeers()
+            expect(pump { overlay6.includesRemote } && overlay6.effective?.peers == [peerA],
+                   "SA3D (6) the next successful list that still has the device restores the selection")
+            overlay6.ensure(view: .hourly, year: nil, clients: nil)
+            expect(pump { fake6.get(\.calls).count == 2 } && settled(),
+                   "SA3D (6) and the device calls resume")
+            fake6.set { $0.peers = .success([peer(peerA, state: "revoked")]) }
+            overlay6.refreshPeers()
+            expect(pump { overlay6.selectablePeers.isEmpty } && overlay6.stored.peers.isEmpty
+                       && overlay6.stored.local,
+                   "SA3D (6) a device that is no longer active is dropped and this Mac is chosen again")
+
+            // (7) The last chosen source cannot be unchecked.
+            let suite7 = freshSuite()
+            suite7.set(try? JSONEncoder().encode(StoredDeviceSelection(local: true, peers: [peerA])),
+                       forKey: DeviceOverlayState.selectionKey)
+            let fake7 = SA3DFakeSource()
+            fake7.set { $0.peers = .success([peer(peerA)]) }
+            let overlay7 = makeModel(fake7, suite7).deviceOverlay
+            overlay7.refreshPeers()
+            _ = pump { overlay7.selectablePeers.count == 1 }
+            overlay7.toggleLocal()
+            expect(!overlay7.stored.local && overlay7.stored.peers == [peerA],
+                   "SA3D (7) with two chosen, this Mac can be unchecked")
+            overlay7.togglePeer(peerA)
+            expect(overlay7.stored.peers == [peerA] && !overlay7.canToggle(local: false, peer: peerA),
+                   "SA3D (7) the last remaining device cannot be unchecked")
+            overlay7.toggleLocal()
+            overlay7.togglePeer(peerA)
+            overlay7.toggleLocal()
+            expect(overlay7.stored.local && overlay7.stored.peers.isEmpty && !overlay7.canToggle(local: true),
+                   "SA3D (7) nor can this Mac when it is the last")
+
+            // (8) Copy: every key has a translation that differs from the key,
+            // every state has a line, and another device's text is only ever a
+            // format argument.
+            var copyMissing: [String] = []
+            for key in DeviceOverlayCopy.all {
+                for locale in ["zh-Hant", "zh-Hans"] {
+                    let value = AppLanguage.localizedString(key, locale: locale, bundle: .tokenBarResources)
+                    if value == nil || value == key { copyMissing.append("\(locale): \(key.prefix(24))") }
+                }
+            }
+            expect(copyMissing.isEmpty,
+                   "SA3D (8) every device-overlay copy key resolves to a zh-Hant and zh-Hans value different from the key: \(copyMissing)")
+            expect(DeviceOverlayCopy.lastGood == "%@: no new data this time. Showing older data (last updated %@)."
+                       && AppLanguage.localizedString(DeviceOverlayCopy.lastGood, locale: "zh-Hant", bundle: .tokenBarResources)?.contains("沒有取得新資料") == true
+                       && AppLanguage.localizedString(DeviceOverlayCopy.lastGood, locale: "zh-Hans", bundle: .tokenBarResources)?.contains("没有取得新数据") == true
+                       && AppLanguage.localizedString("%@ didn't respond. Showing older data (last updated %@).", locale: "zh-Hant", bundle: .tokenBarResources) == nil,
+                   "SA3D (8) the lastGood line says no new data, not that the device did not respond, and the old key is gone")
+            let states = ["lastGood", "stale", "unavailable", "refused", "invalidReply", "incompatible"]
+            let templates = states.compactMap { DeviceOverlayCopy.template(forState: $0) }
+            expect(templates.count == states.count && Set(templates).count == states.count
+                       && templates.allSatisfy { DeviceOverlayCopy.all.contains($0) }
+                       && DeviceOverlayCopy.template(forState: "local") == nil
+                       && DeviceOverlayCopy.template(forState: "fresh") == nil,
+                   "SA3D (8) each non-fresh state has its own listed line; local and fresh have none")
+            let nasty = "100% %@ %lld {x}"
+            let hostile = try! JSONDecoder().decode([RemoteDevice].self, from: Data(#"""
+                [{"id":"local","label":null,"state":"local","lastSuccessAt":null},
+                 {"id":"ffffffffffffffff","label":"\#(nasty)","state":"refused","lastSuccessAt":null},
+                 {"id":"eeeeeeeeeeeeeeee","label":"\#(nasty)","state":"lastGood","lastSuccessAt":1700000000}]
+                """#.utf8))
+            let lines = DeviceOverlayCopy.lines([(hostile, true, true, true)])
+            expect(lines.count == 3 && lines.filter { $0.contains(nasty) }.count == 2
+                       && lines.contains(DeviceOverlayCopy.saturated.localized),
+                   "SA3D (8) a device's own text appears verbatim in its line (a format argument), and the saturated flag adds one line")
+            let freshOnly = statsDevices("fresh")
+            let flagsOnly = DeviceOverlayCopy.lines([(freshOnly, true, false, true)])
+            let satOnly = DeviceOverlayCopy.lines([(freshOnly, true, true, true)])
+            let unavail = DeviceOverlayCopy.lines([(statsDevices("unavailable"), true, false, true)])
+            expect(flagsOnly.isEmpty
+                       && satOnly == [DeviceOverlayCopy.saturated.localized]
+                       && unavail == [DeviceOverlayCopy.unavailable.localized("10.0.0.2:47000")],
+                   "SA3D (8) duplicate and rangeLimited never make a line; saturated does; an unavailable device gives its one line")
+            expect(DeviceOverlayCopy.explanations(rangeLimited: false) == [DeviceOverlayCopy.duplicate.localized]
+                       && DeviceOverlayCopy.explanations(rangeLimited: true)
+                           == [DeviceOverlayCopy.duplicate.localized, DeviceOverlayCopy.rangeLimited.localized],
+                   "SA3D (8) the info popover has the duplicate sentence, plus the 370-day one only when the page reports it")
+
+            // (3) Isolation, with the reopen cache, the disk envelope, the
+            // hourly cache and the record-client defaults all in play. The
+            // record-client key lives in this process's own domain and
+            // survives runs, so a run in which the marker leaked (a mutation)
+            // must not poison the next one: the marker is removed first. The
+            // key is written only when the marker is there, so a clean run
+            // leaves the domain as it found it.
+            let recordKey = DashboardModel.localRecordClientsKey
+            if let recorded = UserDefaults.standard.stringArray(forKey: recordKey),
+               recorded.contains(SA3DFakeSource.remoteClient) {
+                UserDefaults.standard.set(
+                    recorded.filter { $0 != SA3DFakeSource.remoteClient }, forKey: recordKey)
+            }
+            DashboardModel.invalidateScanDerivedCaches()
+            let fake3 = SA3DFakeSource()
+            fake3.set { $0.peers = .success([peer(peerA)]) }
+            let suite3 = freshSuite()
+            let model3 = makeModel(fake3, suite3, snapshots: true)
+            let overlay3 = model3.deviceOverlay
+            run {
+                await model3.load()
+                await model3.ensureData(for: .hourly, clients: ["claude", "codex"])
+                await model3.ensureData(for: .agents, clients: ["claude", "codex"])
+                await model3.ensureModelData(for: .models)
+            }
+            let localGenerated = model3.payload?.meta.generatedAt
+            let localHourlyCached = DashboardModel.hourlyCacheForTesting.count
+            overlay3.refreshPeers()
+            _ = pump { overlay3.selectablePeers.count == 1 }
+            overlay3.togglePeer(peerA)
+            for view in [AppView.stats, .hourly, .agents] {
+                overlay3.ensure(view: view, year: nil, clients: nil)
+                _ = pump {
+                    switch view {
+                    case .stats: overlay3.graph?.data != nil && overlay3.models?.data != nil
+                    case .hourly: overlay3.hourly?.data != nil
+                    default: overlay3.agents?.data != nil
+                    }
+                }
+                _ = settled()
+            }
+            let remote = SA3DFakeSource.remoteClient
+            let remoteModel = SA3DFakeSource.remoteModel
+            let year = SA3DFakeSource.remoteYear
+            /// The year as a year of the payload, not as a substring of a number.
+            func hasYear(_ payload: UsagePayload?) -> Bool {
+                payload?.years.contains { $0.year == year } == true
+                    || payload?.contributions.contains { $0.date.hasPrefix(year + "-") } == true
+            }
+            func text<T: Encodable>(_ value: T?) -> String {
+                value.flatMap { try? JSONEncoder().encode($0) }.map { String(decoding: $0, as: UTF8.self) } ?? ""
+            }
+            expect(overlay3.graphStats?.presentClients.contains(remote) == true
+                       && overlay3.graph?.data?.payload.years.contains { $0.year == year } == true
+                       && overlay3.models?.data?.payload.entries.contains { $0.model.hasPrefix(remoteModel) } == true
+                       && overlay3.hourly?.data?.payload.entries.contains { $0.clients.contains(remote) } == true
+                       && overlay3.agents?.data?.payload.entries.contains { $0.clients.contains(remote) } == true,
+                   "SA3D (3) control: the overlays hold the remote-only client, year and model")
+            expect(model3.payload?.meta.generatedAt == localGenerated && localGenerated != nil
+                       && model3.stats?.presentClients.contains(remote) == false
+                       && !text(model3.payload).contains(remote) && !hasYear(model3.payload)
+                       && !model3.knownYears.contains(year),
+                   "SA3D (3) the local payload, stats and knownYears hold nothing of the overlay")
+            let snapshot = DashboardModel.lastSnapshotForTesting
+            expect(snapshot != nil && !text(snapshot?.payload).contains(remote)
+                       && snapshot?.knownYears.contains(year) == false
+                       && snapshot?.modelReport?.entries.contains { $0.model.hasPrefix(remoteModel) } != true,
+                   "SA3D (3) the reopen snapshot holds nothing of the overlay")
+            let envelope = model3.snapshotEnvelope(
+                identity: BuildIdentity(bundleIdentifier: "com.example.sa3d", shortVersion: "1", buildNumber: "1"))
+            expect(envelope != nil && !text(envelope?.payload).contains(remote)
+                       && !hasYear(envelope?.payload)
+                       && envelope?.knownYears.contains(year) == false,
+                   "SA3D (3) the disk envelope (payload and knownYears) holds nothing of the overlay")
+            expect(localHourlyCached > 0
+                       && !DashboardModel.hourlyCacheForTesting.contains { report in
+                           report.entries.contains { $0.clients.contains(remote) }
+                       },
+                   "SA3D (3) the hourly cache holds nothing of the overlay (control: it holds local reports)")
+            let localMap = ModelColorMap(report: model3.modelReport)
+            expect(model3.modelReport != nil
+                       && model3.modelReport?.entries.contains { $0.model.hasPrefix(remoteModel) } == false
+                       && model3.colors.color("test", remoteModel) == localMap.color("test", remoteModel)
+                       && model3.agents?.entries.contains { $0.clients.contains(remote) } == false
+                       && model3.hourly?.entries.contains { $0.clients.contains(remote) } == false,
+                   "SA3D (3) the local model report, colors, hourly and agents hold nothing of the overlay")
+            expect(!(UserDefaults.standard.stringArray(forKey: DashboardModel.localRecordClientsKey) ?? []).contains(remote)
+                       && !model3.localRecordClients(defaults: suite3).contains(remote),
+                   "SA3D (3) the record-client defaults do not learn the overlay's client")
+
+            // (11) A client only a remote device used: asked for, and shown.
+            fake3.set { $0.calls = [] }
+            let hiddenClientsArgument = DeviceOverlayState.clientsArgument(
+                singleClient: nil, hidden: ["claude"])
+            let expectedHidden = ClientRegistry.allIds.filter {
+                !ClientRegistry.hiddenTabClients(["claude"]).contains($0)
+            }
+            expect(DeviceOverlayState.clientsArgument(singleClient: nil, hidden: []) == nil
+                       && hiddenClientsArgument == expectedHidden && !expectedHidden.contains("claude")
+                       && DeviceOverlayState.clientsArgument(singleClient: "codex", hidden: ["claude"])
+                           == ClientRegistry.tabSlice("codex"),
+                   "SA3D (11) the clients argument is nil with nothing hidden, the registry minus the hidden otherwise, the slice on a client tab")
+            overlay3.ensure(view: .hourly, year: "2018", clients: hiddenClientsArgument)
+            _ = pump { fake3.get(\.calls).contains { $0.kind == "hourly" && $0.mode == .refresh } }
+            _ = settled()
+            expect(!fake3.get(\.calls).isEmpty && fake3.get(\.calls).allSatisfy { $0.clients == expectedHidden },
+                   "SA3D (11) the hidden-clients request sends the registry's ids minus the hidden ones, not this Mac's present list")
+            for kind in [DeviceOverlayKind.graph, .models, .hourly, .agents] {
+                let shown = overlay3.displayClients(kind, singleClient: nil, hiddenRaw: "", orderRaw: "")
+                let hidden = overlay3.displayClients(kind, singleClient: nil, hiddenRaw: "claude", orderRaw: "")
+                expect(shown.contains(remote) && hidden.contains(remote) && !hidden.contains("claude"),
+                       "SA3D (11) on Overview the \(kind) display set holds the remote-only client and drops the hidden one")
+            }
+            expect(overlay3.displayClients(.hourly, singleClient: "codex", hiddenRaw: "", orderRaw: "")
+                       == ClientRegistry.tabSlice("codex"),
+                   "SA3D (11) a single-client tab keeps its own slice")
+            // What the lens selects: only the page for the key it wants now.
+            expect(overlay3.visible(overlay3.hourly, .hourly, year: "2018", clients: expectedHidden).page != nil
+                       && overlay3.visible(overlay3.hourly, .hourly, year: "2017", clients: expectedHidden).page == nil
+                       && overlay3.visible(overlay3.hourly, .hourly, year: "2018", clients: nil).page == nil
+                       && overlay3.visible(overlay3.graph, .graph, year: "2017", clients: nil).page == nil,
+                   "SA3D (5) after a year or client change the lens gets no page (loading) until the new key lands, not the previous key's")
+
+            // (12) Stats with a graph overlay and no models overlay: the model
+            // sections get the fixed line, never this Mac's report.
+            let fake12 = SA3DFakeSource()
+            fake12.set { $0.peers = .success([peer(peerA)]); $0.failModels = true }
+            let suite12 = freshSuite()
+            let model12 = makeModel(fake12, suite12)
+            run {
+                await model12.load()
+                await model12.ensureModelData(for: .models)
+            }
+            let overlay12 = model12.deviceOverlay
+            overlay12.refreshPeers()
+            _ = pump { overlay12.selectablePeers.count == 1 }
+            overlay12.togglePeer(peerA)
+            overlay12.ensure(view: .stats, year: nil, clients: nil)
+            _ = pump { overlay12.graph?.data != nil && overlay12.models?.failed == true }
+            _ = settled()
+            let hiddenModels = overlay12.statsModels(year: nil)
+            expect(overlay12.graph?.data != nil && model12.modelReport != nil
+                       && hiddenModels.report == nil
+                       && hiddenModels.note == DeviceOverlayCopy.modelsHidden.localized,
+                   "SA3D (12) Stats with a graph overlay and no models overlay shows the fixed line, not this Mac's report")
+            fake12.set { $0.failModels = false }
+            overlay12.manualRefresh()
+            expect(pump { overlay12.statsModels(year: nil).report != nil }
+                       && overlay12.statsModels(year: nil).note == nil,
+                   "SA3D (12) once the models overlay arrives the report is the overlay's")
+            expect(overlay12.statsModels(year: "2000").report == nil
+                       && overlay12.statsModels(year: "2000").note == DeviceOverlayCopy.modelsHidden.localized,
+                   "SA3D (12) a models overlay for another year is not shown")
+            _ = settled()
+
+            // (13) At most 16 devices can be checked: a 17th is refused, and
+            // removal still works.
+            let many = (0..<17).map { String(format: "%064x", $0 + 1) }
+            let fake13 = SA3DFakeSource()
+            fake13.set { $0.peers = .success(many.map { peer($0) }) }
+            let overlay13 = makeModel(fake13, freshSuite()).deviceOverlay
+            overlay13.refreshPeers()
+            _ = pump { overlay13.selectablePeers.count == 17 }
+            for id in many { overlay13.togglePeer(id) }
+            expect(overlay13.stored.peers == Array(many.prefix(16))
+                       && !overlay13.canToggle(local: false, peer: many[16])
+                       && overlay13.effective?.peers.count == 16
+                       && overlay13.canToggle(local: false, peer: many[0]),
+                   "SA3D (13) with 17 devices the 17th toggle is refused and the stored selection stays at 16")
+            overlay13.togglePeer(many[0])
+            overlay13.togglePeer(many[16])
+            expect(overlay13.stored.peers.count == 16 && overlay13.stored.peers.contains(many[16])
+                       && !overlay13.stored.peers.contains(many[0]),
+                   "SA3D (13) unchecking one frees a slot for the 17th")
+
+            // (14) A cached load that ends after a newer lens took over must not
+            // replace the newer pending refresh.
+            let fake14 = SA3DFakeSource()
+            fake14.set { $0.peers = .success([peer(peerA)]) }
+            let overlay14 = makeModel(fake14, freshSuite()).deviceOverlay
+            overlay14.refreshPeers()
+            _ = pump { overlay14.selectablePeers.count == 1 }
+            overlay14.togglePeer(peerA)
+            DeviceOverlayState.resetSingleFlightForTesting()
+            fake14.set { $0.holdRefresh = true }
+            overlay14.ensure(view: .agents, year: "2031", clients: nil)
+            _ = pump { fake14.get(\.refreshStarted) == 1 }
+            fake14.set { $0.holdCached = true }
+            overlay14.ensure(view: .agents, year: "2032", clients: nil)
+            _ = pump { fake14.get(\.calls).contains { $0.year == "2032" && $0.mode == .cached } }
+            fake14.set { $0.holdCached = false }
+            overlay14.ensure(view: .agents, year: "2033", clients: nil)
+            _ = pump { overlay14.agents?.key.year == "2033" }
+            pump(for: 0.2)
+            fake14.releaseCached()
+            pump(for: 0.2)
+            fake14.set { $0.holdRefresh = false }
+            fake14.release()
+            expect(pump { fake14.get(\.refreshStarted) == 2 } && settled(),
+                   "SA3D (14) a catch-up refresh runs after the held one")
+            expect(fake14.get(\.calls).filter { $0.mode == .refresh }.map(\.year) == ["2031", "2033"]
+                       && overlay14.agents?.data?.payload.entries.first?.agent == "refresh-2033",
+                   "SA3D (14) the catch-up is the newest lens (2033), not the one whose cached load ended last")
+
+            // (15) The popover closing stops what is on screen: a held
+            // multi-page refresh issues no further call and a pending one is
+            // skipped, while the slots stay.
+            let fake15 = SA3DFakeSource()
+            fake15.set { $0.peers = .success([peer(peerA)]) }
+            let overlay15 = makeModel(fake15, freshSuite()).deviceOverlay
+            overlay15.refreshPeers()
+            _ = pump { overlay15.selectablePeers.count == 1 }
+            overlay15.togglePeer(peerA)
+            DeviceOverlayState.resetSingleFlightForTesting()
+            fake15.set { $0.holdRefresh = true }
+            overlay15.ensure(view: .stats, year: nil, clients: nil)
+            _ = pump { fake15.get(\.refreshStarted) == 1 }
+            overlay15.manualRefresh()
+            overlay15.popoverClosed()
+            fake15.set { $0.holdRefresh = false }
+            fake15.release()
+            _ = settled()
+            pump(for: 0.4)
+            expect(fake15.get(\.refreshStarted) == 1
+                       && overlay15.graph?.data != nil && overlay15.models?.data != nil,
+                   "SA3D (15) after popoverClosed a held two-page refresh issues no further call, nothing pending runs, and the slots stay")
+            overlay15.ensure(view: .stats, year: nil, clients: nil)
+            expect(pump { fake15.get(\.refreshStarted) == 3 } && settled(),
+                   "SA3D (15) a reopened popover's ensure refreshes again")
+
+            freshSuite().removePersistentDomain(forName: suiteName)
+            if let recorded = UserDefaults.standard.stringArray(forKey: recordKey),
+               recorded.contains(SA3DFakeSource.remoteClient) {
+                UserDefaults.standard.set(
+                    recorded.filter { $0 != SA3DFakeSource.remoteClient }, forKey: recordKey)
+            }
+            DashboardModel.invalidateScanDerivedCaches()
+            DeviceOverlayState.resetSingleFlightForTesting()
+            DeviceOverlayState.retryDelaySeconds = 65
+        }
+
         accountsDefaults.restore()
 
         if failures > 0 {
@@ -23520,5 +24216,175 @@ final class SA3CFakePasteboard: DevicesPasteboard {
     func clear() {
         changeCount += 1
         text = nil
+    }
+}
+
+/// SA-3d: the dashboard's source with device calls. The local calls forward to
+/// the ordinary test double; the device calls are recorded, can fail, and can
+/// hold a refresh until released. Pages carry a tag (mode and year) in a model
+/// name so a test can tell which response a slot ended up with.
+final class SA3DFakeSource: UsageDataSource, @unchecked Sendable {
+    let allowsQuotaCachePersistence = false
+    static let remoteClient = "sa3d-remote-client"
+    static let remoteYear = "1999"
+    static let remoteModel = "sa3d-remote-model"
+    static let overlayGeneratedAt = "2099-01-01T00:00:00Z"
+
+    struct Call: Equatable {
+        let kind: String
+        let mode: DeviceFetchMode
+        let year: String?
+        let clients: [String]?
+        let local: Bool
+        let peers: [String]
+    }
+    struct Failure: Error {}
+
+    struct State {
+        var peers: Result<[RemotePeer], any Error> = .success([])
+        var calls: [Call] = []
+        var peerCalls = 0
+        var refreshStarted = 0
+        var holdRefresh = false
+        var holdCached = false
+        var failRefresh = false
+        var failAll = false
+        var failModels = false
+        var remoteState = "fresh"
+        /// A page kind's own device state, over `remoteState`.
+        var remoteStateByKind: [String: String] = [:]
+    }
+
+    private let lock = NSLock()
+    private var state = State()
+    private let gate = DispatchSemaphore(value: 0)
+    private let cachedGate = DispatchSemaphore(value: 0)
+    private let inner = DashboardModelTestSource(failingGraphYear: "")
+
+    func set(_ change: (inout State) -> Void) { lock.withLock { change(&state) } }
+    func get<T>(_ key: KeyPath<State, T>) -> T { lock.withLock { state[keyPath: key] } }
+    func release(_ count: Int = 1) { for _ in 0..<count { gate.signal() } }
+    func releaseCached(_ count: Int = 1) { for _ in 0..<count { cachedGate.signal() } }
+
+    func graph(year: String?, priority: TaskPriority) async throws -> UsagePayload {
+        try await inner.graph(year: year, priority: priority)
+    }
+    func refreshGraph(year: String?, priority: TaskPriority) async throws -> UsagePayload {
+        try await inner.refreshGraph(year: year, priority: priority)
+    }
+    func modelReport(year: String?, priority: TaskPriority) async throws -> ModelReport {
+        try await inner.modelReport(year: year, priority: priority)
+    }
+    func hourlyReport(year: String?, clients: [String]?, priority: TaskPriority) async throws -> HourlyReport {
+        try await inner.hourlyReport(year: year, clients: clients, priority: priority)
+    }
+    func agentsReport(year: String?, clients: [String]?, priority: TaskPriority) async throws -> AgentsReport {
+        try await inner.agentsReport(year: year, clients: clients, priority: priority)
+    }
+    func agentUsage() async throws -> AgentUsagePayload { try await inner.agentUsage() }
+    func usageTrace(windowSecs: Int64) async throws -> [TraceBucket] { try await inner.usageTrace(windowSecs: windowSecs) }
+    func tokensPerMin() async throws -> Double { try await inner.tokensPerMin() }
+
+    func remotePeers() throws -> [RemotePeer] {
+        try lock.withLock { () throws -> [RemotePeer] in
+            state.peerCalls += 1
+            return try state.peers.get()
+        }
+    }
+
+    /// Records the call, holds a refresh while `holdRefresh`, then fails it
+    /// when asked to. Returns the tag the page carries.
+    private func enter(
+        _ kind: String, _ year: String?, _ clients: [String]?, _ selection: DeviceSelection,
+        _ mode: DeviceFetchMode
+    ) throws -> String {
+        let (hold, holdCached) = lock.withLock { () -> (Bool, Bool) in
+            state.calls.append(Call(
+                kind: kind, mode: mode, year: year, clients: clients,
+                local: selection.local, peers: selection.peers))
+            if mode == .refresh { state.refreshStarted += 1 }
+            return (mode == .refresh && state.holdRefresh, mode == .cached && state.holdCached)
+        }
+        if hold { gate.wait() }
+        if holdCached { cachedGate.wait() }
+        let fail = lock.withLock {
+            state.failAll || (mode == .refresh && state.failRefresh) || (kind == "models" && state.failModels)
+        }
+        if fail { throw Failure() }
+        return "\(mode.rawValue)-\(year ?? "all")"
+    }
+
+    private func devices(_ kind: String) -> String {
+        let state = get(\.remoteStateByKind)[kind] ?? get(\.remoteState)
+        return """
+        [{"id":"local","label":null,"state":"local","lastSuccessAt":null},
+         {"id":"aaaaaaaaaaaaaaaa","label":"10.0.0.2:47000","state":"\(state)","lastSuccessAt":1700000000}]
+        """
+    }
+
+    private func page<T: Decodable & Sendable>(_ kind: String, _ body: String) throws -> DeviceAwarePayload<T> {
+        let json = """
+        {"ok":true,"data":{\(body),"devices":\(devices(kind)),
+         "duplicateWarning":true,"saturated":false,"remoteRangeLimited":false}}
+        """
+        return try TBCore.decodeEnvelope(Data(json.utf8))
+    }
+
+    private static let zero = #""input":1,"output":0,"cacheRead":0,"cacheWrite":0,"reasoning":0"#
+
+    func graphDevices(
+        year: String?, selection: DeviceSelection, mode: DeviceFetchMode
+    ) throws -> DeviceAwarePayload<UsagePayload> {
+        let tag = try enter("graph", year, nil, selection, mode)
+        let clients = ["claude", Self.remoteClient]
+        let days = [year ?? Self.remoteYear, Self.remoteYear].map { y in
+            let rows = clients.map {
+                #"{"client":"\#($0)","modelId":"\#(tag)","providerId":"test","tokens":{\#(Self.zero)},"cost":1.0,"messages":1}"#
+            }.joined(separator: ",")
+            return #"{"date":"\#(y)-01-02","totals":{"tokens":10,"cost":2.0,"messages":2},"intensity":1,"tokenBreakdown":{\#(Self.zero)},"clients":[\#(rows)]}"#
+        }
+        let years = Set([year ?? Self.remoteYear, Self.remoteYear]).sorted().map {
+            #"{"year":"\#($0)","totalTokens":10,"totalCost":2.0,"range":{"start":"\#($0)-01-01","end":"\#($0)-12-31"}}"#
+        }
+        return try page("graph", """
+            "meta":{"generatedAt":"\(Self.overlayGeneratedAt)","version":"test","dateRange":{"start":"1999-01-01","end":"2099-01-01"}},
+            "summary":{"totalTokens":20,"totalCost":4.0,"totalDays":2,"activeDays":2,"averagePerDay":2.0,"maxCostInSingleDay":2.0,
+             "clients":["claude","\(Self.remoteClient)"],"models":["\(tag)"]},
+            "years":[\(years.joined(separator: ","))],
+            "contributions":[\(Set(days).sorted().joined(separator: ","))]
+            """)
+    }
+
+    func modelReportDevices(
+        year: String?, selection: DeviceSelection, mode: DeviceFetchMode
+    ) throws -> DeviceAwarePayload<ModelReport> {
+        let tag = try enter("models", year, nil, selection, mode)
+        let rows = ["claude", Self.remoteClient].map {
+            #"{"client":"\#($0)","model":"\#(Self.remoteModel)-\#(tag)","provider":"test",\#(Self.zero),"total":1,"messageCount":1,"cost":1.0,"msPer1kTokens":null,"costEstimate":null}"#
+        }
+        return try page("models", """
+            "entries":[\(rows.joined(separator: ","))],"totalInput":2,"totalOutput":0,"totalCacheRead":0,
+            "totalCacheWrite":0,"totalMessages":2,"totalCost":2.0,"pricingUpdatedAt":null
+            """)
+    }
+
+    func hourlyReportDevices(
+        year: String?, clients: [String]?, selection: DeviceSelection, mode: DeviceFetchMode
+    ) throws -> DeviceAwarePayload<HourlyReport> {
+        let tag = try enter("hourly", year, clients, selection, mode)
+        return try page("hourly", """
+            "entries":[{"hour":"2099-01-01 10:00","clients":["claude","\(Self.remoteClient)"],"models":["\(tag)"],
+            \(Self.zero),"total":1,"messageCount":1,"turnCount":1,"cost":1.0}],"totalCost":1.0
+            """)
+    }
+
+    func agentsReportDevices(
+        year: String?, clients: [String]?, selection: DeviceSelection, mode: DeviceFetchMode
+    ) throws -> DeviceAwarePayload<AgentsReport> {
+        let tag = try enter("agents", year, clients, selection, mode)
+        return try page("agents", """
+            "entries":[{"agent":"\(tag)","clients":["claude","\(Self.remoteClient)"],\(Self.zero),
+            "total":1,"cost":1.0,"messages":1}],"totalCost":1.0,"totalMessages":1
+            """)
     }
 }

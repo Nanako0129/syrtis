@@ -41,6 +41,47 @@ protocol UsageDataSource: Sendable {
     func quotaCurveSync(
         clientId: String, accountKey: String?, windowKey: String, generation: UInt64
     ) throws -> QuotaCurve?
+
+    // SA-3d: the device-aware pages. All five BLOCK (a `refresh` runs up to
+    // one fetch deadline per selected producer), so the dashboard model calls
+    // them on a `Thread` of its own, never on the main actor or the
+    // cooperative pool. Cross-source merging is the core's: these return what
+    // `tb_*_devices` computed, never a sum Swift made.
+    func remotePeers() throws -> [RemotePeer]
+    func graphDevices(
+        year: String?, selection: DeviceSelection, mode: DeviceFetchMode
+    ) throws -> DeviceAwarePayload<UsagePayload>
+    func modelReportDevices(
+        year: String?, selection: DeviceSelection, mode: DeviceFetchMode
+    ) throws -> DeviceAwarePayload<ModelReport>
+    func hourlyReportDevices(
+        year: String?, clients: [String]?, selection: DeviceSelection, mode: DeviceFetchMode
+    ) throws -> DeviceAwarePayload<HourlyReport>
+    func agentsReportDevices(
+        year: String?, clients: [String]?, selection: DeviceSelection, mode: DeviceFetchMode
+    ) throws -> DeviceAwarePayload<AgentsReport>
+}
+
+/// What a source without paired devices answers to the device-aware calls.
+enum DeviceSourceError: Error { case unsupported }
+
+extension UsageDataSource {
+    /// Defaults that never touch `TBCore`: only `LiveUsageDataSource` reaches
+    /// the agent. The demo source and the test doubles list no devices, so the
+    /// device menu never appears for them and no real agent is read.
+    func remotePeers() throws -> [RemotePeer] { [] }
+    func graphDevices(
+        year: String?, selection: DeviceSelection, mode: DeviceFetchMode
+    ) throws -> DeviceAwarePayload<UsagePayload> { throw DeviceSourceError.unsupported }
+    func modelReportDevices(
+        year: String?, selection: DeviceSelection, mode: DeviceFetchMode
+    ) throws -> DeviceAwarePayload<ModelReport> { throw DeviceSourceError.unsupported }
+    func hourlyReportDevices(
+        year: String?, clients: [String]?, selection: DeviceSelection, mode: DeviceFetchMode
+    ) throws -> DeviceAwarePayload<HourlyReport> { throw DeviceSourceError.unsupported }
+    func agentsReportDevices(
+        year: String?, clients: [String]?, selection: DeviceSelection, mode: DeviceFetchMode
+    ) throws -> DeviceAwarePayload<AgentsReport> { throw DeviceSourceError.unsupported }
 }
 
 extension UsageDataSource {
@@ -193,6 +234,34 @@ struct LiveUsageDataSource: UsageDataSource {
         try TBCore.quotaCurve(
             clientId: clientId, accountKey: accountKey, windowKey: windowKey,
             generation: generation)
+    }
+
+    func remotePeers() throws -> [RemotePeer] { try TBCore.remotePeers() }
+
+    func graphDevices(
+        year: String?, selection: DeviceSelection, mode: DeviceFetchMode
+    ) throws -> DeviceAwarePayload<UsagePayload> {
+        try TBCore.graphDevices(year: year, selection: selection, mode: mode)
+    }
+
+    func modelReportDevices(
+        year: String?, selection: DeviceSelection, mode: DeviceFetchMode
+    ) throws -> DeviceAwarePayload<ModelReport> {
+        try TBCore.modelReportDevices(year: year, selection: selection, mode: mode)
+    }
+
+    func hourlyReportDevices(
+        year: String?, clients: [String]?, selection: DeviceSelection, mode: DeviceFetchMode
+    ) throws -> DeviceAwarePayload<HourlyReport> {
+        try TBCore.hourlyReportDevices(
+            year: year, clients: clients, selection: selection, mode: mode)
+    }
+
+    func agentsReportDevices(
+        year: String?, clients: [String]?, selection: DeviceSelection, mode: DeviceFetchMode
+    ) throws -> DeviceAwarePayload<AgentsReport> {
+        try TBCore.agentsReportDevices(
+            year: year, clients: clients, selection: selection, mode: mode)
     }
 
     func graph(year: String?, priority: TaskPriority) async throws -> UsagePayload {

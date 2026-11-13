@@ -136,6 +136,11 @@ pub(crate) struct RemoteAgent {
     /// Test seam: the next monitor spawn fails as if the OS refused a thread.
     #[cfg(test)]
     fail_monitor_spawn: AtomicBool,
+    /// Test seam: runs inside `listen_configure` after the stored address is
+    /// read and before it is written back, the window the `configuring` lock
+    /// closes.
+    #[cfg(test)]
+    listen_pause: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 /// The process's agent, behind the `tb_remote_*` entry points.
@@ -359,6 +364,13 @@ impl RemoteAgent {
             )?;
             let store = current.agent.runtime().store();
             let config = store.state().map_err(storage_class)?.config;
+            #[cfg(test)]
+            {
+                let pause = lock(&self.listen_pause).clone();
+                if let Some(pause) = pause {
+                    pause();
+                }
+            }
             store
                 .set_listen_config(config.bind_host, config.bind_port, label)
                 .map_err(storage_class)?;
@@ -1558,6 +1570,58 @@ mod tests {
             agent.listen_configure("not a host", new, None),
             Err("invalid".into())
         );
+    }
+
+    /// SA-3d deferred item 2: two overlapping `listen_configure` calls. The
+    /// first is held between reading the stored address and writing it back;
+    /// the second must wait for the `configuring` lock, so the stored address
+    /// ends up the one the listener is bound to (the second call's).
+    #[test]
+    fn overlapping_listen_configure_calls_are_serialized() {
+        let clock = TestClock::new();
+        let home = TempHome::new();
+        let agent = Arc::new(RemoteAgent::default());
+        start(&agent, &home, &clock, ScannerSettings::default());
+        // `free_port` releases its listener, so two calls can return the same
+        // port; the assertions below need two different ones.
+        let first = free_port();
+        let second = std::iter::repeat_with(free_port)
+            .find(|port| *port != first)
+            .expect("an endless iterator");
+        let (paused, is_paused) = std::sync::mpsc::channel::<()>();
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let released = Mutex::new(released);
+        let once = AtomicBool::new(true);
+        *lock(&agent.listen_pause) = Some(Arc::new(move || {
+            if once.swap(false, Ordering::SeqCst) {
+                paused.send(()).unwrap();
+                let _ = lock(&released).recv_timeout(Duration::from_secs(30));
+            }
+        }));
+        let one = Arc::clone(&agent);
+        let a = thread::spawn(move || one.listen_configure("127.0.0.1", first, Some("a".into())));
+        is_paused.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert!(
+            agent.configuring.try_lock().is_err(),
+            "the first call does not hold the configuring lock inside the window"
+        );
+        let two = Arc::clone(&agent);
+        let b = thread::spawn(move || two.listen_configure("127.0.0.1", second, Some("b".into())));
+        thread::sleep(Duration::from_millis(400));
+        let early = b.is_finished();
+        release.send(()).unwrap();
+        a.join().unwrap().unwrap();
+        b.join().unwrap().unwrap();
+        assert!(!early, "the second call ran inside the first call's window");
+        let stored = agent
+            .with_agent(|a| a.runtime().store().state().unwrap().config)
+            .unwrap();
+        assert_eq!(
+            stored.bind_port, second,
+            "stored address is not the bound one"
+        );
+        assert!(listening(second));
+        assert!(!listening(first));
     }
 
     /// Acceptance (4): both pricing files are copied at start (same bytes,
