@@ -125,13 +125,13 @@ flowchart LR
 
 ## Settings 的 Devices 頁
 
-Settings sidebar 在 Accounts 與 General 之間的 Devices 頁（`DevicesSettingsView`）。頁面只呼叫 `TBCore.remote*`（經 `DevicesModel.swift` 的 `DevicesRemoteClient`），顯示回傳內容，並把固定的錯誤類別對應到 `DevicesCopy` 的文案；授權、摘要、配對與 grant 的判定都在 agent。`DevicesModel.shared` 是行程層級的單例（`SettingsPanel` 切頁會重建頁面），呼叫在背景 task 上進行，`tb_remote_pair_poll` 在自己的 `Thread` 上等待。
+Settings sidebar 在 Accounts 與 General 之間的 Devices 頁（`DevicesSettingsView`）。頁面只呼叫 `TBCore.remote*`（經 `DevicesModel.swift` 的 `DevicesRemoteClient`），顯示回傳內容，並把固定的錯誤類別對應到 `DevicesCopy` 的文案；授權、摘要、配對與 grant 的判定都在 agent。`DevicesModel.shared` 是行程層級的單例（`SettingsPanel` 切頁會重建頁面），呼叫在背景 task 上進行；頁面顯示時每 2 秒刷新，頁面消失即取消，進行中的刷新在每次呼叫之後檢查取消、不再呼叫也不寫入；`tb_remote_pair_poll` 在自己的 `Thread` 上等待。
 
 | 區塊 | 內容與規則 |
 |---|---|
-| 分享這台 Mac | 服務狀態與「重試」（`RemoteAgentLaunch.start` 同一條路徑）；分享開關只在 `scopeApproved` 時可開、關閉一律可按；裝置名稱（≤128 bytes）、監聽位址（`getifaddrs` 的非 loopback 位址加「僅本機」，不含 `0.0.0.0`／`::` 與需要 zone 的 IPv6 link-local）、port 1024–65535；沒有位址或 `listening` 為 false 時顯示連不到；公開 IPv4 或 global IPv6 顯示可能從網際網路連到。邀請：Pair URL 只存在 `DevicesModel.offer`，頁面消失或到期時清除並呼叫 `remoteOfferCancel`；複製時標記 concealed 與 transient，清除時只在 pasteboard 的 `changeCount` 仍是複製當下的值才清空。待核准列以 `pendingId` 為 identity，Approve／Reject 送出該列自己的 `pendingId`（`sasGeneration` 1）。已核准的 grant 可撤銷（有確認）。 |
-| 掃描範圍 | `tb_remote_scope_disclosure` 的路徑與 client 清單、分享內容的說明、`envRootsSet` 的說明；核准送出畫面上那份揭露的 `ownerInputsSha256`，回 `invalid` 時重新載入揭露、不自動重送。 |
-| 已連結的裝置 | `tb_remote_peers` 的 `host:port`、指紋、狀態、到期日、移除（有確認）；貼上邀請（≤16,384 bytes）→ claim → 顯示 SAS 並等待；取消只停止顯示，之後 poll 若成功就立刻 `remotePeerRemove`。殘餘：upsert 與 remove 之間的短暫空檔內可能已有一次拉取。 |
+| 分享這台 Mac | 服務狀態與「重試」（`RemoteAgentLaunch.start` 同一條路徑）；分享開關只在 `scopeApproved` 時可開、關閉一律可按；裝置名稱（≤128 bytes）、監聽位址（`getifaddrs` 的非 loopback 位址加「僅本機」，不含 `0.0.0.0`／`::` 與需要 zone 的 IPv6 link-local）、port 1024–65535；沒有位址或 `listening` 為 false 時顯示連不到；公開 IPv4 或 global IPv6 顯示可能從網際網路連到。邀請：Pair URL 只存在 `DevicesModel.offer`，頁面消失或到期時清除並呼叫 `remoteOfferCancel`；建立邀請以世代編號綁定，頁面消失後或被較新的建立取代時才回來的結果不發布，並立即在 core 取消；複製時標記 concealed 與 transient，清除時只在 pasteboard 的 `changeCount` 仍是複製當下的值才清空。待核准列以 `pendingId` 為 identity，Approve／Reject 送出該列自己的 `pendingId`（`sasGeneration` 1）。已核准的 grant 可撤銷（有確認）。 |
+| 掃描範圍 | `tb_remote_scope_disclosure` 的路徑與 client 清單、分享內容的說明、`envRootsSet` 的說明；核准送出按鈕所顯示那份揭露的 `ownerInputsSha256`（按下時由畫面帶入），回 `invalid` 時重新載入揭露、不自動重送。頁面開著時若某次刷新看到 `scopeApproved` 由 true 變 false，就重新載入揭露並顯示範圍已變更的說明；其他情況不重新載入。 |
+| 已連結的裝置 | `tb_remote_peers` 的 `host:port`、指紋、狀態、到期日、移除（有確認）；貼上邀請（遮蔽輸入的 `SecureField`，≤16,384 bytes）→ claim → 顯示 SAS 並等待；取消只停止顯示，之後 poll 若成功就立刻 `remotePeerRemove`。殘餘：upsert 與 remove 之間的短暫空檔內可能已有一次拉取。 |
 
 ## Pricing 複製
 

@@ -262,7 +262,12 @@ struct DevicesSettingsView: View {
             } else {
                 notice(DevicesCopy.needsApproval)
             }
-            Button(DevicesCopy.approveScope.localized) { Task { await model.approveScope() } }
+            // The digest of the disclosure this button was rendered with.
+            let shownDigest = model.disclosure?.ownerInputsSha256
+            Button(DevicesCopy.approveScope.localized) {
+                guard let shownDigest else { return }
+                Task { await model.approveScope(digest: shownDigest) }
+            }
                 .controlSize(.small)
                 .disabled(model.disclosure == nil || model.scopeApproved)
                 .padding(.horizontal, 10)
@@ -333,7 +338,8 @@ struct DevicesSettingsView: View {
             ProgressView().controlSize(.small).padding(.horizontal, 10)
         case .idle, .linked, .failed:
             HStack {
-                TextField(DevicesCopy.pastePlaceholder.localized, text: $pasted)
+                // Masked: the invitation is a secret until it is claimed.
+                SecureField(DevicesCopy.pastePlaceholder.localized, text: $pasted)
                     .textFieldStyle(.roundedBorder)
                     .font(.caption)
                 Button(DevicesCopy.link.localized) {

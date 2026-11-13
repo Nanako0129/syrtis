@@ -239,6 +239,9 @@ final class DevicesModel: ObservableObject, CustomStringConvertible, CustomDebug
     /// Claims whose wait the user cancelled; a later success is removed.
     private var cancelledHandles: Set<Int64> = []
     private var refreshTask: Task<Void, Never>?
+    /// Bumped by every create and by `pageDisappeared`: a create publishes
+    /// only if it is still the latest.
+    private var offerGeneration = 0
 
     init(client: DevicesRemoteClient, pasteboard: DevicesPasteboard) {
         self.client = client
@@ -277,15 +280,23 @@ final class DevicesModel: ObservableObject, CustomStringConvertible, CustomDebug
     func pageDisappeared() -> Task<Void, Never>? {
         refreshTask?.cancel()
         refreshTask = nil
+        // A create still in flight must not publish its offer afterwards.
+        offerGeneration &+= 1
         return clearOffer()
     }
 
     // MARK: Status
 
+    /// Every await is followed by a cancellation check: when the page goes
+    /// away mid-refresh (`pageDisappeared` cancels the polling task), the
+    /// rest of that refresh makes no call and writes nothing.
     func refresh() async {
         expireOfferIfDue(nowMs: Int64(Date().timeIntervalSince1970 * 1000))
-        switch await call({ try $0.status() }) {
+        let result = await call({ try $0.status() })
+        guard !Task.isCancelled else { return }
+        switch result {
         case .success(let next):
+            let wasApproved = status?.scopeApproved == true
             status = next
             guard next.running else {
                 pending = []
@@ -294,10 +305,24 @@ final class DevicesModel: ObservableObject, CustomStringConvertible, CustomDebug
                 return
             }
             startFailure = nil
-            if disclosure == nil { await loadDisclosure() }
-            if case .success(let list) = await call({ try $0.pendingList() }) { pending = list }
-            if case .success(let list) = await call({ try $0.grants() }) { grants = list }
-            if case .success(let list) = await call({ try $0.peers() }) { peers = list }
+            if disclosure == nil {
+                await loadDisclosure()
+            } else if wasApproved, next.scopeApproved != true {
+                // The agent restarted over changed inputs: show the new
+                // scope and say so, rather than keep the old one on screen.
+                scopeNotice = DevicesCopy.scopeChanged
+                await loadDisclosure()
+            }
+            guard !Task.isCancelled else { return }
+            let pendingResult = await call({ try $0.pendingList() })
+            guard !Task.isCancelled else { return }
+            if case .success(let list) = pendingResult { pending = list }
+            let grantsResult = await call({ try $0.grants() })
+            guard !Task.isCancelled else { return }
+            if case .success(let list) = grantsResult { grants = list }
+            let peersResult = await call({ try $0.peers() })
+            guard !Task.isCancelled else { return }
+            if case .success(let list) = peersResult { peers = list }
         case .failure:
             status = nil
         }
@@ -345,13 +370,15 @@ final class DevicesModel: ObservableObject, CustomStringConvertible, CustomDebug
     // MARK: Scan scope
 
     func loadDisclosure() async {
-        if case .success(let next) = await call({ try $0.scopeDisclosure() }) { disclosure = next }
+        let result = await call({ try $0.scopeDisclosure() })
+        guard !Task.isCancelled else { return }
+        if case .success(let next) = result { disclosure = next }
     }
 
-    /// Sends the digest of the disclosure on screen. `invalid` (the inputs
-    /// changed after it was shown): reload and ask again; never resent.
-    func approveScope() async {
-        guard let digest = disclosure?.ownerInputsSha256 else { return }
+    /// Sends `digest`, the one the button rendered with the disclosure on
+    /// screen. `invalid` (the inputs changed after it was shown): reload and
+    /// ask again; never resent.
+    func approveScope(digest: String) async {
         scopeNotice = nil
         switch await call({ try $0.scopeApprove(ownerInputsSha256: digest) }) {
         case .success:
@@ -367,11 +394,25 @@ final class DevicesModel: ObservableObject, CustomStringConvertible, CustomDebug
 
     // MARK: Invitation (producer)
 
+    /// Only the newest create, and only one the page has not left since,
+    /// publishes its offer; an older or orphaned success is cancelled in the
+    /// core at once, so no invitation stays claimable out of sight.
     func createOffer() async {
+        offerGeneration &+= 1
+        let generation = offerGeneration
         offerError = nil
         await clearOffer()?.value
         let ttl = Self.offerTTLSeconds
-        switch await call({ try $0.offerCreate(ttlSeconds: ttl) }) {
+        let result = await call({ try $0.offerCreate(ttlSeconds: ttl) })
+        guard generation == offerGeneration else {
+            if case .success(let stale) = result {
+                let client = client
+                let offerId = stale.offerId
+                Task.detached(priority: .utility) { try? client.offerCancel(offerId: offerId) }
+            }
+            return
+        }
+        switch result {
         case .success(let next): offer = next
         case .failure(let error): offerError = DevicesCopy.offerFailure(error.reason)
         }

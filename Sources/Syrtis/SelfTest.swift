@@ -22851,7 +22851,8 @@ enum SelfTest {
             expect(!model.showsRetry && model.startFailure == nil && !model.scopeApproved
                        && !model.canToggleSharing,
                    "SA3C running, scope not approved: the sharing switch is unavailable")
-            run { await model.approveScope() }
+            let approvedDigest = model.disclosure?.ownerInputsSha256 ?? ""
+            run { await model.approveScope(digest: approvedDigest) }
             expect(model.scopeApproved && model.canToggleSharing
                        && fake.get(\.approveCalls) == [SA3CFakeClient.digestA],
                    "SA3C after approving the disclosed digest the sharing switch can be turned on")
@@ -22898,7 +22899,8 @@ enum SelfTest {
             run { await scopeModel.refresh() }
             let shownDigest = scopeModel.disclosure?.ownerInputsSha256
             scopeFake.set { $0.digest = SA3CFakeClient.digestB }
-            run { await scopeModel.approveScope() }
+            let clickedDigest = shownDigest ?? ""
+            run { await scopeModel.approveScope(digest: clickedDigest) }
             expect(shownDigest == SA3CFakeClient.digestA
                        && scopeFake.get(\.approveCalls) == [SA3CFakeClient.digestA]
                        && scopeModel.scopeNotice == DevicesCopy.scopeChanged
@@ -22906,7 +22908,91 @@ enum SelfTest {
                        && !scopeModel.scopeApproved,
                    "SA3C an approval answered invalid sent the shown digest once, reloads the disclosure and is not resent")
 
-            // (2) The Pair URL stays in the model's one field.
+            // A restart over changed inputs while the page stays open: one
+            // refresh shows the new disclosure and says so; Approve sends the
+            // new digest. Control: no flip, no reload.
+            func pumpFor(_ seconds: Double) {
+                RunLoop.current.run(until: Date(timeIntervalSinceNow: seconds))
+            }
+            let staleFake = SA3CFakeClient()
+            let staleModel = DevicesModel(client: staleFake, pasteboard: SA3CFakePasteboard())
+            run { await staleModel.refresh() }
+            let firstDigest = staleModel.disclosure?.ownerInputsSha256 ?? ""
+            run { await staleModel.approveScope(digest: firstDigest) }
+            let loadsBefore = staleFake.get(\.calls).filter { $0 == "scopeDisclosure" }.count
+            run { await staleModel.refresh() }
+            let loadsUnflipped = staleFake.get(\.calls).filter { $0 == "scopeDisclosure" }.count
+            staleFake.set { $0.digest = SA3CFakeClient.digestB; $0.approved = false }
+            run { await staleModel.refresh() }
+            let flipped = (staleModel.disclosure?.ownerInputsSha256, staleModel.scopeNotice, staleModel.scopeApproved)
+            let newDigest = staleModel.disclosure?.ownerInputsSha256 ?? ""
+            run { await staleModel.approveScope(digest: newDigest) }
+            expect(staleModel.scopeApproved && loadsUnflipped == loadsBefore
+                       && flipped.0 == SA3CFakeClient.digestB && flipped.1 == DevicesCopy.scopeChanged && !flipped.2
+                       && staleFake.get(\.approveCalls) == [SA3CFakeClient.digestA, SA3CFakeClient.digestB],
+                   "SA3C approval lost while the page is open: one refresh shows the new disclosure and the scope-changed line, Approve sends the new digest; without the flip nothing is reloaded")
+
+            // Closing Settings stops polling: a refresh caught in its status
+            // call when the page goes away makes no further call and writes
+            // nothing.
+            let pollFake = SA3CFakeClient()
+            let pollModel = DevicesModel(client: pollFake, pasteboard: SA3CFakePasteboard())
+            run { await pollModel.refresh() }
+            let pollBefore = (pollModel.status, pollModel.pending.map(\.pendingId),
+                              pollModel.grants.map(\.grantId), pollModel.peers.map(\.producerStatic))
+            pollFake.set {
+                $0.nodeLabel = "late"
+                $0.pending = [SA3CFakeClient.request("p-late", sas: "7777-8888")]
+                $0.peers = [SA3CFakeClient.producerA]
+                $0.holdStatus = true
+            }
+            pollModel.pageAppeared()
+            let pollEntered = pumpUntil { pollFake.get(\.statusEntered) }
+            pollModel.pageDisappeared()
+            let callsAtLeave = pollFake.get(\.calls).count
+            pollFake.releaseStatus()
+            pumpFor(0.5)
+            expect(pollEntered && pollFake.get(\.calls).count == callsAtLeave
+                       && pollModel.status == pollBefore.0
+                       && pollModel.pending.map(\.pendingId) == pollBefore.1
+                       && pollModel.grants.map(\.grantId) == pollBefore.2
+                       && pollModel.peers.map(\.producerStatic) == pollBefore.3,
+                   "SA3C closing the page mid-refresh: no further client call runs and status, pending, grants and peers are unchanged")
+
+            // Invitations: the fake refuses as the core does, and a create
+            // that ends after the page left, or under a newer create, is not
+            // published and is cancelled.
+            let offerFake = SA3CFakeClient()
+            let offerModel = DevicesModel(client: offerFake, pasteboard: SA3CFakePasteboard())
+            run { await offerModel.createOffer() }
+            let noAddress = offerModel.offerError
+            offerFake.set { $0.bindHost = "127.0.0.1"; $0.listening = true }
+            run { await offerModel.createOffer() }
+            expect(noAddress == DevicesCopy.offerNeedsAddress && offerModel.offerError == DevicesCopy.offerNeedsSharing
+                       && offerModel.offer == nil,
+                   "SA3C Create invitation with no listen address or with sharing off shows the core's refusal line")
+            offerFake.set { $0.sharing = true; $0.holdOffers = true }
+            Task { await offerModel.createOffer() }
+            let firstEntered = pumpUntil { offerFake.get(\.offersEntered) == 1 }
+            offerModel.pageDisappeared()
+            offerFake.releaseOffers(1)
+            let orphanCancelled = pumpUntil { offerFake.get(\.cancelledOffers) == ["offer-1"] }
+            pumpFor(0.2)
+            expect(firstEntered && orphanCancelled && offerModel.offer == nil,
+                   "SA3C an invitation whose create ends after the page disappeared is not kept and is cancelled once")
+            Task { await offerModel.createOffer() }
+            _ = pumpUntil { offerFake.get(\.offersEntered) == 2 }
+            Task { await offerModel.createOffer() }
+            let bothEntered = pumpUntil { offerFake.get(\.offersEntered) == 3 }
+            offerFake.releaseOffers(2)
+            expect(bothEntered && pumpUntil { offerModel.offer?.offerId == "offer-3" }
+                       && pumpUntil { offerFake.get(\.cancelledOffers) == ["offer-1", "offer-2"] },
+                   "SA3C two overlapping creates: only the newer invitation is published and the older one is cancelled")
+            offerModel.pageDisappeared()
+
+            // (2) The Pair URL stays in the model's one field. A listening
+            // address first: the product cannot create one without it.
+            run { await model.applyListen(host: "127.0.0.1", port: 47_000, nodeLabel: "desk") }
             run { await model.createOffer() }
             let url = model.offer?.pairUrl ?? ""
             let defaultsText = UserDefaults.standard.dictionaryRepresentation().values
@@ -23241,11 +23327,30 @@ final class SA3CFakeClient: DevicesRemoteClient, @unchecked Sendable {
         var claims = 0
         var peers: [String] = []
         var removedPeers: [String] = []
+        /// Every read and create, in call order (the polling check).
+        var calls: [String] = []
+        /// While set, `status` blocks until `releaseStatus`.
+        var holdStatus = false
+        var statusEntered = false
+        /// While set, `offerCreate` blocks until `releaseOffers`.
+        var holdOffers = false
+        var offersEntered = 0
     }
 
     private let lock = NSLock()
     private var state = State()
     private let pollGate = DispatchSemaphore(value: 0)
+    private let statusGate = DispatchSemaphore(value: 0)
+    private let offerGate = DispatchSemaphore(value: 0)
+
+    func releaseStatus() {
+        set { $0.holdStatus = false }
+        statusGate.signal()
+    }
+
+    func releaseOffers(_ count: Int) {
+        for _ in 0..<count { offerGate.signal() }
+    }
     private var pollResult: Result<String, Error>?
 
     func set(_ change: (inout State) -> Void) { lock.withLock { change(&state) } }
@@ -23275,6 +23380,12 @@ final class SA3CFakeClient: DevicesRemoteClient, @unchecked Sendable {
     }
 
     func status() throws -> RemoteAgentStatus {
+        let hold = lock.withLock {
+            state.calls.append("status")
+            if state.holdStatus { state.statusEntered = true }
+            return state.holdStatus
+        }
+        if hold { statusGate.wait() }
         let s = lock.withLock { state }
         guard s.running else { return Self.decode(#"{"running":false}"#) }
         let object: [String: Any] = [
@@ -23297,7 +23408,8 @@ final class SA3CFakeClient: DevicesRemoteClient, @unchecked Sendable {
     }
 
     func scopeDisclosure() throws -> RemoteScopeDisclosure {
-        Self.decode(#"""
+        set { $0.calls.append("scopeDisclosure") }
+        return Self.decode(#"""
             {"home":"/fixture/home","configDir":"/fixture/config","dataDir":"/fixture/data",
              "extraScanPaths":{},"excludedScanPaths":{},"opencodeDbPaths":[],"clients":["claude"],
              "ownerInputsSha256":"\#(get(\.digest))","envRootsSet":false,"envRoots":[]}
@@ -23311,18 +23423,37 @@ final class SA3CFakeClient: DevicesRemoteClient, @unchecked Sendable {
         set { $0.approved = true }
     }
 
+    /// Refuses as the agent's `offerCreate` does (`control.rs`
+    /// `offer_create`, through `code_class`): no stored `bindHost` →
+    /// `invalid` (checked first); sharing off → `unauthorized` (the frozen
+    /// `create_offer`).
     func offerCreate(ttlSeconds: Int64) throws -> RemoteOffer {
-        let n = lock.withLock { state.offers += 1; return state.offers }
+        let (n, hold, refusal): (Int, Bool, String?) = lock.withLock {
+            state.calls.append("offerCreate")
+            if state.bindHost == nil { return (0, false, "invalid") }
+            if !state.sharing { return (0, false, "unauthorized") }
+            state.offers += 1
+            if state.holdOffers { state.offersEntered += 1 }
+            return (state.offers, state.holdOffers, nil)
+        }
+        try fail(refusal)
+        if hold { offerGate.wait() }
         return Self.decode(#"""
             {"expiresAt":4102444800000,"offerId":"offer-\#(n)","pairUrl":"syrtis-selftest-pair-url-\#(n)-\#(UUID().uuidString)"}
             """#)
     }
 
     func offerCancel(offerId: String) throws { set { $0.cancelledOffers.append(offerId) } }
-    func pendingList() throws -> [RemotePending] { get(\.pending) }
+    func pendingList() throws -> [RemotePending] {
+        set { $0.calls.append("pendingList") }
+        return get(\.pending)
+    }
     func approve(pendingId: String) throws { set { $0.approvedIds.append(pendingId) } }
     func reject(pendingId: String) throws { set { $0.rejected.append(pendingId) } }
-    func grants() throws -> [RemoteGrant] { [] }
+    func grants() throws -> [RemoteGrant] {
+        set { $0.calls.append("grants") }
+        return []
+    }
     func revoke(grantId: String) throws {}
 
     func pairClaim(pairUrl: String) throws -> RemoteClaim {
@@ -23339,7 +23470,8 @@ final class SA3CFakeClient: DevicesRemoteClient, @unchecked Sendable {
     }
 
     func peers() throws -> [RemotePeer] {
-        get(\.peers).map { producer in
+        set { $0.calls.append("peers") }
+        return get(\.peers).map { producer in
             Self.decode(#"""
                 {"producerStatic":"\#(producer)","fingerprint":"\#(producer.prefix(16))","nodeLabel":null,
                  "host":"192.0.2.10","port":47001,"createdAt":1,"expiresAt":4102444800000,"state":"active"}
