@@ -3370,6 +3370,18 @@ private enum DeviceOverlayResult: Sendable {
         return (slot.data, slot.failed)
     }
 
+    /// Whether a page the lens on screen shows reports `remoteRangeLimited`.
+    func rangeLimited(for view: AppView, year: String?, clients: [String]?) -> Bool {
+        Self.kinds(for: view).contains { kind in
+            switch kind {
+            case .graph: visible(graph, kind, year: year, clients: clients).page?.remoteRangeLimited == true
+            case .models: visible(models, kind, year: year, clients: clients).page?.remoteRangeLimited == true
+            case .hourly: visible(hourly, kind, year: year, clients: clients).page?.remoteRangeLimited == true
+            case .agents: visible(agents, kind, year: year, clients: clients).page?.remoteRangeLimited == true
+            }
+        }
+    }
+
     /// What the Stats lens' model sections get: the models overlay's report
     /// for the current key, or nothing and a fixed line while it has not
     /// arrived. This Mac's own `modelReport` is never the fallback.

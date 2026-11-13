@@ -26,11 +26,12 @@ enum DeviceOverlayCopy {
     static let duplicate = "Devices that sync their usage history can be counted more than once."
     static let saturated = "Some totals reached their limit and are capped."
     static let rangeLimited = "For other devices, All years covers only the last 370 days."
+    static let aboutCombined = "About combined usage"
 
     static let all = [
         menuHelp, thisMac, deviceCount, otherDevices, loading, failedNoData, keptLast,
         modelsHidden, lastGood, stale, unavailable, refused, invalidReply, incompatible,
-        duplicate, saturated, rangeLimited,
+        duplicate, saturated, rangeLimited, aboutCombined,
     ]
 
     /// The state's template; the same fixed line for a state this build does not know.
@@ -56,9 +57,16 @@ enum DeviceOverlayCopy {
     /// `lastGood` on another gets the `unavailable` line only.
     private static let severity = ["unavailable", "refused", "incompatible", "invalidReply", "stale", "lastGood"]
 
+    /// The sentences in the ⓘ popover beside the device menu: the two general
+    /// notes about combining devices, which are not trouble and so are not
+    /// lines under the lens. The range note only when the page reports it.
+    static func explanations(rangeLimited: Bool) -> [String] {
+        [duplicate.localized] + (rangeLimited ? [Self.rangeLimited.localized] : [])
+    }
+
     /// The lines under a lens for pages the core answered: one per device
     /// that is neither this Mac nor fresh (its worst state across the pages;
-    /// Stats shows two), then each flag at most once.
+    /// Stats shows two), then the capped-totals warning at most once.
     static func lines(
         _ pages: [(devices: [RemoteDevice], duplicate: Bool, saturated: Bool, rangeLimited: Bool)],
         now: Date = Date()
@@ -85,9 +93,7 @@ enum DeviceOverlayCopy {
                 out.append(template.localized(name))
             }
         }
-        if pages.contains(where: \.duplicate) { out.append(duplicate.localized) }
         if pages.contains(where: \.saturated) { out.append(saturated.localized) }
-        if pages.contains(where: \.rangeLimited) { out.append(rangeLimited.localized) }
         return out
     }
 }
@@ -96,6 +102,12 @@ enum DeviceOverlayCopy {
 /// active device.
 struct DeviceSelectionMenu: View {
     let overlay: DeviceOverlayState
+    /// Whether the lens on screen reports the 370-day limit for other devices.
+    let rangeLimited: Bool
+    @State private var infoShown = false
+
+    /// Popover width for the two sentences; chosen for readable wrapping, not measured.
+    private static let infoWidth: CGFloat = 260
 
     private var title: String {
         if overlay.selectedCount == 1, !overlay.stored.local,
@@ -108,6 +120,7 @@ struct DeviceSelectionMenu: View {
 
     var body: some View {
         if !overlay.selectablePeers.isEmpty {
+            HStack(spacing: 4) {
             Menu {
                 Toggle(isOn: Binding(
                     get: { overlay.stored.local }, set: { _ in overlay.toggleLocal() })
@@ -133,6 +146,29 @@ struct DeviceSelectionMenu: View {
             .menuIndicator(.visible)
             .fixedSize()
             .help(DeviceOverlayCopy.menuHelp.localized)
+            if overlay.includesRemote { infoButton }
+            }
+        }
+    }
+
+    private var infoButton: some View {
+        let sentences = DeviceOverlayCopy.explanations(rangeLimited: rangeLimited)
+        return Button { infoShown.toggle() } label: {
+            Image(systemName: "info.circle")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+        .buttonStyle(.plain)
+        .help(sentences.joined(separator: " "))
+        .accessibilityLabel(DeviceOverlayCopy.aboutCombined.localized)
+        .popover(isPresented: $infoShown, arrowEdge: .bottom) {
+            VStack(alignment: .leading, spacing: 8) {
+                ForEach(sentences, id: \.self) { Text(verbatim: $0) }
+            }
+            .font(.caption)
+            .fixedSize(horizontal: false, vertical: true)
+            .frame(width: Self.infoWidth, alignment: .leading)
+            .padding(12)
         }
     }
 }

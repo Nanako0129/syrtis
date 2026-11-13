@@ -531,7 +531,10 @@ struct PopoverView: View {
             Spacer()
             liveRateBadge
             yearMenu
-            DeviceSelectionMenu(overlay: model.deviceOverlay)
+            DeviceSelectionMenu(
+                overlay: model.deviceOverlay,
+                rangeLimited: model.deviceOverlay.rangeLimited(
+                    for: effectiveView, year: model.year, clients: overlayClients))
             if GlassTintSlider.glassAvailable {
                 quickSettingsButton
             }

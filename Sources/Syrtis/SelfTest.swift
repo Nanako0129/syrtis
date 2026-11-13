@@ -23330,13 +23330,13 @@ enum SelfTest {
             }
             for pages in [["lastGood", "unavailable"], ["unavailable", "lastGood"]] {
                 let merged = DeviceOverlayCopy.lines(pages.map { (statsDevices($0), true, true, true) })
-                expect(merged.count == 4
+                expect(merged.count == 2
                            && merged.first == DeviceOverlayCopy.unavailable.localized("10.0.0.2:47000")
                            && merged.filter { $0.contains("10.0.0.2:47000") }.count == 1
-                           && merged.filter { $0 == DeviceOverlayCopy.duplicate.localized }.count == 1
                            && merged.filter { $0 == DeviceOverlayCopy.saturated.localized }.count == 1
-                           && merged.filter { $0 == DeviceOverlayCopy.rangeLimited.localized }.count == 1,
-                       "SA3D (one line) \(pages) gives one device line (the unavailable one) and each flag once")
+                           && !merged.contains(DeviceOverlayCopy.duplicate.localized)
+                           && !merged.contains(DeviceOverlayCopy.rangeLimited.localized),
+                       "SA3D (one line) \(pages) gives one device line (the unavailable one) and the saturated line once, no duplicate or range line")
             }
 
             // (6) Pruning follows a SUCCESSFUL list only.
@@ -23426,11 +23426,21 @@ enum SelfTest {
                  {"id":"eeeeeeeeeeeeeeee","label":"\#(nasty)","state":"lastGood","lastSuccessAt":1700000000}]
                 """#.utf8))
             let lines = DeviceOverlayCopy.lines([(hostile, true, true, true)])
-            expect(lines.count == 5 && lines.filter { $0.contains(nasty) }.count == 2
-                       && lines.contains(DeviceOverlayCopy.duplicate.localized)
-                       && lines.contains(DeviceOverlayCopy.saturated.localized)
-                       && lines.contains(DeviceOverlayCopy.rangeLimited.localized),
-                   "SA3D (8) a device's own text appears verbatim in its line (a format argument), and the three flags each add one line")
+            expect(lines.count == 3 && lines.filter { $0.contains(nasty) }.count == 2
+                       && lines.contains(DeviceOverlayCopy.saturated.localized),
+                   "SA3D (8) a device's own text appears verbatim in its line (a format argument), and the saturated flag adds one line")
+            let freshOnly = statsDevices("fresh")
+            let flagsOnly = DeviceOverlayCopy.lines([(freshOnly, true, false, true)])
+            let satOnly = DeviceOverlayCopy.lines([(freshOnly, true, true, true)])
+            let unavail = DeviceOverlayCopy.lines([(statsDevices("unavailable"), true, false, true)])
+            expect(flagsOnly.isEmpty
+                       && satOnly == [DeviceOverlayCopy.saturated.localized]
+                       && unavail == [DeviceOverlayCopy.unavailable.localized("10.0.0.2:47000")],
+                   "SA3D (8) duplicate and rangeLimited never make a line; saturated does; an unavailable device gives its one line")
+            expect(DeviceOverlayCopy.explanations(rangeLimited: false) == [DeviceOverlayCopy.duplicate.localized]
+                       && DeviceOverlayCopy.explanations(rangeLimited: true)
+                           == [DeviceOverlayCopy.duplicate.localized, DeviceOverlayCopy.rangeLimited.localized],
+                   "SA3D (8) the info popover has the duplicate sentence, plus the 370-day one only when the page reports it")
 
             // (3) Isolation, with the reopen cache, the disk envelope, the
             // hourly cache and the record-client defaults all in play. The

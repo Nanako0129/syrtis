@@ -834,3 +834,4 @@
 "Devices that sync their usage history can be counted more than once." = "会同步用量记录的设备，其用量可能被重复计算。";
 "Some totals reached their limit and are capped." = "部分总计已达上限，以上限显示。";
 "For other devices, All years covers only the last 370 days." = "对其他设备而言，“全部年份”只涵盖最近 370 天。";
+"About combined usage" = "关于合并用量";
