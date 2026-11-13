@@ -402,7 +402,8 @@ char *tb_remote_pair_claim(const char *pair_url);
 // Blocks up to 960 s. {producerStatic, fingerprint, expiresAt}. identityChanged:
 // the agent was restarted on another identity meanwhile; nothing was written.
 char *tb_remote_pair_poll(int64_t handle);
-// [{producerStatic, fingerprint, nodeLabel?, createdAt, expiresAt, state}].
+// [{producerStatic, fingerprint, nodeLabel?, host, port, createdAt, expiresAt,
+// state}]; host and port are the address on the claimed Pair URL.
 char *tb_remote_peers(void);
 char *tb_remote_peer_remove(const char *producer_static);
 
