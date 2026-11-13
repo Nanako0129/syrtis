@@ -4,8 +4,8 @@ id: kb-plan-provider-quota-pace
 kind: plan
 scope: repository
 read_when: implementing or reviewing pace duration and historical pace for provider quota cards
-last_verified: 2026-10-19
-sources: ["crates/tb_core_ffi/src/agent_quota_history.rs", "crates/tb_core_ffi/src/agent_usage.rs", "crates/tb_core_ffi/src/agent_antigravity.rs", "crates/tb_core_ffi/src/agent_copilot.rs", "crates/tb_core_ffi/src/agent_grok.rs", "crates/tb_core_ffi/src/agent_opencode_go.rs", "crates/tb_core_ffi/src/agent_kiro.rs", "crates/tb_core_ffi/src/agent_grokbot.rs", "crates/tb_core_ffi/src/opencode_integrations.rs", "Sources/Syrtis/Views/AgentLimitsCard.swift", "Sources/TokenBarCore/UsageAttributionSettings.swift", "Sources/TokenBarCore/AgentUsage.swift", "Sources/TokenBarCore/UsagePace.swift", "Sources/Syrtis/TrayAnimator.swift", "Sources/Syrtis/DashboardModel.swift", "docs/knowledge/plans/codex-historical-pace-v2.md", "docs/knowledge/architecture.md", "docs/knowledge/verification.md", "public TokenBar-Windows PR #7", "public TokenBar PR #114", "public TokenBar-Windows PR #12", "official GitHub Copilot billing documentation", "official Claude usage credits documentation"]
+last_verified: 2026-11-13
+sources: ["crates/tb_core_ffi/src/agent_quota_history.rs", "crates/tb_core_ffi/src/agent_factory.rs", "Sources/Syrtis/FactoryAPIKey.swift", "crates/tb_core_ffi/src/agent_usage.rs", "crates/tb_core_ffi/src/agent_antigravity.rs", "crates/tb_core_ffi/src/agent_copilot.rs", "crates/tb_core_ffi/src/agent_grok.rs", "crates/tb_core_ffi/src/agent_opencode_go.rs", "crates/tb_core_ffi/src/agent_kiro.rs", "crates/tb_core_ffi/src/agent_grokbot.rs", "crates/tb_core_ffi/src/opencode_integrations.rs", "Sources/Syrtis/Views/AgentLimitsCard.swift", "Sources/TokenBarCore/UsageAttributionSettings.swift", "Sources/TokenBarCore/AgentUsage.swift", "Sources/TokenBarCore/UsagePace.swift", "Sources/Syrtis/TrayAnimator.swift", "Sources/Syrtis/DashboardModel.swift", "docs/knowledge/plans/codex-historical-pace-v2.md", "docs/knowledge/architecture.md", "docs/knowledge/verification.md", "public TokenBar-Windows PR #7", "public TokenBar PR #114", "public TokenBar-Windows PR #12", "official GitHub Copilot billing documentation", "official Claude usage credits documentation"]
 ---
 
 # Provider-wide quota pace plan
@@ -59,6 +59,8 @@ sources: ["crates/tb_core_ffi/src/agent_quota_history.rs", "crates/tb_core_ffi/s
 
 `OpenCode` 過去只提供 Copilot authentication，不是獨立 quota provider。**此凍結決定已更新，不是無聲更動**（ported from mana.bar 的 OpenCode Go provider）：OpenCode Go plan 用 opencode 憑證 store 的 `opencode-go` api key（v2：SQLite `credential` 表，`type: "key"`；v1：`auth.json`，`type: "api"`）呼叫 `/zen/go/v1/usage`，回報 rolling／weekly／monthly 三個 percentage window。因此 `opencode` client 現在同時是 router（計入它簽入的 oauth subscriptions）與自有 quota provider。此 quota 以 `client_id = "opencode"` 掛在既有 `opencode` client 與 tab，和 Copilot quota 掛在 `copilot` tab 同一模式，不新增 tab；`AgentLimitsCard` 的 opencode-router 分支因此先列自有 window card，再列它 route 的 subscriptions。window 目前不帶 duration evidence，pace 走 learning-duration lifecycle。Antigravity local IDE與 remote OAuth都是同一 provider，但 current auth evidence不能安全證明兩條 route屬於同一 account；因此兩邊都支援 pace，卻保持 account-scope隔離，直到 authenticated provider ID能證明同一 owner。安全 fragmentation優先於跨帳號污染。
 
+`droid` 過去只有本機用量，沒有 quota provider。**新增（2026-11-13）**：Factory 方案額度來自 `GET https://api.factory.ai/api/billing/limits`，以使用者在 Settings → Accounts → Factory 存入登入鑰匙圈（service `Syrtis Factory API Key`）的 Factory API key 認證。Factory 公開的 Analytics API 只開放給 Enterprise，而且只有消耗量、沒有上限，所以不能作為來源；`/api/billing/limits` 是 Droid CLI 啟動時呼叫的 endpoint，不在 Factory 公開文件中，格式改變時 adapter 以 fail-closed 處理。此 quota 以 `client_id = "droid"` 掛在既有 `droid` client 與 tab，和 OpenCode Go 掛在 `opencode` 同一模式，不新增 tab。回應的 `standard` 與 `core` 兩個層級各有 5 小時、每週、每月 window，最多六張卡片；5 小時與每週 window 帶 contract duration，每月 window 跟隨帳單週期、長度不固定，走 learning-duration lifecycle。`windowEnd` 為 `null`（該 window 尚無用量）時保留 window、不帶 reset。
+
 ## 目前缺口
 
 現在的 nested `historicalPace` 只有 Codex refresh 會填入，而且 enrichment 只選 `Weekly`。其他 provider mapper 都把 `historicalPace` 初始化成 `nil`；Swift Historical mode 遇到 `nil` 便直接使用 Linear，因此 UI 看似支援 Historical，實際上 Claude、Grok、Antigravity 與 Copilot 永遠不會學到個人曲線。
@@ -87,15 +89,16 @@ Rust provider adapter 必須先把每個 emitted window 分類，分類結果是
 
 「不 record」對所有 provider 都成立：共用的 pace enrichment [`enrich_snapshot_with`](../../../crates/tb_core_ffi/src/agent_usage.rs) 在 `agent_usage.rs:4683` 遇到 `reset_at <= now` 就把 window 標成 `unavailable(invalidEvidence)`，不產生 observation，也不寫 history。
 
-卡片層沒有共用的 enforcement point。共用建構點 `UsageWindow::try_from_provider_used_percent`（`agent_usage.rs:746`）只檢查百分比，不看 `resets_at`，所以卡片怎麼處置由各 adapter 自己決定。目前明確處理過期 reset 的是這三個：
+卡片層沒有共用的 enforcement point。共用建構點 `UsageWindow::try_from_provider_used_percent`（`agent_usage.rs:746`）只檢查百分比，不看 `resets_at`，所以卡片怎麼處置由各 adapter 自己決定。目前明確處理過期 reset 的是這四個：
 
 | Provider | 位置 | 處置 | 對卡片與 last-good 的效果 |
 |---|---|---|---|
 | Kiro | [`agent_kiro.rs`](../../../crates/tb_core_ffi/src/agent_kiro.rs):16（契約說明）、:192（`ResetEvidence::Expired` 分支）、:235（分類） | 整個 response 回 `ProviderFetchFailure::terminal` | 走 `apply_provider_outcome_with` 的 Terminal 分支（`agent_usage.rs:1443`）：**清掉** last-good，顯示錯誤卡 |
 | Grok Bot | [`agent_grokbot.rs`](../../../crates/tb_core_ffi/src/agent_grokbot.rs):321-335 | `map_response` 回錯誤，`:188` 包成 terminal | 同 Kiro：清掉 last-good，顯示錯誤卡 |
 | OpenCode Go | [`agent_opencode_go.rs`](../../../crates/tb_core_ffi/src/agent_opencode_go.rs):228 | 只丟掉過期的那個 window | 其餘 window 照常是 Success，依 `usable_success` 進 last-good，過期的那列從卡上消失；三個 window 全部丟光時，`:188-194` 回 terminal，效果同上 |
+| Factory | [`agent_factory.rs`](../../../crates/tb_core_ffi/src/agent_factory.rs) 的 `map_window` | 只丟掉過期的那個 window | 同 OpenCode Go：其餘 window 照常是 Success 並進 last-good；六個 window 全部丟光時，`decode_limits_response` 回 terminal |
 
-這份契約原本允許兩種處置：「保留 last good card」或「依既有 provider error contract 顯示錯誤」。實際上出現的是另外的組合：Kiro、Grok Bot 與 OpenCode Go 全部過期時是顯示錯誤，而且 terminal 會**清掉** last-good；OpenCode Go 只有部分 window 過期時是第三種——部分成功，少一列的卡照常寫進 last-good、覆寫前一筆。目前沒有任何 provider 保留 last good card。刻意不讓 adapter 把 reset 清成 `None` 保留整個 window：Kiro 與 OpenCode Go 的 `usable_success` 只看 window 是否非空，這樣的卡會被當成成功寫進 last-good，而且帶著過期週期的百分比蓋掉前一筆好的讀數。
+這份契約原本允許兩種處置：「保留 last good card」或「依既有 provider error contract 顯示錯誤」。實際上出現的是另外的組合：Kiro、Grok Bot、OpenCode Go 與 Factory 全部過期時是顯示錯誤，而且 terminal 會**清掉** last-good；OpenCode Go 與 Factory 只有部分 window 過期時是第三種——部分成功，少一列的卡照常寫進 last-good、覆寫前一筆。目前沒有任何 provider 保留 last good card。刻意不讓 adapter 把 reset 清成 `None` 保留整個 window：Kiro、OpenCode Go 與 Factory 的 `usable_success` 只看 window 是否非空，這樣的卡會被當成成功寫進 last-good，而且帶著過期週期的百分比蓋掉前一筆好的讀數。
 
 其他 adapter 在建構前沒有檢查過期 reset：卡片照常產生，過期 reset 只會在上述 pace 層被標成 `invalidEvidence`，而卡片依各自的 `usable_success` 判定仍可能寫進 last-good。Antigravity 的 `binding_candidate_is_better`（`agent_antigravity.rs:2028`）雖然會過濾 `reset > now`，但那只是在重複 model 候選之間排序時把過期 reset 當成沒有 reset，選出的候選仍帶著原本的 reset，所以不算卡片層的處置。決定見 [#318](https://github.com/Nanako0129/syrtis/issues/318)。
 
@@ -136,7 +139,7 @@ Security review 與 2026-07-17 live prompt 後的修訂已把 Mac protocol 鎖�
 
 > **產品決策（2026-08-07，owner 拍板）：** pace 曲線模型的是「這個人如何在一個 window 內消耗額度」，那是操作者的性質，不是帳單歸屬的屬性。**分得出來就分，分不出來就不要硬分。**
 >
-> 接受的後果：在沒有 authoritative ID 的 provider 上，同一台機器的兩個帳號共用一條 pace series。影響 Claude 全部路線、Grok、Copilot、Kiro、OpenCode Go、Antigravity remote，以及 `ChatGPT-Account-Id` 缺席時的 Codex。
+> 接受的後果：在沒有 authoritative ID 的 provider 上，同一台機器的兩個帳號共用一條 pace series。影響 Claude 全部路線、Grok、Copilot、Kiro、OpenCode Go、Factory、Antigravity remote，以及 `ChatGPT-Account-Id` 缺席時的 Codex。
 >
 > 一併接受的模型代價：series 存的是 `usedPercent` 對 phase，同一個人在不同規模的方案上斜率不同，合併會讓曲線失真。判斷是「失真的模型遠勝於永遠學不起來的模型」。**刻意不把 plan tier 放進 `windowKey`**，那會重新引入碎片化。
 >
@@ -159,6 +162,7 @@ Antigravity local IDE 的 email 來自 authenticated `GetUserStatus`，可走 au
 | Copilot | OpenCode GitHub credential lineage；本 Plan不新增 `/user` request |
 | Kiro | `getUsageLimits` response沒有 owner ID；kiro-cli SQLite entry與 Kiro IDE token file 兩個來源都走 credential lineage，history使用 provider-only 常數。IDE token file 的 `profileArn` 只用來 scope request，不作為 identity |
 | OpenCode Go | `/zen/go/v1/usage` response沒有 owner ID；`opencode-go` api key 走 credential lineage，history使用 provider-only 常數 |
+| Factory | `/api/billing/limits` response 沒有 owner ID；Syrtis 自有鑰匙圈項目中的 API key 走 credential lineage，history 使用 provider-only 常數 |
 
 #### Installation key and HMAC
 
@@ -191,6 +195,7 @@ Credential marker 固定依下表選擇；同 provider不得由 worker另選較�
 | Antigravity remote | Google refresh token；若未來 provider回傳 replacement，走 refresh transfer |
 | Antigravity local IDE | Authenticated provider ID／email；兩者皆無就 fail closed |
 | Copilot | OpenCode `github-copilot.refresh`，缺少時 `access` |
+| Factory | 鑰匙圈 `Syrtis Factory API Key` 中的 API key |
 
 Application Support 的 `quota-account-scope-v1.json` 使用 authenticated envelope：
 

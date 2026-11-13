@@ -9444,6 +9444,12 @@ enum SelfTest {
             // OpenCode Go reports three rolling windows rather than the
             // session/weekly pair; the card IDs are `agent_opencode_go.rs`'s.
             "opencode": ["rolling.v1", "weekly.v1", "monthly.v1"],
+            // Factory reports a Standard and a Core tier, each with three
+            // windows; the card IDs are `agent_factory.rs`'s.
+            "droid": [
+                "standard.five_hour.v1", "standard.weekly.v1", "standard.monthly.v1",
+                "core.five_hour.v1", "core.weekly.v1", "core.monthly.v1",
+            ],
         ]
         let defaultDemoCardIds = ["session.v1", "weekly.v1"]
         expect(
@@ -17893,6 +17899,27 @@ enum SelfTest {
                 && AccountsCopy.autoToggleGroup(autoCaptureOn: false) == [AccountsCopy.autoOn, AccountsCopy.autoOff]
                 && AccountsCopy.page == SettingsPanel.Page.accounts.rawValue,
             "ACCOUNTS-PAGE Antigravity details keep the keychain / token-service / revoke facts and Claude details keep the CLAUDE_CONFIG_DIR instructions")
+
+        // Factory ⓘ: where the key is stored, that it is not logged, where it
+        // is sent and how much it can do. The Keychain service is the literal
+        // `agent_factory::KEYCHAIN_SERVICE` reads; a rename on either side
+        // leaves the card absent with the key saved.
+        let factoryInfo = AccountsCopy.factoryDetails.joined(separator: "\n")
+        expect(
+            FactoryAPIKey.keychainService == "Syrtis Factory API Key"
+                && ["login Keychain", "Syrtis Factory API Key", "doesn't log", "api.factory.ai",
+                    "app.factory.ai/settings/api-keys", "act as your Factory account"]
+                    .allSatisfy(factoryInfo.contains)
+                && AccountsCopy.translated.contains(AccountsCopy.factorySummary),
+            "ACCOUNTS-PAGE Factory details state the Keychain item, logging, destination and scope of the key")
+        expect(
+            FactoryAPIKey.isWellFormed("fk-" + String(repeating: "a", count: 40))
+                && FactoryAPIKey.isWellFormed("  fk-" + String(repeating: "A1_", count: 10) + "\n")
+                && !FactoryAPIKey.isWellFormed("")
+                && !FactoryAPIKey.isWellFormed("fk-short")
+                && !FactoryAPIKey.isWellFormed("fk-" + String(repeating: "a", count: 30) + "\" -w x")
+                && !FactoryAPIKey.isWellFormed("fk-" + String(repeating: "a", count: 30) + " tail"),
+            "ACCOUNTS-PAGE the Factory key check refuses empty, short, quoted and spaced input before it reaches security -i")
 
         // Claude ⓘ (MA-25): the four questions a user asks of a credential
         // read, and no claim that accounts aren't shown separately (each folder

@@ -4,6 +4,7 @@ use crate::agent_account_scope::{
 };
 use crate::agent_antigravity;
 use crate::agent_copilot;
+use crate::agent_factory;
 use crate::agent_grok;
 use crate::agent_grokbot;
 use crate::agent_kiro;
@@ -123,7 +124,7 @@ impl AgentUsagePayload {
 }
 
 /// A quota provider's client id (#324). In a non-test build the only values
-/// are the eight provider variants (`Test` exists under `cfg(test)` only), and
+/// are the nine provider variants (`Test` exists under `cfg(test)` only), and
 /// `usable_success` must match each one. `run` hands each fetch its table
 /// entry's id to pass to `apply_provider_outcome`, which stamps it on a
 /// successful snapshot. Serialized as the plain string; the wire is unchanged.
@@ -137,6 +138,8 @@ pub(crate) enum ProviderId {
     GrokBot,
     Kiro,
     OpenCode,
+    /// The Factory subscription quota, published on the existing `droid` tab.
+    Droid,
     /// Fixture ids for tests that need a client outside the table.
     #[cfg(test)]
     Test(&'static str),
@@ -153,6 +156,7 @@ impl ProviderId {
             Self::GrokBot => "grok-bot",
             Self::Kiro => "kiro",
             Self::OpenCode => "opencode",
+            Self::Droid => "droid",
             #[cfg(test)]
             Self::Test(id) => id,
         }
@@ -1494,9 +1498,8 @@ fn usable_success(snapshot: &AgentUsageSnapshot) -> bool {
         | ProviderId::Copilot
         | ProviderId::Antigravity
         | ProviderId::Kiro
-        | ProviderId::OpenCode => {
-            !snapshot.windows.is_empty()
-        }
+        | ProviderId::OpenCode
+        | ProviderId::Droid => !snapshot.windows.is_empty(),
         #[cfg(test)]
         ProviderId::Test(_) => false,
     }
@@ -1734,6 +1737,12 @@ pub(crate) const QUOTA_PROVIDERS: &[QuotaProvider] = &[
         id: ProviderId::OpenCode,
         fetch: |id| provider_fetch(async move { fetch_opencode_go(id).await.into_iter().collect() }),
     },
+    // Droid only appears when the login Keychain holds a Factory API key under
+    // `agent_factory::KEYCHAIN_SERVICE`.
+    QuotaProvider {
+        id: ProviderId::Droid,
+        fetch: |id| provider_fetch(async move { fetch_droid(id).await.into_iter().collect() }),
+    },
 ];
 
 /// Run every fetch concurrently and concatenate the results in the order the
@@ -1956,6 +1965,43 @@ async fn fetch_opencode_go(id: ProviderId) -> Option<AgentUsageSnapshot> {
                         account_scope: data.account_scope,
                         // OpenCode Go has no authoritative owner ID in what Syrtis fetches.
                         history_scope: agent_account_scope::resolve_history_scope("opencode", None),
+                        windows: data.windows,
+                        credits: None,
+                        error: None,
+                        transport_diagnostic: None,
+                    },
+                },
+                Err(failure) => ProviderFetchOutcome::Failure(failure),
+            }
+        }
+    };
+    apply_provider_outcome(id, None, "api", outcome)
+}
+
+async fn fetch_droid(id: ProviderId) -> Option<AgentUsageSnapshot> {
+    let now = Utc::now();
+    let outcome = match agent_factory::factory_credential().await {
+        agent_factory::FactoryCredentialLoad::Absent => ProviderFetchOutcome::Absent,
+        agent_factory::FactoryCredentialLoad::Terminal(display) => {
+            ProviderFetchOutcome::Failure(ProviderFetchFailure::terminal(display))
+        }
+        agent_factory::FactoryCredentialLoad::Present(credential) => {
+            match agent_factory::fetch(credential).await {
+                Ok(data) => ProviderFetchOutcome::Success {
+                    cache_binding: Some(data.cache_binding),
+                    snapshot: AgentUsageSnapshot {
+                        agy_login_marker: None,
+                        bound_account_key: None,
+                        account_key: None,
+                        // Factory's quota attaches to the existing `droid` usage
+                        // tab, the way OpenCode Go attaches to `opencode`.
+                        client_id: id,
+                        source: "api".to_string(),
+                        updated_at: now.to_rfc3339_opts(SecondsFormat::Millis, true),
+                        identity: data.identity,
+                        account_scope: data.account_scope,
+                        // The billing response carries no authoritative owner ID.
+                        history_scope: agent_account_scope::resolve_history_scope("factory", None),
                         windows: data.windows,
                         credits: None,
                         error: None,
@@ -8447,7 +8493,17 @@ mod tests {
         let ids: Vec<&str> = QUOTA_PROVIDERS.iter().map(|p| p.id.as_str()).collect();
         assert_eq!(
             ids,
-            ["codex", "claude", "antigravity", "copilot", "grok", "grok-bot", "kiro", "opencode"]
+            [
+                "codex",
+                "claude",
+                "antigravity",
+                "copilot",
+                "grok",
+                "grok-bot",
+                "kiro",
+                "opencode",
+                "droid"
+            ]
         );
     }
 
