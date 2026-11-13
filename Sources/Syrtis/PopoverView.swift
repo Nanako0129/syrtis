@@ -534,7 +534,8 @@ struct PopoverView: View {
             DeviceSelectionMenu(
                 overlay: model.deviceOverlay,
                 rangeLimited: model.deviceOverlay.rangeLimited(
-                    for: effectiveView, year: model.year, clients: overlayClients))
+                    for: effectiveView, year: model.year, clients: overlayClients),
+                lensHasOverlay: !DeviceOverlayState.kinds(for: effectiveView).isEmpty)
             if GlassTintSlider.glassAvailable {
                 quickSettingsButton
             }

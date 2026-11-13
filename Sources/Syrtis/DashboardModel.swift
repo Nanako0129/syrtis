@@ -2953,6 +2953,17 @@ private enum DeviceOverlayResult: Sendable {
     case agents(DeviceAwarePayload<AgentsReport>)
 }
 
+extension DeviceOverlayResult {
+    fileprivate var devices: [RemoteDevice] {
+        switch self {
+        case .graph(let p): p.devices
+        case .models(let p): p.devices
+        case .hourly(let p): p.devices
+        case .agents(let p): p.devices
+        }
+    }
+}
+
 /// The device overlay of the dashboard's Graph (Stats, Daily, Monthly), Models,
 /// Hourly and Agents lenses.
 ///
@@ -3001,6 +3012,8 @@ private enum DeviceOverlayResult: Sendable {
     @ObservationIgnored private var wanted: [DeviceOverlayKind: DeviceOverlayKey] = [:]
     /// The one delayed retry this model may have pending.
     @ObservationIgnored private var retryTask: Task<Void, Never>?
+    /// The keys that retry will ask for again.
+    @ObservationIgnored private var retryKeys: [DeviceOverlayKey] = []
     /// The overlay's own memo for a client slice of `graphStats`; not
     /// `DashboardModel.stats(selecting:)`'s, which keys on `generatedAt` and
     /// would collide with the local payload's.
@@ -3089,6 +3102,7 @@ private enum DeviceOverlayResult: Sendable {
         graphStats = nil
         modelsColors = ModelColorMap(report: nil)
         statsMemo = nil
+        cancelRetry()
     }
 
     // MARK: Peers
@@ -3183,7 +3197,10 @@ private enum DeviceOverlayResult: Sendable {
     /// The popover closed: nothing is on screen, so a refresh in flight stops
     /// issuing its remaining pages and a pending one is skipped. The slots
     /// stay. A reopened popover calls `ensure` again (its `.task(id:)`).
-    func popoverClosed() { wanted = [:] }
+    func popoverClosed() {
+        wanted = [:]
+        cancelRetry()
+    }
 
     private func currentKey(of kind: DeviceOverlayKind) -> DeviceOverlayKey? {
         switch kind {
@@ -3198,7 +3215,9 @@ private enum DeviceOverlayResult: Sendable {
     /// runs is skipped.
     func pollOnce() {
         guard effective != nil, !Self.refreshInFlight, !wanted.isEmpty else { return }
-        startRefresh(Self.order.compactMap { wanted[$0] })
+        // A poll never arms a retry: an offline device would otherwise cost a
+        // second refresh after every tick.
+        startRefresh(Self.order.compactMap { wanted[$0] }, armsRetry: false)
     }
 
     func manualRefresh() {
@@ -3234,47 +3253,64 @@ private enum DeviceOverlayResult: Sendable {
     static func resetSingleFlightForTesting() {
         refreshInFlight = false
         pendingRefresh = nil
+        retryEpoch += 1  // every retry armed so far finds itself void when it wakes
     }
+
+    /// Test seam: whether this model has a retry armed and not yet fired.
+    var retryPendingForTesting: Bool { retryTask != nil }
+
+    private static var retryEpoch = 0
 
     private func scheduleRefresh(_ keys: [DeviceOverlayKey], isRetry: Bool = false) {
         if Self.refreshInFlight {
+            // A retry never replaces a pending request of the user's.
+            if isRetry, let pending = Self.pendingRefresh, !pending.isRetry { return }
             Self.pendingRefresh = PendingRefresh(owner: self, keys: keys, isRetry: isRetry)
             return
         }
-        startRefresh(keys, isRetry: isRetry)
+        startRefresh(keys, armsRetry: !isRetry, isRetry: isRetry)
     }
 
-    private func startRefresh(_ keys: [DeviceOverlayKey], isRetry: Bool = false) {
+    /// `armsRetry`: only a refresh the user asked for (lens shown, selection,
+    /// manual) may arm a retry; a poll refresh and a retry never do.
+    private func startRefresh(_ keys: [DeviceOverlayKey], armsRetry: Bool, isRetry: Bool = false) {
         Self.refreshInFlight = true
         Task {
-            for key in keys { await self.runOnce(key, .refresh) }
-            // A retry never schedules another: the 300 s poll covers that.
-            if !isRetry, self.leftWithoutNewData(keys) { self.scheduleRetry(keys) }
+            var stored: [(key: DeviceOverlayKey, noAnswer: Bool)] = []
+            for key in keys {
+                if case .stored(let noAnswer) = await self.runOnce(key, .refresh) {
+                    stored.append((key, noAnswer))
+                }
+            }
+            // A completed refresh of a retry's keys makes that retry moot.
+            if self.retryKeys.contains(where: { k in stored.contains { $0.key == k } }) {
+                self.cancelRetry()
+            }
+            // Only what this refresh stored decides; the retry asks only for
+            // the pages that came back without new data (one producer
+            // request is refilled in 65 s).
+            let again = stored.filter(\.noAnswer).map(\.key)
+            if armsRetry, !again.isEmpty { self.scheduleRetry(again) }
             Self.finishRefresh()
         }
     }
 
-    /// Whether any selected device, on a page just refreshed for `keys`, is in
-    /// a "no answer" state. Refused, invalid and incompatible are not: asking
-    /// again cannot change them.
-    private func leftWithoutNewData(_ keys: [DeviceOverlayKey]) -> Bool {
-        keys.contains { key in
-            let devices: [RemoteDevice]?
-            switch key.kind {
-            case .graph: devices = graph?.key == key && graph?.failed == false ? graph?.data?.devices : nil
-            case .models: devices = models?.key == key && models?.failed == false ? models?.data?.devices : nil
-            case .hourly: devices = hourly?.key == key && hourly?.failed == false ? hourly?.data?.devices : nil
-            case .agents: devices = agents?.key == key && agents?.failed == false ? agents?.data?.devices : nil
-            }
-            return devices?.contains { ["lastGood", "stale", "unavailable"].contains($0.state) } == true
-        }
+    private func cancelRetry() {
+        retryTask?.cancel()
+        retryTask = nil
+        retryKeys = []
     }
 
     private func scheduleRetry(_ keys: [DeviceOverlayKey]) {
-        retryTask?.cancel()
-        retryTask = Task {
+        cancelRetry()
+        retryKeys = keys
+        let epoch = Self.retryEpoch
+        retryTask = Task { [weak self] in
             try? await Task.sleep(for: .seconds(Self.retryDelaySeconds))
-            guard !Task.isCancelled, keys.allSatisfy({ self.wanted[$0.kind] == $0 }) else { return }
+            guard !Task.isCancelled, let self, epoch == Self.retryEpoch else { return }
+            self.retryTask = nil
+            self.retryKeys = []
+            guard keys.allSatisfy({ self.wanted[$0.kind] == $0 }) else { return }
             self.scheduleRefresh(keys, isRetry: true)
         }
     }
@@ -3284,16 +3320,29 @@ private enum DeviceOverlayResult: Sendable {
         guard let next = pendingRefresh else { return }
         pendingRefresh = nil
         if let owner = next.owner, next.keys.allSatisfy({ owner.wanted[$0.kind] == $0 }) {
-            owner.startRefresh(next.keys, isRetry: next.isRetry)
+            owner.startRefresh(next.keys, armsRetry: !next.isRetry, isRetry: next.isRetry)
         }
     }
 
-    private func runOnce(_ key: DeviceOverlayKey, _ mode: DeviceFetchMode) async {
-        guard wanted[key.kind] == key else { return }
+    private enum RunOutcome {
+        case dropped, failed
+        /// `noAnswer`: a selected device is `lastGood`, `stale` or
+        /// `unavailable` on the page just stored. Refused, invalid and
+        /// incompatible are not: asking again cannot change them.
+        case stored(noAnswer: Bool)
+    }
+
+    @discardableResult
+    private func runOnce(_ key: DeviceOverlayKey, _ mode: DeviceFetchMode) async -> RunOutcome {
+        guard wanted[key.kind] == key else { return .dropped }
         let source = self.source
         let result = await Self.onOwnThread { try Self.fetch(source, key, mode) }
-        guard wanted[key.kind] == key else { return }
+        guard wanted[key.kind] == key else { return .dropped }
         store(result, for: key, mode: mode)
+        guard case .success(let value) = result else { return .failed }
+        return .stored(noAnswer: value.devices.contains {
+            ["lastGood", "stale", "unavailable"].contains($0.state)
+        })
     }
 
     nonisolated private static func fetch(

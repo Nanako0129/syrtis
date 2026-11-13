@@ -94,7 +94,9 @@ enum DeviceOverlayCopy {
             }
         }
         if pages.contains(where: \.saturated) { out.append(saturated.localized) }
-        return out
+        // Two devices with the same label and state read the same.
+        var seen = Set<String>()
+        return out.filter { seen.insert($0).inserted }
     }
 }
 
@@ -104,6 +106,9 @@ struct DeviceSelectionMenu: View {
     let overlay: DeviceOverlayState
     /// Whether the lens on screen reports the 370-day limit for other devices.
     let rangeLimited: Bool
+    /// Whether the lens on screen has overlay pages: Overview and Quota show
+    /// only this Mac, so the note about combining devices has nothing to explain.
+    let lensHasOverlay: Bool
     @State private var infoShown = false
 
     /// Popover width for the two sentences; chosen for readable wrapping, not measured.
@@ -146,7 +151,7 @@ struct DeviceSelectionMenu: View {
             .menuIndicator(.visible)
             .fixedSize()
             .help(DeviceOverlayCopy.menuHelp.localized)
-            if overlay.includesRemote { infoButton }
+            if overlay.includesRemote && lensHasOverlay { infoButton }
             }
         }
     }

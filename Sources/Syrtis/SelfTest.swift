@@ -23142,6 +23142,9 @@ enum SelfTest {
                 suite.data(forKey: DeviceOverlayState.selectionKey)
                     .flatMap { try? JSONDecoder().decode(StoredDeviceSelection.self, from: $0) }
             }
+            // Retries stay armed-but-asleep in every case that does not test
+            // them: the delay is far beyond the run, so no result depends on speed.
+            DeviceOverlayState.retryDelaySeconds = 1e9
             DeviceOverlayState.resetSingleFlightForTesting()
 
             // (1) Only this Mac: no device call, whatever the lens. The demo
@@ -23289,7 +23292,7 @@ enum SelfTest {
 
             // (retry) One delayed retry when a selected device answered with no
             // new data. The delay is shortened; the 65 s is a producer's refill.
-            DeviceOverlayState.retryDelaySeconds = 0.3
+            DeviceOverlayState.retryDelaySeconds = 0.6
             let fakeRetry = SA3DFakeSource()
             fakeRetry.set { $0.peers = .success([peer(peerA)]); $0.remoteState = "unavailable" }
             let overlayRetry = makeModel(fakeRetry, freshSuite()).deviceOverlay
@@ -23301,6 +23304,8 @@ enum SelfTest {
             overlayRetry.ensure(view: .hourly, year: "2013", clients: nil)
             expect(pump { fakeRetry.get(\.refreshStarted) == 1 } && settled(),
                    "SA3D (retry) the first refresh runs")
+            expect(overlayRetry.retryPendingForTesting,
+                   "SA3D (retry) a retry is armed after the refresh left a device without data")
             pump(for: 0.1)
             expect(fakeRetry.get(\.refreshStarted) == 1,
                    "SA3D (retry) the retry does not start before its delay")
@@ -23327,7 +23332,100 @@ enum SelfTest {
                 expect(fakeRetry.get(\.refreshStarted) == 1, "SA3D (retry) a \(state) device is not retried")
             }
             overlayRetry.popoverClosed()
-            DeviceOverlayState.retryDelaySeconds = 65
+
+            // (retry 1) A later refresh of the same key that comes back fresh
+            // cancels the pending retry.
+            fakeRetry.set { $0.remoteState = "unavailable"; $0.refreshStarted = 0; $0.calls = [] }
+            overlayRetry.ensure(view: .hourly, year: "2013", clients: nil)
+            expect(pump { fakeRetry.get(\.refreshStarted) == 1 } && settled() && overlayRetry.retryPendingForTesting,
+                   "SA3D (retry 1) an unavailable refresh arms a retry")
+            fakeRetry.set { $0.remoteState = "fresh" }
+            overlayRetry.manualRefresh()
+            expect(pump { fakeRetry.get(\.refreshStarted) == 2 } && settled() && !overlayRetry.retryPendingForTesting,
+                   "SA3D (retry 1) a fresh refresh of the same key cancels the pending retry")
+            pump(for: 1.0)
+            expect(fakeRetry.get(\.refreshStarted) == 2,
+                   "SA3D (retry 1) and no call is made when the delay passes")
+            overlayRetry.popoverClosed()
+
+            // (retry 2) Stats, graph fresh and models unavailable: the retry
+            // asks for models only.
+            fakeRetry.set {
+                $0.remoteState = "fresh"; $0.remoteStateByKind = ["models": "unavailable"]
+                $0.refreshStarted = 0; $0.calls = []
+            }
+            overlayRetry.ensure(view: .stats, year: nil, clients: nil)
+            expect(pump { fakeRetry.get(\.refreshStarted) == 3 } && settled(),
+                   "SA3D (retry 2) the first Stats refresh asks for both pages, then the retry for one")
+            pump(for: 0.2)
+            expect(fakeRetry.get(\.calls).filter { $0.mode == .refresh }.map(\.kind) == ["graph", "models", "models"],
+                   "SA3D (retry 2) the retry asks only for the page that came back without new data")
+            overlayRetry.popoverClosed()
+            fakeRetry.set { $0.remoteStateByKind = [:] }
+
+            // (retry 3) A poll never arms a retry.
+            fakeRetry.set { $0.remoteState = "fresh"; $0.refreshStarted = 0 }
+            let overlayPoll = makeModel(fakeRetry, freshSuite()).deviceOverlay
+            overlayPoll.refreshPeers()
+            _ = pump { overlayPoll.selectablePeers.count == 1 }
+            overlayPoll.togglePeer(peerA)
+            overlayPoll.ensure(view: .hourly, year: "2012", clients: nil)
+            expect(pump { fakeRetry.get(\.refreshStarted) == 1 } && settled(),
+                   "SA3D (retry 3) the lens refresh runs")
+            fakeRetry.set { $0.remoteState = "unavailable" }
+            overlayPoll.pollOnce()
+            expect(pump { fakeRetry.get(\.refreshStarted) == 2 } && settled() && !overlayPoll.retryPendingForTesting,
+                   "SA3D (retry 3) a poll refresh that leaves a device unavailable arms no retry")
+            pump(for: 1.0)
+            expect(fakeRetry.get(\.refreshStarted) == 2, "SA3D (retry 3) and nothing follows it")
+            overlayPoll.popoverClosed()
+
+            // (retry 4) A refresh whose result was dropped decides nothing,
+            // even though the slot still holds an older unavailable page.
+            fakeRetry.set { $0.remoteState = "unavailable"; $0.refreshStarted = 0; $0.holdRefresh = true }
+            let overlayDrop = makeModel(fakeRetry, freshSuite()).deviceOverlay
+            overlayDrop.refreshPeers()
+            _ = pump { overlayDrop.selectablePeers.count == 1 }
+            overlayDrop.togglePeer(peerA)
+            overlayDrop.ensure(view: .hourly, year: "2011", clients: nil)
+            expect(pump { fakeRetry.get(\.refreshStarted) == 1 } && overlayDrop.hourly?.data != nil,
+                   "SA3D (retry 4) the cached page is in the slot while the refresh is held")
+            overlayDrop.popoverClosed()
+            fakeRetry.set { $0.holdRefresh = false }
+            fakeRetry.release()
+            expect(settled() && !overlayDrop.retryPendingForTesting,
+                   "SA3D (retry 4) a refresh whose result was dropped arms no retry")
+            pump(for: 1.0)
+            expect(fakeRetry.get(\.refreshStarted) == 1, "SA3D (retry 4) and no call follows")
+
+            // (retry 5) A retry that fires during another refresh does not
+            // replace a user's pending request.
+            fakeRetry.set { $0.remoteState = "unavailable"; $0.refreshStarted = 0; $0.calls = [] }
+            DeviceOverlayState.resetSingleFlightForTesting()
+            DeviceOverlayState.retryDelaySeconds = 0.6
+            overlayRetry.ensure(view: .hourly, year: "2013", clients: nil)
+            expect(pump { fakeRetry.get(\.refreshStarted) == 1 } && settled() && overlayRetry.retryPendingForTesting,
+                   "SA3D (retry 5) the first model has a retry armed")
+            let overlayUser = makeModel(fakeRetry, freshSuite()).deviceOverlay
+            overlayUser.refreshPeers()
+            _ = pump { overlayUser.selectablePeers.count == 1 }
+            overlayUser.togglePeer(peerA)
+            fakeRetry.set { $0.refreshStarted = 0; $0.holdRefresh = true }
+            overlayUser.ensure(view: .agents, year: "2014", clients: nil)
+            expect(pump { fakeRetry.get(\.refreshStarted) == 1 }, "SA3D (retry 5) another refresh is held in flight")
+            overlayUser.manualRefresh()
+            pump(for: 0.9)  // the first model's retry fires here and must not replace the manual request
+            fakeRetry.set { $0.holdRefresh = false }
+            fakeRetry.release()
+            expect(pump { fakeRetry.get(\.refreshStarted) == 2 } && settled(),
+                   "SA3D (retry 5) the pending request runs after the held one")
+            expect(fakeRetry.get(\.calls).filter { $0.mode == .refresh }.map(\.kind) == ["hourly", "agents", "agents"]
+                       && overlayUser.retryPendingForTesting,
+                   "SA3D (retry 5) it is the user's request (agents), run as a non-retry that arms its own retry")
+            overlayUser.popoverClosed()
+            overlayRetry.popoverClosed()
+            DeviceOverlayState.resetSingleFlightForTesting()
+            DeviceOverlayState.retryDelaySeconds = 1e9
 
             // (one line) One line per device and each flag once, across Stats' two pages.
             let statsDevices: (String) -> [RemoteDevice] = { state in
@@ -23336,6 +23434,12 @@ enum SelfTest {
                      {"id":"aaaaaaaaaaaaaaaa","label":"10.0.0.2:47000","state":"\#(state)","lastSuccessAt":1700000000}]
                     """#.utf8))
             }
+            let twins = try! JSONDecoder().decode([RemoteDevice].self, from: Data(#"""
+                [{"id":"aaaaaaaaaaaaaaaa","label":"10.0.0.2:47000","state":"unavailable","lastSuccessAt":null},
+                 {"id":"bbbbbbbbbbbbbbbb","label":"10.0.0.2:47000","state":"unavailable","lastSuccessAt":null}]
+                """#.utf8))
+            expect(DeviceOverlayCopy.lines([(twins, false, false, false)]).count == 1,
+                   "SA3D (one line) two devices with the same label and state give one line")
             for pages in [["lastGood", "unavailable"], ["unavailable", "lastGood"]] {
                 let merged = DeviceOverlayCopy.lines(pages.map { (statsDevices($0), true, true, true) })
                 expect(merged.count == 2
@@ -23688,6 +23792,7 @@ enum SelfTest {
             }
             DashboardModel.invalidateScanDerivedCaches()
             DeviceOverlayState.resetSingleFlightForTesting()
+            DeviceOverlayState.retryDelaySeconds = 65
         }
 
         accountsDefaults.restore()
@@ -24146,6 +24251,8 @@ final class SA3DFakeSource: UsageDataSource, @unchecked Sendable {
         var failAll = false
         var failModels = false
         var remoteState = "fresh"
+        /// A page kind's own device state, over `remoteState`.
+        var remoteStateByKind: [String: String] = [:]
     }
 
     private let lock = NSLock()
@@ -24207,16 +24314,17 @@ final class SA3DFakeSource: UsageDataSource, @unchecked Sendable {
         return "\(mode.rawValue)-\(year ?? "all")"
     }
 
-    private var devices: String {
-        """
+    private func devices(_ kind: String) -> String {
+        let state = get(\.remoteStateByKind)[kind] ?? get(\.remoteState)
+        return """
         [{"id":"local","label":null,"state":"local","lastSuccessAt":null},
-         {"id":"aaaaaaaaaaaaaaaa","label":"10.0.0.2:47000","state":"\(get(\.remoteState))","lastSuccessAt":1700000000}]
+         {"id":"aaaaaaaaaaaaaaaa","label":"10.0.0.2:47000","state":"\(state)","lastSuccessAt":1700000000}]
         """
     }
 
-    private func page<T: Decodable & Sendable>(_ body: String) throws -> DeviceAwarePayload<T> {
+    private func page<T: Decodable & Sendable>(_ kind: String, _ body: String) throws -> DeviceAwarePayload<T> {
         let json = """
-        {"ok":true,"data":{\(body),"devices":\(devices),
+        {"ok":true,"data":{\(body),"devices":\(devices(kind)),
          "duplicateWarning":true,"saturated":false,"remoteRangeLimited":false}}
         """
         return try TBCore.decodeEnvelope(Data(json.utf8))
@@ -24238,7 +24346,7 @@ final class SA3DFakeSource: UsageDataSource, @unchecked Sendable {
         let years = Set([year ?? Self.remoteYear, Self.remoteYear]).sorted().map {
             #"{"year":"\#($0)","totalTokens":10,"totalCost":2.0,"range":{"start":"\#($0)-01-01","end":"\#($0)-12-31"}}"#
         }
-        return try page("""
+        return try page("graph", """
             "meta":{"generatedAt":"\(Self.overlayGeneratedAt)","version":"test","dateRange":{"start":"1999-01-01","end":"2099-01-01"}},
             "summary":{"totalTokens":20,"totalCost":4.0,"totalDays":2,"activeDays":2,"averagePerDay":2.0,"maxCostInSingleDay":2.0,
              "clients":["claude","\(Self.remoteClient)"],"models":["\(tag)"]},
@@ -24254,7 +24362,7 @@ final class SA3DFakeSource: UsageDataSource, @unchecked Sendable {
         let rows = ["claude", Self.remoteClient].map {
             #"{"client":"\#($0)","model":"\#(Self.remoteModel)-\#(tag)","provider":"test",\#(Self.zero),"total":1,"messageCount":1,"cost":1.0,"msPer1kTokens":null,"costEstimate":null}"#
         }
-        return try page("""
+        return try page("models", """
             "entries":[\(rows.joined(separator: ","))],"totalInput":2,"totalOutput":0,"totalCacheRead":0,
             "totalCacheWrite":0,"totalMessages":2,"totalCost":2.0,"pricingUpdatedAt":null
             """)
@@ -24264,7 +24372,7 @@ final class SA3DFakeSource: UsageDataSource, @unchecked Sendable {
         year: String?, clients: [String]?, selection: DeviceSelection, mode: DeviceFetchMode
     ) throws -> DeviceAwarePayload<HourlyReport> {
         let tag = try enter("hourly", year, clients, selection, mode)
-        return try page("""
+        return try page("hourly", """
             "entries":[{"hour":"2099-01-01 10:00","clients":["claude","\(Self.remoteClient)"],"models":["\(tag)"],
             \(Self.zero),"total":1,"messageCount":1,"turnCount":1,"cost":1.0}],"totalCost":1.0
             """)
@@ -24274,7 +24382,7 @@ final class SA3DFakeSource: UsageDataSource, @unchecked Sendable {
         year: String?, clients: [String]?, selection: DeviceSelection, mode: DeviceFetchMode
     ) throws -> DeviceAwarePayload<AgentsReport> {
         let tag = try enter("agents", year, clients, selection, mode)
-        return try page("""
+        return try page("agents", """
             "entries":[{"agent":"\(tag)","clients":["claude","\(Self.remoteClient)"],\(Self.zero),
             "total":1,"cost":1.0,"messages":1}],"totalCost":1.0,"totalMessages":1
             """)
