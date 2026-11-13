@@ -103,19 +103,28 @@ final class LiveDevicesPasteboard: DevicesPasteboard {
 enum ListenAddress {
     static let localOnly = "127.0.0.1"
 
-    /// `localOnly` first, then each usable address once, in interface order.
-    /// Dropped: unspecified, loopback, and IPv6 link-local (it needs a zone
-    /// such as `%en0`, which the agent's address parser does not take).
-    static func choices(from addresses: [String]) -> [String] {
+    /// `localOnly` first, then each usable address once, in interface order,
+    /// then `keeping` (the address already configured) if it is not listed.
+    /// Offered: IPv4 (not unspecified, not loopback) and Tailscale's IPv6
+    /// range. Other IPv6 addresses are left out: a Mac carries many
+    /// (privacy addresses that rotate within a day or so), so they made the
+    /// list very long, and a peer bound to a rotating address loses it.
+    static func choices(from addresses: [String], keeping: String = "") -> [String] {
         var seen: Set<String> = [localOnly]
         var out = [localOnly]
         for address in addresses where !address.contains("%") {
             guard let bytes = bytes(address), !isUnspecified(bytes), !isLoopback(bytes),
-                  !isLinkLocalV6(bytes), seen.insert(address).inserted
+                  bytes.count == 4 || isTailscaleV6(bytes), seen.insert(address).inserted
             else { continue }
             out.append(address)
         }
+        if !keeping.isEmpty, bytes(keeping) != nil, seen.insert(keeping).inserted { out.append(keeping) }
         return out
+    }
+
+    /// Tailscale's IPv6 range, `fd7a:115c:a1e0::/48`.
+    private static func isTailscaleV6(_ bytes: [UInt8]) -> Bool {
+        bytes.count == 16 && bytes.prefix(6) == [0xfd, 0x7a, 0x11, 0x5c, 0xa1, 0xe0]
     }
 
     /// A public IPv4 address or a global IPv6 one (2000::/3): it may be
@@ -176,9 +185,6 @@ enum ListenAddress {
         bytes.count == 4 ? bytes[0] == 127 : bytes == [UInt8](repeating: 0, count: 15) + [1]
     }
 
-    private static func isLinkLocalV6(_ bytes: [UInt8]) -> Bool {
-        bytes.count == 16 && bytes[0] == 0xFE && bytes[1] & 0xC0 == 0x80
-    }
 }
 
 @MainActor

@@ -42,7 +42,7 @@ struct DevicesSettingsView: View {
             }
         }
         .onAppear {
-            addresses = ListenAddress.choices(from: ListenAddress.interfaceAddresses())
+            addresses = ListenAddress.interfaceAddresses()
             model.pageAppeared()
         }
         .onDisappear { model.pageDisappeared() }
@@ -132,12 +132,22 @@ struct DevicesSettingsView: View {
                 .font(.caption)
                 .frame(width: Layout.fieldWidth)
         }
-        caption(DevicesCopy.listenOn)
-        panel.radioGroup(
-            selection: $host,
-            options: addresses.map { address in
-                (address, address == ListenAddress.localOnly ? DevicesCopy.localOnlyLabel : address)
-            })
+        // A menu, not a radio list: one row however many addresses the Mac has.
+        panel.row(DevicesCopy.listenOn) {
+            Picker(DevicesCopy.listenOn.localized, selection: $host) {
+                ForEach(ListenAddress.choices(from: addresses, keeping: host), id: \.self) { address in
+                    if address == ListenAddress.localOnly {
+                        Text(DevicesCopy.localOnlyLabel.localized).tag(address)
+                    } else {
+                        Text(verbatim: address).tag(address)
+                    }
+                }
+            }
+            .labelsHidden()
+            .pickerStyle(.menu)
+            .fixedSize()
+            .accessibilityLabel(DevicesCopy.listenOn.localized)
+        }
         panel.row(DevicesCopy.port) {
             TextField("", text: $portText)
                 .textFieldStyle(.roundedBorder)
