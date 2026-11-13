@@ -392,7 +392,9 @@ char *tb_remote_offer_cancel(const char *offer_id);
 char *tb_remote_pending_list(void);
 char *tb_remote_approve(const char *pending_id, int64_t sas_generation);
 char *tb_remote_reject(const char *pending_id, int64_t sas_generation);
-// [{grantId, peerFingerprint, createdAt, expiresAt, state}].
+// [{grantId, peerFingerprint, createdAt, expiresAt, state}]; state is active,
+// revoked, expired, or superseded (stored active, but a later scope approval
+// ended its authorization).
 char *tb_remote_grants(void);
 char *tb_remote_revoke(const char *grant_id);
 // Receiver. {handle, sas, expiresAt, producerFingerprint}.
@@ -400,7 +402,8 @@ char *tb_remote_pair_claim(const char *pair_url);
 // Blocks up to 960 s. {producerStatic, fingerprint, expiresAt}. identityChanged:
 // the agent was restarted on another identity meanwhile; nothing was written.
 char *tb_remote_pair_poll(int64_t handle);
-// [{producerStatic, fingerprint, nodeLabel?, createdAt, expiresAt, state}].
+// [{producerStatic, fingerprint, nodeLabel?, host, port, createdAt, expiresAt,
+// state}]; host and port are the address on the claimed Pair URL.
 char *tb_remote_peers(void);
 char *tb_remote_peer_remove(const char *producer_static);
 

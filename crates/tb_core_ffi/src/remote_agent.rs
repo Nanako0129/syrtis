@@ -470,7 +470,20 @@ impl RemoteAgent {
                             "peerFingerprint": fingerprint(&grant.initiator_static),
                             "createdAt": grant.created_at_ms,
                             "expiresAt": grant.expires_at_ms,
+                            // A stored `Active` grant stops authorizing when
+                            // a scope approval moves the generation and
+                            // raises the deny floor (`security::authorize`);
+                            // the record itself is not rewritten. Listed as
+                            // `active` it would show a device that can no
+                            // longer read as one that can.
                             "state": match grant.state {
+                                GrantState::Active
+                                    if grant.auth_epoch <= state.reference.deny_floor
+                                        || grant.source_scope_generation
+                                            != state.reference.source_scope_generation =>
+                                {
+                                    "superseded"
+                                }
                                 GrantState::Active => "active",
                                 GrantState::Revoked => "revoked",
                                 GrantState::Expired => "expired",
@@ -609,6 +622,8 @@ impl RemoteAgent {
                             "producerStatic": hex_encode(&peer.responder_static),
                             "fingerprint": fingerprint(&peer.responder_static),
                             "nodeLabel": peer.node_label,
+                            "host": peer.host,
+                            "port": peer.port,
                             "createdAt": peer.created_at_ms,
                             "expiresAt": peer.expires_at_ms,
                             "state": match peer.state {
@@ -1461,6 +1476,17 @@ mod tests {
         );
         assert_eq!(epoch(&producer), same, "unchanged inputs must not restart");
 
+        // Approving the new scope moves the generation: the grant made under
+        // the old one can never read again, and the list says so instead of
+        // still calling it active.
+        assert_eq!(producer.grants().unwrap()[0]["state"], "active");
+        let digest = producer.scope_disclosure().unwrap()["ownerInputsSha256"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        producer.scope_approve(&digest).unwrap();
+        assert_eq!(producer.grants().unwrap()[0]["state"], "superseded");
+
         producer.revoke(grant["grantId"].as_str().unwrap()).unwrap();
         assert_eq!(producer.grants().unwrap()[0]["state"], "revoked");
         clock.advance(61);
@@ -1468,6 +1494,48 @@ mod tests {
             pull(&receiver, &producer_static),
             Err(PullError::Fetch(FetchError::Revoked))
         );
+    }
+
+    /// `SA-3c` acceptance (5): each `peers` row carries the record's `host`
+    /// and `port` (the Devices page shows `host:port`).
+    #[test]
+    fn peers_rows_carry_the_record_host_and_port() {
+        let clock = TestClock::new();
+        let home = TempHome::new();
+        let agent = Arc::new(RemoteAgent::default());
+        start(&agent, &home, &clock, ScannerSettings::default());
+        agent
+            .with(|current| {
+                let runtime = current.agent.runtime();
+                let identity = runtime
+                    .store()
+                    .state()
+                    .and_then(|state| state.identity_public())
+                    .map_err(storage_class)?;
+                runtime
+                    .peers()
+                    .upsert(PeerRecord {
+                        auth_epoch: 1,
+                        created_at_ms: 1,
+                        expires_at_ms: i64::MAX / 2,
+                        grant_id: [7; 16],
+                        host: "192.0.2.10".into(),
+                        initiator_static: identity,
+                        node_label: Some("desk".into()),
+                        pending_id: [7; 16],
+                        port: 48_123,
+                        responder_static: [9; 32],
+                        source_scope_generation: 1,
+                        state: PeerState::Active,
+                    })
+                    .map_err(storage_class)
+            })
+            .unwrap();
+        let peers = agent.peers().unwrap();
+        let row = &peers.as_array().unwrap()[0];
+        assert_eq!(row["host"], "192.0.2.10");
+        assert_eq!(row["port"], 48_123);
+        assert_eq!(row["nodeLabel"], "desk");
     }
 
     /// Acceptance (3c): the address goes through the frozen command; after a
