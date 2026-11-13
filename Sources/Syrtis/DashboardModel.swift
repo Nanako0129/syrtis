@@ -3032,10 +3032,19 @@ private enum DeviceOverlayResult: Sendable {
 
     func isSelected(peer: String) -> Bool { stored.peers.contains(peer) }
 
-    /// The last selected source cannot be unchecked.
+    /// Chosen devices that can be chosen (not counting this Mac).
+    var selectedPeerCount: Int {
+        let known = Set(selectablePeers.map(\.producerStatic))
+        return stored.peers.filter(known.contains).count
+    }
+
+    /// The last selected source cannot be unchecked, and no more than
+    /// `maxSelectedPeers` devices can be checked: `effective` would drop the
+    /// extra one silently, so it would look checked and not be asked.
     func canToggle(local: Bool, peer: String? = nil) -> Bool {
         let selected = peer.map(isSelected(peer:)) ?? stored.local
-        return !selected || selectedCount > 1
+        if selected { return selectedCount > 1 }
+        return peer == nil || selectedPeerCount < Self.maxSelectedPeers
     }
 
     func toggleLocal() {
@@ -3156,9 +3165,18 @@ private enum DeviceOverlayResult: Sendable {
         guard !missing.isEmpty else { return scheduleRefresh(keys) }
         Task {
             for key in missing { await self.runOnce(key, .cached) }
+            // Only while these are still the keys on screen: a stale request
+            // would replace a newer pending one, which `finishRefresh` then
+            // drops, leaving the newest lens without its refresh.
+            guard keys.allSatisfy({ self.wanted[$0.kind] == $0 }) else { return }
             self.scheduleRefresh(keys)
         }
     }
+
+    /// The popover closed: nothing is on screen, so a refresh in flight stops
+    /// issuing its remaining pages and a pending one is skipped. The slots
+    /// stay. A reopened popover calls `ensure` again (its `.task(id:)`).
+    func popoverClosed() { wanted = [:] }
 
     private func currentKey(of kind: DeviceOverlayKind) -> DeviceOverlayKey? {
         switch kind {
@@ -3305,6 +3323,16 @@ private enum DeviceOverlayResult: Sendable {
         case .agents: present = Set(agents?.data?.payload.entries.flatMap(\.clients) ?? []).sorted()
         }
         return ClientRegistry.displayClients(present: present, hiddenRaw: hiddenRaw, orderRaw: orderRaw)
+    }
+
+    /// What a lens may show from `slot`: the page only while the slot is for
+    /// the key the lens wants now. After a year or client change the previous
+    /// key's page is not shown while the new one loads.
+    func visible<P>(
+        _ slot: DeviceOverlaySlot<P>?, _ kind: DeviceOverlayKind, year: String?, clients: [String]?
+    ) -> (page: DeviceAwarePayload<P>?, failed: Bool) {
+        guard let slot, slot.key == key(kind, year: year, clients: clients) else { return (nil, false) }
+        return (slot.data, slot.failed)
     }
 
     /// What the Stats lens' model sections get: the models overlay's report

@@ -23245,12 +23245,15 @@ enum SelfTest {
             expect(pump { fake.get(\.refreshStarted) == 1 },
                    "SA3D (10) one refresh is held in flight")
             overlay.ensure(view: .agents, year: "2021", clients: nil)
+            pump(for: 0.15)
             overlay.ensure(view: .agents, year: "2020", clients: nil)
+            pump(for: 0.15)
             overlay.pollOnce()
             overlay.manualRefresh()
             second.deviceOverlay.ensure(view: .agents, year: "2019", clients: nil)
+            pump(for: 0.15)
             second.deviceOverlay.pollOnce()
-            pump(for: 0.5)
+            pump(for: 0.3)
             expect(fake.get(\.refreshStarted) == 1,
                    "SA3D (10) triggers during a refresh start no second refresh")
             fake.set { $0.holdRefresh = false }
@@ -23259,6 +23262,10 @@ enum SelfTest {
             pump(for: 0.4)
             expect(fake.get(\.refreshStarted) == 2,
                    "SA3D (10) at most two refreshes begin: one in flight and one catch-up")
+            expect(fake.get(\.calls).filter { $0.mode == .refresh }.map(\.year) == ["2022", "2019"]
+                       && second.deviceOverlay.agents?.key.year == "2019"
+                       && second.deviceOverlay.agents?.data?.payload.entries.first?.agent == "refresh-2019",
+                   "SA3D (10) the catch-up is the newest request (2019, not the first queued) and its response landed")
             overlay.togglePeer(peerA)
 
             // (6) Pruning follows a SUCCESSFUL list only.
@@ -23465,6 +23472,12 @@ enum SelfTest {
             expect(overlay3.displayClients(.hourly, singleClient: "codex", hiddenRaw: "", orderRaw: "")
                        == ClientRegistry.tabSlice("codex"),
                    "SA3D (11) a single-client tab keeps its own slice")
+            // What the lens selects: only the page for the key it wants now.
+            expect(overlay3.visible(overlay3.hourly, .hourly, year: "2018", clients: expectedHidden).page != nil
+                       && overlay3.visible(overlay3.hourly, .hourly, year: "2017", clients: expectedHidden).page == nil
+                       && overlay3.visible(overlay3.hourly, .hourly, year: "2018", clients: nil).page == nil
+                       && overlay3.visible(overlay3.graph, .graph, year: "2017", clients: nil).page == nil,
+                   "SA3D (5) after a year or client change the lens gets no page (loading) until the new key lands, not the previous key's")
 
             // (12) Stats with a graph overlay and no models overlay: the model
             // sections get the fixed line, never this Mac's report.
@@ -23493,7 +23506,85 @@ enum SelfTest {
             expect(pump { overlay12.statsModels(year: nil).report != nil }
                        && overlay12.statsModels(year: nil).note == nil,
                    "SA3D (12) once the models overlay arrives the report is the overlay's")
+            expect(overlay12.statsModels(year: "2000").report == nil
+                       && overlay12.statsModels(year: "2000").note == DeviceOverlayCopy.modelsHidden.localized,
+                   "SA3D (12) a models overlay for another year is not shown")
             _ = settled()
+
+            // (13) At most 16 devices can be checked: a 17th is refused, and
+            // removal still works.
+            let many = (0..<17).map { String(format: "%064x", $0 + 1) }
+            let fake13 = SA3DFakeSource()
+            fake13.set { $0.peers = .success(many.map { peer($0) }) }
+            let overlay13 = makeModel(fake13, freshSuite()).deviceOverlay
+            overlay13.refreshPeers()
+            _ = pump { overlay13.selectablePeers.count == 17 }
+            for id in many { overlay13.togglePeer(id) }
+            expect(overlay13.stored.peers == Array(many.prefix(16))
+                       && !overlay13.canToggle(local: false, peer: many[16])
+                       && overlay13.effective?.peers.count == 16
+                       && overlay13.canToggle(local: false, peer: many[0]),
+                   "SA3D (13) with 17 devices the 17th toggle is refused and the stored selection stays at 16")
+            overlay13.togglePeer(many[0])
+            overlay13.togglePeer(many[16])
+            expect(overlay13.stored.peers.count == 16 && overlay13.stored.peers.contains(many[16])
+                       && !overlay13.stored.peers.contains(many[0]),
+                   "SA3D (13) unchecking one frees a slot for the 17th")
+
+            // (14) A cached load that ends after a newer lens took over must not
+            // replace the newer pending refresh.
+            let fake14 = SA3DFakeSource()
+            fake14.set { $0.peers = .success([peer(peerA)]) }
+            let overlay14 = makeModel(fake14, freshSuite()).deviceOverlay
+            overlay14.refreshPeers()
+            _ = pump { overlay14.selectablePeers.count == 1 }
+            overlay14.togglePeer(peerA)
+            DeviceOverlayState.resetSingleFlightForTesting()
+            fake14.set { $0.holdRefresh = true }
+            overlay14.ensure(view: .agents, year: "2031", clients: nil)
+            _ = pump { fake14.get(\.refreshStarted) == 1 }
+            fake14.set { $0.holdCached = true }
+            overlay14.ensure(view: .agents, year: "2032", clients: nil)
+            _ = pump { fake14.get(\.calls).contains { $0.year == "2032" && $0.mode == .cached } }
+            fake14.set { $0.holdCached = false }
+            overlay14.ensure(view: .agents, year: "2033", clients: nil)
+            _ = pump { overlay14.agents?.key.year == "2033" }
+            pump(for: 0.2)
+            fake14.releaseCached()
+            pump(for: 0.2)
+            fake14.set { $0.holdRefresh = false }
+            fake14.release()
+            expect(pump { fake14.get(\.refreshStarted) == 2 } && settled(),
+                   "SA3D (14) a catch-up refresh runs after the held one")
+            expect(fake14.get(\.calls).filter { $0.mode == .refresh }.map(\.year) == ["2031", "2033"]
+                       && overlay14.agents?.data?.payload.entries.first?.agent == "refresh-2033",
+                   "SA3D (14) the catch-up is the newest lens (2033), not the one whose cached load ended last")
+
+            // (15) The popover closing stops what is on screen: a held
+            // multi-page refresh issues no further call and a pending one is
+            // skipped, while the slots stay.
+            let fake15 = SA3DFakeSource()
+            fake15.set { $0.peers = .success([peer(peerA)]) }
+            let overlay15 = makeModel(fake15, freshSuite()).deviceOverlay
+            overlay15.refreshPeers()
+            _ = pump { overlay15.selectablePeers.count == 1 }
+            overlay15.togglePeer(peerA)
+            DeviceOverlayState.resetSingleFlightForTesting()
+            fake15.set { $0.holdRefresh = true }
+            overlay15.ensure(view: .stats, year: nil, clients: nil)
+            _ = pump { fake15.get(\.refreshStarted) == 1 }
+            overlay15.manualRefresh()
+            overlay15.popoverClosed()
+            fake15.set { $0.holdRefresh = false }
+            fake15.release()
+            _ = settled()
+            pump(for: 0.4)
+            expect(fake15.get(\.refreshStarted) == 1
+                       && overlay15.graph?.data != nil && overlay15.models?.data != nil,
+                   "SA3D (15) after popoverClosed a held two-page refresh issues no further call, nothing pending runs, and the slots stay")
+            overlay15.ensure(view: .stats, year: nil, clients: nil)
+            expect(pump { fake15.get(\.refreshStarted) == 3 } && settled(),
+                   "SA3D (15) a reopened popover's ensure refreshes again")
 
             freshSuite().removePersistentDomain(forName: suiteName)
             if let recorded = UserDefaults.standard.stringArray(forKey: recordKey),
@@ -23956,6 +24047,7 @@ final class SA3DFakeSource: UsageDataSource, @unchecked Sendable {
         var peerCalls = 0
         var refreshStarted = 0
         var holdRefresh = false
+        var holdCached = false
         var failRefresh = false
         var failAll = false
         var failModels = false
@@ -23965,11 +24057,13 @@ final class SA3DFakeSource: UsageDataSource, @unchecked Sendable {
     private let lock = NSLock()
     private var state = State()
     private let gate = DispatchSemaphore(value: 0)
+    private let cachedGate = DispatchSemaphore(value: 0)
     private let inner = DashboardModelTestSource(failingGraphYear: "")
 
     func set(_ change: (inout State) -> Void) { lock.withLock { change(&state) } }
     func get<T>(_ key: KeyPath<State, T>) -> T { lock.withLock { state[keyPath: key] } }
     func release(_ count: Int = 1) { for _ in 0..<count { gate.signal() } }
+    func releaseCached(_ count: Int = 1) { for _ in 0..<count { cachedGate.signal() } }
 
     func graph(year: String?, priority: TaskPriority) async throws -> UsagePayload {
         try await inner.graph(year: year, priority: priority)
@@ -24003,14 +24097,15 @@ final class SA3DFakeSource: UsageDataSource, @unchecked Sendable {
         _ kind: String, _ year: String?, _ clients: [String]?, _ selection: DeviceSelection,
         _ mode: DeviceFetchMode
     ) throws -> String {
-        let hold = lock.withLock { () -> Bool in
+        let (hold, holdCached) = lock.withLock { () -> (Bool, Bool) in
             state.calls.append(Call(
                 kind: kind, mode: mode, year: year, clients: clients,
                 local: selection.local, peers: selection.peers))
             if mode == .refresh { state.refreshStarted += 1 }
-            return mode == .refresh && state.holdRefresh
+            return (mode == .refresh && state.holdRefresh, mode == .cached && state.holdCached)
         }
         if hold { gate.wait() }
+        if holdCached { cachedGate.wait() }
         let fail = lock.withLock {
             state.failAll || (mode == .refresh && state.failRefresh) || (kind == "models" && state.failModels)
         }

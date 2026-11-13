@@ -449,7 +449,10 @@ struct PopoverView: View {
             }
             routeMemory.record(clientId: activeTab, view: activeViewRaw)
         }
-        .onDisappear { removeKeyMonitors() }
+        .onDisappear {
+            removeKeyMonitors()
+            model.deviceOverlay.popoverClosed()
+        }
         // Reset a stale persisted tab whenever the displayed client set changes,
         // so a saved client id that no longer exists (or that the user just hid)
         // can't strand the dashboard on an empty slice with no visible tab row

@@ -154,9 +154,7 @@ struct DeviceOverlayLens: View {
     private func page<P>(
         _ slot: DeviceOverlaySlot<P>?, _ kind: DeviceOverlayKind
     ) -> (page: DeviceAwarePayload<P>?, failed: Bool) {
-        guard let slot, slot.key == overlay.key(kind, year: year, clients: clientsArgument)
-        else { return (nil, false) }
-        return (slot.data, slot.failed)
+        overlay.visible(slot, kind, year: year, clients: clientsArgument)
     }
 
     var body: some View {

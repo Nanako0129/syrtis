@@ -1572,6 +1572,10 @@ mod tests {
         let one = Arc::clone(&agent);
         let a = thread::spawn(move || one.listen_configure("127.0.0.1", first, Some("a".into())));
         is_paused.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert!(
+            agent.configuring.try_lock().is_err(),
+            "the first call does not hold the configuring lock inside the window"
+        );
         let two = Arc::clone(&agent);
         let b = thread::spawn(move || two.listen_configure("127.0.0.1", second, Some("b".into())));
         thread::sleep(Duration::from_millis(400));
