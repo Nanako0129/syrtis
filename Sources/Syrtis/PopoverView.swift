@@ -311,8 +311,10 @@ struct PopoverView: View {
         // everything the request depends on, including the selection; it only
         // starts the loads (each on its own thread), so cancelling it with a
         // changed key cancels nothing in flight, and a response for an old
-        // key is dropped by the overlay itself.
-        .task(id: "\(activeViewRaw)|\(model.year ?? "")|\(overlayClients?.joined(separator: ",") ?? "-")|\(model.deviceOverlay.signature)") {
+        // key is dropped by the overlay itself. The scan-roots generation is
+        // in the key because this Mac's share of a page depends on the roots:
+        // a change asks for a refresh of the pages on screen.
+        .task(id: "\(activeViewRaw)|\(model.year ?? "")|\(overlayClients?.joined(separator: ",") ?? "-")|\(model.deviceOverlay.signature)|\(extraRootsGeneration)") {
             model.deviceOverlay.ensure(
                 view: effectiveView, year: model.year, clients: overlayClients)
         }

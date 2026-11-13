@@ -3369,6 +3369,10 @@ extension DeviceOverlayResult {
     private func store(_ result: Result<DeviceOverlayResult, Error>, for key: DeviceOverlayKey, mode: DeviceFetchMode) {
         switch result {
         case .success(let value):
+            // A cached answer never replaces what the slot already holds for
+            // this key: a refresh may have stored (or failed) while the
+            // cached call ran.
+            guard mode == .refresh || currentKey(of: key.kind) != key else { return }
             switch value {
             case .graph(let page):
                 graph = .init(key: key, data: page, failed: false)

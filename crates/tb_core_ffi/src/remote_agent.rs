@@ -1582,7 +1582,12 @@ mod tests {
         let home = TempHome::new();
         let agent = Arc::new(RemoteAgent::default());
         start(&agent, &home, &clock, ScannerSettings::default());
-        let (first, second) = (free_port(), free_port());
+        // `free_port` releases its listener, so two calls can return the same
+        // port; the assertions below need two different ones.
+        let first = free_port();
+        let second = std::iter::repeat_with(free_port)
+            .find(|port| *port != first)
+            .expect("an endless iterator");
         let (paused, is_paused) = std::sync::mpsc::channel::<()>();
         let (release, released) = std::sync::mpsc::channel::<()>();
         let released = Mutex::new(released);
