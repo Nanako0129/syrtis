@@ -23066,13 +23066,18 @@ enum SelfTest {
             // (4) The listen menu.
             let choices = ListenAddress.choices(from: [
                 "0.0.0.0", "::", "192.168.1.20", "fe80::1%en0", "fe80::2", "127.0.0.1", "::1",
-                "10.0.0.2", "192.168.1.20", "2001:db8::5",
+                "10.0.0.2", "192.168.1.20", "2001:db8::5", "fd7a:115c:a1e0::1f3b:e46f", "100.76.1.2",
             ])
             let local = ListenAddress.choices(from: ListenAddress.interfaceAddresses())
-            expect(choices == ["127.0.0.1", "192.168.1.20", "10.0.0.2", "2001:db8::5"]
+            expect(ListenAddress.choices(from: ["192.168.1.20", "2001:db8::5"], keeping: "2001:db8::9")
+                       == ["127.0.0.1", "192.168.1.20", "2001:db8::9"]
+                       && ListenAddress.choices(from: ["192.168.1.20"], keeping: "192.168.1.20")
+                       == ["127.0.0.1", "192.168.1.20"],
+                   "SA3C an address already configured stays in the menu even when it is not offered")
+            expect(choices == ["127.0.0.1", "192.168.1.20", "10.0.0.2", "fd7a:115c:a1e0::1f3b:e46f", "100.76.1.2"]
                        && local.first == ListenAddress.localOnly
                        && !local.contains("0.0.0.0") && !local.contains("::"),
-                   "SA3C the listen menu is this Mac only plus real addresses; never 0.0.0.0 or ::")
+                   "SA3C the listen menu is this Mac only plus IPv4 and Tailscale IPv6 addresses; never 0.0.0.0, :: or other IPv6")
             expect(ListenAddress.mayBePublic("8.8.8.8") && ListenAddress.mayBePublic("2001:db8::5")
                        && !ListenAddress.mayBePublic("192.168.1.20") && !ListenAddress.mayBePublic("10.0.0.2")
                        && !ListenAddress.mayBePublic("172.16.0.1") && !ListenAddress.mayBePublic("100.100.1.1")
