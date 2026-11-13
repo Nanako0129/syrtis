@@ -5,14 +5,14 @@ kind: canonical
 scope: repository
 read_when: changing the embedded remote-usage agent, its tb_remote_* C ABI, its start and stop wiring, or the agent dependency pin
 last_verified: 2026-11-13
-sources: ["crates/tb_core_ffi/src/remote_agent.rs", "crates/tb_core_ffi/src/remote_pages.rs", "crates/tb_core_ffi/src/usage_graph.rs", "crates/tb_core_ffi/src/model_report.rs", "crates/tb_core_ffi/src/hourly_report.rs", "crates/tb_core_ffi/src/agents_report.rs", "crates/tb_core_ffi/src/lib.rs", "crates/tb_core_ffi/Cargo.toml", "Cargo.toml", "Cargo.lock", "Sources/CTB/include/ctb.h", "Sources/TokenBarCore/TBCore.swift", "Sources/TokenBarCore/RemoteAgent.swift", "Sources/Syrtis/RemoteAgentLaunch.swift", "Sources/Syrtis/DevicesModel.swift", "Sources/Syrtis/Views/DevicesSettingsView.swift", "Sources/Syrtis/Views/SettingsPanel.swift", "Sources/Syrtis/AppDelegate.swift", "Sources/Syrtis/ClaudeExtraRoots.swift", "Sources/Syrtis/CursorSync.swift", "Sources/Syrtis/SelfTest.swift", "scripts/check_agent_engine_pin.py", ".github/workflows/ci.yml", "public Syrtis-Agent d258e00118158d1464fe35324f7c98db97f464a8"]
+sources: ["crates/tb_core_ffi/src/remote_agent.rs", "crates/tb_core_ffi/src/remote_pages.rs", "crates/tb_core_ffi/src/usage_graph.rs", "crates/tb_core_ffi/src/model_report.rs", "crates/tb_core_ffi/src/hourly_report.rs", "crates/tb_core_ffi/src/agents_report.rs", "crates/tb_core_ffi/src/lib.rs", "crates/tb_core_ffi/Cargo.toml", "Cargo.toml", "Cargo.lock", "Sources/CTB/include/ctb.h", "Sources/TokenBarCore/TBCore.swift", "Sources/TokenBarCore/RemoteAgent.swift", "Sources/Syrtis/RemoteAgentLaunch.swift", "Sources/Syrtis/DevicesModel.swift", "Sources/Syrtis/DashboardModel.swift", "Sources/Syrtis/UsageDataSource.swift", "Sources/Syrtis/PopoverView.swift", "Sources/Syrtis/Views/DeviceSelectionMenu.swift", "Sources/Syrtis/Views/StatsView.swift", "Sources/Syrtis/Views/DevicesSettingsView.swift", "Sources/Syrtis/Views/SettingsPanel.swift", "Sources/Syrtis/AppDelegate.swift", "Sources/Syrtis/ClaudeExtraRoots.swift", "Sources/Syrtis/CursorSync.swift", "Sources/Syrtis/SelfTest.swift", "scripts/check_agent_engine_pin.py", ".github/workflows/ci.yml", "public Syrtis-Agent 76f29d1e98611915176274d48b3d87fc091aa45e"]
 ---
 
 # Embedded remote-usage agent
 
 ## 文件目的
 
-Syrtis 在 `tb_core_ffi` 內嵌 `syrtis-agent`（公開的 [Syrtis-Agent](https://github.com/Nanako0129/Syrtis-Agent/tree/d258e00118158d1464fe35324f7c98db97f464a8) ）：同一個行程裡一個 agent，負責配對、授權、Noise 傳輸、快取與分享開關。這份文件記錄它在 App 裡的接線：誰計算什麼、何時啟動與重啟、根目錄怎麼決定、C ABI 的形狀，以及驗證位置。它不重述 agent 的協定，那些以 agent repo 的 `spec/` 為準。
+Syrtis 在 `tb_core_ffi` 內嵌 `syrtis-agent`（公開的 [Syrtis-Agent](https://github.com/Nanako0129/Syrtis-Agent/tree/76f29d1e98611915176274d48b3d87fc091aa45e) ）：同一個行程裡一個 agent，負責配對、授權、Noise 傳輸、快取與分享開關。這份文件記錄它在 App 裡的接線：誰計算什麼、何時啟動與重啟、根目錄怎麼決定、C ABI 的形狀，以及驗證位置。它不重述 agent 的協定，那些以 agent repo 的 `spec/` 為準。
 
 ## 目錄
 
@@ -22,6 +22,7 @@ Syrtis 在 `tb_core_ffi` 內嵌 `syrtis-agent`（公開的 [Syrtis-Agent](https:
 - [C ABI](#c-abi)
 - [遠端折入四頁](#遠端折入四頁)
 - [Settings 的 Devices 頁](#settings-的-devices-頁)
+- [Dashboard device selection](#dashboard-device-selection)
 - [Pricing 複製](#pricing-複製)
 - [單一引擎與依賴 pin](#單一引擎與依賴-pin)
 - [殘餘風險與未觀察的行為](#殘餘風險與未觀察的行為)
@@ -120,7 +121,7 @@ flowchart LR
 - `CheckGrantStatus`（錯誤碼 2）：以 `PeerRecord` 的 host、port、responder static 問一次 Grant status；`active` → `PeerStore::update_grant`，`revoked`／`expired` → `PeerStore::set_state`；不重拉，該列為 `refused`。
 - 序列化：`remote_pages` 一把 mutex 讓 `refresh` 排隊（`cached` 不連線，不排隊）。agent 的 slot 是讀寫鎖：pull、last-good、peer 讀取與管理操作都拿讀鎖，所以一個卡住的 fetch 不擋 `cached` 呼叫或管理操作；只有輸入改變後的重啟與 `stop` 拿寫鎖，它們會等進行中的 fetch 結束（最多 `FETCH_DEADLINE` 135 秒），所以在舊 agent 上開始的 pull 不會寫進新的 agent。等寫鎖期間，之後的呼叫排在它後面。輸入沒變的 start 與 monitor 週期只拿讀鎖。
 - 相加以 map 找列（Graph 每天的 client＋model＋provider、Models 的 client＋model＋provider、Hourly 的時槽、Agents 的 agent），clients／models 以集合收集後一次寫出，所以一個 producer 的 32,768 筆不同 record 不會讓折疊變成平方時間。
-- Swift：`TBCore.graphDevices`／`modelReportDevices`／`hourlyReportDevices`／`agentsReportDevices` 回 `DeviceAwarePayload<T>`（`payload`、`devices: [RemoteDevice]`、三個旗標），不是頁面原本的型別，所以含遠端的資料不會進 `SnapshotStore`、不會取代 tray 與快照用的本機 payload。
+- Swift：`TBCore.graphDevices`／`modelReportDevices`／`hourlyReportDevices`／`agentsReportDevices` 回 `DeviceAwarePayload<T>`（`payload`、`devices: [RemoteDevice]`、三個旗標），不是頁面原本的型別，型別不符會讓誤用在編譯時露出來；但 `payload` 是公開欄位，型別本身擋不住有人把它交給 `apply`。含遠端的資料不進 `SnapshotStore`、不取代 tray 與快照用的本機 payload，靠的是呼叫端不把它交給 `apply`，由 `SA3D` selftest 守（見下一節）。
 - 查詢送給 producer 的只有凍結 request 已登記的欄位（範圍、時區、clients），而且只送給選中的 producer。
 
 ## Settings 的 Devices 頁
@@ -132,6 +133,27 @@ Settings sidebar 在 Accounts 與 General 之間的 Devices 頁（`DevicesSettin
 | 分享這台 Mac | 服務狀態與「重試」（`RemoteAgentLaunch.start` 同一條路徑）；分享開關只在 `scopeApproved` 時可開、關閉一律可按；裝置名稱（≤128 bytes）、監聽位址（`getifaddrs` 的非 loopback 位址加「僅本機」，不含 `0.0.0.0`／`::` 與需要 zone 的 IPv6 link-local）、port 1024–65535；沒有位址或 `listening` 為 false 時顯示連不到；公開 IPv4 或 global IPv6 顯示可能從網際網路連到。邀請：Pair URL 只存在 `DevicesModel.offer`，頁面消失或到期時清除並呼叫 `remoteOfferCancel`；建立邀請以世代編號綁定，頁面消失後或被較新的建立取代時才回來的結果不發布，並立即在 core 取消；複製時標記 concealed 與 transient，清除時只在 pasteboard 的 `changeCount` 仍是複製當下的值才清空。待核准列以 `pendingId` 為 identity，Approve／Reject 送出該列自己的 `pendingId`（`sasGeneration` 1）。已核准的 grant 可撤銷（有確認）。 |
 | 掃描範圍 | `tb_remote_scope_disclosure` 的路徑與 client 清單、分享內容的說明、`envRootsSet` 的說明；核准送出按鈕所顯示那份揭露的 `ownerInputsSha256`（按下時由畫面帶入），回 `invalid` 時重新載入揭露、不自動重送。頁面開著時若某次刷新看到 `scopeApproved` 由 true 變 false，就重新載入揭露並顯示範圍已變更的說明；其他情況不重新載入。 |
 | 已連結的裝置 | `tb_remote_peers` 的 `host:port`、指紋、狀態、到期日、移除（有確認）；貼上邀請（遮蔽輸入的 `SecureField`，≤16,384 bytes）→ claim → 顯示 SAS 並等待；取消只停止顯示，之後 poll 若成功就立刻 `remotePeerRemove`。殘餘：upsert 與 remove 之間的短暫空檔內可能已有一次拉取。 |
+
+## Dashboard device selection
+
+Popover 的 Graph（Stats、Daily、Monthly）、Models、Hourly、Agents 可以選擇計入哪些裝置（這台 Mac 與已連結且 `active` 的 producer）。預設只有這台 Mac，此時資料路徑與沒有這個功能時完全相同，`*Devices` 呼叫 0 次。Overview、Quota 卡片與 tray 不變。
+
+| 項目 | 規則 |
+|---|---|
+| 誰合併 | 只有 Rust（`remote_pages.rs`、agent 的 `merge::combine`）。Swift 不把本機 payload 與遠端結果相加、相減或拼接；它只 decode，並對**單一個** overlay payload 做既有的推導（`UsageStats(payload:selectedClients:)`、依 client 切片、`ModelColorMap`），用 overlay 自己的實例，不經 `DashboardModel.stats(selecting:)` 的 memo（它以 `generatedAt` 為 key，會與本機結果相撞）。 |
+| 狀態放哪 | `DeviceOverlayState`（`DashboardModel.swift`，`DashboardModel.deviceOverlay`）：選擇（UserDefaults `tokenbar.dashboard.deviceSelection`，JSON `{local, peers}`）、可選的 peer、四個 overlay（graph、models、hourly、agents，各連同它的 key）。它看不到 `DashboardModel` 的私有狀態，隔離由結構保證。 |
+| 隔離清單 | 下列一律只吃本機資料，程式上不得從 overlay 賦值或把 overlay 傳進去：`apply(payload:)`、`payload`、`stats`／`stats(selecting:)` 的 memo、`knownYears`、`recordLocalRecordClients`／`tokenbar.localRecordClients`、`publishModel`／`modelReport`／`colors`、`publishHourly`／`hourly`／`hourlyCache`、`agents`、`cacheSnapshot()`／`lastSnapshot`、`submitDiskCapture()`／`snapshotEnvelope`、`AppDelegate.lastGraph`（tray、各 client tray、Discord presence）。本機的 `load`／`pollGraph` 照舊跑。SA3D selftest (3) 讓 fake 回一個只在遠端的 client、年份、模型，抵達後逐項檢查上面各處不含它們。 |
+| 剔除規則 | `remotePeers()` **成功**回來時才把存檔中不在清單內（或不再 `active`）的 peer 丟掉（丟光時重新選回這台 Mac）。回錯或 agent 沒在跑：存檔不動、選單隱藏、只走本機（`*Devices` 0 次）；下次成功且 peer 仍在就恢復。`remotePeers()` 在 popover 出現與每次本機 poll 時呼叫。最後一個被選的來源不可取消。選擇回到只有這台 Mac：清掉所有 overlay。 |
+| Client 範圍 | Overview 分頁：Hourly／Agents 的 `clients` 參數＝沒有隱藏任何 client 時 nil，有隱藏時 registry 全部 id 扣掉隱藏的（不是本機 present 清單）；顯示用的 client 集合取自 overlay payload 自己（扣掉隱藏的），不與本機 present 清單取交集。單一 client 分頁照舊用該 client 的 slice。Graph 與 Models 不吃 `clients`，分頁切換不觸發它們。 |
+| Stats | 選擇含遠端時，Stats 需要 graph 與 models 兩個 overlay。models overlay 還沒到時，模型與歸因區塊以一句固定文案取代，不顯示本機的 `modelReport`。 |
+| 執行緒與 single-flight | 每個 `*Devices` 與 `remotePeers()` 呼叫都在自己的 `Thread` 上（不在 main、不在 cooperative pool：一次 refresh 每個 peer 最久約 145 秒，取消 Task 也中斷不了）。`refresh` 整個行程同時最多一個（`DeviceOverlayState` 的 static guard）：進行中再有觸發只記住最新的一組 key，結束後最多補跑一次；poll 在進行中時跳過。`cached` 只在該 key 還沒有 overlay 時先跑一次（立即顯示），再排 `refresh`。回來時 key 已不是目前要的就丟棄。FFI 回錯：保留該 key 的上一個 overlay 並顯示固定文案（不顯示原始錯誤）；沒有可保留的就只顯示固定文案。 |
+| 觸發 | lens 顯示、選擇變更、年份變更、client 參數變更、手動 refresh（`DashboardModel.refresh()`）、遠端 poll。 |
+| 遠端 poll 間隔 | `DeviceOverlayState.remotePollSeconds` = 300 秒，只對目前顯示的 lens。理由：producer 每個 grant 的額度是 burst 2、每 60 秒補 1，Stats 一次要 2 個請求。 |
+| 顯示 | 年份選單旁的 `DeviceSelectionMenu`（只在 peer 清單非空時出現）；選擇含遠端時，lens 上方一列小字：非 `local`／`fresh` 的裝置各一句（`lastGood`／`stale` 寫明是舊資料；`unavailable`／`refused`／`invalidReply`／`incompatible` 各一句固定文案），`duplicateWarning`／`saturated`／`remoteRangeLimited` 各一句。遠端或裝置來的字串（label、指紋）只當 format 參數或 `Text(verbatim:)`，不當 localization key；accessibility 同樣。 |
+| Seam | `UsageDataSource` 的 `remotePeers()` 與四個 `*Devices` 是同步（阻塞）呼叫；protocol extension 的預設不碰 `TBCore`（`remotePeers()` 回 `[]`，`*Devices` 丟 `DeviceSourceError.unsupported`），只有 `LiveUsageDataSource` 呼叫 `TBCore`。demo 與測試替身用預設，所以 demo 不出現裝置選單、不碰真實 agent。 |
+| Model 顏色（已知限制，擇一） | Models 與 Stats 兩個 lens 的顏色取自 models overlay 自己的 `ModelColorMap`；Daily／Monthly 沒有 models overlay，沿用本機的 `colors`，所以只在遠端用過的模型在那兩個 lens 的展開列用 provider 的 rank-0 底色。 |
+| 其他已知限制 | 只在遠端存在的年份選不到（`knownYears` 只含本機）；只在遠端用過的 client 沒有自己的分頁，只會出現在 Overview；遠端來的 client、模型、provider、agent 名稱只驗長度與 NFC，不濾控制字元與 bidi；重新配對的 producer 會出現兩列（舊紀錄為 `stale`）；Devices 頁的 Remove 不刪 agent 的 receiver cache；被上限排除的 peer 以 `unavailable` 呈現；每次含遠端的呼叫都重算本機那一份（無 `GRAPH_CACHE`），耗時未量測；producer 的 rate limit 會讓快速切換時多半顯示 `lastGood`；popover 開著時本機的 Hourly／Agents 仍照舊各算一份，與 overlay 並行。 |
+| 驗證 | Rust：`stop_waits_for_a_pull_in_flight`、`a_restart_waits_for_a_pull_in_flight`（`remote_pages.rs`，pull 進行中 stop 或改輸入重啟都要等 pull 結束、不死鎖，測試自己關掉 producer 的 session 放行）、`overlapping_listen_configure_calls_are_serialized`（`remote_agent.rs`，兩個重疊的 `listen_configure`，hook 在讀回位址與寫回之間暫停）。Swift：`SelfTest.swift` 的 `SA3D (1)`–`(12)`。沒有測試看得到的部分（選單位置與換行、深淺色、真實兩台機器的合併數字、refresh 對真實 producer 的耗時、對方可連但不回應時 Devices 頁 Stop 在約 145 秒內完成）靠實機驗收。 |
 
 ## Pricing 複製
 

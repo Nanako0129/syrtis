@@ -43,7 +43,7 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 # The remote-usage agent (pairing, grants, Noise transport, caches), embedded
 # by `remote_agent.rs`. Exact rev; its tokscale-core is the vendored one
 # through the workspace `[patch]`.
-syrtis-agent = { git = "https://github.com/Nanako0129/Syrtis-Agent", rev = "d258e00118158d1464fe35324f7c98db97f464a8" }
+syrtis-agent = { git = "https://github.com/Nanako0129/Syrtis-Agent", rev = "76f29d1e98611915176274d48b3d87fc091aa45e" }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 security-framework = "3.7"

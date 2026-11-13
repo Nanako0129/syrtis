@@ -141,9 +141,10 @@ public struct RemoteDevice: Decodable, Equatable, Sendable {
 
 /// A page payload with paired devices folded in by the core, and the device
 /// rows. Deliberately not the page's own type (`UsagePayload`,
-/// `ModelReport`, …): data that may hold another machine's usage must never
-/// reach `SnapshotStore` or replace the local payload the tray and the
-/// snapshot use.
+/// `ModelReport`, …), so a signature mismatch flags a mix-up. `payload` is a
+/// public field, so this does not stop a caller from handing it to
+/// `SnapshotStore` or the tray's local payload: that holds because callers do
+/// not pass it to `apply`, and the SA3D selftest guards it.
 public struct DeviceAwarePayload<Payload: Decodable & Sendable>: Decodable, Sendable {
     public let payload: Payload
     public let devices: [RemoteDevice]

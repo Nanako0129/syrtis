@@ -816,3 +816,22 @@
 "Active" = "有效";
 "Revoked" = "已撤銷";
 "Expired" = "已過期";
+
+/* Dashboard device selection (SA-3d) */
+"Choose which devices to include" = "選擇要納入的裝置";
+"This Mac" = "這台 Mac";
+"%lld devices" = "%lld 台裝置";
+"Other devices" = "其他裝置";
+"Loading usage from the selected devices…" = "正在從所選裝置載入用量…";
+"Couldn't load usage from the selected devices." = "無法從所選裝置載入用量。";
+"Couldn't update from the selected devices. Showing the last data received." = "無法從所選裝置更新，顯示的是最後收到的資料。";
+"Model details aren't available yet for the selected devices." = "所選裝置的模型明細尚未取得。";
+"%@ didn't respond. Showing older data (last updated %@)." = "%1$@ 沒有回應。顯示的是舊資料（上次更新：%2$@）。";
+"%@: showing older data. The time of its last update isn't known." = "%@：顯示的是舊資料，不知道上次更新的時間。";
+"%@ has no data to show." = "%@ 沒有可顯示的資料。";
+"%@ refused the request. Check Devices in Settings." = "%@ 拒絕了這個請求。請到「設定」的「裝置」查看。";
+"%@ sent a reply Syrtis couldn't use." = "%@ 回傳的內容 Syrtis 無法使用。";
+"%@ can't answer this request. It may need an update." = "%@ 無法回應這個請求，可能需要更新。";
+"Devices that sync their usage history can be counted more than once." = "會同步用量紀錄的裝置，其用量可能被重複計算。";
+"Some totals reached their limit and are capped." = "部分總計已達上限，以上限顯示。";
+"For other devices, All years covers only the last 370 days." = "對其他裝置而言，「全部年份」只涵蓋最近 370 天。";

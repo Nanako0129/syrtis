@@ -2786,6 +2786,126 @@ mod tests {
         assert_ne!(states(&refreshed)[0].1, "fresh");
     }
 
+    /// SA-3d deferred item 2: `op` (a stop, or a start whose inputs changed)
+    /// called while a pull is inside its fetch. Both take the agent's write
+    /// lock, so `op` must still be waiting while the producer stays silent,
+    /// and must finish (no deadlock) once the producer's session is dropped,
+    /// which ends the pull. The test releases the pull itself by closing the
+    /// session; it never waits out `FETCH_DEADLINE`.
+    fn op_waits_for_the_pull(
+        home: &Path,
+        op: impl FnOnce(Arc<RemoteAgent>, Arc<TestClock>) -> Value + Send + 'static,
+        check: impl FnOnce(&RemoteAgent, Value),
+    ) {
+        let clock = TestClock::new();
+        fs::create_dir_all(home).unwrap();
+        let receiver = agent_at(home, &clock);
+        let key = syrtis_agent::noise::StaticKey::generate().unwrap();
+        let silent = *key.public();
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (handshook, handshake) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let session = syrtis_agent::noise::accept(stream, &key);
+            handshook.send(session.is_ok()).unwrap();
+            let _ = released.recv_timeout(Duration::from_secs(60));
+            drop(session);
+            drop(listener);
+        });
+        fake_peer_as(&receiver, silent, 0x51, port, 1);
+        let pulling = Arc::clone(&receiver);
+        let refresh = std::thread::spawn(move || {
+            let context = crate::LocalSourceContext::current();
+            graph(&call(
+                &pulling,
+                &context,
+                false,
+                &[silent],
+                "UTC",
+                Mode::Refresh,
+            ))
+            .unwrap()
+        });
+        assert!(
+            handshake.recv_timeout(Duration::from_secs(10)).unwrap(),
+            "the refresh did not complete the handshake"
+        );
+        let operating = Arc::clone(&receiver);
+        let operation = std::thread::spawn(move || op(operating, clock));
+        std::thread::sleep(Duration::from_millis(400));
+        let early = operation.is_finished();
+        let pull_open = !refresh.is_finished();
+        release.send(()).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while !(operation.is_finished() && refresh.is_finished()) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "deadlock: the operation or the pull never ended"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        server.join().unwrap();
+        let refreshed = refresh.join().unwrap();
+        let result = operation.join().unwrap();
+        assert!(pull_open, "control: the pull had already ended");
+        assert!(
+            !early,
+            "the operation finished while the pull was in flight"
+        );
+        assert_ne!(states(&refreshed)[0].1, "fresh");
+        check(&receiver, result);
+    }
+
+    #[test]
+    fn stop_waits_for_a_pull_in_flight() {
+        if !in_child("stop_waits_for_a_pull_in_flight") {
+            return;
+        }
+        let root = child_root().unwrap();
+        op_waits_for_the_pull(
+            &root.join("r"),
+            |agent, _| agent.stop().unwrap(),
+            |agent, result| {
+                assert_eq!(result["running"], false);
+                assert_eq!(agent.status().unwrap()["running"], false);
+            },
+        );
+    }
+
+    #[test]
+    fn a_restart_waits_for_a_pull_in_flight() {
+        if !in_child("a_restart_waits_for_a_pull_in_flight") {
+            return;
+        }
+        let root = child_root().unwrap();
+        let home = root.join("r");
+        let extra = root.join("extra");
+        fs::create_dir_all(&extra).unwrap();
+        let changed = ScannerSettings {
+            extra_scan_paths: std::collections::BTreeMap::from([(
+                "claude".to_string(),
+                vec![extra],
+            )]),
+            ..ScannerSettings::default()
+        };
+        let restart_home = home.clone();
+        op_waits_for_the_pull(
+            &home,
+            move |agent, clock| {
+                let before = agent.scope_disclosure().unwrap()["ownerInputsSha256"].clone();
+                agent.start(make(&restart_home, &clock, changed)).unwrap();
+                json!({"before": before})
+            },
+            |agent, result| {
+                let after = agent.scope_disclosure().unwrap()["ownerInputsSha256"].clone();
+                assert_ne!(after, result["before"], "the inputs did not change");
+                assert_eq!(agent.status().unwrap()["running"], true);
+            },
+        );
+    }
+
     /// Deferred items (3) and (9d): a record superseded by a newer one at the
     /// same host and port is neither read (cached) nor asked (refresh).
     #[test]
