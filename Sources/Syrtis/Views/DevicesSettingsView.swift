@@ -135,6 +135,8 @@ struct DevicesSettingsView: View {
         // A menu, not a radio list: one row however many addresses the Mac has.
         panel.row(DevicesCopy.listenOn) {
             Picker(DevicesCopy.listenOn.localized, selection: $host) {
+                // Nothing is configured yet: say so, instead of an empty menu.
+                if host.isEmpty { Text(DevicesCopy.chooseAddress.localized).tag("") }
                 ForEach(ListenAddress.choices(from: addresses, keeping: host), id: \.self) { address in
                     if address == ListenAddress.localOnly {
                         Text(DevicesCopy.localOnlyLabel.localized).tag(address)
@@ -146,7 +148,6 @@ struct DevicesSettingsView: View {
             .labelsHidden()
             .pickerStyle(.menu)
             .fixedSize()
-            .accessibilityLabel(DevicesCopy.listenOn.localized)
         }
         panel.row(DevicesCopy.port) {
             TextField("", text: $portText)

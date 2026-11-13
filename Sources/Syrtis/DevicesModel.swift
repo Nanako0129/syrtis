@@ -606,6 +606,7 @@ enum DevicesCopy {
     static let deviceName = "Device name"
     static let listenOn = "Listen on"
     static let localOnlyLabel = "This Mac only (127.0.0.1)"
+    static let chooseAddress = "Choose an address"
     static let port = "Port"
     static let apply = "Apply"
     static let unreachableLine = "Other devices can't reach this Mac."
@@ -728,7 +729,7 @@ enum DevicesCopy {
     static let all = [
         page, shareSection, shareSummary, service, serviceRunning, serviceStopped, notRunning,
         startBusy, startUnsafe, startFailed, retry, shareToggle, shareOffNote, needsScope,
-        sharingBusy, sharingAlreadyOn, deviceName, listenOn, localOnlyLabel, port,
+        sharingBusy, sharingAlreadyOn, deviceName, listenOn, localOnlyLabel, chooseAddress, port,
         apply, unreachableLine, publicAddress, portRangeLine, nameTooLong, addressRefused,
         createInvitation, invitationReady, expiresIn, copy, copiedLine, cancelInvitation,
         offerNeedsSharing, offerNeedsAddress, requests, compareCode, approve, reject, approveEffect,

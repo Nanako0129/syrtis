@@ -752,6 +752,7 @@
 "Device name" = "裝置名稱";
 "Listen on" = "監聽位址";
 "This Mac only (127.0.0.1)" = "僅限這台 Mac（127.0.0.1）";
+"Choose an address" = "選擇位址";
 "Port" = "連接埠";
 "Apply" = "套用";
 "Other devices can't reach this Mac." = "其他裝置連不到這台 Mac。";
