@@ -22833,6 +22833,12 @@ enum SelfTest {
             }
             expect(devicesMissing.isEmpty,
                    "SA3C every Devices copy key resolves to a translation in zh-Hant and zh-Hans: \(devicesMissing)")
+            let envRoots = (try? JSONDecoder().decode(
+                [RemoteScopeDisclosure.EnvRoot].self,
+                from: Data(#"[{"client":"amp","variable":"TOKSCALE_CONFIG_DIR"},{"client":"codex","variable":"CODEX_HOME"},{"client":"pi","variable":"TOKSCALE_CONFIG_DIR"}]"#.utf8))) ?? []
+            expect(envRoots.count == 3
+                       && DevicesSettingsView.variableNames(envRoots) == "TOKSCALE_CONFIG_DIR, CODEX_HOME",
+                   "SA3C the environment-variable notice names each variable once, in order")
 
             // (1) The state machine.
             let fake = SA3CFakeClient()
