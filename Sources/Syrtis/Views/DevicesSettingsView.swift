@@ -353,7 +353,24 @@ struct DevicesSettingsView: View {
             Button(DevicesCopy.cancel.localized) { model.cancelWait() }
                 .controlSize(.small)
                 .padding(.horizontal, 10)
-        case .claiming:
+        case .confirming(let destination):
+            Text(DevicesCopy.linkDestination.localized)
+                .font(.caption)
+                .padding(.horizontal, 10)
+            // In full: a remote string, never a localization key, never cut.
+            Text(verbatim: Self.address(host: destination.host, port: destination.port))
+                .font(.caption.monospaced())
+                .textSelection(.enabled)
+                .fixedSize(horizontal: false, vertical: true)
+                .padding(.horizontal, 10)
+            panel.hint(DevicesCopy.linkDestinationHint)
+            HStack {
+                Button(DevicesCopy.cancel.localized) { model.cancelLink() }
+                Button(DevicesCopy.link.localized) { Task { await model.confirmLink() } }
+            }
+            .controlSize(.small)
+            .padding(.horizontal, 10)
+        case .previewing, .claiming:
             ProgressView().controlSize(.small).padding(.horizontal, 10)
         case .idle, .linked, .failed:
             HStack {
@@ -394,7 +411,12 @@ struct DevicesSettingsView: View {
     }
 
     static func address(_ peer: RemotePeer) -> String {
-        peer.host.contains(":") ? "[\(peer.host)]:\(peer.port)" : "\(peer.host):\(peer.port)"
+        address(host: peer.host, port: peer.port)
+    }
+
+    /// `host:port`; an IPv6 host in brackets.
+    static func address(host: String, port: Int) -> String {
+        host.contains(":") ? "[\(host)]:\(port)" : "\(host):\(port)"
     }
 
     /// Each variable once, in the order given: several clients can follow

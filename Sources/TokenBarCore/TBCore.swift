@@ -739,6 +739,11 @@ public enum TBCore {
         try remoteNothing(grantId.withCString { tb_remote_revoke($0) })
     }
 
+    /// Where `remotePairClaim` would connect for this Pair URL; parses only.
+    public static func remotePairDestination(pairUrl: String) throws -> RemotePairDestination {
+        try unwrap(pairUrl.withCString { tb_remote_pair_destination($0) })
+    }
+
     public static func remotePairClaim(pairUrl: String) throws -> RemoteClaim {
         try unwrap(pairUrl.withCString { tb_remote_pair_claim($0) })
     }

@@ -23030,8 +23030,27 @@ enum SelfTest {
                    "SA3C when the page disappears the Pair URL field is empty and the offer is cancelled; a pasteboard changed since is left alone")
 
             // (2b) A wait that ends after the page left is shown on return.
+            // (2e) Link previews the destination; only the confirm claims.
+            run { await model.link(pairUrl: "  syrtis-selftest-invitation\n") }
+            expect(model.pairing == .confirming(RemotePairDestination(host: "100.73.2.33", port: 47_000))
+                       && model.holdsPairUrl && fake.get(\.claims) == 0
+                       && fake.get(\.previewedUrls) == ["syrtis-selftest-invitation"],
+                   "SA3C Link first shows the destination (.confirming) and makes no claim")
+            model.cancelLink()
+            expect(model.pairing == .idle && !model.holdsPairUrl && fake.get(\.claims) == 0,
+                   "SA3C Cancel on the destination makes no claim and drops the held invitation")
+            run { await model.confirmLink() }
+            expect(fake.get(\.claims) == 0 && model.pairing == .idle,
+                   "SA3C a confirm outside .confirming does nothing")
             run { await model.link(pairUrl: "syrtis-selftest-invitation") }
-            if case .waiting = model.pairing {} else { expect(false, "SA3C a claim starts the wait") }
+            Task { await model.confirmLink() }
+            Task { await model.confirmLink() }
+            expect(pumpUntil { if case .waiting = model.pairing { true } else { false } }
+                       && fake.get(\.claims) == 1
+                       && fake.get(\.claimedUrls) == ["syrtis-selftest-invitation"]
+                       && fake.get(\.previewedUrls).last == "syrtis-selftest-invitation"
+                       && !model.holdsPairUrl,
+                   "SA3C confirm claims the previewed text once (a second confirm claims nothing) and starts the wait")
             model.pageDisappeared()
             fake.releasePoll(.success(SA3CFakeClient.producerA))
             expect(pumpUntil { model.pairing == .linked(fingerprint: SA3CFakeClient.fingerprintA) }
@@ -23040,6 +23059,7 @@ enum SelfTest {
             // Cancelled, then the poll succeeds: removed at once, never listed.
             model.dismissPairingResult()
             run { await model.link(pairUrl: "syrtis-selftest-invitation") }
+            run { await model.confirmLink() }
             model.cancelWait()
             fake.releasePoll(.success(SA3CFakeClient.producerB))
             expect(pumpUntil { fake.get(\.removedPeers) == [SA3CFakeClient.producerB] }
@@ -23049,6 +23069,25 @@ enum SelfTest {
             run { await model.link(pairUrl: String(repeating: "x", count: DevicesModel.pairUrlMaxLength + 1)) }
             expect(model.pairing == .failed(DevicesCopy.invalidInvitation) && fake.get(\.claims) == 2,
                    "SA3C a pasted invitation over 16,384 bytes is refused without a claim")
+            let previews = fake.get(\.previewedUrls).count
+            fake.set { $0.destinationError = "invalidOffer" }
+            run { await model.link(pairUrl: "syrtis-selftest-bad-invitation") }
+            expect(model.pairing == .failed(DevicesCopy.invalidInvitation) && !model.holdsPairUrl
+                       && fake.get(\.previewedUrls).count == previews + 1 && fake.get(\.claims) == 2,
+                   "SA3C a refused preview shows the invalid-invitation line, holds nothing and makes no claim")
+            fake.set { $0.destinationError = "expired" }
+            run { await model.link(pairUrl: "syrtis-selftest-old-invitation") }
+            expect(model.pairing == .failed(DevicesCopy.invitationExpired) && fake.get(\.claims) == 2,
+                   "SA3C an expired invitation is refused at the preview with the expired line")
+            fake.set { $0.destinationError = nil; $0.holdDestination = true }
+            model.dismissPairingResult()
+            Task { await model.link(pairUrl: "syrtis-selftest-invitation") }
+            let previewEntered = pumpUntil { fake.get(\.destinationEntered) }
+            model.pageDisappeared()
+            fake.releaseDestination()
+            pumpFor(0.2)
+            expect(previewEntered && model.pairing == .idle && !model.holdsPairUrl && fake.get(\.claims) == 2,
+                   "SA3C the page leaving before the preview returns: idle, nothing held, no claim")
 
             // (2c) Approve sends the pendingId of the row whose SAS was shown.
             fake.set { $0.pending = [SA3CFakeClient.request("p-shown", sas: "1111-2222")] }
@@ -24040,6 +24079,13 @@ final class SA3CFakeClient: DevicesRemoteClient, @unchecked Sendable {
         var cancelledOffers: [String] = []
         var offers = 0
         var claims = 0
+        /// The text each `pairDestination` and `pairClaim` received.
+        var previewedUrls: [String] = []
+        var claimedUrls: [String] = []
+        var destinationError: String?
+        /// While set, `pairDestination` blocks until `releaseDestination`.
+        var holdDestination = false
+        var destinationEntered = false
         var peers: [String] = []
         var removedPeers: [String] = []
         /// Every read and create, in call order (the polling check).
@@ -24057,6 +24103,12 @@ final class SA3CFakeClient: DevicesRemoteClient, @unchecked Sendable {
     private let pollGate = DispatchSemaphore(value: 0)
     private let statusGate = DispatchSemaphore(value: 0)
     private let offerGate = DispatchSemaphore(value: 0)
+    private let destinationGate = DispatchSemaphore(value: 0)
+
+    func releaseDestination() {
+        set { $0.holdDestination = false }
+        destinationGate.signal()
+    }
 
     func releaseStatus() {
         set { $0.holdStatus = false }
@@ -24171,8 +24223,19 @@ final class SA3CFakeClient: DevicesRemoteClient, @unchecked Sendable {
     }
     func revoke(grantId: String) throws {}
 
+    func pairDestination(pairUrl: String) throws -> RemotePairDestination {
+        let hold = lock.withLock {
+            state.previewedUrls.append(pairUrl)
+            if state.holdDestination { state.destinationEntered = true }
+            return state.holdDestination
+        }
+        if hold { destinationGate.wait() }
+        try fail(get(\.destinationError))
+        return RemotePairDestination(host: "100.73.2.33", port: 47_000)
+    }
+
     func pairClaim(pairUrl: String) throws -> RemoteClaim {
-        let n = lock.withLock { state.claims += 1; return state.claims }
+        let n = lock.withLock { state.claims += 1; state.claimedUrls.append(pairUrl); return state.claims }
         return Self.decode(#"{"handle":\#(n),"sas":"5555-6666","expiresAt":4102444800000,"producerFingerprint":"\#(Self.fingerprintA)"}"#)
     }
 

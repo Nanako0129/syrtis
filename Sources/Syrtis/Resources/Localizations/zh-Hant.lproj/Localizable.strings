@@ -805,6 +805,8 @@
 "Code: %@" = "代碼：%@";
 "Check that the other device shows the same code and approve it there. Waiting…" = "請確認對方螢幕上的代碼相同，並在對方裝置上核准。等待中…";
 "Linked." = "已連結。";
+"Syrtis will connect to:" = "Syrtis 將連線到：";
+"Check that this is the address of your other device. The code you compare next confirms which device it is." = "請確認這是你另一台裝置的位址。接下來比對的代碼會確認是哪一台裝置。";
 "The invitation expired. Create a new one on the other device." = "邀請已過期。請在另一台裝置上建立新的邀請。";
 "The other device declined." = "對方裝置拒絕了。";
 "Syrtis couldn't reach the other device." = "Syrtis 連不到另一台裝置。";
