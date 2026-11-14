@@ -23042,7 +23042,9 @@ enum SelfTest {
             run { await model.confirmLink() }
             expect(fake.get(\.claims) == 0 && model.pairing == .idle,
                    "SA3C a confirm outside .confirming does nothing")
-            run { await model.link(pairUrl: "syrtis-selftest-invitation") }
+            // Padded again, and confirmed this time: what is held and claimed
+            // is the trimmed text the preview read.
+            run { await model.link(pairUrl: "\tsyrtis-selftest-invitation  \n") }
             Task { await model.confirmLink() }
             Task { await model.confirmLink() }
             expect(pumpUntil { if case .waiting = model.pairing { true } else { false } }
@@ -23081,11 +23083,12 @@ enum SelfTest {
                    "SA3C an expired invitation is refused at the preview with the expired line")
             fake.set { $0.destinationError = nil; $0.holdDestination = true }
             model.dismissPairingResult()
-            Task { await model.link(pairUrl: "syrtis-selftest-invitation") }
+            let stalePreview = Task { await model.link(pairUrl: "syrtis-selftest-invitation") }
             let previewEntered = pumpUntil { fake.get(\.destinationEntered) }
             model.pageDisappeared()
             fake.releaseDestination()
-            pumpFor(0.2)
+            // Until `link` itself has returned, so its late result has been handled.
+            run { await stalePreview.value }
             expect(previewEntered && model.pairing == .idle && !model.holdsPairUrl && fake.get(\.claims) == 2,
                    "SA3C the page leaving before the preview returns: idle, nothing held, no claim")
 
