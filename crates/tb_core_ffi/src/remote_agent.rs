@@ -8,8 +8,9 @@
 //! revoke, listen configure) go through `control::Client` against the agent's
 //! own socket, with the control token read from the state store and held only
 //! in memory for that call. The only direct calls are
-//! `Runtime::enable_sharing` / `disable_sharing`, `Agent::approve_scope`, the
-//! receiver's `PairingClient` and `PeerStore`, and one `set_listen_config` that
+//! `Runtime::enable_sharing` / `disable_sharing` / `remove_peer`,
+//! `Agent::approve_scope`, the receiver's `PairingClient`, `PeerStore` and
+//! `security::parse_pair_url` (the destination preview), and one `set_listen_config` that
 //! writes the node label back with the host and port the listen command just
 //! stored (the frozen listen command carries no label).
 //!
@@ -45,10 +46,11 @@ use syrtis_agent::{
     runtime::{Options, PullError, RuntimeError},
     secure_fs::StorageError,
     security::{
-        clock_status, decode_fixed_hex, hex_encode, GrantState, MemoryLedger, SecurityError,
+        clock_status, decode_fixed_hex, hex_encode, parse_pair_url, GrantState, MemoryLedger,
+        SecurityError,
     },
     source::owner_inputs_sha256,
-    state_store::{Secret32, NODE_LABEL_MAX_BYTES},
+    state_store::{Secret32, StoredState, NODE_LABEL_MAX_BYTES},
 };
 
 pub(crate) type Reply = Result<Value, String>;
@@ -523,13 +525,7 @@ impl RemoteAgent {
                 .state()
                 .map_err(storage_class)?;
             let identity = StaticKey::from_state(&state).map_err(storage_class)?;
-            let os_now = current
-                .inputs
-                .clock
-                .os_now_seconds()
-                .map_err(storage_class)?;
-            let now = clock_status(os_now, state.reference.last_accepted_wall_unix_seconds());
-            let now_ms = now.effective_now.checked_mul(1_000).ok_or("invalid")?;
+            let now_ms = effective_now_ms(current, &state)?;
             Ok((identity, now_ms, Arc::clone(&current.inputs.clock)))
         })?;
         let ledger = MemoryLedger::default();
@@ -552,6 +548,28 @@ impl RemoteAgent {
         });
         claims.open.insert(handle, claimed);
         Ok(reply)
+    }
+
+    /// Receiver: where a Pair URL would connect, `{host, port}`, so the
+    /// owner sees it before [`pair_claim`] connects. The same effective now
+    /// and the same frozen `parse_pair_url` as the claim; no connection, and
+    /// the URL and the offer (which holds the secret) are neither kept,
+    /// formatted nor logged.
+    pub(crate) fn pair_destination(&self, pair_url: &str) -> Reply {
+        let now_ms = self.with(|current| {
+            let state = current
+                .agent
+                .runtime()
+                .store()
+                .state()
+                .map_err(storage_class)?;
+            effective_now_ms(current, &state)
+        })?;
+        let offer = parse_pair_url(pair_url, now_ms).map_err(|error| match error {
+            SecurityError::Expired => "expired",
+            _ => "invalidOffer",
+        })?;
+        Ok(json!({"host": offer.host, "port": offer.port}))
     }
 
     /// Receiver: waits (blocking, up to the frozen poll window) for the
@@ -650,15 +668,15 @@ impl RemoteAgent {
         })
     }
 
-    /// Receiver: forgets one producer (`producerStatic`, 64 lowercase hex).
+    /// Receiver: forgets one producer (`producerStatic`, 64 lowercase hex)
+    /// and deletes its receiver cache entries (`Runtime::remove_peer`).
     pub(crate) fn peer_remove(&self, producer_static: &str) -> Reply {
         let key = decode_fixed_hex::<32>(producer_static).map_err(|_| "invalid")?;
         self.with(|current| {
             current
                 .agent
                 .runtime()
-                .peers()
-                .remove(&key)
+                .remove_peer(&key)
                 .map(|()| Value::Null)
                 .map_err(storage_class)
         })
@@ -914,6 +932,21 @@ fn env_roots() -> Vec<Value> {
                 .map(move |var| json!({"client": client.as_str(), "variable": var}))
         })
         .collect()
+}
+
+/// The receiver's effective now in milliseconds: the OS clock, never below
+/// the last accepted wall time in `state` (`clock_status`). Pair claim and
+/// the destination preview read it the same way.
+fn effective_now_ms(current: &Running, state: &StoredState) -> Result<i64, String> {
+    let os_now = current
+        .inputs
+        .clock
+        .os_now_seconds()
+        .map_err(storage_class)?;
+    let now = clock_status(os_now, state.reference.last_accepted_wall_unix_seconds());
+    now.effective_now
+        .checked_mul(1_000)
+        .ok_or_else(|| "invalid".into())
 }
 
 fn storage_class(error: StorageError) -> String {
@@ -1667,6 +1700,249 @@ mod tests {
             thread::sleep(Duration::from_millis(20));
         }
         assert_eq!(epoch(&agent), started);
+    }
+
+    /// A producer with an approved scope, sharing on and listening on
+    /// loopback, paired to `receiver` through offer, claim, approve and
+    /// poll. Returns the producer's static key.
+    fn pair_two(producer: &RemoteAgent, receiver: &RemoteAgent) -> [u8; 32] {
+        producer
+            .listen_configure("127.0.0.1", free_port(), None)
+            .unwrap();
+        let digest = producer.scope_disclosure().unwrap()["ownerInputsSha256"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        producer.scope_approve(&digest).unwrap();
+        producer.sharing_set(true).unwrap();
+        let offer = producer.offer_create(600).unwrap();
+        let claim = receiver
+            .pair_claim(offer["pairUrl"].as_str().unwrap())
+            .unwrap();
+        let pending = producer.pending_list().unwrap();
+        producer
+            .decide(true, pending[0]["pendingId"].as_str().unwrap(), 1)
+            .unwrap();
+        let paired = receiver
+            .pair_poll(claim["handle"].as_u64().unwrap())
+            .unwrap();
+        decode_fixed_hex::<32>(paired["producerStatic"].as_str().unwrap()).unwrap()
+    }
+
+    /// Receiver cache files (`rcache-*`) anywhere below `dir`.
+    fn receiver_cache_files(dir: &Path) -> usize {
+        fs::read_dir(dir)
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .map(|entry| {
+                        let path = entry.path();
+                        if path.is_dir() && !path.is_symlink() {
+                            receiver_cache_files(&path)
+                        } else {
+                            usize::from(entry.file_name().to_string_lossy().starts_with("rcache-"))
+                        }
+                    })
+                    .sum()
+            })
+            .unwrap_or(0)
+    }
+
+    /// `SA-3e` B2: Remove deletes the producer's receiver cache entries at
+    /// once (`Runtime::remove_peer`), not after their 30-day expiry. The
+    /// entry comes from a real pull, so the count before is not vacuous.
+    #[test]
+    fn peer_remove_deletes_the_receiver_cache() {
+        let clock = TestClock::new();
+        let (producer_home, receiver_home) = (TempHome::new(), TempHome::new());
+        let (producer, receiver) = (
+            Arc::new(RemoteAgent::default()),
+            Arc::new(RemoteAgent::default()),
+        );
+        start(
+            &producer,
+            &producer_home,
+            &clock,
+            ScannerSettings::default(),
+        );
+        start(
+            &receiver,
+            &receiver_home,
+            &clock,
+            ScannerSettings::default(),
+        );
+        let producer_static = pair_two(&producer, &receiver);
+        clock.advance(61);
+        assert_eq!(pull(&receiver, &producer_static), Ok(()));
+        assert!(
+            receiver_cache_files(&receiver_home.0) >= 1,
+            "control: the pull must have written a receiver cache entry"
+        );
+
+        receiver.peer_remove(&hex_encode(&producer_static)).unwrap();
+        assert_eq!(receiver_cache_files(&receiver_home.0), 0);
+        assert_eq!(receiver.peers().unwrap(), json!([]));
+    }
+
+    /// A canonical Pair URL to `127.0.0.1:port` that expires `ttl_ms` after
+    /// the clock's now, with a responder key that is not the receiver's.
+    fn loopback_pair_url(clock: &TestClock, port: u16, ttl_ms: i64) -> String {
+        let now_ms = clock.os_now_seconds().unwrap() * 1_000;
+        syrtis_agent::security::pair_url(&syrtis_agent::security::PairOffer {
+            expires_at: now_ms + ttl_ms,
+            host: "127.0.0.1".into(),
+            offer_id: hex_encode(&[3; 16]),
+            port,
+            responder_static: hex_encode(&[4; 32]),
+            secret: hex_encode(&[5; 32]),
+            version: syrtis_agent::security::PEER_PROTOCOL_VERSION,
+        })
+        .unwrap()
+    }
+
+    /// `SA-3e` B2: the preview answers the offer's own host and port, the
+    /// reply holds exactly `host` and `port` (no secret, no offer id), and
+    /// it makes no claim.
+    #[test]
+    fn pair_destination_is_the_offer_address_and_nothing_more() {
+        let clock = TestClock::new();
+        let (producer_home, receiver_home) = (TempHome::new(), TempHome::new());
+        let (producer, receiver) = (
+            Arc::new(RemoteAgent::default()),
+            Arc::new(RemoteAgent::default()),
+        );
+        start(
+            &producer,
+            &producer_home,
+            &clock,
+            ScannerSettings::default(),
+        );
+        let port = free_port();
+        producer.listen_configure("127.0.0.1", port, None).unwrap();
+        let digest = producer.scope_disclosure().unwrap()["ownerInputsSha256"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        producer.scope_approve(&digest).unwrap();
+        producer.sharing_set(true).unwrap();
+        let offer = producer.offer_create(600).unwrap();
+        let pair_url = offer["pairUrl"].as_str().unwrap();
+        let parsed = parse_pair_url(pair_url, clock.os_now_seconds().unwrap() * 1_000).unwrap();
+
+        assert_eq!(
+            receiver.pair_destination(pair_url),
+            Err("notRunning".into())
+        );
+        start(
+            &receiver,
+            &receiver_home,
+            &clock,
+            ScannerSettings::default(),
+        );
+        let reply = receiver.pair_destination(pair_url).unwrap();
+        assert_eq!(reply, json!({"host": "127.0.0.1", "port": port}));
+        let keys: Vec<&String> = reply.as_object().unwrap().keys().collect();
+        assert_eq!(keys, ["host", "port"]);
+        let text = reply.to_string();
+        assert!(
+            !text.contains(&parsed.secret),
+            "the secret must not be answered"
+        );
+        assert!(!text.contains(offer["offerId"].as_str().unwrap()));
+        assert!(!text.contains(&parsed.offer_id));
+        assert!(
+            lock(&receiver.claims).open.is_empty(),
+            "a preview claims nothing"
+        );
+        assert!(
+            producer
+                .pending_list()
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .is_empty(),
+            "the producer saw no claim"
+        );
+    }
+
+    /// `SA-3e` B2: expired, garbage and over-long URLs are their classes, and
+    /// none of them makes a claim.
+    #[test]
+    fn pair_destination_refusals_are_their_classes() {
+        let clock = TestClock::new();
+        let home = TempHome::new();
+        let receiver = Arc::new(RemoteAgent::default());
+        start(&receiver, &home, &clock, ScannerSettings::default());
+        let expired = loopback_pair_url(&clock, 47_000, 60_000);
+        assert!(receiver.pair_destination(&expired).is_ok(), "control");
+        clock.advance(120);
+        assert_eq!(receiver.pair_destination(&expired), Err("expired".into()));
+        assert_eq!(
+            receiver.pair_destination("not a pair url"),
+            Err("invalidOffer".into())
+        );
+        let tampered = loopback_pair_url(&clock, 47_000, 60_000).replacen("7b", "7B", 1);
+        assert_eq!(
+            receiver.pair_destination(&tampered),
+            Err("invalidOffer".into())
+        );
+        let long = format!(
+            "syrtis://pair?offer={}",
+            "0".repeat(syrtis_agent::security::PAIR_URL_RAW_MAX)
+        );
+        assert_eq!(receiver.pair_destination(&long), Err("invalidOffer".into()));
+        let claims = lock(&receiver.claims);
+        assert!(
+            claims.open.is_empty() && claims.next == 0,
+            "no claim was made"
+        );
+    }
+
+    /// `SA-3e` B2: a preview of a URL to a live `127.0.0.1` listener makes
+    /// no connection; control: `pair_claim` with the same URL connects.
+    #[test]
+    fn pair_destination_never_connects() {
+        let clock = TestClock::new();
+        let home = TempHome::new();
+        let receiver = Arc::new(RemoteAgent::default());
+        start(&receiver, &home, &clock, ScannerSettings::default());
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let pair_url = loopback_pair_url(&clock, port, 600_000);
+
+        receiver.pair_destination(&pair_url).unwrap();
+        // A completed connect waits in the backlog whether or not it was
+        // accepted, so a nonblocking accept sees any the preview made.
+        assert_eq!(
+            listener.accept().map(drop).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock,
+            "the preview must not connect"
+        );
+
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let done = Arc::new(AtomicBool::new(false));
+        let acceptor = {
+            let (accepted, done) = (Arc::clone(&accepted), Arc::clone(&done));
+            thread::spawn(move || {
+                while !done.load(Ordering::SeqCst) {
+                    match listener.accept() {
+                        // Dropped at once: the claim fails on its transport.
+                        Ok(_) => {
+                            accepted.fetch_add(1, Ordering::SeqCst);
+                        }
+                        Err(_) => thread::sleep(Duration::from_millis(5)),
+                    }
+                }
+            })
+        };
+        assert!(receiver.pair_claim(&pair_url).is_err());
+        done.store(true, Ordering::SeqCst);
+        acceptor.join().unwrap();
+        assert!(
+            accepted.load(Ordering::SeqCst) >= 1,
+            "control: the claim with the same URL connects"
+        );
     }
 
     /// A panic inside a `tb_remote_*` body is the fixed class, without its

@@ -75,6 +75,18 @@ public struct RemoteGrant: Decodable, Equatable, Sendable {
     public let state: String
 }
 
+/// `tb_remote_pair_destination`: the address a Pair URL would connect to,
+/// shown to the owner before the claim connects.
+public struct RemotePairDestination: Decodable, Equatable, Sendable {
+    public let host: String
+    public let port: Int
+
+    public init(host: String, port: Int) {
+        self.host = host
+        self.port = port
+    }
+}
+
 /// `tb_remote_pair_claim`: compare `sas` with the producer's screen.
 public struct RemoteClaim: Decodable, Equatable, Sendable {
     public let handle: Int64

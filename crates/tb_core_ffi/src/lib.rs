@@ -2214,6 +2214,18 @@ mod remote_ffi {
         })
     }
 
+    /// Data `{host, port}`: where `tb_remote_pair_claim` would connect for
+    /// this Pair URL. Parses only; no connection, nothing kept or logged.
+    ///
+    /// # Safety
+    /// `pair_url` must be a valid NUL-terminated UTF-8 string.
+    #[no_mangle]
+    pub unsafe extern "C" fn tb_remote_pair_destination(pair_url: *const c_char) -> *mut c_char {
+        run("tb_remote_pair_destination", || {
+            AGENT.pair_destination(unsafe { text(pair_url) }?)
+        })
+    }
+
     /// Data `{handle, sas, expiresAt, producerFingerprint}`.
     ///
     /// # Safety

@@ -4,15 +4,15 @@ id: kb-remote-agent
 kind: canonical
 scope: repository
 read_when: changing the embedded remote-usage agent, its tb_remote_* C ABI, its start and stop wiring, or the agent dependency pin
-last_verified: 2026-11-13
-sources: ["crates/tb_core_ffi/src/remote_agent.rs", "crates/tb_core_ffi/src/remote_pages.rs", "crates/tb_core_ffi/src/usage_graph.rs", "crates/tb_core_ffi/src/model_report.rs", "crates/tb_core_ffi/src/hourly_report.rs", "crates/tb_core_ffi/src/agents_report.rs", "crates/tb_core_ffi/src/lib.rs", "crates/tb_core_ffi/Cargo.toml", "Cargo.toml", "Cargo.lock", "Sources/CTB/include/ctb.h", "Sources/TokenBarCore/TBCore.swift", "Sources/TokenBarCore/RemoteAgent.swift", "Sources/Syrtis/RemoteAgentLaunch.swift", "Sources/Syrtis/DevicesModel.swift", "Sources/Syrtis/DashboardModel.swift", "Sources/Syrtis/UsageDataSource.swift", "Sources/Syrtis/PopoverView.swift", "Sources/Syrtis/Views/DeviceSelectionMenu.swift", "Sources/Syrtis/Views/StatsView.swift", "Sources/Syrtis/Views/DevicesSettingsView.swift", "Sources/Syrtis/Views/SettingsPanel.swift", "Sources/Syrtis/AppDelegate.swift", "Sources/Syrtis/ClaudeExtraRoots.swift", "Sources/Syrtis/CursorSync.swift", "Sources/Syrtis/SelfTest.swift", "scripts/check_agent_engine_pin.py", ".github/workflows/ci.yml", "public Syrtis-Agent 76f29d1e98611915176274d48b3d87fc091aa45e"]
+last_verified: 2026-11-14
+sources: ["crates/tb_core_ffi/src/remote_agent.rs", "crates/tb_core_ffi/src/remote_pages.rs", "crates/tb_core_ffi/src/usage_graph.rs", "crates/tb_core_ffi/src/model_report.rs", "crates/tb_core_ffi/src/hourly_report.rs", "crates/tb_core_ffi/src/agents_report.rs", "crates/tb_core_ffi/src/lib.rs", "crates/tb_core_ffi/Cargo.toml", "Cargo.toml", "Cargo.lock", "Sources/CTB/include/ctb.h", "Sources/TokenBarCore/TBCore.swift", "Sources/TokenBarCore/RemoteAgent.swift", "Sources/Syrtis/RemoteAgentLaunch.swift", "Sources/Syrtis/DevicesModel.swift", "Sources/Syrtis/DashboardModel.swift", "Sources/Syrtis/UsageDataSource.swift", "Sources/Syrtis/PopoverView.swift", "Sources/Syrtis/Views/DeviceSelectionMenu.swift", "Sources/Syrtis/Views/StatsView.swift", "Sources/Syrtis/Views/DevicesSettingsView.swift", "Sources/Syrtis/Views/SettingsPanel.swift", "Sources/Syrtis/AppDelegate.swift", "Sources/Syrtis/ClaudeExtraRoots.swift", "Sources/Syrtis/CursorSync.swift", "Sources/Syrtis/SelfTest.swift", "scripts/check_agent_engine_pin.py", ".github/workflows/ci.yml", "public Syrtis-Agent cf5b845338d0a29fbee77fccf1483c5c762e9476"]
 ---
 
 # Embedded remote-usage agent
 
 ## 文件目的
 
-Syrtis 在 `tb_core_ffi` 內嵌 `syrtis-agent`（公開的 [Syrtis-Agent](https://github.com/Nanako0129/Syrtis-Agent/tree/76f29d1e98611915176274d48b3d87fc091aa45e) ）：同一個行程裡一個 agent，負責配對、授權、Noise 傳輸、快取與分享開關。這份文件記錄它在 App 裡的接線：誰計算什麼、何時啟動與重啟、根目錄怎麼決定、C ABI 的形狀，以及驗證位置。它不重述 agent 的協定，那些以 agent repo 的 `spec/` 為準。
+Syrtis 在 `tb_core_ffi` 內嵌 `syrtis-agent`（公開的 [Syrtis-Agent](https://github.com/Nanako0129/Syrtis-Agent/tree/cf5b845338d0a29fbee77fccf1483c5c762e9476) ）：同一個行程裡一個 agent，負責配對、授權、Noise 傳輸、快取與分享開關。這份文件記錄它在 App 裡的接線：誰計算什麼、何時啟動與重啟、根目錄怎麼決定、C ABI 的形狀，以及驗證位置。它不重述 agent 的協定，那些以 agent repo 的 `spec/` 為準。
 
 ## 目錄
 
@@ -40,7 +40,7 @@ Syrtis 在 `tb_core_ffi` 內嵌 `syrtis-agent`（公開的 [Syrtis-Agent](https:
 | `crates/tb_core_ffi/src/remote_pages.rs` | 逐 producer 檢查 record 是否在請求範圍內與筆數上限、交給 `merge::combine` 加總、把合併後的 record 以整數 saturating 加進本機 payload、重算衍生值、產生 `devices` | 不改本機那一份的計算（只選本機時直接跑既有函式）；不寫任何快取 |
 | Swift（`RemoteAgentLaunch`、`TBCore`） | 決定 agent 根目錄、何時呼叫 start／stop、decode payload | 不計算任何授權或聚合；不過濾、不加總 |
 
-凍結的 control 命令（offer create／cancel、pending list、approve、reject、revoke、listen configure、status）一律以 `control::Client` 打 agent 自己的 socket；control token 每次呼叫時從 state store 讀出、只留在記憶體裡。`remote_agent.rs` 直接呼叫的只有 `Runtime::enable_sharing`／`disable_sharing`、`Agent::approve_scope`、receiver 端的 `PairingClient` 與 `PeerStore`，以及一次 `set_listen_config`：凍結的 listen 命令不帶 node label，所以先送 listen 命令，再以讀回的 host 與 port 寫入 label。
+凍結的 control 命令（offer create／cancel、pending list、approve、reject、revoke、listen configure、status）一律以 `control::Client` 打 agent 自己的 socket；control token 每次呼叫時從 state store 讀出、只留在記憶體裡。`remote_agent.rs` 直接呼叫的只有 `Runtime::enable_sharing`／`disable_sharing`／`remove_peer`、`Agent::approve_scope`、receiver 端的 `PairingClient`、`PeerStore` 與 `security::parse_pair_url`（目的地預覽），以及一次 `set_listen_config`：凍結的 listen 命令不帶 node label，所以先送 listen 命令，再以讀回的 host 與 port 寫入 label。
 
 ## 生命週期
 
@@ -93,10 +93,11 @@ flowchart LR
 | `tb_remote_offer_cancel(offer_id)`、`tb_remote_approve`／`tb_remote_reject(pending_id, sas_generation)`、`tb_remote_revoke(grant_id)` | control 命令的資料（`null`） |
 | `tb_remote_pending_list()` | `[{expiresAt, pendingId, sasCode}]` |
 | `tb_remote_grants()` | `[{grantId, peerFingerprint, createdAt, expiresAt, state}]`；`state`＝`active`／`revoked`／`expired`／`superseded`（紀錄仍是 active，但之後的掃描範圍核准把 generation 往前推、deny floor 提高，它已不能授權；Devices 頁只列 `active`，所以這種裝置不再顯示為可存取） |
+| `tb_remote_pair_destination(pair_url)` | `{host, port}`：claim 會連去的位址。與 `pair_claim` 同一個 effective now（OS 時鐘，不低於 state 的 last accepted wall time）、同一個 `security::parse_pair_url`；不連線、不保存、不記錄，回覆只有這兩個 key（不含 secret、`offerId`）。`invalidOffer`（格式、canonical、長度）、`expired`、`notRunning`、storage 類別 |
 | `tb_remote_pair_claim(pair_url)` | `{handle, sas, expiresAt, producerFingerprint}` |
 | `tb_remote_pair_poll(handle)` | `{producerStatic, fingerprint, expiresAt}`；最多阻塞凍結的 960 秒 poll window，成功時寫入 `peers.json`。等待期間 agent 若換到另一個 identity 重啟 → `identityChanged`，什麼都不寫 |
 | `tb_remote_peers()` | `[{producerStatic, fingerprint, nodeLabel, host, port, createdAt, expiresAt, state}]`；`host`／`port` 是配對時領取的邀請上的位址 |
-| `tb_remote_peer_remove(producer_static)` | `null` |
+| `tb_remote_peer_remove(producer_static)` | `null`；`Runtime::remove_peer`：先從 `peers.json` 移除（失敗就回錯誤），再刪掉當下已存在的那台的 receiver cache entry（刪除失敗不改結果；同時進行的 pull 可能再留下一個沒有紀錄讀得到的 entry，到期清除） |
 
 指紋是 static key 的 SHA-256 前 8 bytes（16 個小寫 hex），給人比對用，不是識別碼。`envRoots` 列出本行程設定了哪些 client 的根目錄環境變數（`CODEX_HOME` 等）：本機頁面會跟著它們，分享的來源不會，所以 owner 在本機看到的與分享出去的可能不同。Swift 的 `RemoteOffer` 的 `description` 不含 `pairUrl`。
 
@@ -132,7 +133,7 @@ Settings sidebar 在 Accounts 與 General 之間的 Devices 頁（`DevicesSettin
 |---|---|
 | 分享這台 Mac | 服務狀態與「重試」（`RemoteAgentLaunch.start` 同一條路徑）；分享開關只在 `scopeApproved` 時可開、關閉一律可按；裝置名稱（≤128 bytes）、監聽位址（下拉選單：「僅本機」、`getifaddrs` 的非 loopback IPv4 與 IPv6 unique-local `fc00::/7`（Tailscale 等），再加上已設定的位址與目前的選擇；global IPv6 不列，因為一台 Mac 常有十幾個會輪替的隱私位址，而清單不讀每個位址的 flag、分不出穩定的那個（已知限制：選不到新的 global IPv6）；不含 `0.0.0.0`／`::`、loopback、link-local；選擇不在清單內時顯示「選擇位址」且不能套用）、port 1024–65535；沒有位址或 `listening` 為 false 時顯示連不到；公開 IPv4 或 global IPv6 顯示可能從網際網路連到。邀請：Pair URL 只存在 `DevicesModel.offer`，頁面消失或到期時清除並呼叫 `remoteOfferCancel`；建立邀請以世代編號綁定，頁面消失後或被較新的建立取代時才回來的結果不發布，並立即在 core 取消；複製時標記 concealed 與 transient，清除時只在 pasteboard 的 `changeCount` 仍是複製當下的值才清空。待核准列以 `pendingId` 為 identity，Approve／Reject 送出該列自己的 `pendingId`（`sasGeneration` 1）。已核准的 grant 可撤銷（有確認）。 |
 | 掃描範圍 | `tb_remote_scope_disclosure` 的路徑與 client 清單、分享內容的說明、`envRootsSet` 的說明；核准送出按鈕所顯示那份揭露的 `ownerInputsSha256`（按下時由畫面帶入），回 `invalid` 時重新載入揭露、不自動重送。頁面開著時若某次刷新看到 `scopeApproved` 由 true 變 false，就重新載入揭露並顯示範圍已變更的說明；其他情況不重新載入。 |
-| 已連結的裝置 | `tb_remote_peers` 的 `host:port`、指紋、狀態、到期日、移除（有確認）；貼上邀請（遮蔽輸入的 `SecureField`，≤16,384 bytes）→ claim → 顯示 SAS 並等待；取消只停止顯示，之後 poll 若成功就立刻 `remotePeerRemove`。殘餘：upsert 與 remove 之間的短暫空檔內可能已有一次拉取。 |
+| 已連結的裝置 | `tb_remote_peers` 的 `host:port`、指紋、狀態、到期日、移除（有確認）；貼上邀請（遮蔽輸入的 `SecureField`，≤16,384 bytes）→ 按 Link 先呼叫 `remotePairDestination`（不連線），成功時顯示目的地（`host:port`，IPv6 加方括號，`Text(verbatim:)` 完整顯示、可換行、可選取，不當 localization key）與一句提示（會連到這個位址、請確認是另一台裝置的位址、接下來比對的代碼確認是哪一台），按鈕 Link／Cancel；預覽失敗顯示既有的無效／過期文案，不連線。只有確認的 Link 才 claim，用的是預覽的那一份文字：它暫存在 model 的私有欄位（不 `@Published`、不進 description 或 log），確認、取消、預覽失敗與頁面消失時清掉；預覽有自己的 generation，取消或頁面消失後才回來的結果丟棄、狀態回到 idle；確認只在顯示目的地時有效，await 之前就移出文字並進入 claiming，所以連按兩次只 claim 一次。claim 之後顯示 SAS 並等待；取消只停止顯示，之後 poll 若成功就立刻 `remotePeerRemove`。移除（含取消後的自動移除）同時刪掉那台的 receiver cache。殘餘：upsert 與 remove 之間的短暫空檔內可能已有一次拉取。 |
 
 ## Dashboard device selection
 
@@ -154,7 +155,7 @@ Popover 的 Graph（Stats、Daily、Monthly）、Models、Hourly、Agents 可以
 | 顯示 | 年份選單旁的 `DeviceSelectionMenu`（只在 peer 清單非空時出現）；選擇含遠端時，lens 上方一列小字：非 `local`／`fresh` 的裝置**每個 id 只一句**（Stats 有兩頁時取資料最少的狀態，由差到好：`unavailable`、`overLimit`、`refused`、`incompatible`、`invalidReply`、`stale`、`lastGood`；`lastGood`／`stale` 寫明是舊資料，`lastGood` 的句子說「這次沒有取得新資料」；`unavailable`／`overLimit`／`refused`／`invalidReply`／`incompatible` 各一句固定文案；這個 build 不認得的 state 用 `unavailable` 那句），`saturated` 最多一句（容量上限的正確性警告，留在行內）。`duplicateWarning` 與 `remoteRangeLimited` 不再是行：裝置選單旁、選擇含遠端時多一顆 ⓘ 按鈕（`.help` 同文、accessibility label「About combined usage」），點開的 popover 永遠有「同步用量紀錄的裝置可能被重複計算」，畫面上的頁回報 `remoteRangeLimited` 時再加「All years 只涵蓋最近 370 天」（`DeviceOverlayCopy.explanations(rangeLimited:)`）；只有真正的裝置異常才在 lens 上方顯示。遠端或裝置來的字串（label、指紋）只當 format 參數或 `Text(verbatim:)`，不當 localization key；accessibility 同樣。 |
 | Seam | `UsageDataSource` 的 `remotePeers()` 與四個 `*Devices` 是同步（阻塞）呼叫；protocol extension 的預設不碰 `TBCore`（`remotePeers()` 回 `[]`，`*Devices` 丟 `DeviceSourceError.unsupported`），只有 `LiveUsageDataSource` 呼叫 `TBCore`。demo 與測試替身用預設，所以 demo 不出現裝置選單、不碰真實 agent。 |
 | Model 顏色（已知限制，擇一） | Models 與 Stats 兩個 lens 的顏色取自 models overlay 自己的 `ModelColorMap`；Daily／Monthly 沒有 models overlay，沿用本機的 `colors`，所以只在遠端用過的模型在那兩個 lens 的展開列用 provider 的 rank-0 底色。 |
-| 其他已知限制 | 只在遠端存在的年份選不到（`knownYears` 只含本機）；只在遠端用過的 client 沒有自己的分頁，只會出現在 Overview；遠端來的 client、模型、provider、agent 名稱只驗長度與 NFC，不濾控制字元與 bidi；重新配對的 producer 會出現兩列（舊紀錄為 `stale`）；Devices 頁的 Remove 不刪 agent 的 receiver cache；每次含遠端的呼叫都重算本機那一份（無 `GRAPH_CACHE`），耗時未量測；producer 的 rate limit 會讓快速切換時多半顯示 `lastGood`（延遲重試約 65 秒後補上，65 秒本身未對真實 producer 量測）；popover 開著時本機的 Hourly／Agents 仍照舊各算一份，與 overlay 並行。 |
+| 其他已知限制 | 只在遠端存在的年份選不到（`knownYears` 只含本機）；只在遠端用過的 client 沒有自己的分頁，只會出現在 Overview；遠端來的 client、模型、provider、agent 名稱只驗長度與 NFC，不濾控制字元與 bidi；重新配對的 producer 會出現兩列（舊紀錄為 `stale`）；每次含遠端的呼叫都重算本機那一份（無 `GRAPH_CACHE`），耗時未量測；producer 的 rate limit 會讓快速切換時多半顯示 `lastGood`（延遲重試約 65 秒後補上，65 秒本身未對真實 producer 量測）；popover 開著時本機的 Hourly／Agents 仍照舊各算一份，與 overlay 並行。 |
 | 驗證 | Rust：`stop_waits_for_a_pull_in_flight`、`a_restart_waits_for_a_pull_in_flight`（`remote_pages.rs`，pull 進行中 stop 或改輸入重啟都要等 pull 結束、不死鎖，測試自己關掉 producer 的 session 放行）、`overlapping_listen_configure_calls_are_serialized`（`remote_agent.rs`，兩個重疊的 `listen_configure`，hook 在讀回位址與寫回之間暫停）。Swift：`SelfTest.swift` 的 `SA3D (1)`–`(15)`，另有 `SA3D (retry)`（延遲重試：一次、不連鎖、popover 關閉取消、`fresh`／`refused` 不重試）與 `SA3D (retry 1)`–`(retry 5)`（fresh 取消、只重問該頁、poll 不排、丟棄的結果不排、不覆蓋使用者請求）、`SA3D (one line)`（兩頁同一裝置只一句、同標籤同狀態只一句）。沒有測試看得到的部分（選單位置與換行、深淺色、真實兩台機器的合併數字、refresh 對真實 producer 的耗時、對方可連但不回應時 Devices 頁 Stop 在約 145 秒內完成）靠實機驗收。 |
 
 ## Pricing 複製
@@ -210,7 +211,9 @@ Popover 的 Graph（Stats、Daily、Monthly）、Models、Hourly、Agents 可以
 | pricing 超過一小時時分享出去的 cost | `remote_pages::tests::shared_cost_with_fresh_and_hour_old_pricing` |
 | Swift decode、含遠端的列沒有 implausible-cost ratio；四個呼叫前後，快照目錄與其中各檔的大小與修改時間相同（只比對 metadata，不比對內容：Foundation 的 Caches 目錄不跟隨 `HOME`，selftest 子行程看到的是使用者真正的目錄） | SelfTest 的 `SA3B` 案例 |
 | `tb_remote_peers` 每列帶 record 的 `host` 與 `port` | `remote_agent::tests::peers_rows_carry_the_record_host_and_port` |
-| Devices 頁：sidebar 位置、三語文案、狀態機（未啟動→重試、未核准→開關不可用、核准後可開、錯誤類別對應）、Pair URL 不在 description／UserDefaults 且到期與頁面消失時清除並取消、離開頁面後完成的等待、取消後成功即移除、列綁定、核准綁定、監聽選單（全部以假 client 與假 pasteboard 驅動） | SelfTest 的 `SA3C` 案例 |
+| 目的地預覽：回 offer 的 host／port、key 恰為 `host`／`port`、不含 secret 與 `offerId`、沒在跑時 `notRunning`、不產生 claim；過期、亂碼、canonical 不符、超長各回對應類別；對 `127.0.0.1` listener 預覽 0 個連線，control：同一 URL 的 `pair_claim` 至少 1 個 | `remote_agent::tests::pair_destination_is_the_offer_address_and_nothing_more`、`pair_destination_refusals_are_their_classes`、`pair_destination_never_connects` |
+| `peer_remove` 刪掉 receiver cache：一次真的 pull 之後 `rcache-*` ≥ 1，移除後 0 | `remote_agent::tests::peer_remove_deletes_the_receiver_cache` |
+| Devices 頁：sidebar 位置、三語文案、狀態機（未啟動→重試、未核准→開關不可用、核准後可開、錯誤類別對應）、Pair URL 不在 description／UserDefaults 且到期與頁面消失時清除並取消、Link 先預覽目的地（0 次 claim）、Cancel 與預覽失敗不 claim 且不留文字、確認 claim 預覽的那一份文字且連按兩次只 claim 一次、預覽完成前離開頁面回到 idle、離開頁面後完成的等待、取消後成功即移除、列綁定、核准綁定、監聽選單（全部以假 client 與假 pasteboard 驅動） | SelfTest 的 `SA3C` 案例 |
 | pin 與 lock 閉包 | `python3 scripts/check_agent_engine_pin.py --self-test` 與不帶參數的執行 |
 
 經過 App 自己的來源（`Sources::app`、`LocalSourceContext`）的測試都在清空環境的子行程裡跑：`HOME` 與 `TOKSCALE_CONFIG_DIR` 指向測試建立的 temp root，所以 OpenCode `settings.json`、`OPENCODE_DB`、Cursor 與 extra-root registry、pricing cache 都是 fixture。直接建立 `Inputs` 的測試不經過那些來源。selftest 的 start 案例以同樣方式啟動自己的子行程。

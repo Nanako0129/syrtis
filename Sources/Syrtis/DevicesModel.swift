@@ -26,6 +26,8 @@ protocol DevicesRemoteClient: Sendable {
     func reject(pendingId: String) throws
     func grants() throws -> [RemoteGrant]
     func revoke(grantId: String) throws
+    /// Where `pairClaim` would connect; parses only, no connection.
+    func pairDestination(pairUrl: String) throws -> RemotePairDestination
     func pairClaim(pairUrl: String) throws -> RemoteClaim
     /// Blocks up to the frozen 960 s poll window; no cancellation in the ABI.
     func pairPoll(handle: Int64) throws -> RemotePaired
@@ -56,6 +58,9 @@ struct LiveDevicesClient: DevicesRemoteClient {
     func reject(pendingId: String) throws { try TBCore.remoteReject(pendingId: pendingId, sasGeneration: 1) }
     func grants() throws -> [RemoteGrant] { try TBCore.remoteGrants() }
     func revoke(grantId: String) throws { try TBCore.remoteRevoke(grantId: grantId) }
+    func pairDestination(pairUrl: String) throws -> RemotePairDestination {
+        try TBCore.remotePairDestination(pairUrl: pairUrl)
+    }
     func pairClaim(pairUrl: String) throws -> RemoteClaim { try TBCore.remotePairClaim(pairUrl: pairUrl) }
     func pairPoll(handle: Int64) throws -> RemotePaired { try TBCore.remotePairPoll(handle: handle) }
     func peers() throws -> [RemotePeer] { try TBCore.remotePeers() }
@@ -223,6 +228,10 @@ final class DevicesModel: ObservableObject, CustomStringConvertible, CustomDebug
 
     enum Pairing: Equatable {
         case idle
+        /// Reading where the pasted invitation would connect; no connection.
+        case previewing
+        /// Showing that address; Link claims, Cancel drops the invitation.
+        case confirming(RemotePairDestination)
         case claiming
         case waiting(RemoteClaim)
         case linked(fingerprint: String)
@@ -263,6 +272,14 @@ final class DevicesModel: ObservableObject, CustomStringConvertible, CustomDebug
     /// Bumped by every create and by `pageDisappeared`: a create publishes
     /// only if it is still the latest.
     private var offerGeneration = 0
+    /// The pasted invitation between its preview and the user's choice: the
+    /// very text whose destination is on screen, and the one Link claims.
+    /// A secret: not published, never formatted; cleared on confirm,
+    /// cancel, failure and `pageDisappeared`.
+    private var heldPairUrl: String?
+    /// Bumped by every preview, by Cancel and by `pageDisappeared`: a
+    /// preview result lands only if it is still the latest.
+    private var previewGeneration = 0
 
     init(client: DevicesRemoteClient, pasteboard: DevicesPasteboard) {
         self.client = client
@@ -281,6 +298,8 @@ final class DevicesModel: ObservableObject, CustomStringConvertible, CustomDebug
     /// No address, or one set that does not listen.
     var unreachable: Bool { status?.bindHost == nil || status?.listening != true }
     var showsRetry: Bool { !running }
+    /// Whether an invitation is held for confirmation (never the text).
+    var holdsPairUrl: Bool { heldPairUrl != nil }
 
     // MARK: Page lifetime
 
@@ -303,6 +322,7 @@ final class DevicesModel: ObservableObject, CustomStringConvertible, CustomDebug
         refreshTask = nil
         // A create still in flight must not publish its offer afterwards.
         offerGeneration &+= 1
+        dropHeldInvitation()
         return clearOffer()
     }
 
@@ -502,11 +522,12 @@ final class DevicesModel: ObservableObject, CustomStringConvertible, CustomDebug
         await refresh()
     }
 
-    /// Claims the pasted invitation, then waits for the producer's approval
-    /// on a thread of its own. The text is not kept.
+    /// Reads where the pasted invitation would connect (no connection) and
+    /// shows it for confirmation; `confirmLink` claims. A result that comes
+    /// back after Cancel or after the page left is dropped.
     func link(pairUrl: String) async {
         switch pairing {
-        case .claiming, .waiting: return
+        case .previewing, .confirming, .claiming, .waiting: return
         default: break
         }
         let text = pairUrl.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -514,6 +535,46 @@ final class DevicesModel: ObservableObject, CustomStringConvertible, CustomDebug
             pairing = .failed(DevicesCopy.invalidInvitation)
             return
         }
+        previewGeneration &+= 1
+        let generation = previewGeneration
+        heldPairUrl = nil
+        pairing = .previewing
+        let result = await call({ try $0.pairDestination(pairUrl: text) })
+        guard generation == previewGeneration, pairing == .previewing else { return }
+        switch result {
+        case .success(let destination):
+            heldPairUrl = text
+            pairing = .confirming(destination)
+        case .failure(let error):
+            pairing = .failed(DevicesCopy.linkFailure(error.reason))
+        }
+    }
+
+    /// Drops the invitation shown for confirmation, or a preview in flight.
+    func cancelLink() {
+        switch pairing {
+        case .previewing, .confirming: dropHeldInvitation()
+        default: break
+        }
+    }
+
+    /// Clears the held invitation and leaves the preview states for idle.
+    private func dropHeldInvitation() {
+        previewGeneration &+= 1
+        heldPairUrl = nil
+        switch pairing {
+        case .previewing, .confirming: pairing = .idle
+        default: break
+        }
+    }
+
+    /// Claims the invitation whose destination is on screen, then waits for
+    /// the producer's approval on a thread of its own. Only from
+    /// `.confirming`; the text leaves the model and `.claiming` is set
+    /// before the first await, so a second press claims nothing.
+    func confirmLink() async {
+        guard case .confirming = pairing, let text = heldPairUrl else { return }
+        heldPairUrl = nil
         pairing = .claiming
         switch await call({ try $0.pairClaim(pairUrl: text) }) {
         case .failure(let error):
@@ -680,6 +741,8 @@ enum DevicesCopy {
     static let yourCode = "Code: %@"
     static let waitingApproval = "Check that the other device shows the same code and approve it there. Waiting…"
     static let linkedLine = "Linked."
+    static let linkDestination = "Syrtis will connect to:"
+    static let linkDestinationHint = "Check that this is the address of your other device. The code you compare next confirms which device it is."
     static let invitationExpired = "The invitation expired. Create a new one on the other device."
     static let declined = "The other device declined."
     static let unreachableDevice = "Syrtis couldn't reach the other device."
@@ -753,6 +816,7 @@ enum DevicesCopy {
         excludedFolders, openCodeDatabases, clients, envRoots, scopeApprovedLine, needsApproval,
         approveScope, scopeChanged, linkedSection, linkedSummary, noLinked, remove, removeTitle,
         removeMessage, linkAnother, pastePlaceholder, link, yourCode, waitingApproval, linkedLine,
+        linkDestination, linkDestinationHint,
         invitationExpired, declined, unreachableDevice, identityChanged, invalidInvitation,
         ownInvitation, unusableInvitation, linkFailed, cancelledStillLinked, stateActive,
         stateRevoked, stateExpired, genericFailure,

@@ -397,6 +397,9 @@ char *tb_remote_reject(const char *pending_id, int64_t sas_generation);
 // ended its authorization).
 char *tb_remote_grants(void);
 char *tb_remote_revoke(const char *grant_id);
+// Receiver. {host, port}: where tb_remote_pair_claim would connect for this
+// Pair URL. Parses only (no connection, nothing kept); invalidOffer or expired.
+char *tb_remote_pair_destination(const char *pair_url);
 // Receiver. {handle, sas, expiresAt, producerFingerprint}.
 char *tb_remote_pair_claim(const char *pair_url);
 // Blocks up to 960 s. {producerStatic, fingerprint, expiresAt}. identityChanged:
