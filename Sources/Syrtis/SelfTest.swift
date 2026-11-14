@@ -23524,7 +23524,7 @@ enum SelfTest {
                        && AppLanguage.localizedString(DeviceOverlayCopy.lastGood, locale: "zh-Hans", bundle: .tokenBarResources)?.contains("没有取得新数据") == true
                        && AppLanguage.localizedString("%@ didn't respond. Showing older data (last updated %@).", locale: "zh-Hant", bundle: .tokenBarResources) == nil,
                    "SA3D (8) the lastGood line says no new data, not that the device did not respond, and the old key is gone")
-            let states = ["lastGood", "stale", "unavailable", "refused", "invalidReply", "incompatible"]
+            let states = ["lastGood", "stale", "unavailable", "overLimit", "refused", "invalidReply", "incompatible"]
             let templates = states.compactMap { DeviceOverlayCopy.template(forState: $0) }
             expect(templates.count == states.count && Set(templates).count == states.count
                        && templates.allSatisfy { DeviceOverlayCopy.all.contains($0) }

@@ -539,7 +539,7 @@ struct SettingsPanel: View {
                                         .font(.caption)
                                 }
                                 Spacer()
-                                Toggle("", isOn: Binding(
+                                Toggle(ClientRegistry.shortName(id), isOn: Binding(
                                     get: { !tabHidden && !limitsHiddenSet.contains(id) },
                                     set: { show in
                                         var hidden = limitsHiddenSet
@@ -575,7 +575,7 @@ struct SettingsPanel: View {
                         Text(card.label.localized)
                             .font(.caption)
                         Spacer()
-                        Toggle("", isOn: Binding(
+                        Toggle(card.label.localized, isOn: Binding(
                             get: { !hiddenCards.contains(card.rawValue) },
                             set: { show in
                                 var hidden = hiddenCards
@@ -604,7 +604,7 @@ struct SettingsPanel: View {
                         Text(view.label)
                             .font(.caption)
                         Spacer()
-                        Toggle("", isOn: Binding(
+                        Toggle(view.label, isOn: Binding(
                             get: { !hiddenViews.contains(view.rawValue) },
                             set: { show in
                                 var hidden = hiddenViews
@@ -666,7 +666,7 @@ struct SettingsPanel: View {
                                 Spacer()
 
                                 if canTab {
-                                    Toggle("", isOn: Binding(
+                                    Toggle(ClientRegistry.tabLabel(id), isOn: Binding(
                                         get: { isVisible },
                                         set: { show in
                                             tabsHiddenRaw = ClientRegistry.updatingTabVisibility(
@@ -1673,7 +1673,7 @@ struct SettingsPanel: View {
                         .controlSize(.small)
                 }
                 row("Receive beta updates") {
-                    Toggle("", isOn: $betaUpdates)
+                    Toggle("Receive beta updates".localized, isOn: $betaUpdates)
                         .toggleStyle(.switch)
                         .controlSize(.mini)
                         .labelsHidden()
@@ -1867,7 +1867,9 @@ struct SettingsPanel: View {
 
     func toggleRow(_ label: String, isOn: Binding<Bool>) -> some View {
         row(label) {
-            Toggle("", isOn: isOn)
+            // The title is hidden (the row draws it) but stays the switch's
+            // accessibility label.
+            Toggle(label.localized, isOn: isOn)
                 .toggleStyle(.switch)
                 .controlSize(.mini)
                 .labelsHidden()

@@ -397,7 +397,7 @@ pub(crate) fn assemble(query: &ReportQuery, pulled: Vec<Pulled>) -> Remote {
              }| {
                 let state = fixed.unwrap_or_else(|| match refused.get(&peer) {
                     Some(Refusal::OutOfRange) => "invalidReply",
-                    Some(Refusal::Limit) => "unavailable",
+                    Some(Refusal::Limit) => "overLimit",
                     None => state_of(status.get(&peer).copied(), last_success),
                 });
                 let last_success = if state == "stale" && fixed.is_none() {
@@ -1925,7 +1925,7 @@ mod tests {
             .iter()
             .map(|d| d["state"].as_str().unwrap().to_owned())
             .collect();
-        assert_eq!(rows, ["unavailable", "fresh"]);
+        assert_eq!(rows, ["overLimit", "fresh"]);
         let Some(Records::Graph(kept)) = remote.records else {
             panic!()
         };
@@ -1939,7 +1939,7 @@ mod tests {
             .iter()
             .map(|d| d["state"].as_str().unwrap().to_owned())
             .collect();
-        assert_eq!(rows, ["fresh", "fresh", "fresh", "fresh", "unavailable"]);
+        assert_eq!(rows, ["fresh", "fresh", "fresh", "fresh", "overLimit"]);
     }
 
     /// Acceptance (8): sums that pass the payload's integer width saturate

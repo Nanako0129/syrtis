@@ -129,8 +129,9 @@ public enum DeviceFetchMode: String, Sendable {
 
 /// One `devices` row. `id` is `local`, `peers` (the peer store could not be
 /// read) or a producer's 16-hex fingerprint; `state` is one of `local`,
-/// `fresh`, `lastGood`, `stale`, `unavailable`, `refused`, `invalidReply`,
-/// `incompatible`; `lastSuccessAt` is Unix seconds of the last fresh pull in
+/// `fresh`, `lastGood`, `stale`, `unavailable`, `overLimit` (its reply was
+/// over the record or memory limits and is left out whole), `refused`,
+/// `invalidReply`, `incompatible`; `lastSuccessAt` is Unix seconds of the last fresh pull in
 /// this app run.
 public struct RemoteDevice: Decodable, Equatable, Sendable {
     public let id: String

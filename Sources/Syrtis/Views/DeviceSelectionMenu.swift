@@ -20,6 +20,7 @@ enum DeviceOverlayCopy {
     static let lastGood = "%@: no new data this time. Showing older data (last updated %@)."
     static let stale = "%@: showing older data. The time of its last update isn't known."
     static let unavailable = "%@ has no data to show."
+    static let overLimit = "%@ has too much data to include."
     static let refused = "%@ refused the request. Check Devices in Settings."
     static let invalidReply = "%@ sent a reply Syrtis couldn't use."
     static let incompatible = "%@ can't answer this request. It may need an update."
@@ -30,7 +31,7 @@ enum DeviceOverlayCopy {
 
     static let all = [
         menuHelp, thisMac, deviceCount, otherDevices, loading, failedNoData, keptLast,
-        modelsHidden, lastGood, stale, unavailable, refused, invalidReply, incompatible,
+        modelsHidden, lastGood, stale, unavailable, overLimit, refused, invalidReply, incompatible,
         duplicate, saturated, rangeLimited, aboutCombined,
     ]
 
@@ -40,6 +41,7 @@ enum DeviceOverlayCopy {
         case "local", "fresh": nil
         case "lastGood": lastGood
         case "stale": stale
+        case "overLimit": overLimit
         case "refused": refused
         case "invalidReply": invalidReply
         case "incompatible": incompatible
@@ -55,7 +57,7 @@ enum DeviceOverlayCopy {
 
     /// Least data first: a device that is `unavailable` on one page and
     /// `lastGood` on another gets the `unavailable` line only.
-    private static let severity = ["unavailable", "refused", "incompatible", "invalidReply", "stale", "lastGood"]
+    private static let severity = ["unavailable", "overLimit", "refused", "incompatible", "invalidReply", "stale", "lastGood"]
 
     /// The sentences in the ⓘ popover beside the device menu: the two general
     /// notes about combining devices, which are not trouble and so are not
