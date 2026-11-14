@@ -830,6 +830,7 @@
 "%@: showing older data. The time of its last update isn't known." = "%@：显示的是旧数据，不知道上次更新的时间。";
 "%@ has no data to show." = "%@ 没有可显示的数据。";
 "%@ refused the request. Check Devices in Settings." = "%@ 拒绝了这个请求。请到“设置”的“设备”查看。";
+"%@ has too much data to include." = "%@ 的数据量太大，无法纳入。";
 "%@ sent a reply Syrtis couldn't use." = "%@ 返回的内容 Syrtis 无法使用。";
 "%@ can't answer this request. It may need an update." = "%@ 无法响应这个请求，可能需要更新。";
 "Devices that sync their usage history can be counted more than once." = "会同步用量记录的设备，其用量可能被重复计算。";

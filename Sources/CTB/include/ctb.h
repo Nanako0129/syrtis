@@ -415,8 +415,8 @@ char *tb_remote_peer_remove(const char *producer_static);
 // merge two zones' hour slots and dates); mode = "cached"
 // (no connection) or "refresh". Data = the existing payload plus
 // devices:[{id ("local" or the 16-hex fingerprint), label (host:port or null),
-// state (local|fresh|lastGood|stale|unavailable|refused|invalidReply|
-// incompatible), lastSuccessAt (Unix s or null)}] (an unreadable peer store
+// state (local|fresh|lastGood|stale|unavailable|overLimit|refused|
+// invalidReply|incompatible), lastSuccessAt (Unix s or null)}] (an unreadable peer store
 // adds {id:"peers", state:"unavailable"}), duplicateWarning, saturated,
 // remoteRangeLimited. Local only: the existing data plus those keys.
 // Must never be written to the dashboard snapshot.

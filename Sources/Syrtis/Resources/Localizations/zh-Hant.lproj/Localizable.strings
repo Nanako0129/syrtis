@@ -831,6 +831,7 @@
 "%@: showing older data. The time of its last update isn't known." = "%@：顯示的是舊資料，不知道上次更新的時間。";
 "%@ has no data to show." = "%@ 沒有可顯示的資料。";
 "%@ refused the request. Check Devices in Settings." = "%@ 拒絕了這個請求。請到「設定」的「裝置」查看。";
+"%@ has too much data to include." = "%@ 的資料量太大，無法納入。";
 "%@ sent a reply Syrtis couldn't use." = "%@ 回傳的內容 Syrtis 無法使用。";
 "%@ can't answer this request. It may need an update." = "%@ 無法回應這個請求，可能需要更新。";
 "Devices that sync their usage history can be counted more than once." = "會同步用量紀錄的裝置，其用量可能被重複計算。";

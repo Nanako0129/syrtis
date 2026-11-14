@@ -1867,7 +1867,9 @@ struct SettingsPanel: View {
 
     func toggleRow(_ label: String, isOn: Binding<Bool>) -> some View {
         row(label) {
-            Toggle("", isOn: isOn)
+            // The title is hidden (the row draws it) but stays the switch's
+            // accessibility label.
+            Toggle(label.localized, isOn: isOn)
                 .toggleStyle(.switch)
                 .controlSize(.mini)
                 .labelsHidden()
