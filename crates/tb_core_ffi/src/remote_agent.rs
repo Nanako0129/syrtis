@@ -1101,27 +1101,27 @@ pub(crate) fn app_make_inputs(home_override: Option<PathBuf>) -> MakeInputs {
 /// directories, `context.scanner_settings()`, and the pricing source.
 /// `home_override` `None` is the directory-service home and the frozen root;
 /// a test build refuses it (`homeRequired`), so no test opens the real root.
+///
+/// The config and data directories are `home/.config` and
+/// `home/.local/share` in both branches, from
+/// `syrtis_agent::cli::default_dirs` (the standalone agent's own function, so
+/// both assemblers compute the same owner inputs). They depend on the trusted
+/// or override home alone, never on `$HOME` or another variable. The engine
+/// takes the data dir as the XDG data root and `<config dir>/tokscale` as its
+/// config root; `Library/Application Support` there missed every client the
+/// local report finds under `.local/share` or `.config/tokscale` (DR-1e).
 pub(crate) fn inputs_from(
     home_override: Option<&Path>,
     sources: &Sources,
 ) -> Result<Inputs, String> {
-    let (home, state_suffix, config_dir, data_dir) = match home_override {
+    let (home, state_suffix) = match home_override {
         Some(home) => {
             prepare_override_home(home)?;
-            // The platform directories, moved below the override home.
-            let below = |dir: Option<PathBuf>| -> Result<PathBuf, String> {
-                dir.zip(dirs::home_dir())
-                    .and_then(|(dir, platform)| {
-                        dir.strip_prefix(&platform).ok().map(Path::to_path_buf)
-                    })
-                    .map(|relative| home.join(relative))
-                    .ok_or_else(|| "unsupported".into())
-            };
-            let (config, data) = (below(dirs::config_dir())?, below(dirs::data_dir())?);
-            (home.to_path_buf(), OVERRIDE_SUFFIX, config, data)
+            (home.to_path_buf(), OVERRIDE_SUFFIX)
         }
         None => product_roots()?,
     };
+    let (config_dir, data_dir) = syrtis_agent::cli::default_dirs(&home);
     Ok(Inputs {
         home,
         state_suffix,
@@ -1134,17 +1134,12 @@ pub(crate) fn inputs_from(
     })
 }
 
-type Roots = (PathBuf, &'static [&'static str], PathBuf, PathBuf);
+type Roots = (PathBuf, &'static [&'static str]);
 
 #[cfg(not(test))]
 fn product_roots() -> Result<Roots, String> {
     let home = syrtis_agent::secure_fs::trusted_home().map_err(storage_class)?;
-    Ok((
-        home,
-        syrtis_agent::secure_fs::STATE_SUFFIX,
-        dirs::config_dir().ok_or("unsupported")?,
-        dirs::data_dir().ok_or("unsupported")?,
-    ))
+    Ok((home, syrtis_agent::secure_fs::STATE_SUFFIX))
 }
 
 #[cfg(test)]

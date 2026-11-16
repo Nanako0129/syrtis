@@ -1444,7 +1444,11 @@ mod tests {
 
     /// A producer with sharing on, an approved scope and a listener.
     fn producer(home: &Path, clock: &Arc<TestClock>) -> Arc<RemoteAgent> {
-        let agent = agent_at(home, clock);
+        share(agent_at(home, clock))
+    }
+
+    /// Listener on, the disclosed scope approved, sharing on.
+    fn share(agent: Arc<RemoteAgent>) -> Arc<RemoteAgent> {
         agent
             .listen_configure("127.0.0.1", free_port(), None)
             .unwrap();
@@ -2701,6 +2705,99 @@ mod tests {
         );
         assert_eq!(day(&stale, "2025-03-10")["tokenBreakdown"]["input"], 1000);
         drop(a);
+    }
+
+    /// One OpenCode message (an XdgData-rooted client) and one Antigravity
+    /// session line (a Config-rooted client, below `<config>/tokscale`), both
+    /// on 2025-03-10, with the given input counts.
+    fn write_xdg_clients(config: &Path, data: &Path, opencode: u64, antigravity: u64) {
+        let message = data.join("opencode/storage/message/ses_x/msg_x.json");
+        fs::create_dir_all(message.parent().unwrap()).unwrap();
+        fs::write(
+            message,
+            format!(r#"{{"id":"msg_x","sessionID":"ses_x","role":"assistant","modelID":"m-open","providerID":"anthropic","tokens":{{"input":{opencode},"output":41,"reasoning":0,"cache":{{"read":4,"write":1}}}},"time":{{"created":1741608000000.0}}}}"#),
+        )
+        .unwrap();
+        let session = config.join("tokscale/antigravity-cache/sessions/s.jsonl");
+        fs::create_dir_all(session.parent().unwrap()).unwrap();
+        fs::write(
+            session,
+            format!(r#"{{"type":"usage","sessionId":"s","timestamp":1741608000000,"modelId":"m-anti","input":{antigravity},"output":52}}"#) + "\n",
+        )
+        .unwrap();
+    }
+
+    /// DR-1e acceptance (a)–(d), through the app's own `inputs_from` with an
+    /// override home: the shared config and data dirs are `home/.config` and
+    /// `home/.local/share` (disclosed as such), so an OpenCode message under
+    /// `.local/share` and an Antigravity session under `.config/tokscale`
+    /// reach the shared graph. The child's `HOME` is another directory with
+    /// decoy fixtures of other counts: neither dir follows it.
+    #[test]
+    fn a_share_reaches_xdg_data_and_config_clients_below_the_home() {
+        if !in_child("a_share_reaches_xdg_data_and_config_clients_below_the_home") {
+            return;
+        }
+        let root = child_root().unwrap();
+        let clock = TestClock::new();
+        let env_home = root.join("home");
+        write_xdg_clients(
+            &env_home.join(".config"),
+            &env_home.join(".local/share"),
+            999,
+            888,
+        );
+        let p_home = root.join("p");
+        let (config, data) = (p_home.join(".config"), p_home.join(".local/share"));
+        write_xdg_clients(&config, &data, 410, 520);
+
+        let sources = crate::remote_agent::Sources {
+            context: crate::LocalSourceContext::current(),
+            pricing_source: root.join("config/cache"),
+            period: PERIOD,
+            clock: Arc::clone(&clock) as Arc<dyn Clock>,
+        };
+        let home = p_home.clone();
+        let agent = Arc::new(RemoteAgent::default());
+        agent
+            .start(Arc::new(move || {
+                crate::remote_agent::inputs_from(Some(&home), &sources)
+            }))
+            .unwrap();
+        // (c), and (d) since the decoy `$HOME` is elsewhere: disclosed as
+        // below the override home.
+        assert_eq!(std::env::var_os("HOME"), Some(env_home.into()), "control");
+        let disclosure = agent.scope_disclosure().unwrap();
+        assert_eq!(disclosure["configDir"], json!(config), "{disclosure}");
+        assert_eq!(disclosure["dataDir"], json!(data), "{disclosure}");
+        let producer = share(agent);
+
+        let r_home = root.join("r");
+        fs::create_dir_all(&r_home).unwrap();
+        let receiver = agent_at(&r_home, &clock);
+        let key = pair(&producer, &receiver);
+        clock.advance(61);
+        let context = crate::LocalSourceContext::current();
+        let g = graph(&call(
+            &receiver,
+            &context,
+            false,
+            &[key],
+            "UTC",
+            Mode::Refresh,
+        ))
+        .unwrap();
+        assert_eq!(states(&g), [(fingerprint(&key), "fresh".into())], "{g}");
+        let d10 = day(&g, "2025-03-10");
+        let input = |client: &str| {
+            d10["clients"]
+                .as_array()
+                .and_then(|rows| rows.iter().find(|r| r["client"] == client))
+                .map(|r| r["tokens"]["input"].clone())
+        };
+        // (a) XdgData root and (b) Config root, each the producer's count.
+        assert_eq!(input("opencode"), Some(json!(410)), "{d10}");
+        assert_eq!(input("antigravity"), Some(json!(520)), "{d10}");
     }
 
     /// Review fix 2: a producer that completes the handshake and then never
