@@ -174,7 +174,7 @@ Popover 的 Graph（Stats、Daily、Monthly）、Models、Hourly、Agents 可以
 
 推進 agent rev 或 engine pin 時三者要一起對上；第 3 條不符時，以 `cargo update -p <name>@<version> --precise <baseline version>` 對齊。
 
-目前的 agent rev 是 `df6c0adb147083bff677e91f498b1596f22e2880`（Syrtis-Agent `main`，Syrtis-Agent PR [#29](https://github.com/Nanako0129/Syrtis-Agent/pull/29) 的 merge），它只把該 crate 的引擎 pin 移到 `b0e2e5f4`（另有它的 spec 一句與 digest manifest），與 `vendor/tokscale-core` 的 gitlink 相同。這一步讓分享本機用量不再因本機歷史過大而被拒：內嵌 agent 走的串流來源折疊（`aggregate_remote_usage_from_source_v1`）在 engine PR [#89](https://github.com/Nanako0129/tokscale-core/pull/89) 之前，被查詢的本機歷史超過 262,144 則已接受訊息或 8 MiB 逐訊息 label 位元組就回 `LimitExceeded`，接收端看到該裝置被拒、四頁都沒有資料；現在改為在每張 map 第一次插入 key 時計入 key 字串位元組，該裝置照常回答。純函式 `aggregate_remote_usage_v1`（`remote_pages.rs` 合併 producer 記錄時呼叫的那個）不變。Devices 功能仍未發版。
+目前的 agent rev 是 `df6c0adb147083bff677e91f498b1596f22e2880`（Syrtis-Agent `main`，Syrtis-Agent PR [#29](https://github.com/Nanako0129/Syrtis-Agent/pull/29) 的 merge），它只把該 crate 的引擎 pin 移到 `b0e2e5f4`（另有它的 spec 一句與 digest manifest），與 `vendor/tokscale-core` 的 gitlink 相同。這一步讓分享本機用量不再因本機歷史過大而被拒：內嵌 agent 走的串流來源折疊（`aggregate_remote_usage_from_source_v1`）在 engine PR [#89](https://github.com/Nanako0129/tokscale-core/pull/89) 之前，被查詢的本機歷史超過 262,144 則已接受訊息或 8 MiB 逐訊息 label 位元組就回 `LimitExceeded`，接收端看到該裝置被拒、四頁都沒有資料；現在改為在每張 map 第一次插入 key 時計入 key 字串位元組，該裝置照常回答。純函式 `aggregate_remote_usage_v1` 不變；接收端的 `remote_pages.rs` 只以空的訊息清單呼叫它來驗證查詢，producer 記錄的合併走 agent 的 `merge::combine`，不經過這個折疊。串流那條路仍然受輸出面的上限約束：每張 map 最多 262,144 筆記錄、每張 map 的 key 字串合計 8 MiB，超過仍回 `LimitExceeded`。Devices 功能仍未發版。
 
 ## 殘餘風險與未觀察的行為
 
