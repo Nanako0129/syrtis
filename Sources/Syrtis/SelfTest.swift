@@ -24080,6 +24080,33 @@ enum SelfTest {
                            && first != c.gettingUsage.localized("Studio Mac") && first.hasPrefix(c.gettingUsage.localized("Studio Mac")),
                        "DR2B2 the first-scan half-sentence only when the device never answered and a fetch is in flight")
 
+                // everAnswered is combined over all of a device's rows: Graph
+                // answered (fresh) while Models is still pending and unanswered.
+                let plain = c.gettingUsage.localized("Studio Mac")
+                expect(lines([row("fresh", label: "Studio Mac", answered: true),
+                              row("unavailable", label: "Studio Mac", answered: false)], inFlight: true) == [plain]
+                           && lines([row("unavailable", label: "Studio Mac", answered: false),
+                                     row("fresh", label: "Studio Mac", answered: true)], inFlight: true) == [plain]
+                           && lines([row("fresh", label: "Studio Mac", answered: false),
+                                     row("unavailable", label: "Studio Mac", answered: false)], inFlight: true) == [first],
+                       "DR2B2 a device that answered on one page does not get the first-scan sentence for a page still pending; one that answered on none does")
+
+                // The menu button's text stays on one line and within its maximum width.
+                func width(_ title: String) -> CGFloat {
+                    NSHostingView(rootView: DeviceMenuTitle(title: title).fixedSize()).fittingSize.width
+                }
+                func plainWidth(_ title: String) -> CGFloat {
+                    NSHostingView(rootView: Text(verbatim: title).font(.caption.monospacedDigit())
+                        .foregroundStyle(.secondary).fixedSize()).fittingSize.width
+                }
+                let longName = String(repeating: "Studio Mac ", count: 11)
+                expect(width(longName) <= DeviceMenuTitle.maxWidth + 0.5 && plainWidth(longName) > DeviceMenuTitle.maxWidth * 2
+                           && width(longName) > DeviceMenuTitle.maxWidth - 20,
+                       "DR2B2 a 121-character name is cut to the button's maximum width, not as wide as the text")
+                expect(width("Studio Mac") == plainWidth("Studio Mac") && width("10.0.0.2:47000") == plainWidth("10.0.0.2:47000")
+                           && width("[::1]:47000") == plainWidth("[::1]:47000"),
+                       "DR2B2 short titles render at exactly their own width, as before")
+
                 // A model-level in-flight pass reads everAnswered from the page.
                 do {
                     let fake = SA3DFakeSource()

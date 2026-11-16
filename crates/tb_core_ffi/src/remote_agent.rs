@@ -1644,7 +1644,12 @@ mod tests {
         let home = TempHome::new();
         let agent = Arc::new(RemoteAgent::default());
         start(&agent, &home, &clock, ScannerSettings::default());
-        let (old, new) = (free_port(), free_port());
+        // `free_port` releases its listener, so two calls can return the same
+        // port; the checks below need two different ones.
+        let old = free_port();
+        let new = std::iter::repeat_with(free_port)
+            .find(|port| *port != old)
+            .expect("an endless iterator");
         agent
             .listen_configure("127.0.0.1", old, Some("Desk".into()))
             .unwrap();

@@ -127,7 +127,11 @@ enum DeviceOverlayCopy {
         var order: [String] = []
         var worst: [String: RemoteDevice] = [:]
         var costly: [String: RemoteDevice] = [:]
+        // True when ANY visible row of the device says it has answered, whichever
+        // row is the worst: Graph may have answered while Models is pending.
+        var answered: [String: Bool] = [:]
         for row in rows where row.state != "local" {
+            answered[row.id] = (answered[row.id] ?? false) || row.everAnswered
             if row.state != "fresh" {
                 if let seen = worst[row.id] {
                     if rank(row) < rank(seen) { worst[row.id] = row }
@@ -149,7 +153,11 @@ enum DeviceOverlayCopy {
         }
         var out: [String] = []
         for id in order {
-            if let device = worst[id] {
+            if let row = worst[id] {
+                let device = RemoteDevice(
+                    id: row.id, label: row.label, state: row.state, lastSuccessAt: row.lastSuccessAt,
+                    reason: row.reason, totals: row.totals, address: row.address,
+                    costIncomplete: row.costIncomplete, everAnswered: answered[id] ?? row.everAnswered)
                 out.append(statusLine(
                     device, name: Self.name(of: device), inFlight: inFlight,
                     retryPending: retryPending, now: now))
@@ -209,6 +217,27 @@ enum DeviceOverlayCopy {
     }
 }
 
+/// The device menu's button text: one line, cut with an ellipsis past
+/// `maxWidth`. The title can be another device's own name (up to 128 bytes).
+struct DeviceMenuTitle: View {
+    let title: String
+
+    /// Wide enough for an address like `192.168.100.200:47000` or a usual
+    /// device name, and narrow enough that the popover header (400 pt wide,
+    /// with the wordmark, year menu and two buttons) keeps its other items
+    /// when the name is long. Chosen for the header's layout, not measured there.
+    static let maxWidth: CGFloat = 150
+
+    var body: some View {
+        Text(verbatim: title)
+            .font(.caption.monospacedDigit())
+            .foregroundStyle(.secondary)
+            .lineLimit(1)
+            .truncationMode(.tail)
+            .frame(maxWidth: Self.maxWidth)
+    }
+}
+
 /// The device menu, shown only when a successful peer list has at least one
 /// active device.
 struct DeviceSelectionMenu: View {
@@ -249,9 +278,7 @@ struct DeviceSelectionMenu: View {
                     .disabled(!overlay.canToggle(local: false, peer: peer.producerStatic))
                 }
             } label: {
-                Text(verbatim: title)
-                    .font(.caption.monospacedDigit())
-                    .foregroundStyle(.secondary)
+                DeviceMenuTitle(title: title)
             }
             .menuStyle(.borderlessButton)
             .menuIndicator(.visible)
