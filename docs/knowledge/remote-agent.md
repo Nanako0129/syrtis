@@ -211,7 +211,7 @@ Popover 的 Graph（Stats、Daily、Monthly）、Models、Hourly、Agents 可以
 | 每頁 32,768 筆不同 record 的折疊在 2 秒內 | `remote_pages::tests::folds_of_32768_distinct_records_are_not_quadratic` |
 | `peers.json` 讀不到：`peers` 說明列 | `remote_pages::tests::an_unreadable_peer_store_is_said` |
 | 錯誤碼 2 之後 Grant status 更新 `authEpoch` | `remote_pages::tests::check_grant_status_updates_the_record` |
-| pricing 超過一小時時分享出去的 cost 與新鮮時相同 | `remote_pages::tests::shared_cost_with_fresh_and_hour_old_pricing` |
+| pricing 超過一小時時分享出去的 cost 由那份表計價（表內價格與新鮮的那份不同，以金額區分） | `remote_pages::tests::shared_cost_with_fresh_and_hour_old_pricing` |
 | Swift decode、含遠端的列沒有 implausible-cost ratio；四個呼叫前後，快照目錄與其中各檔的大小與修改時間相同（只比對 metadata，不比對內容：Foundation 的 Caches 目錄不跟隨 `HOME`，selftest 子行程看到的是使用者真正的目錄） | SelfTest 的 `SA3B` 案例 |
 | `tb_remote_peers` 每列帶 record 的 `host` 與 `port` | `remote_agent::tests::peers_rows_carry_the_record_host_and_port` |
 | 目的地預覽：回 offer 的 host／port、key 恰為 `host`／`port`、不含 secret 與 `offerId`、沒在跑時 `notRunning`、不產生 claim；過期、亂碼、canonical 不符、超長各回對應類別；對 `127.0.0.1` listener 預覽 0 個連線，control：同一 URL 的 `pair_claim` 至少 1 個 | `remote_agent::tests::pair_destination_is_the_offer_address_and_nothing_more`、`pair_destination_refusals_are_their_classes`、`pair_destination_never_connects` |
