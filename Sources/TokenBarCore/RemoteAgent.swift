@@ -150,6 +150,42 @@ public struct RemoteDevice: Decodable, Equatable, Sendable {
     public let label: String?
     public let state: String
     public let lastSuccessAt: Int64?
+    /// Why the last pull failed, when `state` alone does not say:
+    /// `unreachable`, `timeout`, `busy`, `stopped` or `error`. Absent for a
+    /// pull that did not fail that way (and from a core that predates it).
+    public let reason: String?
+    /// This device's part of the merged page, one entry per client; absent
+    /// or null when none of it was merged (and on a page that carries none).
+    public let totals: [DeviceClientTotal]?
+
+    public init(
+        id: String, label: String?, state: String, lastSuccessAt: Int64?,
+        reason: String? = nil, totals: [DeviceClientTotal]? = nil
+    ) {
+        self.id = id
+        self.label = label
+        self.state = state
+        self.lastSuccessAt = lastSuccessAt
+        self.reason = reason
+        self.totals = totals
+    }
+}
+
+/// One client's share of a device's part of a merged page (`totals` of a
+/// `devices` row, graph and models pages). The core computes these; the app
+/// only adds the clients on screen.
+public struct DeviceClientTotal: Decodable, Equatable, Sendable {
+    public let client: String
+    public let messages: Int64
+    public let tokens: Int64
+    public let costUsd: Double
+
+    public init(client: String, messages: Int64, tokens: Int64, costUsd: Double) {
+        self.client = client
+        self.messages = messages
+        self.tokens = tokens
+        self.costUsd = costUsd
+    }
 }
 
 /// A page payload with paired devices folded in by the core, and the device

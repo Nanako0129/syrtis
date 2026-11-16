@@ -316,7 +316,8 @@ struct PopoverView: View {
         // a change asks for a refresh of the pages on screen.
         .task(id: "\(activeViewRaw)|\(model.year ?? "")|\(overlayClients?.joined(separator: ",") ?? "-")|\(model.deviceOverlay.signature)|\(extraRootsGeneration)") {
             model.deviceOverlay.ensure(
-                view: effectiveView, year: model.year, clients: overlayClients)
+                view: effectiveView, year: model.year, clients: overlayClients,
+                rootsGeneration: extraRootsGeneration)
         }
         .task { model.deviceOverlay.refreshPeers() }
         .task { await model.deviceOverlay.pollLoop() }
@@ -682,7 +683,16 @@ struct PopoverView: View {
     /// button: a manual refresh does not touch the scan, and the scan's FFI call
     /// runs detached, so a slow one would otherwise lock Refresh with it.
     private var showsUpdating: Bool {
-        refreshDisabled || model.windowScansInFlight > 0
+        Self.spinnerShown(
+            refreshDisabled: refreshDisabled, windowScans: model.windowScansInFlight,
+            overlayRefreshing: model.deviceOverlay.fetching)
+    }
+
+    /// The refresh button spins for a refresh, a window-card scan, or the
+    /// device overlay's refresh (which `refresh()` does not wait for, so the
+    /// button stops only when the other devices have answered).
+    static func spinnerShown(refreshDisabled: Bool, windowScans: Int, overlayRefreshing: Bool) -> Bool {
+        refreshDisabled || windowScans > 0 || overlayRefreshing
     }
 
     /// One source for the button's disabled state and the ⌘R shortcut, so the
@@ -721,7 +731,8 @@ struct PopoverView: View {
     private var liveRateBadge: some View {
         HStack(spacing: 4) {
             activityLED
-            Text(tokensPerMin.map { "\(Format.compactTokens(Int64($0.rounded()))) tok/min" } ?? "— tok/min")
+            Text(verbatim: (tokensPerMin.map { "\(Format.compactTokens(Int64($0.rounded()))) tok/min" } ?? "— tok/min")
+                + (model.deviceOverlay.includesRemote ? " " + DeviceOverlayCopy.thisMacLive.localized : ""))
                 .font(.caption.monospacedDigit())
                 .foregroundStyle(.secondary)
         }
@@ -773,8 +784,37 @@ struct PopoverView: View {
     /// Lens router. The client tab picks *which* data (clientIds slice), the
     /// view switch picks *how* it is broken down; the two compose.
     @ViewBuilder private var lens: some View {
-        lensContent
+        // DR-2a: the status line sits above whatever the lens shows. It is
+        // always in the stack (an empty line draws nothing), so the lens below
+        // keeps its identity, and its state, when a line comes and goes.
+        VStack(alignment: .leading, spacing: Self.statusLineGap) {
+            DeviceStatusLine(lines: model.deviceOverlay.statusLines(
+                for: effectiveView, year: model.year, clients: overlayClients))
+            lensContent
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
     }
+
+    /// Gap above the per-device card, and under the Quota note: the cards' own
+    /// stack spacing.
+    private static let totalsCardGap: CGFloat = 12
+
+    /// Overview's combined pages while devices other than this Mac are
+    /// selected, else nil (this Mac's own cards, as before).
+    private var overviewMerge: OverviewMerge? {
+        model.deviceOverlay.overviewMerge(
+            year: model.year, singleClient: overlaySingleClient, hiddenRaw: hiddenRaw,
+            orderRaw: orderRaw, localColors: model.colors)
+    }
+
+    private var overviewGraphPage: DeviceAwarePayload<UsagePayload>? {
+        let overlay = model.deviceOverlay
+        guard overlay.includesRemote else { return nil }
+        return overlay.visible(overlay.graph, .graph, year: model.year, clients: nil).page
+    }
+
+    /// Gap between the status line and the first card.
+    private static let statusLineGap: CGFloat = 8
 
     @ViewBuilder private var lensContent: some View {
         if let payload = model.payload, let stats = model.stats {
@@ -797,7 +837,7 @@ struct PopoverView: View {
             let overlayActive = model.deviceOverlay.includesRemote
                 && !DeviceOverlayState.kinds(for: effectiveView).isEmpty
             switch effectiveView {
-            case _ where overlayActive:
+            case _ where overlayActive && effectiveView != .overview:
                 // SA-3d: the core's merged pages for the selected devices. Only
                 // read here; none of it goes to the model's own properties.
                 DeviceOverlayLens(
@@ -855,10 +895,24 @@ struct PopoverView: View {
                         // tab an empty map. The rule was written in four places and
                         // reconciled in three.
                         windowCurves: model.windowCurves,
-                        agentUsage: model.agentUsage)
+                        agentUsage: model.agentUsage,
+                        merged: overviewMerge)
+                    if let page = overviewGraphPage {
+                        DeviceTotalsCard(devices: page.devices, clientIds: overviewMerge?.clientIds ?? [])
+                            .padding(.top, Self.totalsCardGap)
+                    }
                 }
             case .quota:
                 VStack(spacing: 0) {  // onboarding containers carry their own gap
+                    // Window usage is this Mac's alone while other devices are
+                    // selected (DR-2a R5).
+                    if model.deviceOverlay.includesRemote {
+                        Text(DeviceOverlayCopy.windowUsageThisMacOnly.localized)
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .frame(maxWidth: .infinity, alignment: .trailing)
+                            .padding(.bottom, Self.totalsCardGap)
+                    }
                     // On every tab: this lens is where the window history reads
                     // 0 / $0.00 until usage is attributed, so the offer has to be
                     // here, not only on the global Overview.
