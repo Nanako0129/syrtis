@@ -171,8 +171,18 @@ pub(crate) enum Got {
 pub(crate) struct Pulled {
     pub peer: [u8; 32],
     pub grant: [u8; 16],
-    pub label: Option<String>,
+    /// The record's `host:port` (`None`: no such record).
+    pub address: Option<String>,
+    /// The name the producer last gave (`PeerRecord::node_label`, already
+    /// checked by the agent), read after the pull so a first answer's name is
+    /// the one shown.
+    pub name: Option<String>,
     pub got: Got,
+    /// The body this page used, fresh or cached, said the producer's price
+    /// table was missing or corrupt (`false`: it did not, or no body).
+    pub cost_incomplete: bool,
+    /// [`RemoteAgent::ever_answered`].
+    pub ever_answered: bool,
     /// [`RemoteAgent::last_success_at`] after the pull.
     pub last_success: Option<i64>,
     /// Why the pull failed, before `merge::classify` folds the failures
@@ -191,9 +201,8 @@ fn fingerprint(key: &[u8; 32]) -> String {
     syrtis_agent::security::hex_encode(&Sha256::digest(key)[..8])
 }
 
-/// The producer's address as the receiver stored it at pairing (the
-/// producer cannot change it later).
-fn label(record: &PeerRecord) -> String {
+/// The producer's address as the receiver stored it at pairing.
+fn address(record: &PeerRecord) -> String {
     if record.host.contains(':') {
         format!("[{}]:{}", record.host, record.port)
     } else {
@@ -201,8 +210,10 @@ fn label(record: &PeerRecord) -> String {
     }
 }
 
-/// A producer's `devices` row. `reason` says why the pull failed when the
-/// state alone does not (`unreachable`, `timeout`, `busy`, `stopped`,
+/// A producer's `devices` row. `label` is what the screens show: the name
+/// the producer gave, else the address (producers' rows also carry the
+/// address on its own, see [`assemble`]). `reason` says why the pull failed when
+/// the state alone does not (`unreachable`, `timeout`, `busy`, `stopped`,
 /// `error`); `totals` is that producer's part of the merged page, one entry
 /// per client, and `null` when no part of it was merged.
 fn device(
@@ -371,22 +382,35 @@ pub(crate) fn gather(
             .as_ref()
             .ok()
             .and_then(|all| all.iter().find(|r| r.responder_static == *peer));
-        let (got, reason) = match &records {
-            Err(_) => (Got::Unavailable, None),
-            Ok(_) if !accepted => (Got::Incompatible, None),
+        let (got, reason, cost_incomplete) = match &records {
+            Err(_) => (Got::Unavailable, None, false),
+            Ok(_) if !accepted => (Got::Incompatible, None, false),
             Ok(all) if record.is_some_and(|record| superseded(record, all)) => {
-                (Got::Superseded, None)
+                (Got::Superseded, None, false)
             }
             Ok(_) => fetch(agent, peer, mode, query),
         };
         pulled.push(Pulled {
             peer: *peer,
             grant: record.map_or([0; 16], |record| record.grant_id),
-            label: record.map(label),
+            address: record.map(address),
+            name: None,
             got,
+            cost_incomplete,
+            ever_answered: agent.ever_answered(peer),
             last_success: agent.last_success_at(peer, query),
             reason,
         });
+    }
+    // A successful pull stores the producer's current name on its record, so
+    // the names are read after the loop, not from the read before it.
+    if let Ok(after) = agent.peer_records() {
+        for item in &mut pulled {
+            item.name = after
+                .iter()
+                .find(|r| r.responder_static == item.peer)
+                .and_then(|r| r.node_label.clone());
+        }
     }
     let mut remote = assemble(query, pulled);
     if records.is_err() {
@@ -418,45 +442,68 @@ fn fetch(
     peer: &[u8; 32],
     mode: Mode,
     query: &ReportQuery,
-) -> (Got, Option<&'static str>) {
-    let cached = || {
-        Got::Cached(
-            agent
-                .last_good_peer(peer, query)
-                .and_then(|body| decode(query.endpoint, body.body())),
-        )
+) -> (Got, Option<&'static str>, bool) {
+    let cached = || match agent
+        .last_good_peer(peer, query)
+        .and_then(|body| decode(query.endpoint, body.body()))
+    {
+        Some((report, incomplete)) => (Got::Cached(Some(report)), incomplete),
+        None => (Got::Cached(None), false),
     };
     match mode {
-        Mode::Cached => (cached(), None),
+        Mode::Cached => {
+            let (got, incomplete) = cached();
+            (got, None, incomplete)
+        }
         Mode::Refresh => match agent.pull_peer(peer, query) {
-            None => (Got::Unavailable, None),
+            None => (Got::Unavailable, None, false),
             Some(Ok(fetched)) => (
                 Got::Fresh(Report {
                     records: fetched.records,
                     saturated: fetched.saturated,
                 }),
                 None,
+                fetched.cost_incomplete,
             ),
-            Some(Err(error)) => {
-                let reason = reason_of(&error);
-                match classify(error) {
-                    FailureClass::NoAnswer => (cached(), reason),
-                    class => (Got::Failed(class), reason),
-                }
-            }
+            Some(Err(error)) => failed(error, cached),
         },
     }
 }
 
+/// What a failed pull leaves: code 6 (the producer does not speak this
+/// receiver's report schema) is the `incompatible` state, not a failure the
+/// status line explains; no answer falls back to the last good body (read
+/// through `cached`); anything else is `merge::classify`'s class.
+fn failed(
+    error: PullError,
+    cached: impl FnOnce() -> (Got, bool),
+) -> (Got, Option<&'static str>, bool) {
+    if matches!(error, PullError::Fetch(FetchError::Incompatible)) {
+        return (Got::Incompatible, None, false);
+    }
+    let reason = reason_of(&error);
+    match classify(error) {
+        FailureClass::NoAnswer => {
+            let (got, incomplete) = cached();
+            (got, reason, incomplete)
+        }
+        class => (Got::Failed(class), reason, false),
+    }
+}
+
 /// A cached body, decoded by the frozen decoder after its decode cost is
-/// reserved; `None` when the reservation or the decode fails.
-fn decode(endpoint: Endpoint, body: &[u8]) -> Option<Report> {
-    fn typed<R: ReportRecord>(body: &[u8], wrap: fn(Vec<R>) -> Records) -> Option<Report> {
+/// reserved, with its `costIncomplete`; `None` when the reservation or the
+/// decode fails.
+fn decode(endpoint: Endpoint, body: &[u8]) -> Option<(Report, bool)> {
+    fn typed<R: ReportRecord>(body: &[u8], wrap: fn(Vec<R>) -> Records) -> Option<(Report, bool)> {
         let response = decode_response::<R>(body, None).ok()?;
-        Some(Report {
-            records: wrap(response.records),
-            saturated: response.saturated,
-        })
+        Some((
+            Report {
+                records: wrap(response.records),
+                saturated: response.saturated,
+            },
+            response.cost_incomplete,
+        ))
     }
     let cost = decode_reservation(body, endpoint).ok()?;
     let _reservation = LEDGER.reserve(cost)?;
@@ -493,7 +540,10 @@ pub(crate) fn assemble(query: &ReportQuery, pulled: Vec<Pulled>) -> Remote {
     /// A `devices` row before the merge outcome is known.
     struct Row {
         peer: [u8; 32],
-        label: Option<String>,
+        name: Option<String>,
+        address: Option<String>,
+        cost_incomplete: bool,
+        ever_answered: bool,
         fixed: Option<&'static str>,
         last_success: Option<i64>,
         reason: Option<&'static str>,
@@ -511,7 +561,10 @@ pub(crate) fn assemble(query: &ReportQuery, pulled: Vec<Pulled>) -> Remote {
         };
         rows.push(Row {
             peer: item.peer,
-            label: item.label.clone(),
+            name: item.name.clone(),
+            address: item.address.clone(),
+            cost_incomplete: item.cost_incomplete,
+            ever_answered: item.ever_answered,
             fixed,
             last_success: item.last_success,
             reason: item.reason,
@@ -556,7 +609,10 @@ pub(crate) fn assemble(query: &ReportQuery, pulled: Vec<Pulled>) -> Remote {
         .map(
             |Row {
                  peer,
-                 label,
+                 name,
+                 address,
+                 cost_incomplete,
+                 ever_answered,
                  fixed,
                  last_success,
                  reason,
@@ -573,14 +629,25 @@ pub(crate) fn assemble(query: &ReportQuery, pulled: Vec<Pulled>) -> Remote {
                 };
                 // Only a part `combine` summed has totals.
                 let merged = matches!(state, "fresh" | "lastGood" | "stale") && fixed.is_none();
-                device(
+                // The name is the producer's own free text; the address is the
+                // fallback and is always kept in its own field.
+                let label = name.or_else(|| address.clone());
+                let mut row = device(
                     fingerprint(&peer),
                     label,
                     state,
                     last_success,
                     reason,
                     if merged { totals.remove(&peer) } else { None },
-                )
+                );
+                // Producers' rows only: `address` is the record's `host:port`
+                // whatever the name; `costIncomplete` is true only when the
+                // body this page merged said so; `everAnswered` is whether
+                // this producer ever gave this receiver a body.
+                row["address"] = json!(address);
+                row["costIncomplete"] = json!(merged && cost_incomplete);
+                row["everAnswered"] = json!(ever_answered);
+                row
             },
         )
         .collect();
@@ -1907,14 +1974,77 @@ mod tests {
         Pulled {
             peer: [key; 32],
             grant: [key; 16],
-            label: Some(format!("10.0.0.{key}:4000")),
+            address: Some(format!("10.0.0.{key}:4000")),
+            name: None,
             got: Got::Fresh(Report {
                 records,
                 saturated: false,
             }),
+            cost_incomplete: false,
+            ever_answered: true,
             last_success: Some(7),
             reason: None,
         }
+    }
+
+    /// DR-2b2: code 6 is the `incompatible` state with no reason and no
+    /// cached fallback; the other failures keep their class and reason.
+    #[test]
+    fn code_6_is_incompatible_and_other_failures_keep_their_class() {
+        let cached = || -> (Got, bool) { panic!("code 6 must not read the cache") };
+        let (got, reason, incomplete) = failed(PullError::Fetch(FetchError::Incompatible), cached);
+        assert!(matches!(got, Got::Incompatible));
+        assert_eq!((reason, incomplete), (None, false));
+        // Control: no answer falls back to the cache (and its flag); a
+        // rejection does not.
+        let (got, reason, incomplete) = failed(PullError::Fetch(FetchError::Timeout), || {
+            (Got::Cached(None), true)
+        });
+        assert!(matches!(got, Got::Cached(None)));
+        assert_eq!((reason, incomplete), (Some("timeout"), true));
+        let (got, reason, _) = failed(PullError::Fetch(FetchError::Rejected), cached);
+        assert!(matches!(got, Got::Failed(FailureClass::Refused)));
+        assert_eq!(reason, Some("error"));
+    }
+
+    /// DR-2b2: a row's `label` is the producer's name, else the address;
+    /// `address` is always the record's; `costIncomplete` counts only for a
+    /// part that was merged; `everAnswered` is passed through.
+    #[test]
+    fn dr2b2_label_address_and_flags_of_a_row() {
+        let named = |key: u8, name: Option<&str>, incomplete: bool| {
+            let mut item = pulled(key, Records::Graph(vec![graph_record("2025-03-10", 1, 0)]));
+            item.name = name.map(Into::into);
+            item.cost_incomplete = incomplete;
+            item
+        };
+        // Same name and state on two devices: two rows, told apart by id.
+        let mut refused = named(3, Some("Studio Mac"), true);
+        refused.got = Got::Failed(FailureClass::Refused);
+        let remote = assemble(
+            &graph_query(),
+            vec![
+                named(1, Some("Studio Mac"), true),
+                named(2, None, false),
+                refused,
+            ],
+        );
+        let rows = &remote.devices;
+        assert_eq!(rows[0]["label"], "Studio Mac");
+        assert_eq!(rows[0]["address"], "10.0.0.1:4000");
+        assert_eq!(rows[0]["costIncomplete"], true);
+        assert_eq!(rows[0]["everAnswered"], true);
+        assert_eq!(rows[1]["label"], "10.0.0.2:4000", "no name: the address");
+        assert_eq!(rows[1]["address"], "10.0.0.2:4000");
+        assert_eq!(rows[1]["costIncomplete"], false);
+        assert_ne!(rows[0]["id"], rows[1]["id"]);
+        assert_eq!(rows[2]["state"], "refused");
+        assert_eq!(rows[2]["costIncomplete"], false, "no part was merged");
+        // The local-only rows are unchanged.
+        assert_eq!(
+            local_device(None),
+            json!({"id": "local", "label": null, "state": "local", "lastSuccessAt": null})
+        );
     }
 
     /// DR-2a R3: every pull failure maps to the reason the status line needs,
@@ -3053,9 +3183,22 @@ mod tests {
             Mode::Cached,
         ))
         .unwrap();
+        // The producer has no price table here, so its cached body carries
+        // `costIncomplete`, and the cache itself says it answered before.
+        let address = format!(
+            "127.0.0.1:{}",
+            stale["devices"][0]["label"]
+                .as_str()
+                .unwrap()
+                .rsplit(':')
+                .next()
+                .unwrap()
+        );
         assert_eq!(
             stale["devices"],
-            json!([{"id": fingerprint(&kb), "label": format!("127.0.0.1:{}", stale["devices"][0]["label"].as_str().unwrap().rsplit(':').next().unwrap()), "state": "stale", "lastSuccessAt": null, "reason": null,
+            json!([{"id": fingerprint(&kb), "label": address, "address": address,
+                    "state": "stale", "lastSuccessAt": null, "reason": null,
+                    "costIncomplete": true, "everAnswered": true,
                     "totals": [{"client": "claude", "costUsd": 0.0, "messages": 1, "tokens": 1100}]}])
         );
         assert_eq!(day(&stale, "2025-03-10")["tokenBreakdown"]["input"], 1000);
@@ -3211,6 +3354,109 @@ mod tests {
         assert_eq!(totals[0]["tokens"], 10, "the kept body is still merged");
         let (_, reason, _) = reason_of_page(&[ka], Mode::Cached);
         assert_eq!(reason, Value::Null);
+    }
+
+    /// DR-2b2 through the real pull. Before the first answer a row shows the
+    /// address and `everAnswered` is false; after it the row shows the name
+    /// the producer sent (stored on the record, so a cached call shows it
+    /// too), keeps the address in its own field, and `everAnswered` is true.
+    /// `costIncomplete` is true for a producer with no price table and false
+    /// once it has one; a producer nobody listens for has neither a name nor
+    /// the flag.
+    #[test]
+    fn dr2b2_rows_carry_the_name_the_address_and_the_flags() {
+        if !in_child("dr2b2_rows_carry_the_name_the_address_and_the_flags") {
+            return;
+        }
+        let root = child_root().unwrap();
+        let clock = TestClock::new();
+        let context = crate::LocalSourceContext::current();
+        let (a_home, r_home) = (TempHome::new(), root.join("r"));
+        write_session(
+            &a_home.0,
+            "a.jsonl",
+            &[claude(
+                "a1",
+                "2025-03-10T05:45:00.000Z",
+                "claude-3-5-sonnet",
+                1_000_000,
+                0,
+                false,
+            )],
+        );
+        fs::create_dir_all(&r_home).unwrap();
+        let a = agent_at(&a_home.0, &clock);
+        let port = free_port();
+        a.listen_configure("127.0.0.1", port, Some("Studio Mac".into()))
+            .unwrap();
+        let digest = a.scope_disclosure().unwrap()["ownerInputsSha256"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        a.scope_approve(&digest).unwrap();
+        a.sharing_set(true).unwrap();
+        let receiver = agent_at(&r_home, &clock);
+        let ka = pair(&a, &receiver);
+        let dead = fake_peer(&receiver, 0xdd, free_port(), 1);
+        let address = format!("127.0.0.1:{port}");
+        let row = |peer: [u8; 32], mode| {
+            let page = graph(&call(&receiver, &context, false, &[peer], "UTC", mode)).unwrap();
+            page["devices"][0].clone()
+        };
+
+        let before = row(ka, Mode::Cached);
+        assert_eq!(before["label"], address.as_str(), "{before}");
+        assert_eq!(before["address"], address.as_str());
+        assert_eq!(before["everAnswered"], false);
+        assert_eq!(before["costIncomplete"], false);
+
+        // No price table on the producer: its numbers say so.
+        clock.advance(61);
+        let first = row(ka, Mode::Refresh);
+        assert_eq!(first["state"], "fresh", "{first}");
+        assert_eq!(first["label"], "Studio Mac", "the name of this answer");
+        assert_eq!(first["address"], address.as_str());
+        assert_eq!(first["everAnswered"], true);
+        assert_eq!(first["costIncomplete"], true, "{first}");
+        // The name and the flag live on: a cached call has no connection.
+        let cached = row(ka, Mode::Cached);
+        assert_eq!(cached["label"], "Studio Mac");
+        assert_eq!(cached["everAnswered"], true);
+        assert_eq!(cached["costIncomplete"], true, "the cached body's flag");
+
+        // A price table on the producer clears the flag.
+        let source = a_home.dir("pricing-src");
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let dataset = |data: Value| json!({"timestamp": now, "data": data}).to_string();
+        fs::write(
+            source.join("pricing-litellm.json"),
+            dataset(json!({"claude-3-5-sonnet": {"input_cost_per_token": 0.000_001}})),
+        )
+        .unwrap();
+        fs::write(source.join("pricing-openrouter.json"), dataset(json!({}))).unwrap();
+        for name in crate::remote_agent::PRICING_FILES {
+            fs::File::options()
+                .write(true)
+                .open(source.join(name))
+                .unwrap()
+                .set_modified(SystemTime::now() + Duration::from_secs(10))
+                .unwrap();
+        }
+        std::thread::sleep(PERIOD * 5);
+        clock.advance(61);
+        let priced = row(ka, Mode::Refresh);
+        assert_eq!(priced["state"], "fresh", "{priced}");
+        assert_eq!(priced["costIncomplete"], false, "{priced}");
+
+        // A producer that never answered: address as label, no flag.
+        let unreachable = row(dead, Mode::Refresh);
+        assert_eq!(unreachable["state"], "unavailable", "{unreachable}");
+        assert_eq!(unreachable["label"], unreachable["address"]);
+        assert_eq!(unreachable["everAnswered"], false);
+        assert_eq!(unreachable["costIncomplete"], false);
     }
 
     /// Review fix 2: a producer that completes the handshake and then never

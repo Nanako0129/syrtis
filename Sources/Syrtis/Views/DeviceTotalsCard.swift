@@ -119,7 +119,8 @@ struct DeviceStatusLine: View {
     var body: some View {
         if !lines.isEmpty {
             VStack(alignment: .leading, spacing: 2) {
-                ForEach(lines, id: \.self) { line in
+                // By position: two devices with the same name and state read the same.
+                ForEach(Array(lines.enumerated()), id: \.offset) { _, line in
                     Text(verbatim: line)
                         .font(.caption2)
                         .foregroundStyle(.secondary)

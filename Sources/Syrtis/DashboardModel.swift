@@ -3570,7 +3570,7 @@ extension DeviceOverlayResult {
         }
         let peers = selection.peers.compactMap { id in
             selectablePeers.first { $0.producerStatic == id }
-        }.map { (id: $0.fingerprint, name: DeviceOverlayCopy.address(host: $0.host, port: $0.port)) }
+        }.map { (id: $0.fingerprint, name: DeviceOverlayCopy.name(of: $0)) }
         return DeviceOverlayCopy.statusLines(
             rows: rows, peers: peers, inFlight: fetching, retryPending: retryTask != nil, now: now)
     }

@@ -780,7 +780,7 @@
 "Expires %@" = "%@ 到期";
 "Scan scope" = "扫描范围";
 "What sharing reads, and what it sends." = "共享会读取哪些数据、发送哪些内容。";
-"Sharing sends usage totals: token counts, cost, message and turn counts, and duration, grouped by day and hour (with the time-zone offset) and by client, model, provider and agent name. Those names are sent exactly as recorded on this Mac. Conversation content is not sent, and there are no fields for file paths or accounts. Clients that a Syrtis update adds support for are included automatically." = "共享发送的是用量汇总：token 数、费用、消息数与回合数，以及耗时，按日与小时（含时区偏移）以及客户端、模型、提供商与 agent 的名称分组。这些名称会按这台 Mac 上的记录原样发送。不会发送对话内容，也没有文件路径或账户的字段。Syrtis 更新后新支持的客户端会自动纳入。";
+"Sharing sends usage totals: token counts, cost, message and turn counts, and duration, grouped by day and hour (with the time-zone offset) and by client, model, provider and agent name. Those names are sent exactly as recorded on this Mac. Conversation content is not sent, and there are no fields for file paths or accounts. This Mac's device name, if you set one, is also sent to the devices linked to it. Clients that a Syrtis update adds support for are included automatically." = "共享发送的是用量汇总：token 数、费用、消息数与回合数，以及耗时，按日与小时（含时区偏移）以及客户端、模型、提供商与 agent 的名称分组。这些名称会按这台 Mac 上的记录原样发送。不会发送对话内容，也没有文件路径或账户的字段。这台 Mac 的设备名称（如果设置了）也会发送给已连接的设备。Syrtis 更新后新支持的客户端会自动纳入。";
 "Home folder" = "主目录";
 "Config folder" = "配置文件夹";
 "Data folder" = "数据文件夹";
@@ -863,3 +863,8 @@
 "Cut" = "剪切";
 "Paste" = "粘贴";
 "Select All" = "全选";
+
+/* Device names, cost note, first scan (DR-2b2) */
+"Linked devices will see this name." = "已连接的设备会看到这个名称。";
+"◌ Getting usage from %@… The first time needs to scan its records, about 1 minute" = "◌ 正在向 %@ 获取用量…首次需要扫描记录，约 1 分钟";
+"The cost for %@ may be incomplete (its price data is incomplete). Tokens and message counts are included in the totals." = "%@ 的费用可能不完整（那台设备的价格数据不全）。token 数与消息数已合计。";

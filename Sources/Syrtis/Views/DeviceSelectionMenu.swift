@@ -32,6 +32,11 @@ enum DeviceOverlayCopy {
     // DR-2a: the status line (one sentence per device that is not fresh), and
     // the labels that say which numbers are combined and which are this Mac's.
     static let gettingUsage = "◌ Getting usage from %@…"
+    // DR-2b2: a device that has never answered this Mac scans its history first.
+    static let gettingUsageFirstScan =
+        "◌ Getting usage from %@… The first time needs to scan its records, about 1 minute"
+    static let costIncomplete =
+        "The cost for %@ may be incomplete (its price data is incomplete). Tokens and message counts are included in the totals."
     static let unreachableData =
         "Can't reach %@. Make sure it has Syrtis open and is on the same network. Showing data from %@."
     static let unreachableNoData =
@@ -56,15 +61,30 @@ enum DeviceOverlayCopy {
         menuHelp, thisMac, deviceCount, otherDevices, loading, failedNoData, keptLast,
         modelsHidden, lastGood, stale, unavailable, overLimit, refused, invalidReply, incompatible,
         duplicate, saturated, rangeLimited, aboutCombined,
-        gettingUsage, unreachableData, unreachableNoData, busyData, busyDataRetry, busyNoData,
+        gettingUsage, gettingUsageFirstScan, costIncomplete, unreachableData, unreachableNoData, busyData, busyDataRetry, busyNoData,
         busyNoDataRetry, stopped, errorData, errorNoData, noDataYet, combined, thisMacLive,
         quotaThisMacOnly, thisMacOnly, windowUsageThisMacOnly, perDevice, updatedAt,
     ]
 
-    /// What names a device in a line: its `host:port` label, else a fixed
-    /// word for the unreadable-peer-list row, else its fingerprint.
+    /// What names a device in a line: the label the core gave (the owner's
+    /// name for it, else its `host:port`), else a fixed word for the
+    /// unreadable-peer-list row, else its fingerprint.
     static func name(of device: RemoteDevice) -> String {
         device.label ?? (device.id == "peers" ? otherDevices.localized : device.id)
+    }
+
+    /// The same for a linked device that has no `devices` row yet: the name it
+    /// last sent, else the address it was linked at.
+    static func name(of peer: RemotePeer) -> String {
+        peer.nodeLabel ?? address(host: peer.host, port: peer.port)
+    }
+
+    /// The device menu's button: the one selected device's name, "This Mac",
+    /// or a count.
+    static func menuTitle(selectedCount: Int, local: Bool, peer: RemotePeer?) -> String {
+        if selectedCount == 1, !local, let peer { return name(of: peer) }
+        if selectedCount == 1 { return thisMac.localized }
+        return deviceCount.localized(selectedCount)
     }
 
     /// Least data first: a device that is `unavailable` on one page and
@@ -85,48 +105,69 @@ enum DeviceOverlayCopy {
 
     /// The status line: one sentence for each selected device that is not
     /// fresh, in the order the pages list them (selected devices that no page
-    /// mentions yet follow, as "no data yet" or "getting usage").
+    /// mentions yet follow, as "no data yet" or "getting usage"), each
+    /// followed by its cost sentence when a page merged a body that said the
+    /// device's price table was incomplete.
     ///
     /// `rows` are the `devices` rows of the pages the lens shows; a device on
-    /// several pages gets its worst row. `inFlight` (a refresh is running)
-    /// replaces every sentence with "getting usage from X"; `retryPending`
-    /// is whether a retry is actually armed, the only case that may say
-    /// "again in a minute". Another device's name is only a format argument.
+    /// several pages gets its worst row, and one line per device id: two
+    /// devices with the same name and state stay two lines. `inFlight` (a
+    /// refresh is running) replaces every state sentence with "getting usage
+    /// from X" (with the first-scan half-sentence when the core says X never
+    /// answered); `retryPending` is whether a retry is actually armed, the
+    /// only case that may say "again in a minute". Another device's name is
+    /// only a format argument.
     static func statusLines(
         rows: [RemoteDevice], peers: [(id: String, name: String)], inFlight: Bool,
         retryPending: Bool, now: Date = Date()
     ) -> [String] {
         func rank(_ d: RemoteDevice) -> Int { severity.firstIndex(of: d.state) ?? 0 }
-        var worst: [RemoteDevice] = []
-        for row in rows where row.state != "local" && row.state != "fresh" {
-            if let i = worst.firstIndex(where: { $0.id == row.id }) {
-                if rank(row) < rank(worst[i]) { worst[i] = row }
-            } else {
-                worst.append(row)
+        // Per device id, in first-appearance order: its worst non-fresh row,
+        // and whether a row with data says its cost is incomplete.
+        var order: [String] = []
+        var worst: [String: RemoteDevice] = [:]
+        var costly: [String: RemoteDevice] = [:]
+        for row in rows where row.state != "local" {
+            if row.state != "fresh" {
+                if let seen = worst[row.id] {
+                    if rank(row) < rank(seen) { worst[row.id] = row }
+                } else {
+                    worst[row.id] = row
+                }
             }
+            if row.costIncomplete, ["fresh", "lastGood", "stale"].contains(row.state), costly[row.id] == nil {
+                costly[row.id] = row
+            }
+            if (worst[row.id] != nil || costly[row.id] != nil), !order.contains(row.id) { order.append(row.id) }
         }
         // A selected device no page lists yet has had no answer.
         let listed = Set(rows.map(\.id))
         for peer in peers where !listed.contains(peer.id) {
-            worst.append(RemoteDevice(
-                id: peer.id, label: peer.name, state: "unavailable", lastSuccessAt: nil))
+            worst[peer.id] = RemoteDevice(
+                id: peer.id, label: peer.name, state: "unavailable", lastSuccessAt: nil)
+            order.append(peer.id)
         }
         var out: [String] = []
-        for device in worst {
-            out.append(statusLine(
-                device, name: Self.name(of: device), inFlight: inFlight,
-                retryPending: retryPending, now: now))
+        for id in order {
+            if let device = worst[id] {
+                out.append(statusLine(
+                    device, name: Self.name(of: device), inFlight: inFlight,
+                    retryPending: retryPending, now: now))
+            }
+            if let device = costly[id] {
+                out.append(costIncomplete.localized(Self.name(of: device)))
+            }
         }
-        // Two devices with the same label and state read the same.
-        var seen = Set<String>()
-        return out.filter { seen.insert($0).inserted }
+        return out
     }
 
     /// One device's sentence; the R3 table of the plan, cell by cell.
     static func statusLine(
         _ device: RemoteDevice, name: String, inFlight: Bool, retryPending: Bool, now: Date
     ) -> String {
-        if inFlight { return gettingUsage.localized(name) }
+        if inFlight {
+            return device.everAnswered ? gettingUsage.localized(name) : gettingUsageFirstScan.localized(name)
+        }
         let age: String? = {
             guard device.state == "lastGood", let at = device.lastSuccessAt, at >= 0 else { return nil }
             return Format.relativeTime(UInt64(at), now: now)
@@ -183,12 +224,9 @@ struct DeviceSelectionMenu: View {
     private static let infoWidth: CGFloat = 260
 
     private var title: String {
-        if overlay.selectedCount == 1, !overlay.stored.local,
-           let peer = overlay.selectablePeers.first(where: { overlay.isSelected(peer: $0.producerStatic) }) {
-            return "\(peer.host):\(peer.port)"
-        }
-        if overlay.selectedCount == 1 { return DeviceOverlayCopy.thisMac.localized }
-        return DeviceOverlayCopy.deviceCount.localized(overlay.selectedCount)
+        DeviceOverlayCopy.menuTitle(
+            selectedCount: overlay.selectedCount, local: overlay.stored.local,
+            peer: overlay.selectablePeers.first { overlay.isSelected(peer: $0.producerStatic) })
     }
 
     var body: some View {
@@ -206,7 +244,7 @@ struct DeviceSelectionMenu: View {
                         get: { overlay.isSelected(peer: peer.producerStatic) },
                         set: { _ in overlay.togglePeer(peer.producerStatic) })
                     ) {
-                        Text(verbatim: "\(peer.host):\(peer.port)")
+                        Text(verbatim: DeviceOverlayCopy.name(of: peer))
                     }
                     .disabled(!overlay.canToggle(local: false, peer: peer.producerStatic))
                 }

@@ -226,6 +226,41 @@ final class DevicesModel: ObservableObject, CustomStringConvertible, CustomDebug
     static let nodeLabelMaxBytes = 128
     static let portRange = 1024...65535
 
+    /// Characters a device name may not contain, besides the control
+    /// characters (Cc): line and paragraph separators and the bidirectional
+    /// marks, embeddings, overrides and isolates. The agent refuses a name with
+    /// any of them, and another device shows the name to its owner.
+    private static let forbiddenNameScalars: Set<Unicode.Scalar> = {
+        var set: Set<Unicode.Scalar> = ["\u{2028}", "\u{2029}", "\u{061C}", "\u{200E}", "\u{200F}"]
+        for value in (0x202A...0x202E).map({ $0 }) + (0x2066...0x2069).map({ $0 }) {
+            if let scalar = Unicode.Scalar(value) { set.insert(scalar) }
+        }
+        return set
+    }()
+
+    /// Characters that draw nothing (the agent's `INVISIBLE_LABEL_CHARS`): a
+    /// name made only of these and whitespace has nothing visible.
+    private static let invisibleNameScalars: Set<Unicode.Scalar> = [
+        "\u{00AD}", "\u{115F}", "\u{1160}", "\u{200B}", "\u{200C}", "\u{200D}", "\u{2060}",
+        "\u{3164}", "\u{FEFF}", "\u{2800}",
+    ]
+
+    /// The typed device name as it is sent: control and the forbidden
+    /// separator and bidi characters removed, whitespace trimmed at both ends;
+    /// nil (no name) when nothing visible remains.
+    static func cleanedName(_ typed: String) -> String? {
+        var scalars = String.UnicodeScalarView()
+        for scalar in typed.unicodeScalars
+        where scalar.properties.generalCategory != .control && !forbiddenNameScalars.contains(scalar) {
+            scalars.append(scalar)
+        }
+        let trimmed = String(scalars).trimmingCharacters(in: .whitespacesAndNewlines)
+        let visible = trimmed.unicodeScalars.contains {
+            !$0.properties.isWhitespace && !invisibleNameScalars.contains($0)
+        }
+        return visible ? trimmed : nil
+    }
+
     enum Pairing: Equatable {
         case idle
         /// Reading where the pasted invitation would connect; no connection.
@@ -396,11 +431,11 @@ final class DevicesModel: ObservableObject, CustomStringConvertible, CustomDebug
             listenError = DevicesCopy.portRangeLine
             return
         }
-        guard nodeLabel.utf8.count <= Self.nodeLabelMaxBytes else {
+        let label = Self.cleanedName(nodeLabel)
+        guard (label?.utf8.count ?? 0) <= Self.nodeLabelMaxBytes else {
             listenError = DevicesCopy.nameTooLong
             return
         }
-        let label = nodeLabel.isEmpty ? nil : nodeLabel
         switch await call({ try $0.listenConfigure(host: host, port: port, nodeLabel: label) }) {
         case .success(let next): status = next
         case .failure(let error):
@@ -680,6 +715,7 @@ enum DevicesCopy {
     static let sharingBusy = "An earlier pairing invitation hasn't expired yet. Try again in a few minutes."
     static let sharingAlreadyOn = "Sharing is already on."
     static let deviceName = "Device name"
+    static let deviceNameHint = "Linked devices will see this name."
     static let listenOn = "Listen on"
     static let localOnlyLabel = "This Mac only (127.0.0.1)"
     static let chooseAddress = "Choose an address"
@@ -714,7 +750,7 @@ enum DevicesCopy {
     // (B) Scan scope
     static let scopeSection = "Scan scope"
     static let scopeSummary = "What sharing reads, and what it sends."
-    static let scopeBody = "Sharing sends usage totals: token counts, cost, message and turn counts, and duration, grouped by day and hour (with the time-zone offset) and by client, model, provider and agent name. Those names are sent exactly as recorded on this Mac. Conversation content is not sent, and there are no fields for file paths or accounts. Clients that a Syrtis update adds support for are included automatically."
+    static let scopeBody = "Sharing sends usage totals: token counts, cost, message and turn counts, and duration, grouped by day and hour (with the time-zone offset) and by client, model, provider and agent name. Those names are sent exactly as recorded on this Mac. Conversation content is not sent, and there are no fields for file paths or accounts. This Mac's device name, if you set one, is also sent to the devices linked to it. Clients that a Syrtis update adds support for are included automatically."
     static let homeFolder = "Home folder"
     static let configFolder = "Config folder"
     static let dataFolder = "Data folder"
@@ -807,7 +843,7 @@ enum DevicesCopy {
     static let all = [
         page, shareSection, shareSummary, service, serviceRunning, serviceStopped, notRunning,
         startBusy, startUnsafe, startFailed, retry, shareToggle, shareOffNote, needsScope,
-        sharingBusy, sharingAlreadyOn, deviceName, listenOn, localOnlyLabel, chooseAddress, port,
+        sharingBusy, sharingAlreadyOn, deviceName, deviceNameHint, listenOn, localOnlyLabel, chooseAddress, port,
         apply, unreachableLine, publicAddress, portRangeLine, nameTooLong, addressRefused,
         createInvitation, invitationReady, expiresIn, copy, copiedLine, cancelInvitation,
         offerNeedsSharing, offerNeedsAddress, requests, compareCode, approve, reject, approveEffect,
