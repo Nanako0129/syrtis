@@ -7,7 +7,7 @@ the shared-engine boundary and
 [`docs/knowledge/verification.md`](../docs/knowledge/verification.md) for
 required consumer evidence. Engine implementation work follows the public
 engine's immutable
-[`AGENTS.md`](https://github.com/Nanako0129/tokscale-core/blob/b0e2e5f43254d8c2c78f07ed9ca23096c4ed8249/AGENTS.md).
+[`AGENTS.md`](https://github.com/Nanako0129/tokscale-core/blob/51047602c7052f4c7a2ec0fc96967958e79aa829/AGENTS.md).
 
 ## Invariants
 

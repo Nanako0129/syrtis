@@ -3084,10 +3084,11 @@ mod tests {
         assert_eq!(states(&page), [(fingerprint(&ka), "fresh".into())]);
     }
 
-    /// Deferred item (5), measured: the producer's pricing copy older than an
-    /// hour (by the dataset's own timestamp) is refused by the engine's remote
-    /// snapshot, and a client that records no cost of its own (Claude Code)
-    /// is then shared with cost 0. A fresh copy prices the same tokens.
+    /// The producer's pricing copy older than an hour (by the dataset's own
+    /// timestamp) still prices what it shares: a client that records no cost
+    /// of its own (Claude Code) is shared with the same cost as under a fresh
+    /// copy. Before engine PR 90 the remote snapshot refused such a copy and
+    /// the shared cost was 0 (measured here at the time).
     #[test]
     fn shared_cost_with_fresh_and_hour_old_pricing() {
         if !in_child("shared_cost_with_fresh_and_hour_old_pricing") {
@@ -3152,6 +3153,6 @@ mod tests {
         let stale = cost("2025");
         println!("SA3B-PRICING fresh={fresh} stale={stale}");
         assert!((fresh - 1.0).abs() < 1e-9, "fresh pricing: {fresh}");
-        assert_eq!(stale, 0.0, "hour-old pricing");
+        assert!((stale - 1.0).abs() < 1e-9, "hour-old pricing: {stale}");
     }
 }
