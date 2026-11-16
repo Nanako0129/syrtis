@@ -316,7 +316,17 @@ final class DevicesModel: ObservableObject, CustomStringConvertible, CustomDebug
     /// preview result lands only if it is still the latest.
     private var previewGeneration = 0
 
-    init(client: DevicesRemoteClient, pasteboard: DevicesPasteboard) {
+    /// Posted when this Mac's list of linked devices changed here (a link
+    /// succeeded, or a linked device was removed): the dashboard reloads its
+    /// peer list at once instead of at its next poll.
+    static let peersChanged = Notification.Name("SyrtisDevicesPeersChanged")
+    private let notifications: NotificationCenter
+
+    init(
+        client: DevicesRemoteClient, pasteboard: DevicesPasteboard,
+        notifications: NotificationCenter = .default
+    ) {
+        self.notifications = notifications
         self.client = client
         self.pasteboard = pasteboard
     }
@@ -553,6 +563,8 @@ final class DevicesModel: ObservableObject, CustomStringConvertible, CustomDebug
         let key = peer.producerStatic
         if case .failure = await call({ try $0.peerRemove(producerStatic: key) }) {
             manageError = DevicesCopy.genericFailure
+        } else {
+            notifications.post(name: Self.peersChanged, object: nil)
         }
         await refresh()
     }
@@ -649,6 +661,7 @@ final class DevicesModel: ObservableObject, CustomStringConvertible, CustomDebug
             }
         case .success(let paired):
             pairing = .linked(fingerprint: paired.fingerprint)
+            notifications.post(name: Self.peersChanged, object: nil)
         case .failure where cancelled:
             break
         case .failure(let error):

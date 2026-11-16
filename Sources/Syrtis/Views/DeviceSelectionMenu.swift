@@ -81,8 +81,8 @@ enum DeviceOverlayCopy {
 
     /// The device menu's button: the one selected device's name, "This Mac",
     /// or a count.
-    static func menuTitle(selectedCount: Int, local: Bool, peer: RemotePeer?) -> String {
-        if selectedCount == 1, !local, let peer { return name(of: peer) }
+    static func menuTitle(selectedCount: Int, local: Bool, peerName: String?) -> String {
+        if selectedCount == 1, !local, let peerName { return peerName }
         if selectedCount == 1 { return thisMac.localized }
         return deviceCount.localized(selectedCount)
     }
@@ -119,8 +119,11 @@ enum DeviceOverlayCopy {
     /// only a format argument.
     static func statusLines(
         rows: [RemoteDevice], peers: [(id: String, name: String)], inFlight: Bool,
-        retryPending: Bool, now: Date = Date()
+        retryPending: Bool, names: [String: String] = [:], now: Date = Date()
     ) -> [String] {
+        /// `names` (the newest real name per device id) wins over a row's own
+        /// label, which may come from an older page.
+        func nameOf(_ d: RemoteDevice) -> String { names[d.id] ?? Self.name(of: d) }
         func rank(_ d: RemoteDevice) -> Int { severity.firstIndex(of: d.state) ?? 0 }
         // Per device id, in first-appearance order: its worst non-fresh row,
         // and whether a row with data says its cost is incomplete.
@@ -159,11 +162,11 @@ enum DeviceOverlayCopy {
                     reason: row.reason, totals: row.totals, address: row.address,
                     costIncomplete: row.costIncomplete, everAnswered: answered[id] ?? row.everAnswered)
                 out.append(statusLine(
-                    device, name: Self.name(of: device), inFlight: inFlight,
+                    device, name: nameOf(device), inFlight: inFlight,
                     retryPending: retryPending, now: now))
             }
             if let device = costly[id] {
-                out.append(costIncomplete.localized(Self.name(of: device)))
+                out.append(costIncomplete.localized(nameOf(device)))
             }
         }
         return out
@@ -255,7 +258,8 @@ struct DeviceSelectionMenu: View {
     private var title: String {
         DeviceOverlayCopy.menuTitle(
             selectedCount: overlay.selectedCount, local: overlay.stored.local,
-            peer: overlay.selectablePeers.first { overlay.isSelected(peer: $0.producerStatic) })
+            peerName: overlay.selectablePeers.first { overlay.isSelected(peer: $0.producerStatic) }
+                .map { overlay.displayName(of: $0) })
     }
 
     var body: some View {
@@ -273,7 +277,7 @@ struct DeviceSelectionMenu: View {
                         get: { overlay.isSelected(peer: peer.producerStatic) },
                         set: { _ in overlay.togglePeer(peer.producerStatic) })
                     ) {
-                        Text(verbatim: DeviceOverlayCopy.name(of: peer))
+                        Text(verbatim: overlay.displayName(of: peer))
                     }
                     .disabled(!overlay.canToggle(local: false, peer: peer.producerStatic))
                 }
@@ -374,7 +378,7 @@ struct DeviceOverlayLens: View {
                                 payload: page.payload, clientIds: ids,
                                 turnClientIds: PopoverView.supportedTurnClients(ids),
                                 colors: localColors, onExpand: onExpand)
-                            DeviceTotalsCard(devices: page.devices, clientIds: ids)
+                            DeviceTotalsCard(devices: page.devices, clientIds: ids, names: overlay.learnedNames)
                         }
                     case .monthly:
                         VStack(spacing: Self.blockSpacing) {
@@ -382,7 +386,7 @@ struct DeviceOverlayLens: View {
                                 payload: page.payload, clientIds: ids,
                                 turnClientIds: PopoverView.supportedTurnClients(ids),
                                 colors: localColors, onExpand: onExpand)
-                            DeviceTotalsCard(devices: page.devices, clientIds: ids)
+                            DeviceTotalsCard(devices: page.devices, clientIds: ids, names: overlay.learnedNames)
                         }
                     default:
                         if let stats = overlay.stats(selecting: Set(ids)) {

@@ -447,11 +447,13 @@ private struct DashboardSnapshot {
         initialYear: String? = DashboardModel.resolveYear(),
         buildIdentity: BuildIdentity? = BuildIdentity.shipping(),
         snapshotDirectory: @autoclosure () -> URL? = SnapshotStore.defaultDirectory(),
-        deviceDefaults: UserDefaults = .standard
+        deviceDefaults: UserDefaults = .standard,
+        peerNotifications: NotificationCenter = .default
     ) {
         self.cachesSnapshot = cachesSnapshot
         self.source = source
-        self.deviceOverlay = DeviceOverlayState(source: source, defaults: deviceDefaults)
+        self.deviceOverlay = DeviceOverlayState(
+            source: source, defaults: deviceDefaults, notifications: peerNotifications)
         self.year = initialYear
         self.buildIdentity = buildIdentity
         self.resolvedSnapshotDirectory =
@@ -3050,7 +3052,31 @@ extension DeviceOverlayResult {
     /// would collide with the local payload's.
     @ObservationIgnored private var statsMemo: (key: DeviceOverlayKey, selected: Set<String>, value: UsageStats)?
 
-    init(source: any UsageDataSource, defaults: UserDefaults = .standard) {
+    /// Removes the notification observer when the overlay state goes away
+    /// (the state's own deinit cannot touch its main-actor properties).
+    private final class PeerChangeObserver {
+        private let center: NotificationCenter
+        private let token: NSObjectProtocol
+        init(center: NotificationCenter, token: NSObjectProtocol) {
+            self.center = center
+            self.token = token
+        }
+        deinit { center.removeObserver(token) }
+    }
+    @ObservationIgnored private var peerObserver: PeerChangeObserver?
+
+    /// The newest real name the core has reported for each linked device, by
+    /// the 16-hex id of a `devices` row (= `RemotePeer.fingerprint`): learned
+    /// from every page stored, dropped when a later row says the device has
+    /// no name. The peer record only gets a name after its first pull, which
+    /// is after the peer list was read, so the list's `nodeLabel` lags a
+    /// page's row; every place that shows a device name asks `displayName`.
+    private(set) var learnedNames: [String: String] = [:]
+
+    init(
+        source: any UsageDataSource, defaults: UserDefaults = .standard,
+        notifications: NotificationCenter = .default
+    ) {
         self.source = source
         self.defaults = defaults
         let storedData = defaults.data(forKey: Self.selectionKey)
@@ -3066,6 +3092,12 @@ extension DeviceOverlayResult {
         }
         // else: a selection from before this key existed. The first successful
         // list marks its devices seen without checking them (see `peersArrived`).
+        let token = notifications.addObserver(
+            forName: DevicesModel.peersChanged, object: nil, queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { self?.refreshPeers() }
+        }
+        peerObserver = PeerChangeObserver(center: notifications, token: token)
     }
 
     // MARK: Selection
@@ -3172,6 +3204,8 @@ extension DeviceOverlayResult {
         switch result {
         case .success(let list):
             selectablePeers = list.filter { $0.state == "active" }
+            let listed = Set(list.map(\.fingerprint))
+            learnedNames = learnedNames.filter { listed.contains($0.key) }
             let known = Set(selectablePeers.map(\.producerStatic))
             var kept = stored.peers.filter(known.contains)
             // A device never offered before is checked on arrival, once; the
@@ -3471,6 +3505,30 @@ extension DeviceOverlayResult {
         }
     }
 
+    /// A row has a real name when the core's label is not the address it falls
+    /// back to (rows without an address, from a core that predates it, say
+    /// nothing).
+    private func learnNames(_ rows: [RemoteDevice]) {
+        for row in rows where row.id != "local" && row.id != "peers" {
+            if let label = row.label, let address = row.address, label != address {
+                learnedNames[row.id] = label
+            } else if row.address != nil {
+                learnedNames[row.id] = nil
+            }
+        }
+    }
+
+    /// The one place a linked device's name is chosen: the newest name a page
+    /// reported, else the peer list's, else its address.
+    func displayName(of peer: RemotePeer) -> String {
+        learnedNames[peer.fingerprint] ?? DeviceOverlayCopy.name(of: peer)
+    }
+
+    /// The same for a `devices` row.
+    func displayName(of device: RemoteDevice) -> String {
+        learnedNames[device.id] ?? DeviceOverlayCopy.name(of: device)
+    }
+
     /// A cached miss changes nothing (a refresh follows); a refresh miss keeps
     /// the last good answer for this key and says so.
     private func store(_ result: Result<DeviceOverlayResult, Error>, for key: DeviceOverlayKey, mode: DeviceFetchMode) {
@@ -3492,14 +3550,20 @@ extension DeviceOverlayResult {
             let failed = mode == .cached && held
             switch value {
             case .graph(let page):
+                learnNames(page.devices)
                 graph = .init(key: key, data: page, failed: failed)
                 graphStats = UsageStats(payload: page.payload, selectedClients: Set(page.payload.summary.clients))
                 statsMemo = nil
             case .models(let page):
+                learnNames(page.devices)
                 models = .init(key: key, data: page, failed: failed)
                 modelsColors = ModelColorMap(report: page.payload)
-            case .hourly(let page): hourly = .init(key: key, data: page, failed: failed)
-            case .agents(let page): agents = .init(key: key, data: page, failed: failed)
+            case .hourly(let page):
+                learnNames(page.devices)
+                hourly = .init(key: key, data: page, failed: failed)
+            case .agents(let page):
+                learnNames(page.devices)
+                agents = .init(key: key, data: page, failed: failed)
             }
         case .failure:
             guard mode == .refresh else { return }
@@ -3570,9 +3634,10 @@ extension DeviceOverlayResult {
         }
         let peers = selection.peers.compactMap { id in
             selectablePeers.first { $0.producerStatic == id }
-        }.map { (id: $0.fingerprint, name: DeviceOverlayCopy.name(of: $0)) }
+        }.map { (id: $0.fingerprint, name: displayName(of: $0)) }
         return DeviceOverlayCopy.statusLines(
-            rows: rows, peers: peers, inFlight: fetching, retryPending: retryTask != nil, now: now)
+            rows: rows, peers: peers, inFlight: fetching, retryPending: retryTask != nil,
+            names: learnedNames, now: now)
     }
 
     /// What Overview shows while devices other than this Mac are selected: the

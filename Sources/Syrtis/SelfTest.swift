@@ -23081,6 +23081,47 @@ enum SelfTest {
             expect(pumpUntil { model.pairing == .linked(fingerprint: SA3CFakeClient.fingerprintA) }
                        && model.peers.contains { $0.producerStatic == SA3CFakeClient.producerA },
                    "SA3C a wait that succeeds after leaving the page shows Linked and the device on return")
+            // DR-2b2 (D2): a successful link, and a removal, make the dashboard
+            // read its peer list at once (no 60 s poll runs in this test).
+            do {
+                let center = NotificationCenter()
+                let suiteName = "com.nyanako.tokenbar.selftest.dr2b2-peers"
+                let suite = UserDefaults(suiteName: suiteName)!
+                suite.removePersistentDomain(forName: suiteName)
+                let dashSource = SA3DFakeSource()
+                let linked = try! JSONDecoder().decode(RemotePeer.self, from: Data(#"""
+                    {"producerStatic":"\#(SA3CFakeClient.producerA)","fingerprint":"\#(SA3CFakeClient.fingerprintA)",
+                     "nodeLabel":null,"host":"10.0.0.2","port":47000,"createdAt":1,"expiresAt":4102444800000,"state":"active"}
+                    """#.utf8))
+                dashSource.set { $0.peers = .success([]) }
+                let dash = DashboardModel(
+                    cachesSnapshot: false, source: dashSource, initialYear: nil, buildIdentity: nil,
+                    deviceDefaults: suite, peerNotifications: center)
+                let linkFake = SA3CFakeClient()
+                let linkModel = DevicesModel(client: linkFake, pasteboard: SA3CFakePasteboard(), notifications: center)
+                run { await linkModel.link(pairUrl: "syrtis-selftest-invitation") }
+                run { await linkModel.confirmLink() }
+                let beforeLink = dashSource.get(\.peerCalls)
+                dashSource.set { $0.peers = .success([linked]) }
+                linkFake.releasePoll(.success(SA3CFakeClient.producerA))
+                expect(pumpUntil { linkModel.pairing == .linked(fingerprint: SA3CFakeClient.fingerprintA) }
+                           && pumpUntil { dashSource.get(\.peerCalls) > beforeLink }
+                           && pumpUntil { dash.deviceOverlay.selectablePeers.count == 1 }
+                           && dash.deviceOverlay.includesRemote,
+                       "DR2B2 (D2) a successful link makes the dashboard read its peer list at once: the new device is listed and ticked")
+                let beforeRemove = dashSource.get(\.peerCalls)
+                dashSource.set { $0.peers = .success([]) }
+                if let peer = linkModel.peers.first { run { await linkModel.removePeer(peer) } }
+                expect(pumpUntil { dashSource.get(\.peerCalls) > beforeRemove }
+                           && pumpUntil { dash.deviceOverlay.selectablePeers.isEmpty },
+                       "DR2B2 (D2) removing a linked device makes the dashboard read its peer list at once")
+                let beforeOther = dashSource.get(\.peerCalls)
+                run { await linkModel.refresh() }
+                pumpFor(0.2)
+                expect(dashSource.get(\.peerCalls) == beforeOther,
+                       "DR2B2 (D2) control: an ordinary refresh of the Devices page does not make the dashboard read its peer list")
+                suite.removePersistentDomain(forName: suiteName)
+            }
             // Cancelled, then the poll succeeds: removed at once, never listed.
             model.dismissPairingResult()
             run { await model.link(pairUrl: "syrtis-selftest-invitation") }
@@ -24007,10 +24048,10 @@ enum SelfTest {
                            && lines([row("lastGood", label: "Studio Mac", reason: "unreachable")])
                                == [c.unreachableData.localized("Studio Mac", Format.relativeTime(1_700_000_000, now: now))],
                        "DR2B2 status line: the name when there is one, else host:port")
-                expect(c.menuTitle(selectedCount: 1, local: false, peer: named) == "Studio Mac"
-                           && c.menuTitle(selectedCount: 1, local: false, peer: bare) == address
-                           && c.menuTitle(selectedCount: 1, local: true, peer: named) == c.thisMac.localized
-                           && c.menuTitle(selectedCount: 2, local: true, peer: named) == c.deviceCount.localized(2),
+                expect(c.menuTitle(selectedCount: 1, local: false, peerName: c.name(of: named)) == "Studio Mac"
+                           && c.menuTitle(selectedCount: 1, local: false, peerName: c.name(of: bare)) == address
+                           && c.menuTitle(selectedCount: 1, local: true, peerName: c.name(of: named)) == c.thisMac.localized
+                           && c.menuTitle(selectedCount: 2, local: true, peerName: c.name(of: named)) == c.deviceCount.localized(2),
                        "DR2B2 device menu: the button names the one selected device by its name, else host:port")
                 let cardRows = DeviceTotals.rows(
                     devices: [row("fresh", label: "Studio Mac"), row("fresh", id: "bbbbbbbbbbbbbbbb", label: address)],
@@ -24107,6 +24148,60 @@ enum SelfTest {
                            && width("[::1]:47000") == plainWidth("[::1]:47000"),
                        "DR2B2 short titles render at exactly their own width, as before")
 
+                // (D1) One function names a device: the newest name a page
+                // reported, over the peer list's, over the address. The peer
+                // list here has no name (the record gets one at the first pull,
+                // after the list was read); the page row has.
+                do {
+                    let fake = SA3DFakeSource()
+                    fake.set { $0.peers = .success([bare]); $0.remoteState = "lastGood"; $0.remoteReason = "busy"
+                        $0.remoteLabel = "Studio Mac" }
+                    let overlay = makeModel(fake, freshSuite()).deviceOverlay
+                    overlay.refreshPeers()
+                    _ = pump { overlay.selectablePeers.count == 1 }
+                    overlay.togglePeer(peerA)
+                    DeviceOverlayState.resetSingleFlightForTesting()
+                    let peerRow = overlay.selectablePeers[0]
+                    expect(overlay.displayName(of: peerRow) == address && overlay.learnedNames.isEmpty,
+                           "DR2B2 (D1) before any page, a device without a name on the peer list is its address")
+                    overlay.ensure(view: .overview, year: nil, clients: nil)
+                    _ = pump { overlay.graph?.data != nil && overlay.models?.data != nil }
+                    _ = settled()
+                    expect(overlay.displayName(of: peerRow) == "Studio Mac"
+                               && DeviceOverlayCopy.menuTitle(
+                                   selectedCount: 1, local: false, peerName: overlay.displayName(of: peerRow)) == "Studio Mac"
+                               && DeviceTotals.rows(devices: [row("fresh", label: address)], clientIds: [], names: overlay.learnedNames)[0].name
+                                   == "Studio Mac"
+                               && overlay.displayName(of: row("fresh", label: address)) == "Studio Mac",
+                           "DR2B2 (D1) once a page row has a name, the menu item, the menu title and the card all show it, though the peer list has none")
+                    // A year no page was loaded for: the line falls back to the
+                    // peer, by the learned name too.
+                    fake.set { $0.holdCached = true }
+                    overlay.ensure(view: .overview, year: "2000", clients: nil)
+                    _ = pump { fake.get(\.calls).count > 4 }
+                    expect(overlay.statusLines(for: .overview, year: "2000", clients: nil)
+                               == [c.gettingUsage.localized("Studio Mac")],
+                           "DR2B2 (D1) a device no page lists yet is in the status line by the learned name, not the peer list's address")
+                    fake.set { $0.holdCached = false }
+                    fake.releaseCached(2)
+                    _ = pump { !overlay.fetching }
+                    _ = settled()
+                    // A row with an older address-only label does not undo it.
+                    expect(DeviceOverlayCopy.statusLines(
+                               rows: [row("lastGood", label: address, reason: "busy")], peers: [], inFlight: true,
+                               retryPending: false, names: ["aaaaaaaaaaaaaaaa": "Studio Mac"], now: now)
+                               == [c.gettingUsage.localized("Studio Mac")],
+                           "DR2B2 (D1) a page row that still carries the address is named by the learned name in the status line")
+                    // The owner clears the name: the next page says so.
+                    fake.set { $0.remoteLabel = nil }
+                    overlay.manualRefresh()
+                    _ = pump { overlay.displayName(of: peerRow) == address }
+                    _ = settled()
+                    expect(overlay.displayName(of: peerRow) == address,
+                           "DR2B2 (D1) a later page row without a name drops the learned name")
+                    overlay.popoverClosed()
+                }
+
                 // A model-level in-flight pass reads everAnswered from the page.
                 do {
                     let fake = SA3DFakeSource()
@@ -24148,7 +24243,7 @@ enum SelfTest {
                        "DR2B2 a name with %@, %d and a bidi character appears literally in the status lines")
                 let hostilePeer = peer(peerA, label: hostile)
                 expect(c.name(of: hostilePeer) == hostile
-                           && c.menuTitle(selectedCount: 1, local: false, peer: hostilePeer) == hostile
+                           && c.menuTitle(selectedCount: 1, local: false, peerName: c.name(of: hostilePeer)) == hostile
                            && DeviceTotals.rows(devices: [row("fresh", label: hostile)], clientIds: [])[0].name == hostile
                            && DevicesSettingsView.nameLine(hostilePeer) == hostile
                            && lines([], peers: [(id: "cccccccccccccccc", name: c.name(of: hostilePeer))])
