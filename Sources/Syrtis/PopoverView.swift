@@ -316,7 +316,8 @@ struct PopoverView: View {
         // a change asks for a refresh of the pages on screen.
         .task(id: "\(activeViewRaw)|\(model.year ?? "")|\(overlayClients?.joined(separator: ",") ?? "-")|\(model.deviceOverlay.signature)|\(extraRootsGeneration)") {
             model.deviceOverlay.ensure(
-                view: effectiveView, year: model.year, clients: overlayClients)
+                view: effectiveView, year: model.year, clients: overlayClients,
+                rootsGeneration: extraRootsGeneration)
         }
         .task { model.deviceOverlay.refreshPeers() }
         .task { await model.deviceOverlay.pollLoop() }

@@ -3026,6 +3026,7 @@ extension DeviceOverlayResult {
     private(set) var refreshing = false
     /// When each key's last refresh was stored (see `freshWindowSeconds`).
     @ObservationIgnored private var refreshedAt: [DeviceOverlayKey: Date] = [:]
+    @ObservationIgnored private var lastRootsGeneration: Int?
     /// Peers already offered once; see `seenPeersKey`. Nil until the first
     /// successful peer list when an older selection exists without the key.
     @ObservationIgnored private var seenPeers: Set<String>?
@@ -3224,7 +3225,14 @@ extension DeviceOverlayResult {
     /// page without an overlay for its key, one `cached` call (shown at once),
     /// then a `refresh`. Overview and Quota need none. Safe to call on every
     /// change of lens, year, client slice or selection.
-    func ensure(view: AppView, year: String?, clients: [String]?) {
+    /// `rootsGeneration`: the scan-roots generation the caller is on. When it
+    /// changed since the last call, this Mac's share of every page is stale,
+    /// so the visible keys are asked again whatever the 60 s window says.
+    func ensure(view: AppView, year: String?, clients: [String]?, rootsGeneration: Int? = nil) {
+        if let generation = rootsGeneration {
+            if let last = lastRootsGeneration, last != generation { refreshedAt = [:] }
+            lastRootsGeneration = generation
+        }
         var next: [DeviceOverlayKind: DeviceOverlayKey] = [:]
         for kind in Self.kinds(for: view) {
             if let key = key(kind, year: year, clients: clients) { next[kind] = key }
@@ -3410,7 +3418,11 @@ extension DeviceOverlayResult {
         guard wanted[key.kind] == key else { return .dropped }
         store(result, for: key, mode: mode)
         guard case .success(let value) = result else { return .failed }
-        if mode == .refresh { refreshedAt[key] = Date() }
+        // Only a refresh that brought every selected device back fresh counts
+        // against the request budget; a failed or busy one may be asked again.
+        if mode == .refresh, value.devices.allSatisfy({ $0.state == "fresh" || $0.state == "local" }) {
+            refreshedAt[key] = Date()
+        }
         return .stored(
             noAnswer: value.devices.contains {
                 ["lastGood", "stale", "unavailable"].contains($0.state)
@@ -3567,7 +3579,10 @@ extension DeviceOverlayResult {
             modelClientIds: displayClients(
                 .models, singleClient: singleClient, hiddenRaw: hiddenRaw, orderRaw: orderRaw),
             graphFailed: graphPage.failed && graphPage.page == nil,
-            modelsFailed: modelsPage.failed && modelsPage.page == nil)
+            modelsFailed: modelsPage.failed && modelsPage.page == nil,
+            keptLast: (graphPage.failed && graphPage.page != nil)
+                || (modelsPage.failed && modelsPage.page != nil),
+            saturated: graphPage.page?.saturated == true || modelsPage.page?.saturated == true)
     }
 
     /// What the Stats lens' model sections get: the models overlay's report

@@ -24176,10 +24176,12 @@ enum SelfTest {
                 expect(!overlay.retryPendingForTesting
                            && lines() == [DeviceOverlayCopy.busyData.localized(name, age)],
                        "DR2A (R2, R3) with no retry armed the sentence does not promise one")
+                fake.set { $0.remoteState = "fresh"; $0.remoteReason = nil }
                 overlay.ensure(view: .overview, year: nil, clients: nil)
                 pump(for: 0.2)
                 _ = settled()
                 expect(!overlay.retryPendingForTesting, "DR2A (R2) control: nothing is armed before the poll")
+                fake.set { $0.remoteState = "lastGood"; $0.remoteReason = "busy" }
                 overlay.pollOnce()
                 expect(pump { overlay.retryPendingForTesting } && settled(),
                        "DR2A (R2) a poll's refresh that gets busy arms the retry too")
@@ -24273,6 +24275,97 @@ enum SelfTest {
                 pump(for: 0.2)
                 expect(failOverlay.stored == StoredDeviceSelection() && seen(failing) == nil,
                        "DR2A (R4) an unreadable list changes nothing and records nothing")
+            }
+
+            // Review round 1.
+            do {
+                func setup(_ fake: SA3DFakeSource) -> DeviceOverlayState {
+                    fake.set { $0.peers = .success([peer(peerA)]) }
+                    let overlay = makeModel(fake, freshSuite()).deviceOverlay
+                    overlay.refreshPeers()
+                    _ = pump { overlay.selectablePeers.count == 1 }
+                    overlay.togglePeer(peerA)
+                    DeviceOverlayState.resetSingleFlightForTesting()
+                    return overlay
+                }
+                func refreshes(_ f: SA3DFakeSource) -> Int { f.get(\.calls).filter { $0.mode == .refresh }.count }
+                // 1. A scan-roots change inside the window refreshes the visible keys.
+                let rootsFake = SA3DFakeSource()
+                let rootsOverlay = setup(rootsFake)
+                rootsOverlay.ensure(view: .overview, year: nil, clients: nil, rootsGeneration: 1)
+                _ = pump { refreshes(rootsFake) == 2 }
+                _ = settled()
+                rootsOverlay.ensure(view: .overview, year: nil, clients: nil, rootsGeneration: 1)
+                pump(for: 0.15)
+                expect(refreshes(rootsFake) == 2, "DR2A (review 1) control: the same roots inside the window ask nothing")
+                rootsOverlay.ensure(view: .overview, year: nil, clients: nil, rootsGeneration: 2)
+                expect(pump { refreshes(rootsFake) == 4 } && settled(),
+                       "DR2A (review 1) a scan-roots change inside the window refreshes the visible keys")
+                rootsOverlay.popoverClosed()
+
+                // (b) A cached load followed by a refresh is also held to the window.
+                let yearFake = SA3DFakeSource()
+                let yearOverlay = setup(yearFake)
+                yearOverlay.ensure(view: .daily, year: nil, clients: nil)
+                _ = pump { refreshes(yearFake) == 1 }
+                _ = settled()
+                yearOverlay.ensure(view: .daily, year: "2024", clients: nil)
+                _ = pump { refreshes(yearFake) == 2 }
+                _ = settled()
+                let before = yearFake.get(\.calls).count
+                yearOverlay.ensure(view: .daily, year: nil, clients: nil)
+                _ = pump { yearFake.get(\.calls).count > before }
+                pump(for: 0.25)
+                _ = settled()
+                expect(refreshes(yearFake) == 2
+                           && yearFake.get(\.calls).dropFirst(before).map({ "\($0.mode.rawValue)-\($0.year ?? "all")" }) == ["cached-all"],
+                       "DR2A (review b) coming back to a year refreshed inside the window loads the cached page and asks no producer")
+                yearOverlay.popoverClosed()
+
+                // (a) A refresh that did not bring the device back fresh does not use the budget.
+                let busyFake = SA3DFakeSource()
+                busyFake.set { $0.remoteState = "lastGood"; $0.remoteReason = "busy" }
+                let busyOverlay = setup(busyFake)
+                busyOverlay.ensure(view: .overview, year: nil, clients: nil)
+                _ = pump { refreshes(busyFake) == 2 }
+                _ = settled()
+                busyOverlay.ensure(view: .overview, year: nil, clients: nil)
+                expect(pump { refreshes(busyFake) == 4 } && settled(),
+                       "DR2A (review a) a busy refresh does not count as fresh: the lens asks again")
+                busyOverlay.popoverClosed()
+
+                // 2 and 3. Notes carried into Overview.
+                let noteFake = SA3DFakeSource()
+                let noteOverlay = setup(noteFake)
+                func merge() -> OverviewMerge? {
+                    noteOverlay.overviewMerge(year: nil, singleClient: nil, hiddenRaw: "", orderRaw: "", localColors: ModelColorMap(report: nil))
+                }
+                noteOverlay.ensure(view: .overview, year: nil, clients: nil)
+                expect(pump { noteOverlay.graph?.data != nil && noteOverlay.models?.data != nil } && settled(),
+                       "DR2A (review 2) the pages load")
+                expect(merge()?.keptLast == false && merge()?.saturated == false && merge()?.noteLines.isEmpty == true,
+                       "DR2A (review 2, 3) a clean page has no Overview note")
+                noteFake.set { $0.failRefresh = true }
+                noteOverlay.manualRefresh()
+                expect(pump { noteOverlay.graph?.failed == true } && settled(),
+                       "DR2A (review 2) a failed refresh marks the slot")
+                expect(merge()?.graph != nil && merge()?.keptLast == true
+                           && merge()?.noteLines == [DeviceOverlayCopy.keptLast.localized],
+                       "DR2A (review 2) the retained page carries the kept-last line into Overview")
+                noteFake.set { $0.failRefresh = false; $0.saturated = true }
+                noteOverlay.manualRefresh()
+                expect(pump { merge()?.saturated == true } && settled(),
+                       "DR2A (review 3) a saturated page is flagged")
+                expect(merge()?.keptLast == false && merge()?.noteLines == [DeviceOverlayCopy.saturated.localized],
+                       "DR2A (review 3) Overview shows the saturated line once, with both pages saturated")
+                noteOverlay.popoverClosed()
+
+                // 4. The models card for a failed request is not the empty-data message.
+                expect(OverviewMerge.modelsCard(hasReport: false, failed: true) == .failed
+                           && OverviewMerge.modelsCard(hasReport: false, failed: false) == .loading
+                           && OverviewMerge.modelsCard(hasReport: true, failed: true) == .card
+                           && OverviewMerge.modelsCard(hasReport: true, failed: false) == .card,
+                       "DR2A (review 4) no report and a failed request shows the failure; a report (even empty) shows the card")
             }
 
             freshSuite().removePersistentDomain(forName: suiteName)
@@ -24769,6 +24862,8 @@ final class SA3DFakeSource: UsageDataSource, @unchecked Sendable {
         var remoteState = "fresh"
         /// The device row's `reason` (DR-2a), over every page kind.
         var remoteReason: String?
+        /// The page's `saturated` flag.
+        var saturated = false
         /// A page kind's own device state, over `remoteState`.
         var remoteStateByKind: [String: String] = [:]
     }
@@ -24844,7 +24939,7 @@ final class SA3DFakeSource: UsageDataSource, @unchecked Sendable {
     private func page<T: Decodable & Sendable>(_ kind: String, _ body: String) throws -> DeviceAwarePayload<T> {
         let json = """
         {"ok":true,"data":{\(body),"devices":\(devices(kind)),
-         "duplicateWarning":true,"saturated":false,"remoteRangeLimited":false}}
+         "duplicateWarning":true,"saturated":\(get(\.saturated)),"remoteRangeLimited":false}}
         """
         return try TBCore.decodeEnvelope(Data(json.utf8))
     }

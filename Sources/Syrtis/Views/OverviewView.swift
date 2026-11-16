@@ -21,6 +21,24 @@ struct OverviewMerge {
     /// The graph or models refresh failed with nothing to show.
     let graphFailed: Bool
     let modelsFailed: Bool
+    /// A refresh failed and the page shown is the last good one.
+    let keptLast: Bool
+    /// Either page reports a capped sum.
+    let saturated: Bool
+
+    /// The lines `DeviceOverlayLens` shows above a combined page, in its order.
+    var noteLines: [String] {
+        (saturated ? [DeviceOverlayCopy.saturated.localized] : [])
+            + (keptLast ? [DeviceOverlayCopy.keptLast.localized] : [])
+    }
+
+    enum ModelsCard: Equatable { case card, loading, failed }
+
+    /// What the models card shows: the report (an empty one says so itself), a
+    /// failure when the request failed with nothing to show, else loading.
+    static func modelsCard(hasReport: Bool, failed: Bool) -> ModelsCard {
+        hasReport ? .card : (failed ? .failed : .loading)
+    }
 }
 
 /// The usage stack. Leads with the chart, then the live-session trace and the
@@ -68,6 +86,17 @@ struct OverviewView: View {
 
     var body: some View {
         VStack(spacing: 12) {
+            if let merged, !merged.noteLines.isEmpty {
+                VStack(alignment: .leading, spacing: 2) {
+                    ForEach(merged.noteLines, id: \.self) { line in
+                        Text(verbatim: line)
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
             // Quota cards moved to the Quota lens (2026-08-17): the window card
             // and the Agent-limits card answer the same question at two scales,
             // and having them here while the window history lived elsewhere
@@ -163,12 +192,14 @@ struct OverviewView: View {
             } ?? "Models by cost"
             if let merged {
                 combined(merged) {
-                    if merged.models != nil || merged.modelsFailed {
+                    switch OverviewMerge.modelsCard(
+                        hasReport: merged.models != nil, failed: merged.modelsFailed) {
+                    case .card:
                         ModelBreakdownCard(
                             report: merged.models, clientIds: merged.modelClientIds,
                             colors: merged.colors, title: title, loading: false)
-                    } else {
-                        loadingCard(title, failed: false)
+                    case .failed: loadingCard(title, failed: true)
+                    case .loading: loadingCard(title, failed: false)
                     }
                 }
             } else {
