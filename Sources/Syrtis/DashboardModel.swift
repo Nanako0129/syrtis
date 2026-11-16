@@ -3192,15 +3192,36 @@ extension DeviceOverlayResult {
     /// drop a stored peer that is no longer listed; a failed one leaves the
     /// stored choice alone and hides the menu, so a stopped agent does not
     /// forget the user's selection.
+    ///
+    /// Reads can overlap (the poll, the popover opening, and a link or removal
+    /// in Settings all start one). Each read takes the next generation and only
+    /// the newest read's result is applied: an older list arriving late would
+    /// drop a just-linked device from the selection while `seenPeers` keeps it,
+    /// and it would never be ticked again.
     func refreshPeers() {
         let source = self.source
+        let generation = beginPeersRead()
         Task {
             let result = await Self.onOwnThread { try source.remotePeers() }
-            self.peersArrived(result)
+            self.peersArrived(result, generation: generation)
         }
     }
 
-    private func peersArrived(_ result: Result<[RemotePeer], Error>) {
+    @ObservationIgnored private var peersGeneration = 0
+
+    private func beginPeersRead() -> Int {
+        peersGeneration += 1
+        return peersGeneration
+    }
+
+    /// Test seams for the ordering of two reads.
+    func beginPeersReadForTesting() -> Int { beginPeersRead() }
+    func deliverPeersForTesting(_ result: Result<[RemotePeer], Error>, generation: Int) {
+        peersArrived(result, generation: generation)
+    }
+
+    private func peersArrived(_ result: Result<[RemotePeer], Error>, generation: Int) {
+        guard generation == peersGeneration else { return }
         switch result {
         case .success(let list):
             selectablePeers = list.filter { $0.state == "active" }

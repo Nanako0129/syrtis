@@ -24202,6 +24202,38 @@ enum SelfTest {
                     overlay.popoverClosed()
                 }
 
+                // Two overlapping peer reads: only the newest result is applied.
+                // A late, older list without a just-linked device must not drop
+                // it from the selection (it was already marked seen and would
+                // never be ticked again).
+                do {
+                    let fake = SA3DFakeSource()
+                    let suite = UserDefaults(suiteName: "com.nyanako.tokenbar.selftest.dr2b2-generation")!
+                    suite.removePersistentDomain(forName: "com.nyanako.tokenbar.selftest.dr2b2-generation")
+                    let overlay = makeModel(fake, suite).deviceOverlay
+                    let readA = overlay.beginPeersReadForTesting()
+                    let readB = overlay.beginPeersReadForTesting()
+                    overlay.deliverPeersForTesting(.success([bare]), generation: readB)
+                    let afterB = overlay.stored.peers
+                    overlay.deliverPeersForTesting(.success([]), generation: readA)
+                    expect(afterB == [peerA] && overlay.stored.peers == [peerA]
+                               && overlay.selectablePeers.map(\.producerStatic) == [peerA]
+                               && overlay.includesRemote,
+                           "DR2B2 an older peer read that finishes after a newer one is ignored: the new device stays listed and ticked")
+                    // Control: the newest read's own result still applies.
+                    let readC = overlay.beginPeersReadForTesting()
+                    overlay.deliverPeersForTesting(.success([]), generation: readC)
+                    expect(overlay.selectablePeers.isEmpty && overlay.stored.peers.isEmpty,
+                           "DR2B2 control: the newest peer read's list is applied, including one that drops a device")
+                    // And a read superseded before it returns is ignored too.
+                    let readD = overlay.beginPeersReadForTesting()
+                    _ = overlay.beginPeersReadForTesting()
+                    overlay.deliverPeersForTesting(.success([bare]), generation: readD)
+                    expect(overlay.selectablePeers.isEmpty,
+                           "DR2B2 a read that was superseded while still in flight is not applied")
+                    suite.removePersistentDomain(forName: "com.nyanako.tokenbar.selftest.dr2b2-generation")
+                }
+
                 // A model-level in-flight pass reads everAnswered from the page.
                 do {
                     let fake = SA3DFakeSource()

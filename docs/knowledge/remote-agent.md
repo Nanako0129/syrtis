@@ -173,7 +173,7 @@ Popover 的 Overview、Graph（Stats、Daily、Monthly）、Models、Hourly、Ag
 
 來源是引擎的 pricing cache（`tokscale_core::pricing::cache::get_cache_dir()`）。啟動後把 `pricing-litellm.json` 與 `pricing-openrouter.json` 以暫存檔加 rename、`0600` 複製到 `Agent::pricing_dir()`；之後 monitor 在每個週期（5 分鐘）的輸入重算之後比較來源與目的地的 mtime，來源較新就再複製。來源不存在就略過。
 
-> **已知限制**：引擎的 remote pricing snapshot 依 dataset 內的 `timestamp`（不是檔案 mtime）判斷新舊。engine PR [#90](https://github.com/Nanako0129/tokscale-core/pull/90) 之前，`timestamp` 超過 3,600 秒的 dataset 會被拒收，不自帶 cost 的 client（例如 Claude Code）分享出去的 cost 在每小時有一段時間為 0；現在可解析且 `timestamp` 不在未來的 dataset 不論多舊都用來計價（仍回報 `Stale`），所以這一項不再發生。仍然成立：分享端沒有價格表（檔案不存在）、檔案無法解析、或 `timestamp` 在未來（時鐘偏差）時，不自帶 cost 的 client 分享出去的 cost 仍為 0，畫面上目前沒有任何提示。
+> **已知限制**：引擎的 remote pricing snapshot 依 dataset 內的 `timestamp`（不是檔案 mtime）判斷新舊。engine PR [#90](https://github.com/Nanako0129/tokscale-core/pull/90) 之前，`timestamp` 超過 3,600 秒的 dataset 會被拒收，不自帶 cost 的 client（例如 Claude Code）分享出去的 cost 在每小時有一段時間為 0；現在可解析且 `timestamp` 不在未來的 dataset 不論多舊都用來計價（仍回報 `Stale`），所以這一項不再發生。仍然成立：分享端沒有價格表（檔案不存在）、檔案無法解析、或 `timestamp` 在未來（時鐘偏差）時，不自帶 cost 的 client 分享出去的 cost 仍為 0；這三種現在**都有**提示：引擎的診斷是 `Missing`（檔案不存在）或 `Corrupt`（無法解析，**或 `timestamp` 在未來**，見 `vendor/tokscale-core/src/pricing/mod.rs` 的 `decode_dataset`），agent 把 `Missing`／`Corrupt` 送成 `costIncomplete: true`（`source.rs` 的 `cost_incomplete`），狀態列對該裝置顯示「費用可能不完整」那句（DR-2b）；兩個價格檔中只要一個缺或壞就算。**仍然沒有提示**的：`Stale`（價格表可解析但超過 3,600 秒，仍用來計價，費用可能落後最新價格，`costIncomplete` 為 false），以及價格表載入成功但沒有某個模型的價格（診斷沒有這一種，該模型的 cost 為 0；從 `pricing/mod.rs` 讀出，沒有實測）。
 
 ## 單一引擎與依賴 pin
 
@@ -196,7 +196,7 @@ Popover 的 Overview、Graph（Stats、Daily、Monthly）、Models、Hourly、Ag
 - Devices 頁的畫面、深淺色與「減少透明度」下的對比、關閉 Settings 視窗時是否觸發 `onDisappear`，以及與第二台機器的實際配對，都還沒有實機觀察；selftest 只驅動 model。
 - 四頁的裝置選擇還沒有畫面（`SA-3d`）；`refresh` 對真實網路（非 loopback）與真實 session 量的耗時沒有量測。
 - Grant status 回 `revoked`／`expired` 的分支只經程式閱讀：producer 對被撤銷或到期的 grant 直接回錯誤碼 3／4，測試做不出錯誤碼 2 之後又是 `revoked` 的時序。
-- 分享端完全沒有價格表，或價格表的 `timestamp` 在未來（時鐘偏差）時，它分享出去的 cost 為 0，接收端的畫面沒有任何提示。
+- 分享端完全沒有價格表、價格表無法解析、或 `timestamp` 在未來（時鐘偏差）時，它分享出去的 cost 為 0，接收端狀態列會說「費用可能不完整」（DR-2b，`costIncomplete`）。沒有提示的是 `Stale`（仍計價、可能落後）與價格表缺某個模型的價格（該模型 cost 為 0，診斷沒有這一種）。這句提示的畫面沒有實機看過。
 - 選了 producer 時本機那一份每次重新掃描（不經 `GRAPH_CACHE`），比只選本機慢。
 
 ## 驗證
