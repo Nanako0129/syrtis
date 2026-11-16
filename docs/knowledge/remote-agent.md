@@ -4,15 +4,15 @@ id: kb-remote-agent
 kind: canonical
 scope: repository
 read_when: changing the embedded remote-usage agent, its tb_remote_* C ABI, its start and stop wiring, or the agent dependency pin
-last_verified: 2026-11-14
-sources: ["crates/tb_core_ffi/src/remote_agent.rs", "crates/tb_core_ffi/src/remote_pages.rs", "crates/tb_core_ffi/src/usage_graph.rs", "crates/tb_core_ffi/src/model_report.rs", "crates/tb_core_ffi/src/hourly_report.rs", "crates/tb_core_ffi/src/agents_report.rs", "crates/tb_core_ffi/src/lib.rs", "crates/tb_core_ffi/Cargo.toml", "Cargo.toml", "Cargo.lock", "Sources/CTB/include/ctb.h", "Sources/TokenBarCore/TBCore.swift", "Sources/TokenBarCore/RemoteAgent.swift", "Sources/Syrtis/RemoteAgentLaunch.swift", "Sources/Syrtis/DevicesModel.swift", "Sources/Syrtis/DashboardModel.swift", "Sources/Syrtis/UsageDataSource.swift", "Sources/Syrtis/PopoverView.swift", "Sources/Syrtis/Views/DeviceSelectionMenu.swift", "Sources/Syrtis/Views/StatsView.swift", "Sources/Syrtis/Views/DevicesSettingsView.swift", "Sources/Syrtis/Views/SettingsPanel.swift", "Sources/Syrtis/AppDelegate.swift", "Sources/Syrtis/ClaudeExtraRoots.swift", "Sources/Syrtis/CursorSync.swift", "Sources/Syrtis/SelfTest.swift", "scripts/check_agent_engine_pin.py", ".github/workflows/ci.yml", "public Syrtis-Agent cf5b845338d0a29fbee77fccf1483c5c762e9476"]
+last_verified: 2026-11-16
+sources: ["crates/tb_core_ffi/src/remote_agent.rs", "crates/tb_core_ffi/src/remote_pages.rs", "crates/tb_core_ffi/src/usage_graph.rs", "crates/tb_core_ffi/src/model_report.rs", "crates/tb_core_ffi/src/hourly_report.rs", "crates/tb_core_ffi/src/agents_report.rs", "crates/tb_core_ffi/src/lib.rs", "crates/tb_core_ffi/Cargo.toml", "Cargo.toml", "Cargo.lock", "Sources/CTB/include/ctb.h", "Sources/TokenBarCore/TBCore.swift", "Sources/TokenBarCore/RemoteAgent.swift", "Sources/Syrtis/RemoteAgentLaunch.swift", "Sources/Syrtis/DevicesModel.swift", "Sources/Syrtis/DashboardModel.swift", "Sources/Syrtis/UsageDataSource.swift", "Sources/Syrtis/PopoverView.swift", "Sources/Syrtis/Views/DeviceSelectionMenu.swift", "Sources/Syrtis/Views/StatsView.swift", "Sources/Syrtis/Views/DevicesSettingsView.swift", "Sources/Syrtis/Views/SettingsPanel.swift", "Sources/Syrtis/AppDelegate.swift", "Sources/Syrtis/ClaudeExtraRoots.swift", "Sources/Syrtis/CursorSync.swift", "Sources/Syrtis/SelfTest.swift", "scripts/check_agent_engine_pin.py", ".github/workflows/ci.yml", "public Syrtis-Agent df6c0adb147083bff677e91f498b1596f22e2880"]
 ---
 
 # Embedded remote-usage agent
 
 ## 文件目的
 
-Syrtis 在 `tb_core_ffi` 內嵌 `syrtis-agent`（公開的 [Syrtis-Agent](https://github.com/Nanako0129/Syrtis-Agent/tree/cf5b845338d0a29fbee77fccf1483c5c762e9476) ）：同一個行程裡一個 agent，負責配對、授權、Noise 傳輸、快取與分享開關。這份文件記錄它在 App 裡的接線：誰計算什麼、何時啟動與重啟、根目錄怎麼決定、C ABI 的形狀，以及驗證位置。它不重述 agent 的協定，那些以 agent repo 的 `spec/` 為準。
+Syrtis 在 `tb_core_ffi` 內嵌 `syrtis-agent`（公開的 [Syrtis-Agent](https://github.com/Nanako0129/Syrtis-Agent/tree/df6c0adb147083bff677e91f498b1596f22e2880) ）：同一個行程裡一個 agent，負責配對、授權、Noise 傳輸、快取與分享開關。這份文件記錄它在 App 裡的接線：誰計算什麼、何時啟動與重啟、根目錄怎麼決定、C ABI 的形狀，以及驗證位置。它不重述 agent 的協定，那些以 agent repo 的 `spec/` 為準。
 
 ## 目錄
 
@@ -173,6 +173,8 @@ Popover 的 Graph（Stats、Daily、Monthly）、Models、Hourly、Agents 可以
 3. agent 在 lock 裡的直接依賴必須正好是 snow、hmac、sha2、serde、serde_json、unicode-normalization、libc 加上引擎，多一個或少一個都 fail；這些非引擎依賴的閉包（以 name、version、source 辨識同一個 package）裡，每個 package 的 (name, version, source, checksum) 都等於 agent 在該 rev 的 `tests/fixtures/v1/runtime/storage/cargo-lock-baseline.json` 的某一筆。
 
 推進 agent rev 或 engine pin 時三者要一起對上；第 3 條不符時，以 `cargo update -p <name>@<version> --precise <baseline version>` 對齊。
+
+目前的 agent rev 是 `df6c0adb147083bff677e91f498b1596f22e2880`（Syrtis-Agent `main`，Syrtis-Agent PR [#29](https://github.com/Nanako0129/Syrtis-Agent/pull/29) 的 merge），它只把該 crate 的引擎 pin 移到 `b0e2e5f4`（另有它的 spec 一句與 digest manifest），與 `vendor/tokscale-core` 的 gitlink 相同。這一步讓分享本機用量不再因本機歷史過大而被拒：內嵌 agent 走的串流來源折疊（`aggregate_remote_usage_from_source_v1`）在 engine PR [#89](https://github.com/Nanako0129/tokscale-core/pull/89) 之前，被查詢的本機歷史超過 262,144 則已接受訊息或 8 MiB 逐訊息 label 位元組就回 `LimitExceeded`，接收端看到該裝置被拒、四頁都沒有資料；現在改為在每張 map 第一次插入 key 時計入 key 字串位元組，該裝置照常回答。純函式 `aggregate_remote_usage_v1`（`remote_pages.rs` 合併 producer 記錄時呼叫的那個）不變。Devices 功能仍未發版。
 
 ## 殘餘風險與未觀察的行為
 
