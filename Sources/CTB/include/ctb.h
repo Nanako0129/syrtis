@@ -421,7 +421,14 @@ char *tb_remote_peer_remove(const char *producer_static);
 // state (local|fresh|lastGood|stale|unavailable|overLimit|refused|
 // invalidReply|incompatible), lastSuccessAt (Unix s or null)}] (an unreadable peer store
 // adds {id:"peers", state:"unavailable"}), duplicateWarning, saturated,
-// remoteRangeLimited. Local only: the existing data plus those keys.
+// remoteRangeLimited. Local only: the existing data plus those keys (a local-only
+// row has exactly the four fields above).
+// With at least one producer every row also has reason (null, or why the pull
+// failed before it was classified: unreachable|timeout|busy|stopped|error;
+// state does not depend on it) and totals (graph and models pages: this
+// device's part of the merged page as [{client, messages, tokens, costUsd}],
+// one per client, taken before the sum; null when none of it was merged and
+// on hourly and agents pages). The rows' totals add up to the page's totals.
 // Must never be written to the dashboard snapshot.
 char *tb_graph_devices(const char *year, const char *devices_json, const char *timezone,
                        const char *mode);

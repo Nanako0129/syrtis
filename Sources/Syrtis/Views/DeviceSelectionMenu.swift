@@ -29,25 +29,38 @@ enum DeviceOverlayCopy {
     static let rangeLimited = "For other devices, All years covers only the last 370 days."
     static let aboutCombined = "About combined usage"
 
+    // DR-2a: the status line (one sentence per device that is not fresh), and
+    // the labels that say which numbers are combined and which are this Mac's.
+    static let gettingUsage = "◌ Getting usage from %@…"
+    static let unreachableData =
+        "Can't reach %@. Make sure it has Syrtis open and is on the same network. Showing data from %@."
+    static let unreachableNoData =
+        "No data from %@ yet. Can't reach it. Make sure it has Syrtis open and is on the same network."
+    static let busyData = "%@ is busy for now. Showing data from %@."
+    static let busyDataRetry = "%@ is busy for now and will be retried in 1 minute. Showing data from %@."
+    static let busyNoData = "No data from %@ yet. It is busy for now."
+    static let busyNoDataRetry = "No data from %@ yet. It is busy for now and will be retried in 1 minute."
+    static let stopped = "%@ stopped sharing. Reconnect it in Settings → Devices."
+    static let errorData = "%@ couldn't answer this request. Showing data from %@."
+    static let errorNoData = "No data from %@ yet. It couldn't answer this request."
+    static let noDataYet = "No data from %@ yet."
+    static let combined = "%lld devices combined"
+    static let thisMacLive = "(this Mac)"
+    static let quotaThisMacOnly = "Quota counts this Mac only"
+    static let thisMacOnly = "This Mac only"
+    static let windowUsageThisMacOnly = "Usage inside windows counts this Mac only"
+    static let perDevice = "Per device"
+    static let messagesCount = "%lld messages"
+    static let updatedAt = "Updated %@"
+
     static let all = [
         menuHelp, thisMac, deviceCount, otherDevices, loading, failedNoData, keptLast,
         modelsHidden, lastGood, stale, unavailable, overLimit, refused, invalidReply, incompatible,
         duplicate, saturated, rangeLimited, aboutCombined,
+        gettingUsage, unreachableData, unreachableNoData, busyData, busyDataRetry, busyNoData,
+        busyNoDataRetry, stopped, errorData, errorNoData, noDataYet, combined, thisMacLive,
+        quotaThisMacOnly, thisMacOnly, windowUsageThisMacOnly, perDevice, messagesCount, updatedAt,
     ]
-
-    /// The state's template; the same fixed line for a state this build does not know.
-    static func template(forState state: String) -> String? {
-        switch state {
-        case "local", "fresh": nil
-        case "lastGood": lastGood
-        case "stale": stale
-        case "overLimit": overLimit
-        case "refused": refused
-        case "invalidReply": invalidReply
-        case "incompatible": incompatible
-        default: unavailable
-        }
-    }
 
     /// What names a device in a line: its `host:port` label, else a fixed
     /// word for the unreadable-peer-list row, else its fingerprint.
@@ -56,7 +69,7 @@ enum DeviceOverlayCopy {
     }
 
     /// Least data first: a device that is `unavailable` on one page and
-    /// `lastGood` on another gets the `unavailable` line only.
+    /// `lastGood` on another gets the `unavailable` sentence only.
     private static let severity = ["unavailable", "overLimit", "refused", "incompatible", "invalidReply", "stale", "lastGood"]
 
     /// The sentences in the ⓘ popover beside the device menu: the two general
@@ -66,39 +79,93 @@ enum DeviceOverlayCopy {
         [duplicate.localized] + (rangeLimited ? [Self.rangeLimited.localized] : [])
     }
 
-    /// The lines under a lens for pages the core answered: one per device
-    /// that is neither this Mac nor fresh (its worst state across the pages;
-    /// Stats shows two), then the capped-totals warning at most once.
-    static func lines(
-        _ pages: [(devices: [RemoteDevice], duplicate: Bool, saturated: Bool, rangeLimited: Bool)],
-        now: Date = Date()
+    /// A producer's address as the core labels it: IPv6 hosts in brackets.
+    static func address(host: String, port: Int) -> String {
+        host.contains(":") ? "[\(host)]:\(port)" : "\(host):\(port)"
+    }
+
+    /// The status line: one sentence for each selected device that is not
+    /// fresh, in the order the pages list them (selected devices that no page
+    /// mentions yet follow, as "no data yet" or "getting usage").
+    ///
+    /// `rows` are the `devices` rows of the pages the lens shows; a device on
+    /// several pages gets its worst row. `inFlight` (a refresh is running)
+    /// replaces every sentence with "getting usage from X"; `retryPending`
+    /// is whether a retry is actually armed, the only case that may say
+    /// "again in a minute". Another device's name is only a format argument.
+    static func statusLines(
+        rows: [RemoteDevice], peers: [(id: String, name: String)], inFlight: Bool,
+        retryPending: Bool, now: Date = Date()
     ) -> [String] {
-        var worst: [(id: String, device: RemoteDevice)] = []
-        for device in pages.flatMap(\.devices) where template(forState: device.state) != nil {
-            // A state this build does not know is shown as `unavailable`.
-            func rank(_ d: RemoteDevice) -> Int { severity.firstIndex(of: d.state) ?? 0 }
-            if let i = worst.firstIndex(where: { $0.id == device.id }) {
-                if rank(device) < rank(worst[i].device) { worst[i].device = device }
+        func rank(_ d: RemoteDevice) -> Int { severity.firstIndex(of: d.state) ?? 0 }
+        var worst: [RemoteDevice] = []
+        for row in rows where row.state != "local" && row.state != "fresh" {
+            if let i = worst.firstIndex(where: { $0.id == row.id }) {
+                if rank(row) < rank(worst[i]) { worst[i] = row }
             } else {
-                worst.append((device.id, device))
+                worst.append(row)
             }
+        }
+        // A selected device no page lists yet has had no answer.
+        let listed = Set(rows.map(\.id))
+        for peer in peers where !listed.contains(peer.id) {
+            worst.append(RemoteDevice(
+                id: peer.id, label: peer.name, state: "unavailable", lastSuccessAt: nil))
         }
         var out: [String] = []
-        for (_, device) in worst {
-            let template = template(forState: device.state)!
-            let name = name(of: device)
-            if device.state == "lastGood", let at = device.lastSuccessAt, at >= 0 {
-                out.append(template.localized(name, Format.relativeTime(UInt64(at), now: now)))
-            } else if device.state == "lastGood" {
-                out.append(stale.localized(name))
-            } else {
-                out.append(template.localized(name))
-            }
+        for device in worst {
+            out.append(statusLine(
+                device, name: Self.name(of: device), inFlight: inFlight,
+                retryPending: retryPending, now: now))
         }
-        if pages.contains(where: \.saturated) { out.append(saturated.localized) }
         // Two devices with the same label and state read the same.
         var seen = Set<String>()
         return out.filter { seen.insert($0).inserted }
+    }
+
+    /// One device's sentence; the R3 table of the plan, cell by cell.
+    static func statusLine(
+        _ device: RemoteDevice, name: String, inFlight: Bool, retryPending: Bool, now: Date
+    ) -> String {
+        if inFlight { return gettingUsage.localized(name) }
+        let age: String? = {
+            guard device.state == "lastGood", let at = device.lastSuccessAt, at >= 0 else { return nil }
+            return Format.relativeTime(UInt64(at), now: now)
+        }()
+        switch (device.state, device.reason) {
+        case ("stale", _):
+            return stale.localized(name)
+        case ("invalidReply", _): return invalidReply.localized(name)
+        case ("overLimit", _): return overLimit.localized(name)
+        case ("incompatible", _): return incompatible.localized(name)
+        case (_, "unreachable"?), (_, "timeout"?):
+            return age.map { unreachableData.localized(name, $0) } ?? unreachableNoData.localized(name)
+        case (_, "busy"?):
+            switch (age, retryPending) {
+            case (let age?, true): return busyDataRetry.localized(name, age)
+            case (let age?, false): return busyData.localized(name, age)
+            case (nil, true): return busyNoDataRetry.localized(name)
+            case (nil, false): return busyNoData.localized(name)
+            }
+        case (_, "stopped"?): return stopped.localized(name)
+        case (_, "error"?):
+            return age.map { errorData.localized(name, $0) } ?? errorNoData.localized(name)
+        case ("refused", _): return refused.localized(name)
+        case ("lastGood", _):
+            return age.map { lastGood.localized(name, $0) } ?? stale.localized(name)
+        case ("unavailable", _) where device.id == "peers":
+            return unavailable.localized(name)
+        default:
+            return noDataYet.localized(name)
+        }
+    }
+
+    /// The lines under a lens that are not about one device: the capped-totals
+    /// warning, at most once across the pages.
+    static func lines(
+        _ pages: [(devices: [RemoteDevice], duplicate: Bool, saturated: Bool, rangeLimited: Bool)]
+    ) -> [String] {
+        pages.contains(where: \.saturated) ? [saturated.localized] : []
     }
 }
 
@@ -199,6 +266,9 @@ struct DeviceOverlayLens: View {
 
     /// Gap between the note lines and the lens below them.
     private static let noteSpacing: CGFloat = 8
+    /// Gap between a lens and the per-device card under it: the cards' own
+    /// stack spacing elsewhere in the popover.
+    private static let blockSpacing: CGFloat = 12
 
     private var clientsArgument: [String]? {
         DeviceOverlayState.clientsArgument(
@@ -235,15 +305,21 @@ struct DeviceOverlayLens: View {
                         .graph, singleClient: singleClient, hiddenRaw: hiddenRaw, orderRaw: orderRaw)
                     switch view {
                     case .daily:
-                        DailyView(
-                            payload: page.payload, clientIds: ids,
-                            turnClientIds: PopoverView.supportedTurnClients(ids),
-                            colors: localColors, onExpand: onExpand)
+                        VStack(spacing: Self.blockSpacing) {
+                            DailyView(
+                                payload: page.payload, clientIds: ids,
+                                turnClientIds: PopoverView.supportedTurnClients(ids),
+                                colors: localColors, onExpand: onExpand)
+                            DeviceTotalsCard(devices: page.devices, clientIds: ids)
+                        }
                     case .monthly:
-                        MonthlyView(
-                            payload: page.payload, clientIds: ids,
-                            turnClientIds: PopoverView.supportedTurnClients(ids),
-                            colors: localColors, onExpand: onExpand)
+                        VStack(spacing: Self.blockSpacing) {
+                            MonthlyView(
+                                payload: page.payload, clientIds: ids,
+                                turnClientIds: PopoverView.supportedTurnClients(ids),
+                                colors: localColors, onExpand: onExpand)
+                            DeviceTotalsCard(devices: page.devices, clientIds: ids)
+                        }
                     default:
                         if let stats = overlay.stats(selecting: Set(ids)) {
                             let modelPart = overlay.statsModels(year: year)
@@ -291,6 +367,7 @@ struct DeviceOverlayLens: View {
         if let page {
             let lines = DeviceOverlayCopy.lines(notes.compactMap { $0 })
                 + (failed ? [DeviceOverlayCopy.keptLast.localized] : [])
+            DevicesCombinedBadge(count: overlay.selectedCount)
             ForEach(lines, id: \.self) { line in
                 Text(verbatim: line)
                     .font(.caption2)

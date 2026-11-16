@@ -1,6 +1,28 @@
 import SwiftUI
 import TokenBarCore
 
+/// What Overview shows of the selected devices' combined pages (DR-2a): the
+/// usage cards (chart, models, streaks) come from these, never from this
+/// Mac's own payload; the quota summary, the Agent-limits card, the trace and
+/// "Today" stay this Mac's. A page that has not arrived is nil and its cards
+/// show a loading line, not this Mac's numbers in its place.
+struct OverviewMerge {
+    /// Devices combined (this Mac and the chosen ones).
+    let deviceCount: Int
+    /// The graph overlay's own payload and stats, for the clients shown.
+    let graph: (payload: UsagePayload, stats: UsageStats)?
+    let models: ModelReport?
+    let colors: ModelColorMap
+    /// The clients the combined pages show (a client only a remote device used
+    /// included).
+    let clientIds: [String]
+    /// The same for the models page.
+    let modelClientIds: [String]
+    /// The graph or models refresh failed with nothing to show.
+    let graphFailed: Bool
+    let modelsFailed: Bool
+}
+
 /// The usage stack. Leads with the chart, then the live-session trace and the
 /// model breakdown.
 ///
@@ -38,6 +60,8 @@ struct OverviewView: View {
     /// rather than saving anything.
     var windowCurves: [String: [QuotaSample]] = [:]
     var agentUsage: AgentUsagePayload?
+    /// Set while devices other than this Mac are selected.
+    var merged: OverviewMerge?
 
     @AppStorage(OverviewCard.hiddenKey) private var hiddenCardsRaw = ""
     @AppStorage("tokenbar.limits.enabled") private var limitsEnabled = true
@@ -67,11 +91,22 @@ struct OverviewView: View {
             // that Overview summary; only the `.limits` branch below was
             // honouring it.
             if singleClient == nil, limitsEnabled {
+                let todayFigure = stats.perDayMap[Format.todayKey()].map {
+                    (tokens: $0.tokens, cost: $0.cost)
+                }
                 QuotaSummaryLine(
-                    summary: quotaSummary, attempted: usageAttempted,
-                    today: stats.perDayMap[Format.todayKey()].map {
-                        (tokens: $0.tokens, cost: $0.cost)
-                    })
+                    summary: quotaSummary, attempted: usageAttempted, today: todayFigure)
+                    // With other devices selected, the quota and "Today" are
+                    // still this Mac's: say so in the card's corners. "Today"
+                    // is the card's last row, so its note sits bottom right.
+                    .overlay(alignment: .topTrailing) {
+                        if merged != nil { thisMacNote(DeviceOverlayCopy.quotaThisMacOnly) }
+                    }
+                    .overlay(alignment: .bottomTrailing) {
+                        if merged != nil, todayFigure != nil, quotaSummary != nil {
+                            thisMacNote(DeviceOverlayCopy.thisMacOnly)
+                        }
+                    }
             }
         case .limits:
             // Back on Overview as of 2026-08-17. Moving it to the Quota lens
@@ -98,7 +133,17 @@ struct OverviewView: View {
                     curves: windowCurves)
             }
         case .chart:
-            if singleClient != nil && !hasLocalUsage {
+            if let merged {
+                combined(merged) {
+                    if let graph = merged.graph {
+                        UsageChartCard(
+                            payload: graph.payload, clientIds: merged.clientIds,
+                            stats: graph.stats, colors: merged.colors, year: year)
+                    } else {
+                        loadingCard("Token Usage", failed: merged.graphFailed)
+                    }
+                }
+            } else if singleClient != nil && !hasLocalUsage {
                 DashCard("Token Usage") {
                     Text("No local usage records in this range.")
                         .font(.caption)
@@ -113,14 +158,71 @@ struct OverviewView: View {
                 UsageTraceCard(buckets: trace, windowSecs: 600, hidden: hidden)
             }
         case .models:
-            ModelBreakdownCard(
-                report: modelReport, clientIds: clientIds, colors: colors,
-                title: singleClient.map {
-                    "%@ models".localized(ClientRegistry.style($0).displayName)
-                } ?? "Models by cost",
-                loading: modelLoading)
+            let title = singleClient.map {
+                "%@ models".localized(ClientRegistry.style($0).displayName)
+            } ?? "Models by cost"
+            if let merged {
+                combined(merged) {
+                    if merged.models != nil || merged.modelsFailed {
+                        ModelBreakdownCard(
+                            report: merged.models, clientIds: merged.modelClientIds,
+                            colors: merged.colors, title: title, loading: false)
+                    } else {
+                        loadingCard(title, failed: false)
+                    }
+                }
+            } else {
+                ModelBreakdownCard(
+                    report: modelReport, clientIds: clientIds, colors: colors,
+                    title: title, loading: modelLoading)
+            }
         case .streaks:
-            StreaksCard(streaks: stats.streaks)
+            if let merged {
+                combined(merged) {
+                    if let graph = merged.graph {
+                        StreaksCard(streaks: graph.stats.streaks)
+                    } else {
+                        loadingCard("Streaks", failed: merged.graphFailed)
+                    }
+                }
+            } else {
+                StreaksCard(streaks: stats.streaks)
+            }
+        }
+    }
+
+    private func thisMacNote(_ text: String) -> some View {
+        Text(text.localized)
+            .font(.caption2)
+            .foregroundStyle(.tertiary)
+            .padding(Self.noteInset)
+    }
+
+    /// The notes sit in the card's padding, clear of its text.
+    private static let noteInset: CGFloat = 6
+
+    /// A combined card with its "N devices combined" label above it.
+    private func combined<Content: View>(
+        _ merged: OverviewMerge, @ViewBuilder _ card: () -> Content
+    ) -> some View {
+        VStack(spacing: Self.badgeGap) {
+            DevicesCombinedBadge(count: merged.deviceCount)
+            card()
+        }
+    }
+
+    /// Gap between the label and its card: closer to the card than to the one above.
+    private static let badgeGap: CGFloat = 4
+
+    private func loadingCard(_ title: String, failed: Bool) -> some View {
+        DashCard(title) {
+            if failed {
+                Text(DeviceOverlayCopy.failedNoData.localized)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            } else {
+                LoadingLine(title: DeviceOverlayCopy.loading)
+            }
         }
     }
 

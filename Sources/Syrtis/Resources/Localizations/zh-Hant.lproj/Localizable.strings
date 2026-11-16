@@ -840,3 +840,28 @@
 "Some totals reached their limit and are capped." = "部分總計已達上限，以上限顯示。";
 "For other devices, All years covers only the last 370 days." = "對其他裝置而言，「全部年份」只涵蓋最近 370 天。";
 "About combined usage" = "關於合併用量";
+
+/* Merged Overview, per-device subtotals, status line, Edit menu (DR-2a) */
+"◌ Getting usage from %@…" = "◌ 正在向 %@ 取得用量…";
+"Can't reach %@. Make sure it has Syrtis open and is on the same network. Showing data from %@." = "連不上 %1$@。請確認那台有開 Syrtis 而且在同一個網路。顯示的是 %2$@ 的資料。";
+"No data from %@ yet. Can't reach it. Make sure it has Syrtis open and is on the same network." = "還沒有 %@ 的資料。連不上那台，請確認它有開 Syrtis 而且在同一個網路。";
+"%@ is busy for now. Showing data from %@." = "%1$@ 暫時忙碌。顯示的是 %2$@ 的資料。";
+"%@ is busy for now and will be retried in 1 minute. Showing data from %@." = "%1$@ 暫時忙碌，1 分鐘後自動再試。顯示的是 %2$@ 的資料。";
+"No data from %@ yet. It is busy for now." = "還沒有 %@ 的資料。那台暫時忙碌。";
+"No data from %@ yet. It is busy for now and will be retried in 1 minute." = "還沒有 %@ 的資料。那台暫時忙碌，1 分鐘後自動再試。";
+"%@ stopped sharing. Reconnect it in Settings → Devices." = "%@ 已停止分享。到「設定 → 裝置」重新連結。";
+"%@ couldn't answer this request. Showing data from %@." = "%1$@ 無法回應這次請求。顯示的是 %2$@ 的資料。";
+"No data from %@ yet. It couldn't answer this request." = "還沒有 %@ 的資料。那台無法回應這次請求。";
+"No data from %@ yet." = "還沒有 %@ 的資料。";
+"%lld devices combined" = "%lld 台裝置合計";
+"(this Mac)" = "(這台)";
+"Quota counts this Mac only" = "額度只計這台 Mac";
+"This Mac only" = "只計這台 Mac";
+"Usage inside windows counts this Mac only" = "窗內用量只計這台 Mac";
+"Per device" = "各裝置";
+"%lld messages" = "%lld 則訊息";
+"Updated %@" = "更新於 %@";
+"Edit" = "編輯";
+"Cut" = "剪下";
+"Paste" = "貼上";
+"Select All" = "全選";

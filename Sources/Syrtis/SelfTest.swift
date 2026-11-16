@@ -23148,9 +23148,17 @@ enum SelfTest {
             let peerA = String(repeating: "a", count: 64)
             let peerB = String(repeating: "b", count: 64)
             let suiteName = "tokenbar.selftest.sa3d.\(getpid())"
-            func freshSuite() -> UserDefaults {
+            /// `seeded`: the devices these cases list have already been offered
+            /// (the seen set), so a listed device is not checked on arrival
+            /// (DR-2a R4); the DR2A peer cases ask for an unseeded suite.
+            func freshSuite(seeded: Bool = true) -> UserDefaults {
                 let suite = UserDefaults(suiteName: suiteName)!
                 suite.removePersistentDomain(forName: suiteName)
+                if seeded {
+                    let known = [peerA, peerB, String(repeating: "c", count: 64)]
+                        + (0..<17).map { String(format: "%064x", $0 + 1) }
+                    suite.set(try? JSONEncoder().encode(known), forKey: DeviceOverlayState.seenPeersKey)
+                }
                 return suite
             }
             func peer(_ id: String, state: String = "active") -> RemotePeer {
@@ -23187,6 +23195,9 @@ enum SelfTest {
             // Retries stay armed-but-asleep in every case that does not test
             // them: the delay is far beyond the run, so no result depends on speed.
             DeviceOverlayState.retryDelaySeconds = 1e9
+            // The request-budget window (DR-2a R2) is off for the cases below,
+            // which refresh the same keys again and again; the DR2A cases at the end turn it on.
+            DeviceOverlayState.freshWindowSeconds = 0
             DeviceOverlayState.resetSingleFlightForTesting()
 
             // (1) Only this Mac: no device call, whatever the lens. The demo
@@ -23480,16 +23491,18 @@ enum SelfTest {
                 [{"id":"aaaaaaaaaaaaaaaa","label":"10.0.0.2:47000","state":"unavailable","lastSuccessAt":null},
                  {"id":"bbbbbbbbbbbbbbbb","label":"10.0.0.2:47000","state":"unavailable","lastSuccessAt":null}]
                 """#.utf8))
-            expect(DeviceOverlayCopy.lines([(twins, false, false, false)]).count == 1,
+            func statusOf(_ rows: [RemoteDevice]) -> [String] {
+                DeviceOverlayCopy.statusLines(rows: rows, peers: [], inFlight: false, retryPending: false)
+            }
+            expect(statusOf(twins).count == 1,
                    "SA3D (one line) two devices with the same label and state give one line")
             for pages in [["lastGood", "unavailable"], ["unavailable", "lastGood"]] {
-                let merged = DeviceOverlayCopy.lines(pages.map { (statsDevices($0), true, true, true) })
-                expect(merged.count == 2
-                           && merged.first == DeviceOverlayCopy.unavailable.localized("10.0.0.2:47000")
-                           && merged.filter { $0.contains("10.0.0.2:47000") }.count == 1
-                           && merged.filter { $0 == DeviceOverlayCopy.saturated.localized }.count == 1
-                           && !merged.contains(DeviceOverlayCopy.duplicate.localized)
-                           && !merged.contains(DeviceOverlayCopy.rangeLimited.localized),
+                let status = statusOf(pages.flatMap(statsDevices))
+                let notes = DeviceOverlayCopy.lines(pages.map { (statsDevices($0), true, true, true) })
+                expect(status == [DeviceOverlayCopy.noDataYet.localized("10.0.0.2:47000")]
+                           && notes == [DeviceOverlayCopy.saturated.localized]
+                           && !(status + notes).contains(DeviceOverlayCopy.duplicate.localized)
+                           && !(status + notes).contains(DeviceOverlayCopy.rangeLimited.localized),
                        "SA3D (one line) \(pages) gives one device line (the unavailable one) and the saturated line once, no duplicate or range line")
             }
 
@@ -23567,29 +23580,31 @@ enum SelfTest {
                        && AppLanguage.localizedString("%@ didn't respond. Showing older data (last updated %@).", locale: "zh-Hant", bundle: .tokenBarResources) == nil,
                    "SA3D (8) the lastGood line says no new data, not that the device did not respond, and the old key is gone")
             let states = ["lastGood", "stale", "unavailable", "overLimit", "refused", "invalidReply", "incompatible"]
-            let templates = states.compactMap { DeviceOverlayCopy.template(forState: $0) }
-            expect(templates.count == states.count && Set(templates).count == states.count
-                       && templates.allSatisfy { DeviceOverlayCopy.all.contains($0) }
-                       && DeviceOverlayCopy.template(forState: "local") == nil
-                       && DeviceOverlayCopy.template(forState: "fresh") == nil,
-                   "SA3D (8) each non-fresh state has its own listed line; local and fresh have none")
+            let stateLines = states.map { state in
+                statusOf([RemoteDevice(id: "aaaaaaaaaaaaaaaa", label: "10.0.0.2:47000", state: state,
+                                       lastSuccessAt: 1_700_000_000)])
+            }
+            expect(stateLines.allSatisfy { $0.count == 1 } && Set(stateLines.flatMap { $0 }).count == states.count
+                       && statusOf(statsDevices("fresh")).isEmpty
+                       && statusOf(statsDevices("local")).isEmpty,
+                   "SA3D (8) each non-fresh state has its own line; this Mac and a fresh device have none")
             let nasty = "100% %@ %lld {x}"
             let hostile = try! JSONDecoder().decode([RemoteDevice].self, from: Data(#"""
                 [{"id":"local","label":null,"state":"local","lastSuccessAt":null},
                  {"id":"ffffffffffffffff","label":"\#(nasty)","state":"refused","lastSuccessAt":null},
                  {"id":"eeeeeeeeeeeeeeee","label":"\#(nasty)","state":"lastGood","lastSuccessAt":1700000000}]
                 """#.utf8))
-            let lines = DeviceOverlayCopy.lines([(hostile, true, true, true)])
+            let lines = statusOf(hostile) + DeviceOverlayCopy.lines([(hostile, true, true, true)])
             expect(lines.count == 3 && lines.filter { $0.contains(nasty) }.count == 2
                        && lines.contains(DeviceOverlayCopy.saturated.localized),
                    "SA3D (8) a device's own text appears verbatim in its line (a format argument), and the saturated flag adds one line")
             let freshOnly = statsDevices("fresh")
             let flagsOnly = DeviceOverlayCopy.lines([(freshOnly, true, false, true)])
             let satOnly = DeviceOverlayCopy.lines([(freshOnly, true, true, true)])
-            let unavail = DeviceOverlayCopy.lines([(statsDevices("unavailable"), true, false, true)])
+            let unavail = statusOf(statsDevices("unavailable"))
             expect(flagsOnly.isEmpty
                        && satOnly == [DeviceOverlayCopy.saturated.localized]
-                       && unavail == [DeviceOverlayCopy.unavailable.localized("10.0.0.2:47000")],
+                       && unavail == [DeviceOverlayCopy.noDataYet.localized("10.0.0.2:47000")],
                    "SA3D (8) duplicate and rangeLimited never make a line; saturated does; an unavailable device gives its one line")
             expect(DeviceOverlayCopy.explanations(rangeLimited: false) == [DeviceOverlayCopy.duplicate.localized]
                        && DeviceOverlayCopy.explanations(rangeLimited: true)
@@ -23826,6 +23841,440 @@ enum SelfTest {
             expect(pump { fake15.get(\.refreshStarted) == 3 } && settled(),
                    "SA3D (15) a reopened popover's ensure refreshes again")
 
+
+            // DR-2a. The merged Overview, the per-device figures, the status
+            // line, the request budget, the in-flight state and the peers a
+            // user has already been offered. Everything runs against fakes: no
+            // agent, socket or real preference is touched.
+            DeviceOverlayState.freshWindowSeconds = 60
+            DeviceOverlayState.resetSingleFlightForTesting()
+            DeviceOverlayState.retryDelaySeconds = 1e9
+
+            // (R3) The status line, cell by cell. The device's own text is a
+            // format argument; the zh-Hant sentences are the approved copy.
+            do {
+                let now = Date(timeIntervalSince1970: 1_700_000_000 + 300)
+                let age = Format.relativeTime(1_700_000_000, now: now)
+                let name = "10.0.0.2:47000"
+                func row(_ state: String, _ reason: String?, data: Bool = true, id: String = "aaaaaaaaaaaaaaaa",
+                         label: String? = name) -> RemoteDevice {
+                    RemoteDevice(id: id, label: label, state: state,
+                                 lastSuccessAt: data ? 1_700_000_000 : nil, reason: reason)
+                }
+                func line(_ device: RemoteDevice, inFlight: Bool = false, retry: Bool = false) -> String {
+                    DeviceOverlayCopy.statusLine(device, name: DeviceOverlayCopy.name(of: device),
+                                                 inFlight: inFlight, retryPending: retry, now: now)
+                }
+                let c = DeviceOverlayCopy.self
+                expect(line(row("lastGood", "unreachable")) == c.unreachableData.localized(name, age)
+                           && line(row("lastGood", "timeout")) == c.unreachableData.localized(name, age),
+                       "DR2A (R3) unreachable and timeout with data: one sentence, cannot reach, with the age")
+                expect(line(row("unavailable", "unreachable", data: false)) == c.unreachableNoData.localized(name)
+                           && line(row("unavailable", "timeout", data: false)) == c.unreachableNoData.localized(name),
+                       "DR2A (R3) unreachable and timeout without data: no data yet, cannot reach")
+                expect(line(row("lastGood", "busy"), retry: true) == c.busyDataRetry.localized(name, age)
+                           && line(row("lastGood", "busy"), retry: false) == c.busyData.localized(name, age)
+                           && line(row("unavailable", "busy", data: false), retry: true) == c.busyNoDataRetry.localized(name)
+                           && line(row("unavailable", "busy", data: false), retry: false) == c.busyNoData.localized(name)
+                           && c.busyData != c.busyDataRetry && c.busyNoData != c.busyNoDataRetry,
+                       "DR2A (R2, R3) busy: the retry clause appears only when a retry is armed, with and without data")
+                expect(line(row("refused", "stopped", data: false)) == c.stopped.localized(name)
+                           && line(row("lastGood", "stopped")) == c.stopped.localized(name),
+                       "DR2A (R3) stopped: one sentence with or without data")
+                expect(line(row("lastGood", "error")) == c.errorData.localized(name, age)
+                           && line(row("refused", "error", data: false)) == c.errorNoData.localized(name),
+                       "DR2A (R3) error: couldn't answer, with the age or without data")
+                expect(line(row("stale", nil, data: false)) == c.stale.localized(name)
+                           && line(row("stale", "unreachable", data: false)) == c.stale.localized(name),
+                       "DR2A (R3) stale keeps its existing sentence whatever the reason")
+                expect(line(row("invalidReply", nil)) == c.invalidReply.localized(name)
+                           && line(row("overLimit", nil)) == c.overLimit.localized(name)
+                           && line(row("incompatible", nil)) == c.incompatible.localized(name)
+                           && line(row("unavailable", nil, data: false, id: "peers", label: nil))
+                               == c.unavailable.localized(c.otherDevices.localized),
+                       "DR2A (R3) invalid, over-limit, incompatible and an unreadable peer list keep their sentences")
+                expect(line(row("unavailable", nil, data: false)) == c.noDataYet.localized(name),
+                       "DR2A (R3) unavailable with no reason (cached call, never fetched): no data yet")
+                for device in [row("lastGood", "busy"), row("unavailable", nil, data: false), row("refused", "stopped", data: false),
+                               row("lastGood", "unreachable"), row("refused", "error", data: false), row("stale", nil, data: false),
+                               row("invalidReply", nil)] {
+                    expect(line(device, inFlight: true) == c.gettingUsage.localized(name),
+                           "DR2A (R3) a refresh in flight covers the \(device.state)/\(device.reason ?? "-") sentence")
+                }
+                expect(DeviceOverlayCopy.statusLines(rows: [RemoteDevice(id: "local", label: nil, state: "local", lastSuccessAt: nil),
+                                                            row("fresh", nil)],
+                                                     peers: [(id: "aaaaaaaaaaaaaaaa", name: name)],
+                                                     inFlight: true, retryPending: false, now: now).isEmpty,
+                       "DR2A (R3) when every device is fresh there is no line, in flight or not")
+                expect(DeviceOverlayCopy.statusLines(rows: [], peers: [(id: "bbbbbbbbbbbbbbbb", name: "[::1]:47000")],
+                                                     inFlight: false, retryPending: false, now: now)
+                           == [c.noDataYet.localized("[::1]:47000")]
+                           && DeviceOverlayCopy.statusLines(rows: [], peers: [(id: "bbbbbbbbbbbbbbbb", name: "[::1]:47000")],
+                                                            inFlight: true, retryPending: false, now: now)
+                           == [c.gettingUsage.localized("[::1]:47000")],
+                       "DR2A (R3) a selected device no page lists yet reads as no data, or as getting usage while a refresh runs")
+                let nasty = "100% %@ %lld {x}"
+                expect(line(row("lastGood", "unreachable", label: nasty)).contains(nasty)
+                           && line(row("lastGood", "busy", label: nasty), retry: true).contains(nasty),
+                       "DR2A (R3) another device's text is a format argument, shown verbatim")
+                expect(DeviceOverlayCopy.address(host: "10.0.0.2", port: 47000) == "10.0.0.2:47000"
+                           && DeviceOverlayCopy.address(host: "::1", port: 47000) == "[::1]:47000",
+                       "DR2A (R3) names are host:port, IPv6 in brackets, as the core labels them")
+                func zh(_ key: String, _ locale: String = "zh-Hant") -> String? {
+                    AppLanguage.localizedString(key, locale: locale, bundle: .tokenBarResources)
+                }
+                expect(zh(c.gettingUsage) == "◌ 正在向 %@ 取得用量…"
+                           && zh(c.unreachableData) == "連不上 %1$@。請確認那台有開 Syrtis 而且在同一個網路。顯示的是 %2$@ 的資料。"
+                           && zh(c.unreachableNoData) == "還沒有 %@ 的資料。連不上那台，請確認它有開 Syrtis 而且在同一個網路。"
+                           && zh(c.busyDataRetry) == "%1$@ 暫時忙碌，1 分鐘後自動再試。顯示的是 %2$@ 的資料。"
+                           && zh(c.busyData) == "%1$@ 暫時忙碌。顯示的是 %2$@ 的資料。"
+                           && zh(c.busyNoDataRetry) == "還沒有 %@ 的資料。那台暫時忙碌，1 分鐘後自動再試。"
+                           && zh(c.busyNoData) == "還沒有 %@ 的資料。那台暫時忙碌。"
+                           && zh(c.stopped) == "%@ 已停止分享。到「設定 → 裝置」重新連結。"
+                           && zh(c.errorData) == "%1$@ 無法回應這次請求。顯示的是 %2$@ 的資料。"
+                           && zh(c.errorNoData) == "還沒有 %@ 的資料。那台無法回應這次請求。"
+                           && zh(c.noDataYet) == "還沒有 %@ 的資料。"
+                           && zh(c.combined) == "%lld 台裝置合計"
+                           && zh(c.quotaThisMacOnly) == "額度只計這台 Mac"
+                           && zh(c.thisMacOnly) == "只計這台 Mac"
+                           && zh(c.perDevice) == "各裝置",
+                       "DR2A (e) the zh-Hant sentences are the approved copy")
+                expect(["Edit", "Cut", "Copy", "Paste", "Select All"].allSatisfy { key in
+                           ["zh-Hant", "zh-Hans"].allSatisfy { zh(key, $0) != nil && zh(key, $0) != key }
+                       },
+                       "DR2A (7, e) the Edit menu titles have zh-Hant and zh-Hans values")
+            }
+
+            // (7) The main menu has an Edit menu whose items carry the
+            // standard selectors and key equivalents, so the shortcuts reach a
+            // text field's editor. (Seeing ⌘V work in the Settings window is
+            // an on-screen check.)
+            do {
+                let menu = AppDelegate.makeMainMenu()
+                let edit = menu.items.last?.submenu
+                let table = edit?.items.map { ($0.action, $0.keyEquivalent, $0.keyEquivalentModifierMask) }
+                expect(menu.items.count == 2 && table?.count == 4
+                           && table?[0].0 == #selector(NSText.cut(_:)) && table?[0].1 == "x"
+                           && table?[1].0 == #selector(NSText.copy(_:)) && table?[1].1 == "c"
+                           && table?[2].0 == #selector(NSText.paste(_:)) && table?[2].1 == "v"
+                           && table?[3].0 == #selector(NSText.selectAll(_:)) && table?[3].1 == "a"
+                           && table?.allSatisfy({ $0.2.contains(.command) }) == true,
+                       "DR2A (7) the main menu's Edit menu has Cut, Copy, Paste and Select All with ⌘X, ⌘C, ⌘V, ⌘A")
+                let field = NSTextView()
+                expect([#selector(NSText.cut(_:)), #selector(NSText.copy(_:)), #selector(NSText.paste(_:)),
+                        #selector(NSText.selectAll(_:))].allSatisfy { field.responds(to: $0) },
+                       "DR2A (7) a text view's editor answers each of the four actions")
+            }
+
+            // (1, R1) The per-device figures: the core's per-client entries of
+            // the clients on screen, added; they match the combined numbers
+            // above them with a client hidden and on a single-client tab.
+            do {
+                let json = #"""
+                {"ok":true,"data":{
+                 "meta":{"generatedAt":"2099-01-01T00:00:00Z","version":"t","dateRange":{"start":"2025-01-01","end":"2025-01-02"}},
+                 "summary":{"totalTokens":0,"totalCost":0,"totalDays":2,"activeDays":2,"averagePerDay":0,"maxCostInSingleDay":0,
+                  "clients":["claude","codex"],"models":["m"]},
+                 "years":[{"year":"2025","totalTokens":0,"totalCost":0,"range":{"start":"2025-01-01","end":"2025-12-31"}}],
+                 "contributions":[
+                  {"date":"2025-01-01","totals":{"tokens":0,"cost":0,"messages":0},"intensity":1,
+                   "tokenBreakdown":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"reasoning":0},
+                   "clients":[
+                    {"client":"claude","modelId":"m","providerId":"p","tokens":{"input":60,"output":30,"cacheRead":0,"cacheWrite":0,"reasoning":10},"cost":1.5,"messages":3},
+                    {"client":"codex","modelId":"m","providerId":"p","tokens":{"input":20,"output":0,"cacheRead":0,"cacheWrite":0,"reasoning":0},"cost":0.25,"messages":1}]},
+                  {"date":"2025-01-02","totals":{"tokens":0,"cost":0,"messages":0},"intensity":1,
+                   "tokenBreakdown":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"reasoning":0},
+                   "clients":[
+                    {"client":"claude","modelId":"m","providerId":"p","tokens":{"input":5,"output":5,"cacheRead":0,"cacheWrite":0,"reasoning":0},"cost":0.5,"messages":2},
+                    {"client":"codex","modelId":"m","providerId":"p","tokens":{"input":40,"output":0,"cacheRead":0,"cacheWrite":0,"reasoning":0},"cost":0.75,"messages":4}]}],
+                 "devices":[
+                  {"id":"local","label":null,"state":"local","lastSuccessAt":null,"reason":null,
+                   "totals":[{"client":"claude","messages":3,"tokens":100,"costUsd":1.5},{"client":"codex","messages":1,"tokens":20,"costUsd":0.25}]},
+                  {"id":"aaaaaaaaaaaaaaaa","label":"10.0.0.2:47000","state":"fresh","lastSuccessAt":1700000000,"reason":null,
+                   "totals":[{"client":"claude","messages":2,"tokens":10,"costUsd":0.5},{"client":"codex","messages":4,"tokens":40,"costUsd":0.75}]},
+                  {"id":"bbbbbbbbbbbbbbbb","label":"10.0.0.3:47000","state":"unavailable","lastSuccessAt":null,"reason":"unreachable","totals":null}],
+                 "duplicateWarning":true,"saturated":false,"remoteRangeLimited":false}}
+                """#
+                let page: DeviceAwarePayload<UsagePayload> = try! TBCore.decodeEnvelope(Data(json.utf8))
+                func messages(_ clients: Set<String>) -> Int64 {
+                    page.payload.contributions.flatMap(\.clients).filter { clients.contains($0.client) }
+                        .reduce(Int64(0)) { $0 + Int64($1.messages) }
+                }
+                for clients in [["claude", "codex"], ["codex"], ["claude"]] as [[String]] {
+                    let rows = DeviceTotals.rows(devices: page.devices, clientIds: clients)
+                    let stats = UsageStats(payload: page.payload, selectedClients: Set(clients))
+                    expect(rows.compactMap(\.tokens).reduce(0, +) == stats.totalTokens
+                               && abs(rows.compactMap(\.cost).reduce(0, +) - stats.totalCost) < 1e-9
+                               && rows.compactMap(\.messages).reduce(0, +) == messages(Set(clients)),
+                           "DR2A (R1) \(clients): the device rows add up to the combined card's tokens, cost and messages")
+                }
+                let hidden = DeviceTotals.rows(devices: page.devices, clientIds: ["claude"])
+                expect(hidden.map(\.tokens) == [100, 10, nil] && hidden.map(\.messages) == [3, 2, nil]
+                           && hidden[0].isLocal && hidden[0].updatedAt == nil
+                           && hidden[1].updatedAt == 1_700_000_000 && hidden[2].tokens == nil
+                           && hidden[1].name == "10.0.0.2:47000",
+                       "DR2A (R1) a hidden client is left out of every row, a device with no merged part has no figures, this Mac has no update time")
+                let old = try! JSONDecoder().decode([RemoteDevice].self, from: Data(#"""
+                    [{"id":"local","label":null,"state":"local","lastSuccessAt":null}]
+                    """#.utf8))
+                expect(old.count == 1 && old[0].reason == nil && old[0].totals == nil
+                           && DeviceTotals.rows(devices: old, clientIds: ["claude"])[0].tokens == nil,
+                       "DR2A (1) a device row without the new fields still decodes")
+                expect(page.devices[2].reason == "unreachable" && page.devices[1].totals?.count == 2,
+                       "DR2A (4, 1) the new reason and totals fields decode from the core's rows")
+            }
+
+            // (2, 3) Overview takes the overlay's pages when devices are
+            // chosen: the kinds are the graph and models pages Stats shares;
+            // until they arrive there is nothing to draw (never this Mac's
+            // numbers in their place); once they have, the cards read the
+            // overlay's own payload, models and clients, and nothing of it
+            // reaches this Mac's payload.
+            do {
+                let fake = SA3DFakeSource()
+                fake.set { $0.peers = .success([peer(peerA)]) }
+                let model = makeModel(fake, freshSuite())
+                run { await model.load() }
+                let overlay = model.deviceOverlay
+                let localGenerated = model.payload?.meta.generatedAt
+                overlay.refreshPeers()
+                _ = pump { overlay.selectablePeers.count == 1 }
+                overlay.togglePeer(peerA)
+                DeviceOverlayState.resetSingleFlightForTesting()
+                expect(DeviceOverlayState.kinds(for: .overview) == [.graph, .models]
+                           && DeviceOverlayState.kinds(for: .overview) == DeviceOverlayState.kinds(for: .stats)
+                           && DeviceOverlayState.kinds(for: .quota).isEmpty,
+                       "DR2A (2) Overview needs the graph and models overlays, the same keys as Stats; Quota none")
+                func merge(_ single: String? = nil, hidden: String = "") -> OverviewMerge? {
+                    overlay.overviewMerge(
+                        year: nil, singleClient: single, hiddenRaw: hidden, orderRaw: "", localColors: model.colors)
+                }
+                fake.set { $0.calls = []; $0.holdCached = true }
+                overlay.ensure(view: .overview, year: nil, clients: nil)
+                _ = pump { !fake.get(\.calls).isEmpty }
+                let early = merge()
+                expect(early != nil && early?.graph == nil && early?.models == nil
+                           && early?.deviceCount == 2 && model.payload != nil && model.modelReport != nil,
+                       "DR2A (2) before the overlay arrives Overview has no graph and no models to draw (loading), though this Mac's own data exists")
+                fake.set { $0.holdCached = false }
+                fake.releaseCached(2)
+                expect(pump { overlay.graph?.data != nil && overlay.models?.data != nil } && settled(),
+                       "DR2A (2) the overlay pages arrive")
+                expect(fake.get(\.calls).map({ "\($0.kind)-\($0.mode.rawValue)" })
+                           == ["graph-cached", "models-cached", "graph-refresh", "models-refresh"],
+                       "DR2A (2) Overview asks for the graph and models pages, cached then refreshed")
+                let full = merge()
+                expect(full?.graph?.payload.meta.generatedAt == SA3DFakeSource.overlayGeneratedAt
+                           && localGenerated != SA3DFakeSource.overlayGeneratedAt
+                           && full?.models?.entries.contains { $0.model.hasPrefix(SA3DFakeSource.remoteModel) } == true
+                           && full?.clientIds.contains(SA3DFakeSource.remoteClient) == true
+                           && full?.graph?.stats.presentClients.contains(SA3DFakeSource.remoteClient) == true,
+                       "DR2A (2) the cards read the overlay's own payload, models and clients (a client only the other device used included)")
+                expect(model.payload?.meta.generatedAt == localGenerated
+                           && model.stats?.presentClients.contains(SA3DFakeSource.remoteClient) == false
+                           && model.modelReport?.entries.contains { $0.model.hasPrefix(SA3DFakeSource.remoteModel) } == false
+                           && !model.knownYears.contains(SA3DFakeSource.remoteYear),
+                       "DR2A (isolation) Overview's overlay never reaches this Mac's payload, stats, models or known years")
+                expect(merge("claude")?.clientIds == ClientRegistry.tabSlice("claude")
+                           && merge(hidden: "claude")?.clientIds.contains("claude") == false,
+                       "DR2A (2) a single-client tab takes its slice and a hidden client is left out, from the same pages")
+                overlay.togglePeer(peerA)
+                expect(merge() == nil, "DR2A (2) back to this Mac alone, Overview has no merge")
+                overlay.popoverClosed()
+            }
+
+            // (R2) The request budget: after one refresh, Overview, Stats and
+            // Daily (the same graph and models keys) ask nothing for a
+            // minute, so a producer sees at most two requests.
+            do {
+                let fake = SA3DFakeSource()
+                fake.set { $0.peers = .success([peer(peerA)]) }
+                let overlay = makeModel(fake, freshSuite()).deviceOverlay
+                overlay.refreshPeers()
+                _ = pump { overlay.selectablePeers.count == 1 }
+                overlay.togglePeer(peerA)
+                DeviceOverlayState.resetSingleFlightForTesting()
+                func refreshes() -> Int { fake.get(\.calls).filter { $0.mode == .refresh }.count }
+                overlay.ensure(view: .overview, year: nil, clients: nil)
+                _ = pump { refreshes() == 2 }
+                _ = settled()
+                for view in [AppView.stats, .daily, .overview, .monthly] {
+                    overlay.ensure(view: view, year: nil, clients: nil)
+                    pump(for: 0.15)
+                    _ = settled()
+                }
+                expect(refreshes() == 2 && fake.get(\.calls).count == 4,
+                       "DR2A (R2) Overview, then Stats, Daily, Overview and Monthly inside the window: the producer got 2 refresh requests, not one per lens")
+                overlay.ensure(view: .overview, year: nil, clients: nil)
+                pump(for: 0.15)
+                _ = settled()
+                overlay.manualRefresh()
+                expect(pump { refreshes() == 4 } && settled(),
+                       "DR2A (R2) a manual refresh still asks inside the window")
+                DeviceOverlayState.freshWindowSeconds = 0.2
+                pump(for: 0.3)
+                overlay.ensure(view: .stats, year: nil, clients: nil)
+                expect(pump { refreshes() == 6 } && settled(),
+                       "DR2A (R2) once the window has passed a lens asks again")
+                DeviceOverlayState.freshWindowSeconds = 60
+                overlay.popoverClosed()
+            }
+
+            // (5) The refresh button keeps spinning while the overlay's
+            // refresh is out; the status line says so, and stops when it is
+            // back. (The spinner itself is an on-screen check.)
+            do {
+                expect(PopoverView.spinnerShown(refreshDisabled: false, windowScans: 0, overlayRefreshing: true)
+                           && !PopoverView.spinnerShown(refreshDisabled: false, windowScans: 0, overlayRefreshing: false)
+                           && PopoverView.spinnerShown(refreshDisabled: true, windowScans: 0, overlayRefreshing: false)
+                           && PopoverView.spinnerShown(refreshDisabled: false, windowScans: 1, overlayRefreshing: false),
+                       "DR2A (5) the button spins for the overlay's refresh as well as the local ones")
+                let fake = SA3DFakeSource()
+                fake.set { $0.peers = .success([peer(peerA)]); $0.remoteState = "lastGood" }
+                let overlay = makeModel(fake, freshSuite()).deviceOverlay
+                overlay.refreshPeers()
+                _ = pump { overlay.selectablePeers.count == 1 }
+                overlay.togglePeer(peerA)
+                DeviceOverlayState.resetSingleFlightForTesting()
+                expect(!overlay.refreshing, "DR2A (5) nothing is refreshing before a lens asks")
+                fake.set { $0.holdRefresh = true }
+                overlay.ensure(view: .overview, year: nil, clients: nil)
+                _ = pump { fake.get(\.refreshStarted) == 1 }
+                let name = "10.0.0.2:47000"
+                expect(overlay.refreshing
+                           && overlay.statusLines(for: .overview, year: nil, clients: nil)
+                               == [DeviceOverlayCopy.gettingUsage.localized(name)],
+                       "DR2A (5) while the refresh is out the overlay is refreshing and the status line says getting usage")
+                fake.set { $0.holdRefresh = false }
+                fake.release()
+                expect(pump { !overlay.refreshing } && settled()
+                           && overlay.statusLines(for: .overview, year: nil, clients: nil)
+                               .allSatisfy { !$0.contains("◌") },
+                       "DR2A (5) once the answer is back the overlay is no longer refreshing and the sentence is gone")
+                overlay.popoverClosed()
+            }
+
+            // (R2, R3) A busy producer: a retry is armed whoever asked
+            // (a poll included) and the sentence says "again in a minute" only
+            // while it is armed; another failure from a poll arms nothing.
+            do {
+                let fake = SA3DFakeSource()
+                fake.set { $0.peers = .success([peer(peerA)]); $0.remoteState = "lastGood"; $0.remoteReason = "busy" }
+                let overlay = makeModel(fake, freshSuite()).deviceOverlay
+                overlay.refreshPeers()
+                _ = pump { overlay.selectablePeers.count == 1 }
+                overlay.togglePeer(peerA)
+                DeviceOverlayState.resetSingleFlightForTesting()
+                let name = "10.0.0.2:47000"
+                let age = Format.relativeTime(1_700_000_000)
+                func lines() -> [String] { overlay.statusLines(for: .overview, year: nil, clients: nil) }
+                overlay.ensure(view: .overview, year: nil, clients: nil)
+                expect(pump { overlay.retryPendingForTesting } && settled()
+                           && lines() == [DeviceOverlayCopy.busyDataRetry.localized(name, age)],
+                       "DR2A (R2, R3) a busy refresh arms one retry and the sentence says it will be retried")
+                overlay.popoverClosed()
+                expect(!overlay.retryPendingForTesting
+                           && lines() == [DeviceOverlayCopy.busyData.localized(name, age)],
+                       "DR2A (R2, R3) with no retry armed the sentence does not promise one")
+                overlay.ensure(view: .overview, year: nil, clients: nil)
+                pump(for: 0.2)
+                _ = settled()
+                expect(!overlay.retryPendingForTesting, "DR2A (R2) control: nothing is armed before the poll")
+                overlay.pollOnce()
+                expect(pump { overlay.retryPendingForTesting } && settled(),
+                       "DR2A (R2) a poll's refresh that gets busy arms the retry too")
+                overlay.popoverClosed()
+
+                fake.set { $0.remoteReason = "unreachable" }
+                overlay.ensure(view: .overview, year: nil, clients: nil)
+                pump(for: 0.2)
+                _ = settled()
+                overlay.pollOnce()
+                pump(for: 0.3)
+                _ = settled()
+                expect(!overlay.retryPendingForTesting,
+                       "DR2A (R2) a poll's refresh that is unreachable arms no retry")
+                overlay.popoverClosed()
+            }
+
+            // (6, R4) A device not offered before is chosen on arrival, once.
+            do {
+                let peerC = String(repeating: "c", count: 64)
+                func seen(_ suite: UserDefaults) -> Set<String>? {
+                    suite.data(forKey: DeviceOverlayState.seenPeersKey)
+                        .flatMap { try? JSONDecoder().decode([String].self, from: $0) }.map(Set.init)
+                }
+                func overlayFor(_ suite: UserDefaults, _ peers: [RemotePeer]) -> (DeviceOverlayState, SA3DFakeSource) {
+                    let fake = SA3DFakeSource()
+                    fake.set { $0.peers = .success(peers) }
+                    let overlay = makeModel(fake, suite).deviceOverlay
+                    overlay.refreshPeers()
+                    _ = pump { overlay.selectablePeers.count == peers.filter { $0.state == "active" }.count }
+                    return (overlay, fake)
+                }
+                // Neither key: the first device is checked, and remembered.
+                let fresh = freshSuite(seeded: false)
+                let (first, firstFake) = overlayFor(fresh, [peer(peerA)])
+                expect(first.stored.peers == [peerA] && first.includesRemote && seen(fresh) == [peerA]
+                           && storedSelection(fresh)?.peers == [peerA],
+                       "DR2A (R4) with neither key a newly linked device is checked and recorded as seen")
+                // Unchecked by hand: not checked again, by this instance, a new one,
+                // or after the device goes inactive and returns.
+                first.togglePeer(peerA)  // this Mac stays chosen, so the device can go
+                expect(first.stored.local == true && first.stored.peers.isEmpty,
+                       "DR2A (R4) control: the user unchecked the device")
+                firstFake.set { $0.peers = .success([peer(peerA)]) }
+                first.refreshPeers()
+                pump(for: 0.3)
+                expect(first.stored.peers.isEmpty, "DR2A (R4) a later list does not check the unchecked device again")
+                let (second, secondFake) = overlayFor(fresh, [peer(peerA)])
+                pump(for: 0.2)
+                expect(second.stored.peers.isEmpty && !second.includesRemote,
+                       "DR2A (R4) a new instance (a reopened popover) does not check it either")
+                secondFake.set { $0.peers = .success([peer(peerA, state: "revoked")]) }
+                second.refreshPeers()
+                _ = pump { second.selectablePeers.isEmpty }
+                secondFake.set { $0.peers = .success([peer(peerA)]) }
+                second.refreshPeers()
+                _ = pump { second.selectablePeers.count == 1 }
+                pump(for: 0.2)
+                expect(second.stored.peers.isEmpty && seen(fresh) == [peerA],
+                       "DR2A (R4) inactive and then active again is not a new device")
+                secondFake.set { $0.peers = .success([peer(peerA), peer(peerC)]) }
+                second.refreshPeers()
+                _ = pump { second.selectablePeers.count == 2 }
+                expect(second.stored.peers == [peerC] && seen(fresh) == [peerA, peerC],
+                       "DR2A (R4) a device linked later is checked, the unchecked one stays unchecked")
+
+                // An older selection (the key without the seen set): decodes
+                // unchanged, and the first list only records what exists.
+                let upgraded = freshSuite(seeded: false)
+                upgraded.set(Data(#"{"local":false,"peers":["\#(peerA)"]}"#.utf8),
+                             forKey: DeviceOverlayState.selectionKey)
+                let decoded = try? JSONDecoder().decode(
+                    StoredDeviceSelection.self, from: Data(#"{"local":true,"peers":["\#(peerB)"]}"#.utf8))
+                expect(decoded == StoredDeviceSelection(local: true, peers: [peerB])
+                           && storedSelection(upgraded) == StoredDeviceSelection(local: false, peers: [peerA]),
+                       "DR2A (R4) a selection saved before the seen set decodes unchanged")
+                let (old, oldFake) = overlayFor(upgraded, [peer(peerA), peer(peerB)])
+                expect(old.stored == StoredDeviceSelection(local: false, peers: [peerA])
+                           && seen(upgraded) == [peerA, peerB],
+                       "DR2A (R4) after an upgrade the first list keeps the user's choice and records the existing devices as seen")
+                oldFake.set { $0.peers = .success([peer(peerA), peer(peerB), peer(peerC)]) }
+                old.refreshPeers()
+                _ = pump { old.selectablePeers.count == 3 }
+                expect(old.stored.peers == [peerA, peerC], "DR2A (R4) after that a new device is checked")
+                // A failed list changes nothing and records nothing.
+                let failing = freshSuite(seeded: false)
+                let failFake = SA3DFakeSource()
+                failFake.set { $0.peers = .failure(SA3DFakeSource.Failure()) }
+                let failOverlay = makeModel(failFake, failing).deviceOverlay
+                failOverlay.refreshPeers()
+                pump(for: 0.2)
+                expect(failOverlay.stored == StoredDeviceSelection() && seen(failing) == nil,
+                       "DR2A (R4) an unreadable list changes nothing and records nothing")
+            }
+
             freshSuite().removePersistentDomain(forName: suiteName)
             if let recorded = UserDefaults.standard.stringArray(forKey: recordKey),
                recorded.contains(SA3DFakeSource.remoteClient) {
@@ -23835,6 +24284,7 @@ enum SelfTest {
             DashboardModel.invalidateScanDerivedCaches()
             DeviceOverlayState.resetSingleFlightForTesting()
             DeviceOverlayState.retryDelaySeconds = 65
+            DeviceOverlayState.freshWindowSeconds = 60
         }
 
         accountsDefaults.restore()
@@ -24317,6 +24767,8 @@ final class SA3DFakeSource: UsageDataSource, @unchecked Sendable {
         var failAll = false
         var failModels = false
         var remoteState = "fresh"
+        /// The device row's `reason` (DR-2a), over every page kind.
+        var remoteReason: String?
         /// A page kind's own device state, over `remoteState`.
         var remoteStateByKind: [String: String] = [:]
     }
@@ -24384,7 +24836,8 @@ final class SA3DFakeSource: UsageDataSource, @unchecked Sendable {
         let state = get(\.remoteStateByKind)[kind] ?? get(\.remoteState)
         return """
         [{"id":"local","label":null,"state":"local","lastSuccessAt":null},
-         {"id":"aaaaaaaaaaaaaaaa","label":"10.0.0.2:47000","state":"\(state)","lastSuccessAt":1700000000}]
+         {"id":"aaaaaaaaaaaaaaaa","label":"10.0.0.2:47000","state":"\(state)","lastSuccessAt":1700000000,
+          "reason":\(get(\.remoteReason).map { "\"\($0)\"" } ?? "null")}]
         """
     }
 

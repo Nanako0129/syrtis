@@ -62,8 +62,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         max(1, UserDefaults.standard.object(forKey: intervalKey).flatMap { $0 as? Int } ?? 30)
     }
 
+    /// The app's main menu: an application item and an Edit menu, so ⌘X, ⌘C,
+    /// ⌘V and ⌘A reach the focused text field. The app is an accessory (no menu
+    /// bar), but AppKit still looks key equivalents up in `NSApp.mainMenu` while
+    /// a window of the app is key; without an Edit menu the Settings window's
+    /// text fields ignore them. The actions are the responder-chain selectors
+    /// of `NSText`, which a field's editor handles.
+    static func makeMainMenu() -> NSMenu {
+        let main = NSMenu()
+        main.addItem(withTitle: "", action: nil, keyEquivalent: "").submenu = NSMenu()
+        let edit = NSMenu(title: "Edit".localized)
+        for (title, action, key) in [
+            ("Cut", #selector(NSText.cut(_:)), "x"),
+            ("Copy", #selector(NSText.copy(_:)), "c"),
+            ("Paste", #selector(NSText.paste(_:)), "v"),
+            ("Select All", #selector(NSText.selectAll(_:)), "a"),
+        ] as [(String, Selector, String)] {
+            edit.addItem(withTitle: title.localized, action: action, keyEquivalent: key)
+        }
+        main.addItem(withTitle: "Edit".localized, action: nil, keyEquivalent: "").submenu = edit
+        return main
+    }
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
+        NSApp.mainMenu = Self.makeMainMenu()
 #if DEBUG
         if TrayAnimationCPUTestConfiguration.current != nil {
             startTrayAnimationCPUTest()
