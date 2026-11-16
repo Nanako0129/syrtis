@@ -5,14 +5,14 @@ kind: canonical
 scope: repository
 read_when: changing the embedded remote-usage agent, its tb_remote_* C ABI, its start and stop wiring, or the agent dependency pin
 last_verified: 2026-11-16
-sources: ["crates/tb_core_ffi/src/remote_agent.rs", "crates/tb_core_ffi/src/remote_pages.rs", "crates/tb_core_ffi/src/usage_graph.rs", "crates/tb_core_ffi/src/model_report.rs", "crates/tb_core_ffi/src/hourly_report.rs", "crates/tb_core_ffi/src/agents_report.rs", "crates/tb_core_ffi/src/lib.rs", "crates/tb_core_ffi/Cargo.toml", "Cargo.toml", "Cargo.lock", "Sources/CTB/include/ctb.h", "Sources/TokenBarCore/TBCore.swift", "Sources/TokenBarCore/RemoteAgent.swift", "Sources/Syrtis/RemoteAgentLaunch.swift", "Sources/Syrtis/DevicesModel.swift", "Sources/Syrtis/DashboardModel.swift", "Sources/Syrtis/UsageDataSource.swift", "Sources/Syrtis/PopoverView.swift", "Sources/Syrtis/Views/DeviceSelectionMenu.swift", "Sources/Syrtis/Views/StatsView.swift", "Sources/Syrtis/Views/DevicesSettingsView.swift", "Sources/Syrtis/Views/SettingsPanel.swift", "Sources/Syrtis/AppDelegate.swift", "Sources/Syrtis/ClaudeExtraRoots.swift", "Sources/Syrtis/CursorSync.swift", "Sources/Syrtis/SelfTest.swift", "scripts/check_agent_engine_pin.py", ".github/workflows/ci.yml", "public Syrtis-Agent df6c0adb147083bff677e91f498b1596f22e2880"]
+sources: ["crates/tb_core_ffi/src/remote_agent.rs", "crates/tb_core_ffi/src/remote_pages.rs", "crates/tb_core_ffi/src/usage_graph.rs", "crates/tb_core_ffi/src/model_report.rs", "crates/tb_core_ffi/src/hourly_report.rs", "crates/tb_core_ffi/src/agents_report.rs", "crates/tb_core_ffi/src/lib.rs", "crates/tb_core_ffi/Cargo.toml", "Cargo.toml", "Cargo.lock", "Sources/CTB/include/ctb.h", "Sources/TokenBarCore/TBCore.swift", "Sources/TokenBarCore/RemoteAgent.swift", "Sources/Syrtis/RemoteAgentLaunch.swift", "Sources/Syrtis/DevicesModel.swift", "Sources/Syrtis/DashboardModel.swift", "Sources/Syrtis/UsageDataSource.swift", "Sources/Syrtis/PopoverView.swift", "Sources/Syrtis/Views/DeviceSelectionMenu.swift", "Sources/Syrtis/Views/StatsView.swift", "Sources/Syrtis/Views/DevicesSettingsView.swift", "Sources/Syrtis/Views/SettingsPanel.swift", "Sources/Syrtis/AppDelegate.swift", "Sources/Syrtis/ClaudeExtraRoots.swift", "Sources/Syrtis/CursorSync.swift", "Sources/Syrtis/SelfTest.swift", "scripts/check_agent_engine_pin.py", ".github/workflows/ci.yml", "public Syrtis-Agent eafcc1caef4c172d4d387a7f538cf294c567ae8e"]
 ---
 
 # Embedded remote-usage agent
 
 ## 文件目的
 
-Syrtis 在 `tb_core_ffi` 內嵌 `syrtis-agent`（公開的 [Syrtis-Agent](https://github.com/Nanako0129/Syrtis-Agent/tree/df6c0adb147083bff677e91f498b1596f22e2880) ）：同一個行程裡一個 agent，負責配對、授權、Noise 傳輸、快取與分享開關。這份文件記錄它在 App 裡的接線：誰計算什麼、何時啟動與重啟、根目錄怎麼決定、C ABI 的形狀，以及驗證位置。它不重述 agent 的協定，那些以 agent repo 的 `spec/` 為準。
+Syrtis 在 `tb_core_ffi` 內嵌 `syrtis-agent`（公開的 [Syrtis-Agent](https://github.com/Nanako0129/Syrtis-Agent/tree/eafcc1caef4c172d4d387a7f538cf294c567ae8e) ）：同一個行程裡一個 agent，負責配對、授權、Noise 傳輸、快取與分享開關。這份文件記錄它在 App 裡的接線：誰計算什麼、何時啟動與重啟、根目錄怎麼決定、C ABI 的形狀，以及驗證位置。它不重述 agent 的協定，那些以 agent repo 的 `spec/` 為準。
 
 ## 目錄
 
@@ -162,7 +162,7 @@ Popover 的 Graph（Stats、Daily、Monthly）、Models、Hourly、Agents 可以
 
 來源是引擎的 pricing cache（`tokscale_core::pricing::cache::get_cache_dir()`）。啟動後把 `pricing-litellm.json` 與 `pricing-openrouter.json` 以暫存檔加 rename、`0600` 複製到 `Agent::pricing_dir()`；之後 monitor 在每個週期（5 分鐘）的輸入重算之後比較來源與目的地的 mtime，來源較新就再複製。來源不存在就略過。
 
-> **已知限制（已量測）**：引擎的 remote pricing snapshot 依 dataset 內的 `timestamp`（不是檔案 mtime）拒收超過 3,600 秒的 dataset。以 fixture 量測：producer 的 pricing 為新的時，一則 1,000,000 input tokens 的 Claude Code 訊息分享出去的 cost 是 1.0 美元；把兩個 pricing 檔的 `timestamp` 改成 3,700 秒前、再被週期複製之後，同一則訊息分享出去的 cost 是 0（Claude Code 沒有自帶的 cost）。所以 App 一小時以上沒有刷新價格時，不自帶 cost 的 client 分享出去的 cost 為 0。
+> **已知限制**：引擎的 remote pricing snapshot 依 dataset 內的 `timestamp`（不是檔案 mtime）判斷新舊。engine PR [#90](https://github.com/Nanako0129/tokscale-core/pull/90) 之前，`timestamp` 超過 3,600 秒的 dataset 會被拒收，不自帶 cost 的 client（例如 Claude Code）分享出去的 cost 在每小時有一段時間為 0；現在可解析且 `timestamp` 不在未來的 dataset 不論多舊都用來計價（仍回報 `Stale`），所以這一項不再發生。仍然成立：分享端沒有價格表（檔案不存在）、檔案無法解析、或 `timestamp` 在未來（時鐘偏差）時，不自帶 cost 的 client 分享出去的 cost 仍為 0，畫面上目前沒有任何提示。
 
 ## 單一引擎與依賴 pin
 
@@ -174,7 +174,7 @@ Popover 的 Graph（Stats、Daily、Monthly）、Models、Hourly、Agents 可以
 
 推進 agent rev 或 engine pin 時三者要一起對上；第 3 條不符時，以 `cargo update -p <name>@<version> --precise <baseline version>` 對齊。
 
-目前的 agent rev 是 `df6c0adb147083bff677e91f498b1596f22e2880`（Syrtis-Agent `main`，Syrtis-Agent PR [#29](https://github.com/Nanako0129/Syrtis-Agent/pull/29) 的 merge），它只把該 crate 的引擎 pin 移到 `b0e2e5f4`（另有它的 spec 一句與 digest manifest），與 `vendor/tokscale-core` 的 gitlink 相同。這一步讓分享本機用量不再因本機歷史過大而被拒：內嵌 agent 走的串流來源折疊（`aggregate_remote_usage_from_source_v1`）在 engine PR [#89](https://github.com/Nanako0129/tokscale-core/pull/89) 之前，被查詢的本機歷史超過 262,144 則已接受訊息或 8 MiB 逐訊息 label 位元組就回 `LimitExceeded`，接收端看到該裝置被拒、四頁都沒有資料；現在改為在每張 map 第一次插入 key 時計入 key 字串位元組，該裝置照常回答。純函式 `aggregate_remote_usage_v1` 不變；接收端的 `remote_pages.rs` 只以空的訊息清單呼叫它來驗證查詢，producer 記錄的合併走 agent 的 `merge::combine`，不經過這個折疊。串流那條路仍然受輸出面的上限約束：每張 map 最多 262,144 筆記錄、每張 map 的 key 字串合計 8 MiB，超過仍回 `LimitExceeded`。Devices 功能仍未發版。
+目前的 agent rev 是 `eafcc1caef4c172d4d387a7f538cf294c567ae8e`（Syrtis-Agent `main`，Syrtis-Agent PR [#30](https://github.com/Nanako0129/Syrtis-Agent/pull/30) 的 merge），它把該 crate 的引擎 pin 移到 `51047602`（與 `vendor/tokscale-core` 的 gitlink 相同），並更正兩句關於定價的 spec。這一步讓同時選兩台裝置時，分享端的價格表副本超過一小時也不再讓另一台裝置的 cost 從合併頁面消失（見〈Pricing 複製〉）。前一個 agent rev 是 `df6c0adb147083bff677e91f498b1596f22e2880`（Syrtis-Agent PR [#29](https://github.com/Nanako0129/Syrtis-Agent/pull/29) 的 merge），它只把該 crate 的引擎 pin 移到 `b0e2e5f4`（另有它的 spec 一句與 digest manifest）。那一步讓分享本機用量不再因本機歷史過大而被拒：內嵌 agent 走的串流來源折疊（`aggregate_remote_usage_from_source_v1`）在 engine PR [#89](https://github.com/Nanako0129/tokscale-core/pull/89) 之前，被查詢的本機歷史超過 262,144 則已接受訊息或 8 MiB 逐訊息 label 位元組就回 `LimitExceeded`，接收端看到該裝置被拒、四頁都沒有資料；現在改為在每張 map 第一次插入 key 時計入 key 字串位元組，該裝置照常回答。純函式 `aggregate_remote_usage_v1` 不變；接收端的 `remote_pages.rs` 只以空的訊息清單呼叫它來驗證查詢，producer 記錄的合併走 agent 的 `merge::combine`，不經過這個折疊。串流那條路仍然受輸出面的上限約束：每張 map 最多 262,144 筆記錄、每張 map 的 key 字串合計 8 MiB，超過仍回 `LimitExceeded`。Devices 功能仍未發版。
 
 ## 殘餘風險與未觀察的行為
 
@@ -185,6 +185,7 @@ Popover 的 Graph（Stats、Daily、Monthly）、Models、Hourly、Agents 可以
 - Devices 頁的畫面、深淺色與「減少透明度」下的對比、關閉 Settings 視窗時是否觸發 `onDisappear`，以及與第二台機器的實際配對，都還沒有實機觀察；selftest 只驅動 model。
 - 四頁的裝置選擇還沒有畫面（`SA-3d`）；`refresh` 對真實網路（非 loopback）與真實 session 量的耗時沒有量測。
 - Grant status 回 `revoked`／`expired` 的分支只經程式閱讀：producer 對被撤銷或到期的 grant 直接回錯誤碼 3／4，測試做不出錯誤碼 2 之後又是 `revoked` 的時序。
+- 分享端完全沒有價格表，或價格表的 `timestamp` 在未來（時鐘偏差）時，它分享出去的 cost 為 0，接收端的畫面沒有任何提示。
 - 選了 producer 時本機那一份每次重新掃描（不經 `GRAPH_CACHE`），比只選本機慢。
 
 ## 驗證
@@ -210,7 +211,7 @@ Popover 的 Graph（Stats、Daily、Monthly）、Models、Hourly、Agents 可以
 | 每頁 32,768 筆不同 record 的折疊在 2 秒內 | `remote_pages::tests::folds_of_32768_distinct_records_are_not_quadratic` |
 | `peers.json` 讀不到：`peers` 說明列 | `remote_pages::tests::an_unreadable_peer_store_is_said` |
 | 錯誤碼 2 之後 Grant status 更新 `authEpoch` | `remote_pages::tests::check_grant_status_updates_the_record` |
-| pricing 超過一小時時分享出去的 cost | `remote_pages::tests::shared_cost_with_fresh_and_hour_old_pricing` |
+| pricing 超過一小時時分享出去的 cost 由那份表計價（表內價格與新鮮的那份不同，以金額區分） | `remote_pages::tests::shared_cost_with_fresh_and_hour_old_pricing` |
 | Swift decode、含遠端的列沒有 implausible-cost ratio；四個呼叫前後，快照目錄與其中各檔的大小與修改時間相同（只比對 metadata，不比對內容：Foundation 的 Caches 目錄不跟隨 `HOME`，selftest 子行程看到的是使用者真正的目錄） | SelfTest 的 `SA3B` 案例 |
 | `tb_remote_peers` 每列帶 record 的 `host` 與 `port` | `remote_agent::tests::peers_rows_carry_the_record_host_and_port` |
 | 目的地預覽：回 offer 的 host／port、key 恰為 `host`／`port`、不含 secret 與 `offerId`、沒在跑時 `notRunning`、不產生 claim；過期、亂碼、canonical 不符、超長各回對應類別；對 `127.0.0.1` listener 預覽 0 個連線，control：同一 URL 的 `pair_claim` 至少 1 個 | `remote_agent::tests::pair_destination_is_the_offer_address_and_nothing_more`、`pair_destination_refusals_are_their_classes`、`pair_destination_never_connects` |

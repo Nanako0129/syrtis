@@ -3084,10 +3084,12 @@ mod tests {
         assert_eq!(states(&page), [(fingerprint(&ka), "fresh".into())]);
     }
 
-    /// Deferred item (5), measured: the producer's pricing copy older than an
-    /// hour (by the dataset's own timestamp) is refused by the engine's remote
-    /// snapshot, and a client that records no cost of its own (Claude Code)
-    /// is then shared with cost 0. A fresh copy prices the same tokens.
+    /// The producer's pricing copy older than an hour (by the dataset's own
+    /// timestamp) still prices what it shares: a client that records no cost
+    /// of its own (Claude Code) is priced by that copy (its price differs
+    /// from the fresh copy's here, so the cost tells which one was used).
+    /// Before engine PR 90 the remote snapshot refused such a copy and
+    /// the shared cost was 0 (measured here at the time).
     #[test]
     fn shared_cost_with_fresh_and_hour_old_pricing() {
         if !in_child("shared_cost_with_fresh_and_hour_old_pricing") {
@@ -3109,7 +3111,7 @@ mod tests {
             )],
         );
         let source = a_home.dir("pricing-src");
-        let write = |age: u64, bump: u64| {
+        let write = |age: u64, bump: u64, input_price: f64| {
             let now = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
@@ -3117,7 +3119,7 @@ mod tests {
             let dataset = |data: Value| json!({"timestamp": now - age, "data": data}).to_string();
             fs::write(
                 source.join("pricing-litellm.json"),
-                dataset(json!({"claude-3-5-sonnet": {"input_cost_per_token": 0.000001}})),
+                dataset(json!({"claude-3-5-sonnet": {"input_cost_per_token": input_price}})),
             )
             .unwrap();
             fs::write(source.join("pricing-openrouter.json"), dataset(json!({}))).unwrap();
@@ -3130,7 +3132,7 @@ mod tests {
                     .unwrap();
             }
         };
-        write(0, 0);
+        write(0, 0, 0.000_001);
         let a = producer(&a_home.0, &clock);
         let receiver = agent_at(&r_home.0, &clock);
         let ka = pair(&a, &receiver);
@@ -3147,11 +3149,13 @@ mod tests {
             page["totalCost"].as_f64().unwrap()
         };
         let fresh = cost("2025");
-        write(3_700, 10);
+        // A different price in the hour-old table: its cost shows that this
+        // table, not the fresh one copied before it, priced the report.
+        write(3_700, 10, 0.000_002);
         std::thread::sleep(PERIOD * 5);
         let stale = cost("2025");
         println!("SA3B-PRICING fresh={fresh} stale={stale}");
         assert!((fresh - 1.0).abs() < 1e-9, "fresh pricing: {fresh}");
-        assert_eq!(stale, 0.0, "hour-old pricing");
+        assert!((stale - 2.0).abs() < 1e-9, "hour-old pricing: {stale}");
     }
 }
