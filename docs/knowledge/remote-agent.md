@@ -5,14 +5,14 @@ kind: canonical
 scope: repository
 read_when: changing the embedded remote-usage agent, its tb_remote_* C ABI, its start and stop wiring, or the agent dependency pin
 last_verified: 2026-11-16
-sources: ["crates/tb_core_ffi/src/remote_agent.rs", "crates/tb_core_ffi/src/remote_pages.rs", "crates/tb_core_ffi/src/usage_graph.rs", "crates/tb_core_ffi/src/model_report.rs", "crates/tb_core_ffi/src/hourly_report.rs", "crates/tb_core_ffi/src/agents_report.rs", "crates/tb_core_ffi/src/lib.rs", "crates/tb_core_ffi/Cargo.toml", "Cargo.toml", "Cargo.lock", "Sources/CTB/include/ctb.h", "Sources/TokenBarCore/TBCore.swift", "Sources/TokenBarCore/RemoteAgent.swift", "Sources/Syrtis/RemoteAgentLaunch.swift", "Sources/Syrtis/DevicesModel.swift", "Sources/Syrtis/DashboardModel.swift", "Sources/Syrtis/UsageDataSource.swift", "Sources/Syrtis/PopoverView.swift", "Sources/Syrtis/Views/DeviceSelectionMenu.swift", "Sources/Syrtis/Views/StatsView.swift", "Sources/Syrtis/Views/DevicesSettingsView.swift", "Sources/Syrtis/Views/SettingsPanel.swift", "Sources/Syrtis/AppDelegate.swift", "Sources/Syrtis/ClaudeExtraRoots.swift", "Sources/Syrtis/CursorSync.swift", "Sources/Syrtis/SelfTest.swift", "scripts/check_agent_engine_pin.py", ".github/workflows/ci.yml", "public Syrtis-Agent eafcc1caef4c172d4d387a7f538cf294c567ae8e"]
+sources: ["crates/tb_core_ffi/src/remote_agent.rs", "crates/tb_core_ffi/src/remote_pages.rs", "crates/tb_core_ffi/src/usage_graph.rs", "crates/tb_core_ffi/src/model_report.rs", "crates/tb_core_ffi/src/hourly_report.rs", "crates/tb_core_ffi/src/agents_report.rs", "crates/tb_core_ffi/src/lib.rs", "crates/tb_core_ffi/Cargo.toml", "Cargo.toml", "Cargo.lock", "Sources/CTB/include/ctb.h", "Sources/TokenBarCore/TBCore.swift", "Sources/TokenBarCore/RemoteAgent.swift", "Sources/Syrtis/RemoteAgentLaunch.swift", "Sources/Syrtis/DevicesModel.swift", "Sources/Syrtis/DashboardModel.swift", "Sources/Syrtis/UsageDataSource.swift", "Sources/Syrtis/PopoverView.swift", "Sources/Syrtis/Views/DeviceSelectionMenu.swift", "Sources/Syrtis/Views/StatsView.swift", "Sources/Syrtis/Views/DevicesSettingsView.swift", "Sources/Syrtis/Views/SettingsPanel.swift", "Sources/Syrtis/AppDelegate.swift", "Sources/Syrtis/ClaudeExtraRoots.swift", "Sources/Syrtis/CursorSync.swift", "Sources/Syrtis/SelfTest.swift", "scripts/check_agent_engine_pin.py", ".github/workflows/ci.yml", "public Syrtis-Agent 51de667d408358bc51e8b1455855ca264677bea1"]
 ---
 
 # Embedded remote-usage agent
 
 ## 文件目的
 
-Syrtis 在 `tb_core_ffi` 內嵌 `syrtis-agent`（公開的 [Syrtis-Agent](https://github.com/Nanako0129/Syrtis-Agent/tree/eafcc1caef4c172d4d387a7f538cf294c567ae8e) ）：同一個行程裡一個 agent，負責配對、授權、Noise 傳輸、快取與分享開關。這份文件記錄它在 App 裡的接線：誰計算什麼、何時啟動與重啟、根目錄怎麼決定、C ABI 的形狀，以及驗證位置。它不重述 agent 的協定，那些以 agent repo 的 `spec/` 為準。
+Syrtis 在 `tb_core_ffi` 內嵌 `syrtis-agent`（公開的 [Syrtis-Agent](https://github.com/Nanako0129/Syrtis-Agent/tree/51de667d408358bc51e8b1455855ca264677bea1) ）：同一個行程裡一個 agent，負責配對、授權、Noise 傳輸、快取與分享開關。這份文件記錄它在 App 裡的接線：誰計算什麼、何時啟動與重啟、根目錄怎麼決定、C ABI 的形狀，以及驗證位置。它不重述 agent 的協定，那些以 agent repo 的 `spec/` 為準。
 
 ## 目錄
 
@@ -75,6 +75,8 @@ flowchart LR
 | 其餘一律（裸執行檔、`make run`、selftest、暫時 bundle id、`DEBUG` 建置） | `/tmp/syrtis-agent-dev-<uid>/<bundle id 或 bare>`，root 為其下的 `a` |
 
 開發用的目錄由 Rust 以 `0700` 建立；home 本身必須是本使用者擁有的實體目錄（不是 symlink），上層目錄必須屬於本使用者或 root。用 `/tmp` 與短 suffix 是因為 control socket 的路徑必須放進 macOS `sun_path` 的 104 bytes。macOS 開機時清空 `/tmp`，所以開發版的配對不會跨過重開機。`tb_core_ffi` 的測試建置收到 NULL home 時回 `homeRequired`，不開啟真正的 root。
+
+掃描用的 config 與 data 目錄由 `inputs_from` 的兩個分支（產品的 trusted home、開發用的 override home）都以 `syrtis_agent::cli::default_dirs(&home)` 算出：`home/.config` 與 `home/.local/share`，與獨立版 agent 是同一個函式，只依 home 決定，不讀 `$HOME` 或任何環境變數，也不經 `dirs` crate（它讀 `$HOME`）。引擎的 remote context 以 data 目錄當 XDG data root、以 `<config 目錄>/tokscale` 當 config root。先前兩個分支在 macOS 都是 `Library/Application Support`，分享因此掃不到本機報表找得到的十個 client：放在 `~/.local/share` 的 OpenCode、Amp、Kilo、Crush、MiCode、Muse、Octofriend，與放在 `~/.config/tokscale` 的 Antigravity、Trae、Warp。`tb_remote_scope_disclosure` 的 `configDir`／`dataDir` 顯示的就是這兩個目錄（Devices 頁只顯示它回的值）。這兩個值是 owner inputs 的一部分，所以這次改變讓 `ownerInputsSha256` 改變：先前核准的範圍要重新核准，核准後 deny floor 提高、既有 grant 變 `superseded`，既有配對都要重做（Devices 功能未發版）。產品分支（`product_roots`）在測試建置回 `homeRequired`，沒有單元測試，只由真實資料的探測涵蓋。
 
 ## C ABI
 
@@ -174,7 +176,7 @@ Popover 的 Graph（Stats、Daily、Monthly）、Models、Hourly、Agents 可以
 
 推進 agent rev 或 engine pin 時三者要一起對上；第 3 條不符時，以 `cargo update -p <name>@<version> --precise <baseline version>` 對齊。
 
-目前的 agent rev 是 `eafcc1caef4c172d4d387a7f538cf294c567ae8e`（Syrtis-Agent `main`，Syrtis-Agent PR [#30](https://github.com/Nanako0129/Syrtis-Agent/pull/30) 的 merge），它把該 crate 的引擎 pin 移到 `51047602`（與 `vendor/tokscale-core` 的 gitlink 相同），並更正兩句關於定價的 spec。這一步讓同時選兩台裝置時，分享端的價格表副本超過一小時也不再讓另一台裝置的 cost 從合併頁面消失（見〈Pricing 複製〉）。前一個 agent rev 是 `df6c0adb147083bff677e91f498b1596f22e2880`（Syrtis-Agent PR [#29](https://github.com/Nanako0129/Syrtis-Agent/pull/29) 的 merge），它只把該 crate 的引擎 pin 移到 `b0e2e5f4`（另有它的 spec 一句與 digest manifest）。那一步讓分享本機用量不再因本機歷史過大而被拒：內嵌 agent 走的串流來源折疊（`aggregate_remote_usage_from_source_v1`）在 engine PR [#89](https://github.com/Nanako0129/tokscale-core/pull/89) 之前，被查詢的本機歷史超過 262,144 則已接受訊息或 8 MiB 逐訊息 label 位元組就回 `LimitExceeded`，接收端看到該裝置被拒、四頁都沒有資料；現在改為在每張 map 第一次插入 key 時計入 key 字串位元組，該裝置照常回答。純函式 `aggregate_remote_usage_v1` 不變；接收端的 `remote_pages.rs` 只以空的訊息清單呼叫它來驗證查詢，producer 記錄的合併走 agent 的 `merge::combine`，不經過這個折疊。串流那條路仍然受輸出面的上限約束：每張 map 最多 262,144 筆記錄、每張 map 的 key 字串合計 8 MiB，超過仍回 `LimitExceeded`。Devices 功能仍未發版。
+目前的 agent rev 是 `51de667d408358bc51e8b1455855ca264677bea1`（Syrtis-Agent `main`，Syrtis-Agent PR [#31](https://github.com/Nanako0129/Syrtis-Agent/pull/31) 的 merge），它讓 macOS 上 `cli::default_dirs` 回 `home/.config` 與 `home/.local/share`（原本是 `Library/Application Support`）；App 呼叫這個公開函式算出掃描用的 config 與 data 目錄（見〈Agent 根目錄〉）。引擎 pin 不變。前一個 agent rev 是 `eafcc1caef4c172d4d387a7f538cf294c567ae8e`（Syrtis-Agent PR [#30](https://github.com/Nanako0129/Syrtis-Agent/pull/30) 的 merge），它把該 crate 的引擎 pin 移到 `51047602`（與 `vendor/tokscale-core` 的 gitlink 相同），並更正兩句關於定價的 spec。這一步讓同時選兩台裝置時，分享端的價格表副本超過一小時也不再讓另一台裝置的 cost 從合併頁面消失（見〈Pricing 複製〉）。前一個 agent rev 是 `df6c0adb147083bff677e91f498b1596f22e2880`（Syrtis-Agent PR [#29](https://github.com/Nanako0129/Syrtis-Agent/pull/29) 的 merge），它只把該 crate 的引擎 pin 移到 `b0e2e5f4`（另有它的 spec 一句與 digest manifest）。那一步讓分享本機用量不再因本機歷史過大而被拒：內嵌 agent 走的串流來源折疊（`aggregate_remote_usage_from_source_v1`）在 engine PR [#89](https://github.com/Nanako0129/tokscale-core/pull/89) 之前，被查詢的本機歷史超過 262,144 則已接受訊息或 8 MiB 逐訊息 label 位元組就回 `LimitExceeded`，接收端看到該裝置被拒、四頁都沒有資料；現在改為在每張 map 第一次插入 key 時計入 key 字串位元組，該裝置照常回答。純函式 `aggregate_remote_usage_v1` 不變；接收端的 `remote_pages.rs` 只以空的訊息清單呼叫它來驗證查詢，producer 記錄的合併走 agent 的 `merge::combine`，不經過這個折疊。串流那條路仍然受輸出面的上限約束：每張 map 最多 262,144 筆記錄、每張 map 的 key 字串合計 8 MiB，超過仍回 `LimitExceeded`。Devices 功能仍未發版。
 
 ## 殘餘風險與未觀察的行為
 
@@ -195,6 +197,7 @@ Popover 的 Graph（Stats、Daily、Monthly）、Models、Hourly、Agents 可以
 | 兩個 agent 配對、SAS、approve、poll、peers、revoke；輸入變更後重啟且舊 grant 的報表被拒 | `remote_agent::tests::two_agents_pair_a_changed_scope_is_refused_and_revoke_ends_the_grant` |
 | FFI：新 root 的 status、重複 start 不重啟、揭露 extra roots、同輸入同摘要、錯的摘要被拒、stop、不安全 root 的類別字串 | `remote_agent::tests::ffi_lifecycle_disclosure_scope_approval_and_errors` |
 | 輸入全來自 fixture：fixture `settings.json` 的 sentinel 資料庫正是揭露的清單、揭露的路徑都在 temp root 內、pricing 從 fixture cache 複製 | `remote_agent::tests::ffi_disclosure_holds_only_fixture_inputs` |
+| 經 `inputs_from` 的 override home：揭露的 `configDir`／`dataDir` 是 `home/.config`／`home/.local/share`；`.local/share` 下的 OpenCode 訊息與 `.config/tokscale` 下的 Antigravity session 出現在分享的 graph 頁，數值是 producer 自己的；子行程的 `HOME` 是另一個放了不同數值 decoy 的目錄，兩個目錄與頁面都不跟隨它 | `remote_pages::tests::a_share_reaches_xdg_data_and_config_clients_below_the_home` |
 | 手改 `settings.json` 的 OpenCode 清單：一個週期內重啟、scope 未核准、舊 grant 的報表被拒；檔案不變則不重啟 | `remote_agent::tests::a_hand_edit_of_the_opencode_list_restarts_within_one_period` |
 | listen 設定經凍結命令、舊 port 不再接受連線 | `remote_agent::tests::listen_configure_moves_the_listener_off_the_old_port` |
 | pricing 複製與週期更新 | `remote_agent::tests::pricing_is_copied_at_start_and_again_when_the_source_is_newer` |
