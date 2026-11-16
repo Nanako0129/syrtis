@@ -23924,14 +23924,14 @@ enum SelfTest {
                     AppLanguage.localizedString(key, locale: locale, bundle: .tokenBarResources)
                 }
                 expect(zh(c.gettingUsage) == "◌ 正在向 %@ 取得用量…"
-                           && zh(c.unreachableData) == "連不上 %1$@。請確認那台有開 Syrtis 而且在同一個網路。顯示的是 %2$@ 的資料。"
+                           && zh(c.unreachableData) == "連不上 %1$@。請確認那台有開 Syrtis 而且在同一個網路。顯示的是 %2$@的資料。"
                            && zh(c.unreachableNoData) == "還沒有 %@ 的資料。連不上那台，請確認它有開 Syrtis 而且在同一個網路。"
-                           && zh(c.busyDataRetry) == "%1$@ 暫時忙碌，1 分鐘後自動再試。顯示的是 %2$@ 的資料。"
-                           && zh(c.busyData) == "%1$@ 暫時忙碌。顯示的是 %2$@ 的資料。"
+                           && zh(c.busyDataRetry) == "%1$@ 暫時忙碌，1 分鐘後自動再試。顯示的是 %2$@的資料。"
+                           && zh(c.busyData) == "%1$@ 暫時忙碌。顯示的是 %2$@的資料。"
                            && zh(c.busyNoDataRetry) == "還沒有 %@ 的資料。那台暫時忙碌，1 分鐘後自動再試。"
                            && zh(c.busyNoData) == "還沒有 %@ 的資料。那台暫時忙碌。"
                            && zh(c.stopped) == "%@ 已停止分享。到「設定 → 裝置」重新連結。"
-                           && zh(c.errorData) == "%1$@ 無法回應這次請求。顯示的是 %2$@ 的資料。"
+                           && zh(c.errorData) == "%1$@ 無法回應這次請求。顯示的是 %2$@的資料。"
                            && zh(c.errorNoData) == "還沒有 %@ 的資料。那台無法回應這次請求。"
                            && zh(c.noDataYet) == "還沒有 %@ 的資料。"
                            && zh(c.combined) == "%lld 台裝置合計"
@@ -24366,6 +24366,95 @@ enum SelfTest {
                            && OverviewMerge.modelsCard(hasReport: true, failed: true) == .card
                            && OverviewMerge.modelsCard(hasReport: true, failed: false) == .card,
                        "DR2A (review 4) no report and a failed request shows the failure; a report (even empty) shows the card")
+            }
+
+            // On-screen round 1.
+            do {
+                // 2. Message counts are grouped like the Monthly rows.
+                let row = DeviceTotals.Row(
+                    id: "x", name: "n", isLocal: false, messages: 124_634, tokens: 5, cost: 1, updatedAt: nil)
+                expect(DeviceTotalsCard.detail(row, now: Date()).contains(Int64(124_634).formatted())
+                           && Int64(124_634).formatted() != "124634",
+                       "DR2A (screen 2) the per-device message count is grouped like the Monthly rows")
+                // 3. No stray space between the age and the next word.
+                var spaced: [String] = []
+                for locale in ["zh-Hant", "zh-Hans"] {
+                    for key in [DeviceOverlayCopy.unreachableData, DeviceOverlayCopy.busyData,
+                                DeviceOverlayCopy.busyDataRetry, DeviceOverlayCopy.errorData] {
+                        let value = AppLanguage.localizedString(key, locale: locale, bundle: .tokenBarResources) ?? ""
+                        if value.contains("%2$@ ") { spaced.append("\(locale) \(key.prefix(20))") }
+                    }
+                }
+                expect(spaced.isEmpty, "DR2A (screen 3) no space follows the relative time in the status sentences: \(spaced)")
+
+                func setup(_ fake: SA3DFakeSource, state: String = "unavailable") -> DeviceOverlayState {
+                    fake.set { $0.peers = .success([peer(peerA)]); $0.remoteState = state }
+                    let overlay = makeModel(fake, freshSuite()).deviceOverlay
+                    overlay.refreshPeers()
+                    _ = pump { overlay.selectablePeers.count == 1 }
+                    overlay.togglePeer(peerA)
+                    DeviceOverlayState.resetSingleFlightForTesting()
+                    return overlay
+                }
+                func refreshes(_ f: SA3DFakeSource) -> Int { f.get(\.calls).filter { $0.mode == .refresh }.count }
+                let name = "10.0.0.2:47000"
+                let gettingUsage = DeviceOverlayCopy.gettingUsage.localized(name)
+                // 4. While the cached load (a cold local scan) runs, the refresh is pending: say so.
+                let slowFake = SA3DFakeSource()
+                let slow = setup(slowFake)
+                slowFake.set { $0.holdCached = true }
+                slow.ensure(view: .overview, year: nil, clients: nil)
+                _ = pump { !slowFake.get(\.calls).isEmpty }
+                expect(!slow.refreshing && slow.fetching
+                           && slow.statusLines(for: .overview, year: nil, clients: nil) == [gettingUsage],
+                       "DR2A (screen 4) while the cached load runs, a selected device with no data reads as getting usage, not no data yet")
+                slowFake.set { $0.holdCached = false }
+                slowFake.releaseCached(2)
+                _ = pump { slow.graph?.data != nil && slow.models?.data != nil }
+                _ = settled()
+                expect(!slow.fetching && slow.statusLines(for: .overview, year: nil, clients: nil)
+                           == [DeviceOverlayCopy.noDataYet.localized(name)],
+                       "DR2A (screen 4) once nothing is pending the no-data sentence returns")
+                slow.popoverClosed()
+                // 4b. A refresh queued behind another model's counts as pending too.
+                let qFake = SA3DFakeSource()
+                let first = setup(qFake)
+                let secondFake = SA3DFakeSource()
+                let second = setup(secondFake)
+                DeviceOverlayState.resetSingleFlightForTesting()
+                qFake.set { $0.holdRefresh = true }
+                first.ensure(view: .daily, year: nil, clients: nil)
+                _ = pump { qFake.get(\.refreshStarted) == 1 }
+                second.ensure(view: .daily, year: nil, clients: nil)
+                _ = pump { second.graph?.data != nil && second.queuedRefresh }
+                expect(second.queuedRefresh && !second.refreshing && second.fetching
+                           && second.statusLines(for: .daily, year: nil, clients: nil) == [gettingUsage],
+                       "DR2A (screen 4) a refresh queued behind another model's reads as getting usage")
+                qFake.set { $0.holdRefresh = false }
+                qFake.release()
+                expect(pump { refreshes(secondFake) == 1 } && settled() && !second.fetching,
+                       "DR2A (screen 4) the queued refresh runs and the pending state ends")
+                first.popoverClosed()
+                second.popoverClosed()
+                // 6. A refresh begun under older roots does not suppress the new roots' refresh.
+                let rFake = SA3DFakeSource()
+                let roots = setup(rFake, state: "fresh")
+                rFake.set { $0.holdRefresh = true }
+                roots.ensure(view: .daily, year: nil, clients: nil, rootsGeneration: 1)
+                _ = pump { refreshes(rFake) == 1 }
+                roots.ensure(view: .daily, year: "2024", clients: nil, rootsGeneration: 1)
+                _ = pump { roots.graph?.key.year == "2024" }
+                rFake.set { $0.holdCached = true }
+                roots.ensure(view: .daily, year: nil, clients: nil, rootsGeneration: 2)
+                _ = pump { rFake.get(\.calls).filter { $0.mode == .cached && $0.year == nil }.count == 2 }
+                rFake.set { $0.holdRefresh = false }
+                rFake.release()
+                _ = pump { !roots.refreshing }
+                rFake.set { $0.holdCached = false }
+                rFake.releaseCached()
+                expect(pump { refreshes(rFake) == 2 } && settled(),
+                       "DR2A (screen 6) a refresh that began under the old roots does not suppress the refresh the new roots need")
+                roots.popoverClosed()
             }
 
             freshSuite().removePersistentDomain(forName: suiteName)

@@ -50,7 +50,6 @@ enum DeviceOverlayCopy {
     static let thisMacOnly = "This Mac only"
     static let windowUsageThisMacOnly = "Usage inside windows counts this Mac only"
     static let perDevice = "Per device"
-    static let messagesCount = "%lld messages"
     static let updatedAt = "Updated %@"
 
     static let all = [
@@ -59,7 +58,7 @@ enum DeviceOverlayCopy {
         duplicate, saturated, rangeLimited, aboutCombined,
         gettingUsage, unreachableData, unreachableNoData, busyData, busyDataRetry, busyNoData,
         busyNoDataRetry, stopped, errorData, errorNoData, noDataYet, combined, thisMacLive,
-        quotaThisMacOnly, thisMacOnly, windowUsageThisMacOnly, perDevice, messagesCount, updatedAt,
+        quotaThisMacOnly, thisMacOnly, windowUsageThisMacOnly, perDevice, updatedAt,
     ]
 
     /// What names a device in a line: its `host:port` label, else a fixed

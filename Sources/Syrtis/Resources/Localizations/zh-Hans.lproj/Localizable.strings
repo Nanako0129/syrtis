@@ -842,14 +842,14 @@
 
 /* Merged Overview, per-device subtotals, status line, Edit menu (DR-2a) */
 "◌ Getting usage from %@…" = "◌ 正在向 %@ 获取用量…";
-"Can't reach %@. Make sure it has Syrtis open and is on the same network. Showing data from %@." = "连不上 %1$@。请确认那台设备已打开 Syrtis，并且在同一个网络。显示的是 %2$@ 的数据。";
+"Can't reach %@. Make sure it has Syrtis open and is on the same network. Showing data from %@." = "连不上 %1$@。请确认那台设备已打开 Syrtis，并且在同一个网络。显示的是 %2$@的数据。";
 "No data from %@ yet. Can't reach it. Make sure it has Syrtis open and is on the same network." = "还没有 %@ 的数据。连不上那台设备，请确认它已打开 Syrtis，并且在同一个网络。";
-"%@ is busy for now. Showing data from %@." = "%1$@ 暂时忙碌。显示的是 %2$@ 的数据。";
-"%@ is busy for now and will be retried in 1 minute. Showing data from %@." = "%1$@ 暂时忙碌，1 分钟后自动再试。显示的是 %2$@ 的数据。";
+"%@ is busy for now. Showing data from %@." = "%1$@ 暂时忙碌。显示的是 %2$@的数据。";
+"%@ is busy for now and will be retried in 1 minute. Showing data from %@." = "%1$@ 暂时忙碌，1 分钟后自动再试。显示的是 %2$@的数据。";
 "No data from %@ yet. It is busy for now." = "还没有 %@ 的数据。那台设备暂时忙碌。";
 "No data from %@ yet. It is busy for now and will be retried in 1 minute." = "还没有 %@ 的数据。那台设备暂时忙碌，1 分钟后自动再试。";
 "%@ stopped sharing. Reconnect it in Settings → Devices." = "%@ 已停止分享。到“设置 → 设备”重新连接。";
-"%@ couldn't answer this request. Showing data from %@." = "%1$@ 无法响应这次请求。显示的是 %2$@ 的数据。";
+"%@ couldn't answer this request. Showing data from %@." = "%1$@ 无法响应这次请求。显示的是 %2$@的数据。";
 "No data from %@ yet. It couldn't answer this request." = "还没有 %@ 的数据。那台设备无法响应这次请求。";
 "No data from %@ yet." = "还没有 %@ 的数据。";
 "%lld devices combined" = "%lld 台设备合计";
@@ -858,7 +858,6 @@
 "This Mac only" = "只计这台 Mac";
 "Usage inside windows counts this Mac only" = "窗内用量只计这台 Mac";
 "Per device" = "各设备";
-"%lld messages" = "%lld 条消息";
 "Updated %@" = "更新于 %@";
 "Edit" = "编辑";
 "Cut" = "剪切";

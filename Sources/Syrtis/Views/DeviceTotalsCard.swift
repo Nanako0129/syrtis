@@ -77,7 +77,7 @@ struct DeviceTotalsCard: View {
                                 .font(.caption.weight(.medium))
                                 .lineLimit(1)
                                 .truncationMode(.middle)
-                            Text(verbatim: detail(row))
+                            Text(verbatim: Self.detail(row, now: now))
                                 .font(.caption2)
                                 .foregroundStyle(.secondary)
                         }
@@ -94,10 +94,11 @@ struct DeviceTotalsCard: View {
     /// air keeps neighbouring rows from reading as one.
     private static let rowSpacing: CGFloat = 8
 
-    private func detail(_ row: DeviceTotals.Row) -> String {
+    static func detail(_ row: DeviceTotals.Row, now: Date) -> String {
         var parts: [String] = []
         if let messages = row.messages, let tokens = row.tokens {
-            parts.append(DeviceOverlayCopy.messagesCount.localized(messages))
+            // Grouped like the Monthly rows: the same key, the same `.formatted()`.
+            parts.append("%@ msgs".localized(messages.formatted()))
             parts.append("%@ tokens".localized(Format.compactTokens(tokens)))
         } else {
             parts.append("—")

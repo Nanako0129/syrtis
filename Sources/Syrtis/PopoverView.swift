@@ -685,7 +685,7 @@ struct PopoverView: View {
     private var showsUpdating: Bool {
         Self.spinnerShown(
             refreshDisabled: refreshDisabled, windowScans: model.windowScansInFlight,
-            overlayRefreshing: model.deviceOverlay.refreshing)
+            overlayRefreshing: model.deviceOverlay.fetching)
     }
 
     /// The refresh button spins for a refresh, a window-card scan, or the

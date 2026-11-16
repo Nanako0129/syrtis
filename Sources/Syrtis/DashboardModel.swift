@@ -3024,6 +3024,17 @@ extension DeviceOverlayResult {
     /// guard below says whether any model has one). Observable: the header's
     /// refresh button spins and the status line says "getting usage" from it.
     private(set) var refreshing = false
+    /// Cached loads (this Mac's share is computed there, which can take a cold
+    /// scan) that have not yet handed over to their refresh, and a refresh
+    /// queued behind another in the process. Observable, with `refreshing`:
+    /// until a lens's pages are fresh, "pending" is part of "in flight".
+    private(set) var cachedLoads = 0
+    private(set) var queuedRefresh = false
+    /// A refresh for the lens on screen is pending or running.
+    var fetching: Bool { refreshing || cachedLoads > 0 || queuedRefresh }
+    /// Bumped when the scan roots change: a refresh that began under an older
+    /// one must not count as recent.
+    @ObservationIgnored private var rootsEpoch = 0
     /// When each key's last refresh was stored (see `freshWindowSeconds`).
     @ObservationIgnored private var refreshedAt: [DeviceOverlayKey: Date] = [:]
     @ObservationIgnored private var lastRootsGeneration: Int?
@@ -3230,7 +3241,10 @@ extension DeviceOverlayResult {
     /// so the visible keys are asked again whatever the 60 s window says.
     func ensure(view: AppView, year: String?, clients: [String]?, rootsGeneration: Int? = nil) {
         if let generation = rootsGeneration {
-            if let last = lastRootsGeneration, last != generation { refreshedAt = [:] }
+            if let last = lastRootsGeneration, last != generation {
+                refreshedAt = [:]
+                rootsEpoch += 1
+            }
             lastRootsGeneration = generation
         }
         var next: [DeviceOverlayKind: DeviceOverlayKey] = [:]
@@ -3242,7 +3256,9 @@ extension DeviceOverlayResult {
         guard !keys.isEmpty else { return }
         let missing = keys.filter { currentKey(of: $0.kind) != $0 }
         guard !missing.isEmpty else { return scheduleRefresh(notRecentlyRefreshed(keys)) }
+        cachedLoads += 1
         Task {
+            defer { self.cachedLoads -= 1 }
             for key in missing { await self.runOnce(key, .cached) }
             // Only while these are still the keys on screen: a stale request
             // would replace a newer pending one, which `finishRefresh` then
@@ -3333,7 +3349,9 @@ extension DeviceOverlayResult {
         if Self.refreshInFlight {
             // A retry never replaces a pending request of the user's.
             if isRetry, let pending = Self.pendingRefresh, !pending.isRetry { return }
+            Self.pendingRefresh?.owner?.queuedRefresh = false
             Self.pendingRefresh = PendingRefresh(owner: self, keys: keys, isRetry: isRetry)
+            queuedRefresh = true
             return
         }
         startRefresh(keys, armsRetry: !isRetry, isRetry: isRetry)
@@ -3344,6 +3362,7 @@ extension DeviceOverlayResult {
     private func startRefresh(_ keys: [DeviceOverlayKey], armsRetry: Bool, isRetry: Bool = false) {
         Self.refreshInFlight = true
         refreshing = true
+        queuedRefresh = false
         Task {
             var stored: [(key: DeviceOverlayKey, noAnswer: Bool, busy: Bool)] = []
             for key in keys {
@@ -3396,6 +3415,7 @@ extension DeviceOverlayResult {
         refreshInFlight = false
         guard let next = pendingRefresh else { return }
         pendingRefresh = nil
+        next.owner?.queuedRefresh = false
         if let owner = next.owner, next.keys.allSatisfy({ owner.wanted[$0.kind] == $0 }) {
             owner.startRefresh(next.keys, armsRetry: !next.isRetry, isRetry: next.isRetry)
         }
@@ -3413,6 +3433,7 @@ extension DeviceOverlayResult {
     @discardableResult
     private func runOnce(_ key: DeviceOverlayKey, _ mode: DeviceFetchMode) async -> RunOutcome {
         guard wanted[key.kind] == key else { return .dropped }
+        let epoch = rootsEpoch
         let source = self.source
         let result = await Self.onOwnThread { try Self.fetch(source, key, mode) }
         guard wanted[key.kind] == key else { return .dropped }
@@ -3420,7 +3441,8 @@ extension DeviceOverlayResult {
         guard case .success(let value) = result else { return .failed }
         // Only a refresh that brought every selected device back fresh counts
         // against the request budget; a failed or busy one may be asked again.
-        if mode == .refresh, value.devices.allSatisfy({ $0.state == "fresh" || $0.state == "local" }) {
+        if mode == .refresh, epoch == rootsEpoch,
+           value.devices.allSatisfy({ $0.state == "fresh" || $0.state == "local" }) {
             refreshedAt[key] = Date()
         }
         return .stored(
@@ -3550,7 +3572,7 @@ extension DeviceOverlayResult {
             selectablePeers.first { $0.producerStatic == id }
         }.map { (id: $0.fingerprint, name: DeviceOverlayCopy.address(host: $0.host, port: $0.port)) }
         return DeviceOverlayCopy.statusLines(
-            rows: rows, peers: peers, inFlight: refreshing, retryPending: retryTask != nil, now: now)
+            rows: rows, peers: peers, inFlight: fetching, retryPending: retryTask != nil, now: now)
     }
 
     /// What Overview shows while devices other than this Mac are selected: the

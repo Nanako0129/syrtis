@@ -123,19 +123,26 @@ struct OverviewView: View {
                 let todayFigure = stats.perDayMap[Format.todayKey()].map {
                     (tokens: $0.tokens, cost: $0.cost)
                 }
+                // With other devices selected, the quota and "Today" are still
+                // this Mac's. The quota note is a caption above the card, like
+                // the "devices combined" one (overlaid on the card it ran into
+                // the first line). "Today" is the card's last row, so its note
+                // sits bottom right.
+                VStack(spacing: Self.badgeGap) {
+                    if merged != nil {
+                        Text(DeviceOverlayCopy.quotaThisMacOnly.localized)
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .frame(maxWidth: .infinity, alignment: .trailing)
+                    }
                 QuotaSummaryLine(
                     summary: quotaSummary, attempted: usageAttempted, today: todayFigure)
-                    // With other devices selected, the quota and "Today" are
-                    // still this Mac's: say so in the card's corners. "Today"
-                    // is the card's last row, so its note sits bottom right.
-                    .overlay(alignment: .topTrailing) {
-                        if merged != nil { thisMacNote(DeviceOverlayCopy.quotaThisMacOnly) }
-                    }
                     .overlay(alignment: .bottomTrailing) {
                         if merged != nil, todayFigure != nil, quotaSummary != nil {
                             thisMacNote(DeviceOverlayCopy.thisMacOnly)
                         }
                     }
+                }
             }
         case .limits:
             // Back on Overview as of 2026-08-17. Moving it to the Quota lens
