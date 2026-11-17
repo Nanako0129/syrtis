@@ -3025,8 +3025,15 @@ extension DeviceOverlayResult {
     // here (another lens, the popover closing) is published even when it
     // starts no fetch.
     @ObservationIgnored private var wanted: [DeviceOverlayKind: DeviceOverlayKey] = [:] {
-        didSet { if wanted != oldValue { republishIfActive() } }
+        didSet {
+            guard wanted != oldValue else { return }
+            wantedRevision += 1
+            republishIfActive()
+        }
     }
+    /// Observable stand-in for `wanted` (which is not observed): `fetching`
+    /// reads it, so a view redraws when the lens on screen changes.
+    private var wantedRevision = 0
     /// Whether a refresh this model started has not finished (the process-wide
     /// guard below says whether any model has one). Observable: the header's
     /// refresh button spins and the status line says "getting usage" from it.
@@ -3035,7 +3042,16 @@ extension DeviceOverlayResult {
     /// scan) that have not yet handed over to their refresh, and a refresh
     /// queued behind another in the process. Observable, with `refreshing`:
     /// until a lens's pages are fresh, "pending" is part of "in flight".
-    private(set) var cachedLoads = 0 { didSet { republishIfActive() } }
+    /// Keyed by load, with the keys the load was started for: a load for a
+    /// lens that is no longer on screen is not "in flight" for the one that
+    /// is (its result is dropped when it arrives, as `runOnce` always did).
+    private var cachedLoadKeys: [Int: [DeviceOverlayKey]] = [:] { didSet { republishIfActive() } }
+    @ObservationIgnored private var nextCachedLoad = 0
+    /// The cached loads whose keys are still the ones wanted.
+    var cachedLoads: Int {
+        _ = wantedRevision
+        return cachedLoadKeys.values.filter { $0.allSatisfy { wanted[$0.kind] == $0 } }.count
+    }
     private(set) var queuedRefresh = false { didSet { republishIfActive() } }
     /// A refresh for the lens on screen is pending or running.
     var fetching: Bool { refreshing || cachedLoads > 0 || queuedRefresh }
@@ -3049,7 +3065,12 @@ extension DeviceOverlayResult {
     /// successful peer list when an older selection exists without the key.
     @ObservationIgnored private var seenPeers: Set<String>?
     /// The one delayed retry this model may have pending.
-    @ObservationIgnored private var retryTask: Task<Void, Never>?
+    @ObservationIgnored private var retryTask: Task<Void, Never>? {
+        didSet { retryArmed = retryTask != nil }
+    }
+    /// Observable twin of `retryTask`: the status line says "will be retried"
+    /// from it, and must redraw when the retry fires or is dropped.
+    private(set) var retryArmed = false
     /// The keys that retry will ask for again.
     @ObservationIgnored private var retryKeys: [DeviceOverlayKey] = []
     /// The overlay's own memo for a client slice of `graphStats`; not
@@ -3349,9 +3370,11 @@ extension DeviceOverlayResult {
         guard !keys.isEmpty else { return }
         let missing = keys.filter { currentKey(of: $0.kind) != $0 }
         guard !missing.isEmpty else { return scheduleRefresh(notRecentlyRefreshed(keys)) }
-        cachedLoads += 1
+        nextCachedLoad += 1
+        let load = nextCachedLoad
+        cachedLoadKeys[load] = keys
         Task {
-            defer { self.cachedLoads -= 1 }
+            defer { self.cachedLoadKeys[load] = nil }
             for key in missing { await self.runOnce(key, .cached) }
             // Only while these are still the keys on screen: a stale request
             // would replace a newer pending one, which `finishRefresh` then
@@ -3496,9 +3519,12 @@ extension DeviceOverlayResult {
         let epoch = Self.retryEpoch
         retryTask = Task { [weak self] in
             try? await Task.sleep(for: .seconds(Self.retryDelaySeconds))
-            guard !Task.isCancelled, let self, epoch == Self.retryEpoch else { return }
+            guard !Task.isCancelled, let self else { return }
+            // Armed no longer, whether or not it still runs: a retry voided
+            // by the process-wide reset must not keep the sentence up.
             self.retryTask = nil
             self.retryKeys = []
+            guard epoch == Self.retryEpoch else { return }
             guard keys.allSatisfy({ self.wanted[$0.kind] == $0 }) else { return }
             self.scheduleRefresh(keys, isRetry: true)
         }
@@ -3696,7 +3722,7 @@ extension DeviceOverlayResult {
             selectablePeers.first { $0.producerStatic == id }
         }.map { (id: $0.fingerprint, name: displayName(of: $0)) }
         return DeviceOverlayCopy.statusLines(
-            rows: rows, peers: peers, inFlight: fetching, retryPending: retryTask != nil,
+            rows: rows, peers: peers, inFlight: fetching, retryPending: retryArmed,
             names: learnedNames, now: now)
     }
 

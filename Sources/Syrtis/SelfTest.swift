@@ -24687,6 +24687,28 @@ enum SelfTest {
                 expect(pump { overlay.retryPendingForTesting } && settled()
                            && lines() == [DeviceOverlayCopy.busyDataRetry.localized(name, age)],
                        "DR2A (R2, R3) a busy refresh arms one retry and the sentence says it will be retried")
+                // A retry voided by the process-wide reset stops being armed
+                // when it wakes, and the sentence drops the retry clause.
+                do {
+                    let voidFake = SA3DFakeSource()
+                    voidFake.set { $0.peers = .success([peer(peerA)]); $0.remoteState = "lastGood"; $0.remoteReason = "busy" }
+                    let voided = makeModel(voidFake, freshSuite()).deviceOverlay
+                    voided.refreshPeers()
+                    _ = pump { voided.selectablePeers.count == 1 }
+                    voided.togglePeer(peerA)
+                    DeviceOverlayState.resetSingleFlightForTesting()
+                    let saved = DeviceOverlayState.retryDelaySeconds
+                    DeviceOverlayState.retryDelaySeconds = 0.3
+                    voided.ensure(view: .overview, year: nil, clients: nil)
+                    let armed = pump { voided.retryPendingForTesting } && settled()
+                    DeviceOverlayState.resetSingleFlightForTesting()
+                    expect(armed && pump { !voided.retryPendingForTesting }
+                               && voided.statusLines(for: .overview, year: nil, clients: nil)
+                                   == [DeviceOverlayCopy.busyData.localized(name, age)],
+                           "FOLLOWUP a voided retry is no longer armed once it wakes, and the retry clause goes")
+                    DeviceOverlayState.retryDelaySeconds = saved
+                    DeviceOverlayState.resetSingleFlightForTesting()
+                }
                 overlay.popoverClosed()
                 expect(!overlay.retryPendingForTesting
                            && lines() == [DeviceOverlayCopy.busyData.localized(name, age)],
@@ -24923,8 +24945,15 @@ enum SelfTest {
                 expect(!slow.refreshing && slow.fetching
                            && slow.statusLines(for: .overview, year: nil, clients: nil) == [gettingUsage],
                        "DR2A (screen 4) while the cached load runs, a selected device with no data reads as getting usage, not no data yet")
+                // A load for a lens no longer on screen is not in flight for the
+                // one that is (the popover closed: nothing is wanted). Back on
+                // screen, the lens loads again and counts again.
+                slow.popoverClosed()
+                expect(!slow.fetching && slow.cachedLoads == 0,
+                       "FOLLOWUP a cached load whose lens left the screen does not count as in flight")
                 slowFake.set { $0.holdCached = false }
                 slowFake.releaseCached(2)
+                slow.ensure(view: .overview, year: nil, clients: nil)
                 _ = pump { slow.graph?.data != nil && slow.models?.data != nil }
                 _ = settled()
                 expect(!slow.fetching && slow.statusLines(for: .overview, year: nil, clients: nil)
