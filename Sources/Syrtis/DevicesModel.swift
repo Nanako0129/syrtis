@@ -291,10 +291,17 @@ final class DevicesModel: ObservableObject, CustomStringConvertible, CustomDebug
     @Published private(set) var pending: [RemotePending] = []
     @Published private(set) var grants: [RemoteGrant] = []
     @Published private(set) var peers: [RemotePeer] = []
+    /// What the dashboard's device overlay last published, for the short
+    /// status under each linked device. Empty until the dashboard has a result.
+    @Published private(set) var overlay = DeviceOverlaySnapshot()
     @Published private(set) var pairing: Pairing = .idle
     /// Pending ids with an Approve or Reject in flight.
     @Published private(set) var deciding: Set<String> = []
     @Published private(set) var working = false
+
+    func overlayChanged(_ snapshot: DeviceOverlaySnapshot) {
+        if snapshot != overlay { overlay = snapshot }
+    }
 
     private let client: DevicesRemoteClient
     private let pasteboard: DevicesPasteboard

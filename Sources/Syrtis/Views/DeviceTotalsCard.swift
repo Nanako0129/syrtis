@@ -69,6 +69,8 @@ struct DeviceTotalsCard: View {
     let devices: [RemoteDevice]
     let clientIds: [String]
     var names: [String: String] = [:]
+    /// Whether a refresh is running (`DeviceOverlayState.fetching`).
+    var inFlight = false
     var now: Date = Date()
 
     var body: some View {
@@ -85,6 +87,12 @@ struct DeviceTotalsCard: View {
                             Text(verbatim: Self.detail(row, now: now))
                                 .font(.caption2)
                                 .foregroundStyle(.secondary)
+                            // This Mac has no status; a listed device is a selected one.
+                            if !row.isLocal {
+                                DeviceShortStatusView(status: DeviceOverlayCopy.shortStatus(
+                                    device: devices.first { $0.id == row.id }, selected: true,
+                                    inFlight: inFlight, now: now))
+                            }
                         }
                         Spacer(minLength: 8)
                         Text(verbatim: row.cost.map(Format.usd) ?? "—")

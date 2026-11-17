@@ -900,7 +900,8 @@ struct PopoverView: View {
                     if let page = overviewGraphPage {
                         DeviceTotalsCard(
                             devices: page.devices, clientIds: overviewMerge?.clientIds ?? [],
-                            names: model.deviceOverlay.learnedNames)
+                            names: model.deviceOverlay.learnedNames,
+                            inFlight: model.deviceOverlay.fetching)
                             .padding(.top, Self.totalsCardGap)
                     }
                 }

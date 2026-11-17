@@ -333,7 +333,7 @@ struct DevicesSettingsView: View {
                 // The name its owner gave it, on its own line and only as
                 // data: `panel.row` and `hint` look their text up as a
                 // localization key.
-                if let name = Self.nameLine(peer) {
+                if let name = Self.nameLine(peer, learned: model.overlay.names) {
                     Text(verbatim: name)
                         .font(.caption.weight(.medium))
                         .lineLimit(1)
@@ -346,6 +346,13 @@ struct DevicesSettingsView: View {
                         .foregroundStyle(.secondary)
                     Button(DevicesCopy.remove.localized) { removeTarget = peer }
                         .controlSize(.small)
+                }
+                // Third line: how this device is doing, from what the dashboard
+                // last learned; minute-level text, so it re-reads each 30 s.
+                TimelineView(.periodic(from: .now, by: Self.statusTick)) { context in
+                    if let status = model.overlay.settingsStatus(for: peer, now: context.date) {
+                        DeviceShortStatusView(status: status).padding(.horizontal, 10)
+                    }
                 }
                 panel.hint("\(peer.fingerprint) · " + DevicesCopy.expiresOn.localized(Self.date(peer.expiresAt)))
                     .padding(.horizontal, 10)
@@ -426,7 +433,15 @@ struct DevicesSettingsView: View {
 
     /// The linked device's own name for itself, shown on its own line; nil
     /// until it has sent one.
-    static func nameLine(_ peer: RemotePeer) -> String? { peer.nodeLabel }
+    /// The newest name the dashboard learned wins over the peer record's
+    /// (`DeviceOverlayCopy.displayName`'s order); the address is not repeated
+    /// here, the row below shows it.
+    static func nameLine(_ peer: RemotePeer, learned: [String: String] = [:]) -> String? {
+        learned[peer.fingerprint] ?? peer.nodeLabel
+    }
+
+    /// Relative times are in minutes; 30 s keeps "just now" from lingering.
+    private static let statusTick: TimeInterval = 30
 
     static func address(_ peer: RemotePeer) -> String {
         address(host: peer.host, port: peer.port)
