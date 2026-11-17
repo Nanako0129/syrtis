@@ -3309,9 +3309,9 @@ extension DeviceOverlayResult {
                 for id in ids where !next.contains(id) && kept.count < Self.maxSelectedPeers {
                     kept.append(id)
                 }
-                // Seen once it is checked: a device the cap kept out is
-                // checked on a later list, when a slot is free.
-                next.formUnion(kept)
+                // Every listed device is seen from here on, checked or not: one
+                // the 16-device cap kept out is the user's to check by hand.
+                next.formUnion(ids)
                 if next != seen { persistSeen(next) }
             } else {
                 persistSeen(Set(ids))
