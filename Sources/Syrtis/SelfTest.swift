@@ -23121,6 +23121,67 @@ enum SelfTest {
                        "DR2B2 (D2) removing a linked device makes the dashboard read its peer list at once"
                            + " (listed \(listedForRemoval), read \(readAfterRemove), emptied \(emptiedAfterRemove),"
                            + " manageError \(linkModel.manageError ?? "-"))")
+                // A checked device whose grant stops (revoked) leaves the menu;
+                // linked again, it is checked again. One the user unchecked is not.
+                do {
+                    let relinkSuite = UserDefaults(suiteName: "com.nyanako.tokenbar.selftest.relink")!
+                    relinkSuite.removePersistentDomain(forName: "com.nyanako.tokenbar.selftest.relink")
+                    let source = SA3DFakeSource()
+                    func listed(_ state: String) -> RemotePeer {
+                        try! JSONDecoder().decode(RemotePeer.self, from: Data(#"""
+                            {"producerStatic":"\#(SA3CFakeClient.producerA)","fingerprint":"\#(SA3CFakeClient.fingerprintA)",
+                             "nodeLabel":null,"host":"10.0.0.2","port":47000,"createdAt":1,"expiresAt":4102444800000,"state":"\#(state)"}
+                            """#.utf8))
+                    }
+                    source.set { $0.peers = .success([listed("active")]) }
+                    let overlay = DashboardModel(
+                        cachesSnapshot: false, source: source, initialYear: nil, buildIdentity: nil,
+                        deviceDefaults: relinkSuite, peerNotifications: NotificationCenter()).deviceOverlay
+                    // Delivered through the seam: applied before the next line runs.
+                    func reload(_ state: String) {
+                        source.set { $0.peers = .success([listed(state)]) }
+                        overlay.deliverPeersForTesting(
+                            .success([listed(state)]), generation: overlay.beginPeersReadForTesting())
+                    }
+                    overlay.refreshPeers()
+                    let ticked = pumpUntil { overlay.includesRemote }
+                    reload("revoked")
+                    let gone = overlay.selectablePeers.isEmpty && !overlay.includesRemote
+                    reload("active")
+                    expect(ticked && gone && overlay.includesRemote,
+                           "FOLLOWUP a checked device that was revoked is checked again when it is linked again")
+                    overlay.togglePeer(SA3CFakeClient.producerA)
+                    let unticked = !overlay.includesRemote
+                    reload("revoked")
+                    reload("active")
+                    expect(unticked && overlay.selectablePeers.count == 1 && !overlay.includesRemote,
+                           "FOLLOWUP a device the user unchecked stays unchecked through a revoke and a new link")
+                    // A second instance (the Settings window's) loaded while the
+                    // device was still checked must not undo that.
+                    overlay.togglePeer(SA3CFakeClient.producerA)
+                    let stale = DashboardModel(
+                        cachesSnapshot: false, source: source, initialYear: nil, buildIdentity: nil,
+                        deviceDefaults: relinkSuite, peerNotifications: NotificationCenter()).deviceOverlay
+                    overlay.togglePeer(SA3CFakeClient.producerA)
+                    stale.deliverPeersForTesting(.success([listed("revoked")]), generation: stale.beginPeersReadForTesting())
+                    let fresh = DashboardModel(
+                        cachesSnapshot: false, source: source, initialYear: nil, buildIdentity: nil,
+                        deviceDefaults: relinkSuite, peerNotifications: NotificationCenter()).deviceOverlay
+                    fresh.deliverPeersForTesting(.success([listed("active")]), generation: fresh.beginPeersReadForTesting())
+                    expect(!fresh.includesRemote && fresh.selectablePeers.count == 1,
+                           "FOLLOWUP an instance loaded before the device was unchecked does not make it checked again")
+                    // Two instances hold the device checked; one sees it revoked
+                    // (and forgets it), the other, which never saw that, then
+                    // sees it active: it keeps one entry, not two.
+                    fresh.togglePeer(SA3CFakeClient.producerA)
+                    let other = DashboardModel(
+                        cachesSnapshot: false, source: source, initialYear: nil, buildIdentity: nil,
+                        deviceDefaults: relinkSuite, peerNotifications: NotificationCenter()).deviceOverlay
+                    fresh.deliverPeersForTesting(.success([listed("revoked")]), generation: fresh.beginPeersReadForTesting())
+                    other.deliverPeersForTesting(.success([listed("active")]), generation: other.beginPeersReadForTesting())
+                    expect(other.stored.peers == [SA3CFakeClient.producerA],
+                           "FOLLOWUP a device another instance forgot is not listed twice in this one's selection (got \(other.stored.peers.count))")
+                }
                 let beforeOther = dashSource.get(\.peerCalls)
                 run { await linkModel.refresh() }
                 pumpFor(0.2)

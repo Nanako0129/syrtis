@@ -2982,8 +2982,10 @@ extension DeviceOverlayResult {
     static let selectionKey = "tokenbar.dashboard.deviceSelection"
     /// Peers this app has already offered for selection (JSON array of
     /// `producerStatic`). Apart from `selectionKey` so an older selection
-    /// decodes unchanged. Only grows: a peer that goes inactive and returns is
-    /// not new, so a device the user unchecked is never checked again for them.
+    /// decodes unchanged. A device the user unchecked stays in it, so it is
+    /// never checked again for them. A device that was checked when it stopped
+    /// being active (its grant was revoked or expired) leaves it, so linking it
+    /// again checks it again: that is how the user gets it back.
     static let seenPeersKey = "tokenbar.dashboard.deviceSeenPeers"
     /// A key refreshed this recently is not asked for again when a lens comes
     /// on screen: a producer grants a burst of 2 and refills one per 60 s, and
@@ -3287,14 +3289,34 @@ extension DeviceOverlayResult {
             learnedNames = learnedNames.filter { listed.contains($0.key) }
             let known = Set(selectablePeers.map(\.producerStatic))
             var kept = stored.peers.filter(known.contains)
+            // Checked devices that are no longer active: forgotten as "seen",
+            // so they are checked again when they come back. Read from what is
+            // persisted, not from this instance's copy: the Settings window
+            // has an instance of its own, loaded before the popover's last
+            // change, and a device unchecked there since must stay seen.
+            let persisted = defaults.data(forKey: Self.selectionKey)
+                .flatMap { try? JSONDecoder().decode(StoredDeviceSelection.self, from: $0) }
+            let dropped = (persisted ?? stored).peers.filter { !known.contains($0) }
+            if let data = defaults.data(forKey: Self.seenPeersKey),
+               let seen = try? JSONDecoder().decode([String].self, from: data) {
+                seenPeers = Set(seen)
+            }
             // A device never offered before is checked on arrival, once; the
             // first list after an upgrade only records what already exists.
             let ids = selectablePeers.map(\.producerStatic)
             if let seen = seenPeers {
-                for id in ids where !seen.contains(id) && kept.count < Self.maxSelectedPeers {
+                var next = seen.subtracting(dropped)
+                // `kept` is this instance's copy and may already hold a device
+                // another instance has just forgotten: never list it twice (the
+                // core refuses a selection with a repeated key).
+                for id in ids
+                where !next.contains(id) && !kept.contains(id) && kept.count < Self.maxSelectedPeers {
                     kept.append(id)
                 }
-                if !seen.isSuperset(of: ids) { persistSeen(seen.union(ids)) }
+                // Every listed device is seen from here on, checked or not: one
+                // the 16-device cap kept out is the user's to check by hand.
+                next.formUnion(ids)
+                if next != seen { persistSeen(next) }
             } else {
                 persistSeen(Set(ids))
             }
