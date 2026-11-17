@@ -23170,6 +23170,17 @@ enum SelfTest {
                     fresh.deliverPeersForTesting(.success([listed("active")]), generation: fresh.beginPeersReadForTesting())
                     expect(!fresh.includesRemote && fresh.selectablePeers.count == 1,
                            "FOLLOWUP an instance loaded before the device was unchecked does not make it checked again")
+                    // Two instances hold the device checked; one sees it revoked
+                    // (and forgets it), the other, which never saw that, then
+                    // sees it active: it keeps one entry, not two.
+                    fresh.togglePeer(SA3CFakeClient.producerA)
+                    let other = DashboardModel(
+                        cachesSnapshot: false, source: source, initialYear: nil, buildIdentity: nil,
+                        deviceDefaults: relinkSuite, peerNotifications: NotificationCenter()).deviceOverlay
+                    fresh.deliverPeersForTesting(.success([listed("revoked")]), generation: fresh.beginPeersReadForTesting())
+                    other.deliverPeersForTesting(.success([listed("active")]), generation: other.beginPeersReadForTesting())
+                    expect(other.stored.peers == [SA3CFakeClient.producerA],
+                           "FOLLOWUP a device another instance forgot is not listed twice in this one's selection (got \(other.stored.peers.count))")
                 }
                 let beforeOther = dashSource.get(\.peerCalls)
                 run { await linkModel.refresh() }

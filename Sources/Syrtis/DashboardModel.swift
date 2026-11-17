@@ -3306,7 +3306,11 @@ extension DeviceOverlayResult {
             let ids = selectablePeers.map(\.producerStatic)
             if let seen = seenPeers {
                 var next = seen.subtracting(dropped)
-                for id in ids where !next.contains(id) && kept.count < Self.maxSelectedPeers {
+                // `kept` is this instance's copy and may already hold a device
+                // another instance has just forgotten: never list it twice (the
+                // core refuses a selection with a repeated key).
+                for id in ids
+                where !next.contains(id) && !kept.contains(id) && kept.count < Self.maxSelectedPeers {
                     kept.append(id)
                 }
                 // Every listed device is seen from here on, checked or not: one
