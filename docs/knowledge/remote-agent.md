@@ -206,7 +206,7 @@ Popover 的 Overview、Graph（Stats、Daily、Monthly）、Models、Hourly、Ag
 - 四頁的裝置選擇還沒有畫面（`SA-3d`）；`refresh` 對真實網路（非 loopback）與真實 session 量的耗時沒有量測。
 - 錯誤碼 2 之後 Grant status 回 `revoked` 只發生在兩步之間被撤銷的時序（producer 對被撤銷或到期的 grant 直接回錯誤碼 3／4）；測試以 `RemoteAgent::after_pull` 這個 test seam 在兩步之間撤銷做出它。`expired` 的分支只經程式閱讀。
 - DR-3b 前建立的 grant 仍是 30 天，到期時以「已停止分享」或被拒的狀態出現，畫面上沒有日期預告；重新配對即可。沒有日期的 Devices 頁沒有實機看過。
-- 待核准列下方的核准說明（`DevicesCopy.approveEffect`，三語）仍說存取為期 30 天、到期或撤銷為止，也沒說核准會結束同一台先前的 grant；DR-3b 不改文案，與 agent DR-3a 的行為不符，待另行改寫。
+- 待核准列下方的核准說明（`DevicesCopy.approveEffect`，三語）寫「直到你撤銷為止」，不再提 30 天與到期。它沒有說核准會結束同一台先前的 grant（使用者 2026-11-17 選了一句版）。
 - 分享端完全沒有價格表、價格表無法解析、或 `timestamp` 在未來（時鐘偏差）時，不自帶 cost 的 client 分享出去的 cost 為 0，接收端狀態列會說「費用可能不完整」（DR-2b，`costIncomplete`）。沒有提示的是 `Stale`（仍計價、可能落後）與價格表缺某個模型的價格（該模型 cost 為 0，診斷沒有這一種）。這句提示的畫面沒有實機看過。
 - 選了 producer 時本機那一份每次重新掃描（不經 `GRAPH_CACHE`），比只選本機慢。
 

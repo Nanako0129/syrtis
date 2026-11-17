@@ -771,7 +771,7 @@
 "Check that the other device shows the same code." = "请确认对方屏幕上的代码相同。";
 "Approve" = "批准";
 "Reject" = "拒绝";
-"Approving lets that device read this Mac's usage totals in the approved scan scope for 30 days, until you revoke it or it expires." = "批准后，该设备可以读取这台 Mac 在已批准扫描范围内的用量汇总，期限 30 天，直到你撤销或到期为止。";
+"Approving lets that device read this Mac's usage totals in the approved scan scope until you revoke it." = "批准后，该设备可以读取这台 Mac 在已批准扫描范围内的用量汇总，直到你撤销为止。";
 "This request has expired." = "这个请求已经过期。";
 "Devices with access" = "可访问的设备";
 "Revoke" = "撤销";
