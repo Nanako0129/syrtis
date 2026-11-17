@@ -781,7 +781,7 @@
 "Expires %@" = "%@ 到期";
 "Scan scope" = "掃描範圍";
 "What sharing reads, and what it sends." = "分享會讀取哪些資料、送出哪些內容。";
-"Sharing sends usage totals: token counts, cost, message and turn counts, and duration, grouped by day and hour (with the time-zone offset) and by client, model, provider and agent name. Those names are sent exactly as recorded on this Mac. Conversation content is not sent, and there are no fields for file paths or accounts. Clients that a Syrtis update adds support for are included automatically." = "分享送出的是用量彙總：token 數、費用、訊息數與回合數，以及耗時，依日與小時（含時區位移）以及用戶端、模型、供應商與 agent 的名稱分組。這些名稱會照這台 Mac 上的紀錄原樣送出。不會送出對話內容，也沒有檔案路徑或帳號的欄位。Syrtis 更新後新支援的用戶端會自動納入。";
+"Sharing sends usage totals: token counts, cost, message and turn counts, and duration, grouped by day and hour (with the time-zone offset) and by client, model, provider and agent name. Those names are sent exactly as recorded on this Mac. Conversation content is not sent, and there are no fields for file paths or accounts. This Mac's device name, if you set one, is also sent to the devices linked to it. Clients that a Syrtis update adds support for are included automatically." = "分享送出的是用量彙總：token 數、費用、訊息數與回合數，以及耗時，依日與小時（含時區位移）以及用戶端、模型、供應商與 agent 的名稱分組。這些名稱會照這台 Mac 上的紀錄原樣送出。不會送出對話內容，也沒有檔案路徑或帳號的欄位。這台 Mac 的裝置名稱（有設定的話）也會送給已連結的裝置。Syrtis 更新後新支援的用戶端會自動納入。";
 "Home folder" = "家目錄";
 "Config folder" = "設定資料夾";
 "Data folder" = "資料資料夾";
@@ -864,3 +864,8 @@
 "Cut" = "剪下";
 "Paste" = "貼上";
 "Select All" = "全選";
+
+/* Device names, cost note, first scan (DR-2b2) */
+"Linked devices will see this name." = "已連結的裝置會看到這個名稱。";
+"◌ Getting usage from %@… The first time needs to scan its records, about 1 minute" = "◌ 正在向 %@ 取得用量…首次需要掃描紀錄，約 1 分鐘";
+"The cost for %@ may be incomplete (its price data is incomplete). Tokens and message counts are included in the totals." = "%@ 的費用可能不完整（那台的價格資料不齊）。token 與訊息數已合計。";

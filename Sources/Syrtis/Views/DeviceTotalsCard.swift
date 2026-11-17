@@ -23,14 +23,18 @@ enum DeviceTotals {
     /// One row per device of the page. A device's figures are its core-computed
     /// per-client entries for `clientIds` added together, so they equal the
     /// combined card above them when that card shows the same clients.
-    static func rows(devices: [RemoteDevice], clientIds: [String]) -> [Row] {
+    /// `names`: the newest real name per device id (`DeviceOverlayState.learnedNames`),
+    /// which wins over the row's own label so the card agrees with the menu.
+    static func rows(devices: [RemoteDevice], clientIds: [String], names: [String: String] = [:]) -> [Row] {
         let shown = Set(clientIds)
         return devices.map { device in
             let isLocal = device.id == "local"
             let parts = device.totals?.filter { shown.contains($0.client) }
             return Row(
                 id: device.id,
-                name: isLocal ? DeviceOverlayCopy.thisMac.localized : DeviceOverlayCopy.name(of: device),
+                name: isLocal
+                    ? DeviceOverlayCopy.thisMac.localized
+                    : (names[device.id] ?? DeviceOverlayCopy.name(of: device)),
                 isLocal: isLocal,
                 messages: parts.map { list in list.reduce(Int64(0)) { sum, t in sum.saturatingAdd(t.messages) } },
                 tokens: parts.map { list in list.reduce(Int64(0)) { sum, t in sum.saturatingAdd(t.tokens) } },
@@ -64,10 +68,11 @@ struct DevicesCombinedBadge: View {
 struct DeviceTotalsCard: View {
     let devices: [RemoteDevice]
     let clientIds: [String]
+    var names: [String: String] = [:]
     var now: Date = Date()
 
     var body: some View {
-        let rows = DeviceTotals.rows(devices: devices, clientIds: clientIds)
+        let rows = DeviceTotals.rows(devices: devices, clientIds: clientIds, names: names)
         DashCard(DeviceOverlayCopy.perDevice) {
             VStack(alignment: .leading, spacing: Self.rowSpacing) {
                 ForEach(rows, id: \.id) { row in
@@ -119,7 +124,8 @@ struct DeviceStatusLine: View {
     var body: some View {
         if !lines.isEmpty {
             VStack(alignment: .leading, spacing: 2) {
-                ForEach(lines, id: \.self) { line in
+                // By position: two devices with the same name and state read the same.
+                ForEach(Array(lines.enumerated()), id: \.offset) { _, line in
                     Text(verbatim: line)
                         .font(.caption2)
                         .foregroundStyle(.secondary)

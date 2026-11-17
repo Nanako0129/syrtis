@@ -134,6 +134,8 @@ struct DevicesSettingsView: View {
                 .font(.caption)
                 .frame(width: Layout.fieldWidth)
         }
+        panel.hint(DevicesCopy.deviceNameHint)
+            .padding(.horizontal, 10)
         // A menu, not a radio list: one row however many addresses the Mac has.
         panel.row(DevicesCopy.listenOn) {
             // The configured address stays listed while another one is being
@@ -164,6 +166,8 @@ struct DevicesSettingsView: View {
         }
         Button(DevicesCopy.apply.localized) {
             let (host, port, name) = (host, Int(portText) ?? 0, nodeName)
+            // The field shows what is sent.
+            nodeName = DevicesModel.cleanedName(name) ?? ""
             Task { await model.applyListen(host: host, port: port, nodeLabel: name) }
         }
         .controlSize(.small)
@@ -326,6 +330,16 @@ struct DevicesSettingsView: View {
         ) {
             if model.peers.isEmpty { panel.hint(DevicesCopy.noLinked) }
             ForEach(model.peers, id: \.producerStatic) { peer in
+                // The name its owner gave it, on its own line and only as
+                // data: `panel.row` and `hint` look their text up as a
+                // localization key.
+                if let name = Self.nameLine(peer) {
+                    Text(verbatim: name)
+                        .font(.caption.weight(.medium))
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                        .padding(.horizontal, 10)
+                }
                 panel.row(Self.address(peer)) {
                     Text(DevicesCopy.state(peer.state).localized)
                         .font(.caption2)
@@ -409,6 +423,10 @@ struct DevicesSettingsView: View {
             .foregroundStyle(.orange)
             .fixedSize(horizontal: false, vertical: true)
     }
+
+    /// The linked device's own name for itself, shown on its own line; nil
+    /// until it has sent one.
+    static func nameLine(_ peer: RemotePeer) -> String? { peer.nodeLabel }
 
     static func address(_ peer: RemotePeer) -> String {
         address(host: peer.host, port: peer.port)

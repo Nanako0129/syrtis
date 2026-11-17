@@ -347,6 +347,14 @@ impl RemoteAgent {
 
     /// The frozen `listenConfigure`, then the node label written with the
     /// host and port that command stored. Returns the status.
+    ///
+    /// The agent refuses a changed label that fails `valid_node_label` (after
+    /// its own NFC step, which this crate cannot repeat: `unicode-normalization`
+    /// is not a direct dependency). That refusal would come at the second step,
+    /// after the address had already moved, so a changed label is first
+    /// written alone, with the stored host and port: the agent's own check,
+    /// before anything else changes. If the address step then fails, the old
+    /// label is put back.
     pub(crate) fn listen_configure(&self, host: &str, port: u16, label: Option<String>) -> Reply {
         if label
             .as_ref()
@@ -359,12 +367,29 @@ impl RemoteAgent {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         self.with(|current| {
-            call(
+            let store = current.agent.runtime().store();
+            let before = store.state().map_err(storage_class)?.config;
+            let changed = label != before.node_label;
+            if changed {
+                store
+                    .set_listen_config(before.bind_host.clone(), before.bind_port, label.clone())
+                    .map_err(storage_class)?;
+            }
+            if let Err(error) = call(
                 current,
                 control::LISTEN_CONFIGURE,
                 json!({"bindHost": host, "bindPort": port}),
-            )?;
-            let store = current.agent.runtime().store();
+            ) {
+                if changed {
+                    // Best effort: the old label may itself predate the rule.
+                    let _ = store.set_listen_config(
+                        before.bind_host,
+                        before.bind_port,
+                        before.node_label,
+                    );
+                }
+                return Err(error);
+            }
             let config = store.state().map_err(storage_class)?.config;
             #[cfg(test)]
             {
@@ -754,6 +779,14 @@ impl RemoteAgent {
         read(&self.running)
             .as_ref()
             .map(|current| body(&current.agent))
+    }
+
+    /// `Runtime::ever_answered`: the producer ever gave this receiver a body
+    /// (`false` too when no agent runs).
+    pub(crate) fn ever_answered(&self, producer: &[u8; 32]) -> bool {
+        read(&self.running)
+            .as_ref()
+            .is_some_and(|current| current.agent.runtime().ever_answered(producer))
     }
 
     /// The Unix seconds of the last fresh [`pull_peer`] of this query from
@@ -1598,6 +1631,69 @@ mod tests {
             agent.listen_configure("not a host", new, None),
             Err("invalid".into())
         );
+    }
+
+    /// DR-2b2: a label the agent refuses (control or bidi character, blank,
+    /// invisible only) is `invalid` before the address moves: the stored host,
+    /// port and label, and the listener, stay as they were. A valid label
+    /// moves the address and is stored in NFC; a failing address step puts
+    /// the old label back.
+    #[test]
+    fn an_invalid_label_leaves_the_listen_address_and_label_unchanged() {
+        let clock = TestClock::new();
+        let home = TempHome::new();
+        let agent = Arc::new(RemoteAgent::default());
+        start(&agent, &home, &clock, ScannerSettings::default());
+        // `free_port` releases its listener, so two calls can return the same
+        // port; the checks below need two different ones.
+        let old = free_port();
+        let new = std::iter::repeat_with(free_port)
+            .find(|port| *port != old)
+            .expect("an endless iterator");
+        agent
+            .listen_configure("127.0.0.1", old, Some("Desk".into()))
+            .unwrap();
+        let stored = || {
+            let config = agent
+                .with_agent(|a| a.runtime().store().state().unwrap().config)
+                .unwrap();
+            (config.bind_host, config.bind_port, config.node_label)
+        };
+        let before = stored();
+        assert_eq!(before.1, old);
+        for bad in [
+            "Mac\u{202E}cod.exe",
+            "tab\there",
+            "line\u{2028}break",
+            "   ",
+            "\u{200B}",
+            "",
+        ] {
+            assert_eq!(
+                agent.listen_configure("127.0.0.1", new, Some(bad.into())),
+                Err("invalid".into()),
+                "{bad:?}"
+            );
+            assert_eq!(stored(), before, "{bad:?} changed the stored config");
+            assert!(listening(old), "{bad:?} moved the listener");
+            assert!(!listening(new), "{bad:?} moved the listener");
+        }
+        // Control: a valid label moves the address; NFD input is stored as NFC.
+        agent
+            .listen_configure("127.0.0.1", new, Some("Cafe\u{301}".into()))
+            .unwrap();
+        assert_eq!(stored().1, new);
+        assert_eq!(stored().2.as_deref(), Some("Caf\u{e9}"));
+        assert!(listening(new) && !listening(old));
+        // A refused address after a label change restores the old label.
+        assert_eq!(
+            agent.listen_configure("not a host", new, Some("Other".into())),
+            Err("invalid".into())
+        );
+        assert_eq!(stored().2.as_deref(), Some("Caf\u{e9}"));
+        // The label alone may be cleared.
+        agent.listen_configure("127.0.0.1", new, None).unwrap();
+        assert_eq!(stored().2, None);
     }
 
     /// SA-3d deferred item 2: two overlapping `listen_configure` calls. The

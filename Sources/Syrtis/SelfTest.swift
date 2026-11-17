@@ -22899,6 +22899,29 @@ enum SelfTest {
             expect(model.listenError == DevicesCopy.nameTooLong,
                    "SA3C a device name over 128 bytes is refused with the name line")
 
+            // DR-2b2: the typed name is cleaned before it is sent.
+            func sentLabel(_ typed: String) -> String?? {
+                fake.set { $0.nodeLabel = "unset" }
+                run { await model.applyListen(host: "127.0.0.1", port: 47_000, nodeLabel: typed) }
+                return model.listenError == nil ? .some(fake.get(\.nodeLabel)) : nil
+            }
+            expect(sentLabel("  desk  ") == .some("desk")
+                       && sentLabel("de\u{7}s\tk\u{2028}\u{2029}") == .some("desk")
+                       && sentLabel("\u{202E}desk\u{202A}\u{202B}\u{202C}\u{202D}\u{2066}\u{2067}\u{2068}\u{2069}") == .some("desk")
+                       && sentLabel("d\u{61C}e\u{200E}s\u{200F}k") == .some("desk")
+                       && sentLabel("a b") == .some("a b")
+                       && sentLabel("Caf\u{e9} \u{1F469}\u{200D}\u{1F4BB}") == .some("Caf\u{e9} \u{1F469}\u{200D}\u{1F4BB}"),
+                   "DR2B2 the name is sent without control, separator and bidi characters and without surrounding whitespace; inner spaces and a joiner inside an emoji stay")
+            expect(sentLabel("") == .some(nil) && sentLabel("   \t\n ") == .some(nil)
+                       && sentLabel("\u{202E}\u{7}") == .some(nil) && sentLabel("\u{200B} \u{FEFF}\u{2800}") == .some(nil),
+                   "DR2B2 a name with nothing visible left is no name")
+            expect(DevicesModel.cleanedName(" \u{202E}desk\u{7} ") == "desk" && DevicesModel.cleanedName("\u{202E}") == nil,
+                   "DR2B2 the field shows the cleaned value (the view assigns cleanedName)")
+            expect(sentLabel(String(repeating: "a", count: 128) + " \u{202E}") == .some(String(repeating: "a", count: 128))
+                       && sentLabel(String(repeating: "a", count: 129) + "\u{202E}") == nil
+                       && model.listenError == DevicesCopy.nameTooLong,
+                   "DR2B2 the 128-byte limit counts the cleaned name")
+
             // (3) Scope approval is bound to the disclosure shown.
             let scopeFake = SA3CFakeClient()
             let scopeModel = DevicesModel(client: scopeFake, pasteboard: SA3CFakePasteboard())
@@ -23058,6 +23081,47 @@ enum SelfTest {
             expect(pumpUntil { model.pairing == .linked(fingerprint: SA3CFakeClient.fingerprintA) }
                        && model.peers.contains { $0.producerStatic == SA3CFakeClient.producerA },
                    "SA3C a wait that succeeds after leaving the page shows Linked and the device on return")
+            // DR-2b2 (D2): a successful link, and a removal, make the dashboard
+            // read its peer list at once (no 60 s poll runs in this test).
+            do {
+                let center = NotificationCenter()
+                let suiteName = "com.nyanako.tokenbar.selftest.dr2b2-peers"
+                let suite = UserDefaults(suiteName: suiteName)!
+                suite.removePersistentDomain(forName: suiteName)
+                let dashSource = SA3DFakeSource()
+                let linked = try! JSONDecoder().decode(RemotePeer.self, from: Data(#"""
+                    {"producerStatic":"\#(SA3CFakeClient.producerA)","fingerprint":"\#(SA3CFakeClient.fingerprintA)",
+                     "nodeLabel":null,"host":"10.0.0.2","port":47000,"createdAt":1,"expiresAt":4102444800000,"state":"active"}
+                    """#.utf8))
+                dashSource.set { $0.peers = .success([]) }
+                let dash = DashboardModel(
+                    cachesSnapshot: false, source: dashSource, initialYear: nil, buildIdentity: nil,
+                    deviceDefaults: suite, peerNotifications: center)
+                let linkFake = SA3CFakeClient()
+                let linkModel = DevicesModel(client: linkFake, pasteboard: SA3CFakePasteboard(), notifications: center)
+                run { await linkModel.link(pairUrl: "syrtis-selftest-invitation") }
+                run { await linkModel.confirmLink() }
+                let beforeLink = dashSource.get(\.peerCalls)
+                dashSource.set { $0.peers = .success([linked]) }
+                linkFake.releasePoll(.success(SA3CFakeClient.producerA))
+                expect(pumpUntil { linkModel.pairing == .linked(fingerprint: SA3CFakeClient.fingerprintA) }
+                           && pumpUntil { dashSource.get(\.peerCalls) > beforeLink }
+                           && pumpUntil { dash.deviceOverlay.selectablePeers.count == 1 }
+                           && dash.deviceOverlay.includesRemote,
+                       "DR2B2 (D2) a successful link makes the dashboard read its peer list at once: the new device is listed and ticked")
+                let beforeRemove = dashSource.get(\.peerCalls)
+                dashSource.set { $0.peers = .success([]) }
+                if let peer = linkModel.peers.first { run { await linkModel.removePeer(peer) } }
+                expect(pumpUntil { dashSource.get(\.peerCalls) > beforeRemove }
+                           && pumpUntil { dash.deviceOverlay.selectablePeers.isEmpty },
+                       "DR2B2 (D2) removing a linked device makes the dashboard read its peer list at once")
+                let beforeOther = dashSource.get(\.peerCalls)
+                run { await linkModel.refresh() }
+                pumpFor(0.2)
+                expect(dashSource.get(\.peerCalls) == beforeOther,
+                       "DR2B2 (D2) control: an ordinary refresh of the Devices page does not make the dashboard read its peer list")
+                suite.removePersistentDomain(forName: suiteName)
+            }
             // Cancelled, then the poll succeeds: removed at once, never listed.
             model.dismissPairingResult()
             run { await model.link(pairUrl: "syrtis-selftest-invitation") }
@@ -23161,9 +23225,10 @@ enum SelfTest {
                 }
                 return suite
             }
-            func peer(_ id: String, state: String = "active") -> RemotePeer {
-                try! JSONDecoder().decode(RemotePeer.self, from: Data(#"""
-                    {"producerStatic":"\#(id)","fingerprint":"\#(id.prefix(16))","nodeLabel":null,
+            func peer(_ id: String, state: String = "active", label: String? = nil) -> RemotePeer {
+                let nodeLabel = label.map { String(decoding: try! JSONEncoder().encode($0), as: UTF8.self) } ?? "null"
+                return try! JSONDecoder().decode(RemotePeer.self, from: Data(#"""
+                    {"producerStatic":"\#(id)","fingerprint":"\#(id.prefix(16))","nodeLabel":\#(nodeLabel),
                      "host":"10.0.0.2","port":47000,"createdAt":1,"expiresAt":4102444800000,"state":"\#(state)"}
                     """#.utf8))
             }
@@ -23494,8 +23559,8 @@ enum SelfTest {
             func statusOf(_ rows: [RemoteDevice]) -> [String] {
                 DeviceOverlayCopy.statusLines(rows: rows, peers: [], inFlight: false, retryPending: false)
             }
-            expect(statusOf(twins).count == 1,
-                   "SA3D (one line) two devices with the same label and state give one line")
+            expect(statusOf(twins).count == 2,
+                   "SA3D (one line, DR-2b2) two devices with the same label and state keep one line each: lines are per device id, not per text")
             for pages in [["lastGood", "unavailable"], ["unavailable", "lastGood"]] {
                 let status = statusOf(pages.flatMap(statsDevices))
                 let notes = DeviceOverlayCopy.lines(pages.map { (statsDevices($0), true, true, true) })
@@ -23943,6 +24008,295 @@ enum SelfTest {
                            ["zh-Hant", "zh-Hans"].allSatisfy { zh(key, $0) != nil && zh(key, $0) != key }
                        },
                        "DR2A (7, e) the Edit menu titles have zh-Hant and zh-Hans values")
+            }
+
+            // DR-2b2: the device's own name in the four places, the cost
+            // sentence, the first-scan half-sentence, and the name as data.
+            do {
+                let c = DeviceOverlayCopy.self
+                let now = Date(timeIntervalSince1970: 1_700_000_000 + 300)
+                let address = "10.0.0.2:47000"
+                func row(_ state: String, id: String = "aaaaaaaaaaaaaaaa", label: String? = address,
+                         reason: String? = nil, incomplete: Bool = false, answered: Bool = true) -> RemoteDevice {
+                    RemoteDevice(id: id, label: label, state: state, lastSuccessAt: 1_700_000_000, reason: reason,
+                                 address: address, costIncomplete: incomplete, everAnswered: answered)
+                }
+                func lines(_ rows: [RemoteDevice], inFlight: Bool = false, peers: [(id: String, name: String)] = []) -> [String] {
+                    c.statusLines(rows: rows, peers: peers, inFlight: inFlight, retryPending: false, now: now)
+                }
+
+                // The row decodes, and a core without the new keys reads as
+                // "no cost note, no first-scan claim".
+                let decoded = try! JSONDecoder().decode([RemoteDevice].self, from: Data(#"""
+                    [{"id":"aaaaaaaaaaaaaaaa","label":"Studio Mac","address":"10.0.0.2:47000","state":"fresh",
+                      "lastSuccessAt":1,"reason":null,"totals":null,"costIncomplete":true,"everAnswered":false},
+                     {"id":"bbbbbbbbbbbbbbbb","label":"10.0.0.3:47000","state":"fresh","lastSuccessAt":1}]
+                    """#.utf8))
+                expect(decoded[0].label == "Studio Mac" && decoded[0].address == address
+                           && decoded[0].costIncomplete && !decoded[0].everAnswered
+                           && decoded[1].address == nil && !decoded[1].costIncomplete && decoded[1].everAnswered,
+                       "DR2B2 a devices row carries label, address, costIncomplete and everAnswered; absent keys default")
+
+                // Name present and absent, at each of the four places.
+                let named = peer(peerA, label: "Studio Mac")
+                let bare = peer(peerA)
+                expect(c.name(of: named) == "Studio Mac" && c.name(of: bare) == address
+                           && lines([], peers: [(id: "bbbbbbbbbbbbbbbb", name: c.name(of: named))])
+                               == [c.noDataYet.localized("Studio Mac")]
+                           && lines([], peers: [(id: "bbbbbbbbbbbbbbbb", name: c.name(of: bare))])
+                               == [c.noDataYet.localized(address)]
+                           && lines([row("lastGood", label: "Studio Mac", reason: "unreachable")])
+                               == [c.unreachableData.localized("Studio Mac", Format.relativeTime(1_700_000_000, now: now))],
+                       "DR2B2 status line: the name when there is one, else host:port")
+                expect(c.menuTitle(selectedCount: 1, local: false, peerName: c.name(of: named)) == "Studio Mac"
+                           && c.menuTitle(selectedCount: 1, local: false, peerName: c.name(of: bare)) == address
+                           && c.menuTitle(selectedCount: 1, local: true, peerName: c.name(of: named)) == c.thisMac.localized
+                           && c.menuTitle(selectedCount: 2, local: true, peerName: c.name(of: named)) == c.deviceCount.localized(2),
+                       "DR2B2 device menu: the button names the one selected device by its name, else host:port")
+                let cardRows = DeviceTotals.rows(
+                    devices: [row("fresh", label: "Studio Mac"), row("fresh", id: "bbbbbbbbbbbbbbbb", label: address)],
+                    clientIds: ["claude"])
+                expect(cardRows.map(\.name) == ["Studio Mac", address],
+                       "DR2B2 per-device card: the name when there is one, else host:port")
+                expect(DevicesSettingsView.nameLine(named) == "Studio Mac" && DevicesSettingsView.nameLine(bare) == nil
+                           && DevicesSettingsView.address(named) == "10.0.0.2:47000",
+                       "DR2B2 linked devices: the name on its own line only when there is one; the address stays")
+
+                // The model wires the peer's name into the status line.
+                do {
+                    let fake = SA3DFakeSource()
+                    fake.set { $0.peers = .success([named]) }
+                    let overlay = makeModel(fake, freshSuite()).deviceOverlay
+                    overlay.refreshPeers()
+                    _ = pump { overlay.selectablePeers.count == 1 }
+                    overlay.togglePeer(peerA)
+                    DeviceOverlayState.resetSingleFlightForTesting()
+                    fake.set { $0.holdCached = true }
+                    overlay.ensure(view: .overview, year: nil, clients: nil)
+                    _ = pump { !fake.get(\.calls).isEmpty }
+                    // No page row yet for the selected device: its record's name.
+                    expect(overlay.statusLines(for: .overview, year: nil, clients: nil)
+                               == [c.gettingUsage.localized("Studio Mac")],
+                           "DR2B2 a selected device with no page row yet is in the line by the name on its peer record")
+                    fake.set { $0.holdCached = false }
+                    fake.releaseCached(2)
+                    _ = pump { !overlay.refreshing && !overlay.fetching }
+                    _ = settled()
+                    overlay.popoverClosed()
+                }
+
+                // Two devices with the same name and state stay two lines;
+                // one device on two pages is one line.
+                let twin = [row("lastGood", id: "aaaaaaaaaaaaaaaa", label: "Studio Mac", reason: "busy"),
+                            row("lastGood", id: "bbbbbbbbbbbbbbbb", label: "Studio Mac", reason: "busy")]
+                let twinLines = lines(twin)
+                expect(twinLines.count == 2 && twinLines[0] == twinLines[1]
+                           && lines(twin + twin).count == 2,
+                       "DR2B2 same name, same state, two device ids: two lines; the same id on two pages: one")
+
+                // The cost sentence: only with data and the flag.
+                let cost = c.costIncomplete.localized("Studio Mac")
+                expect(lines([row("fresh", label: "Studio Mac", incomplete: true)]) == [cost]
+                           && lines([row("lastGood", label: "Studio Mac", reason: "busy", incomplete: true)])
+                               == [c.busyData.localized("Studio Mac", Format.relativeTime(1_700_000_000, now: now)), cost]
+                           && lines([row("stale", label: "Studio Mac", incomplete: true)])
+                               == [c.stale.localized("Studio Mac"), cost],
+                       "DR2B2 a device with data and costIncomplete gets the cost sentence, after its own state line")
+                expect(lines([row("fresh", label: "Studio Mac", incomplete: false)]).isEmpty
+                           && !lines([row("refused", label: "Studio Mac", reason: "stopped", incomplete: true)]).contains(cost)
+                           && !lines([row("unavailable", label: "Studio Mac", incomplete: true)]).contains(cost)
+                           && lines([row("fresh", label: "Studio Mac", incomplete: true)], inFlight: true) == [cost],
+                       "DR2B2 no cost sentence without the flag or without data; a fresh device's stays while another refresh runs")
+                expect(lines([row("fresh", id: "aaaaaaaaaaaaaaaa", label: "Studio Mac", incomplete: true),
+                              row("fresh", id: "aaaaaaaaaaaaaaaa", label: "Studio Mac", incomplete: false)]) == [cost],
+                       "DR2B2 one page saying the cost is incomplete is enough, once per device")
+
+                // The first-scan half-sentence: never answered AND in flight.
+                let first = c.gettingUsageFirstScan.localized("Studio Mac")
+                expect(lines([row("unavailable", label: "Studio Mac", answered: false)], inFlight: true) == [first]
+                           && lines([row("unavailable", label: "Studio Mac", answered: true)], inFlight: true)
+                               == [c.gettingUsage.localized("Studio Mac")]
+                           && lines([row("unavailable", label: "Studio Mac", answered: false)], inFlight: false)
+                               == [c.noDataYet.localized("Studio Mac")]
+                           && first != c.gettingUsage.localized("Studio Mac") && first.hasPrefix(c.gettingUsage.localized("Studio Mac")),
+                       "DR2B2 the first-scan half-sentence only when the device never answered and a fetch is in flight")
+
+                // everAnswered is combined over all of a device's rows: Graph
+                // answered (fresh) while Models is still pending and unanswered.
+                let plain = c.gettingUsage.localized("Studio Mac")
+                expect(lines([row("fresh", label: "Studio Mac", answered: true),
+                              row("unavailable", label: "Studio Mac", answered: false)], inFlight: true) == [plain]
+                           && lines([row("unavailable", label: "Studio Mac", answered: false),
+                                     row("fresh", label: "Studio Mac", answered: true)], inFlight: true) == [plain]
+                           && lines([row("fresh", label: "Studio Mac", answered: false),
+                                     row("unavailable", label: "Studio Mac", answered: false)], inFlight: true) == [first],
+                       "DR2B2 a device that answered on one page does not get the first-scan sentence for a page still pending; one that answered on none does")
+
+                // The menu button's text stays on one line and within its maximum width.
+                func width(_ title: String) -> CGFloat {
+                    NSHostingView(rootView: DeviceMenuTitle(title: title).fixedSize()).fittingSize.width
+                }
+                func plainWidth(_ title: String) -> CGFloat {
+                    NSHostingView(rootView: Text(verbatim: title).font(.caption.monospacedDigit())
+                        .foregroundStyle(.secondary).fixedSize()).fittingSize.width
+                }
+                let longName = String(repeating: "Studio Mac ", count: 11)
+                expect(width(longName) <= DeviceMenuTitle.maxWidth + 0.5 && plainWidth(longName) > DeviceMenuTitle.maxWidth * 2
+                           && width(longName) > DeviceMenuTitle.maxWidth - 20,
+                       "DR2B2 a 121-character name is cut to the button's maximum width, not as wide as the text")
+                expect(width("Studio Mac") == plainWidth("Studio Mac") && width("10.0.0.2:47000") == plainWidth("10.0.0.2:47000")
+                           && width("[::1]:47000") == plainWidth("[::1]:47000"),
+                       "DR2B2 short titles render at exactly their own width, as before")
+
+                // (D1) One function names a device: the newest name a page
+                // reported, over the peer list's, over the address. The peer
+                // list here has no name (the record gets one at the first pull,
+                // after the list was read); the page row has.
+                do {
+                    let fake = SA3DFakeSource()
+                    fake.set { $0.peers = .success([bare]); $0.remoteState = "lastGood"; $0.remoteReason = "busy"
+                        $0.remoteLabel = "Studio Mac" }
+                    let overlay = makeModel(fake, freshSuite()).deviceOverlay
+                    overlay.refreshPeers()
+                    _ = pump { overlay.selectablePeers.count == 1 }
+                    overlay.togglePeer(peerA)
+                    DeviceOverlayState.resetSingleFlightForTesting()
+                    let peerRow = overlay.selectablePeers[0]
+                    expect(overlay.displayName(of: peerRow) == address && overlay.learnedNames.isEmpty,
+                           "DR2B2 (D1) before any page, a device without a name on the peer list is its address")
+                    overlay.ensure(view: .overview, year: nil, clients: nil)
+                    _ = pump { overlay.graph?.data != nil && overlay.models?.data != nil }
+                    _ = settled()
+                    expect(overlay.displayName(of: peerRow) == "Studio Mac"
+                               && DeviceOverlayCopy.menuTitle(
+                                   selectedCount: 1, local: false, peerName: overlay.displayName(of: peerRow)) == "Studio Mac"
+                               && DeviceTotals.rows(devices: [row("fresh", label: address)], clientIds: [], names: overlay.learnedNames)[0].name
+                                   == "Studio Mac"
+                               && overlay.displayName(of: row("fresh", label: address)) == "Studio Mac",
+                           "DR2B2 (D1) once a page row has a name, the menu item, the menu title and the card all show it, though the peer list has none")
+                    // A year no page was loaded for: the line falls back to the
+                    // peer, by the learned name too.
+                    fake.set { $0.holdCached = true }
+                    overlay.ensure(view: .overview, year: "2000", clients: nil)
+                    _ = pump { fake.get(\.calls).count > 4 }
+                    expect(overlay.statusLines(for: .overview, year: "2000", clients: nil)
+                               == [c.gettingUsage.localized("Studio Mac")],
+                           "DR2B2 (D1) a device no page lists yet is in the status line by the learned name, not the peer list's address")
+                    fake.set { $0.holdCached = false }
+                    fake.releaseCached(2)
+                    _ = pump { !overlay.fetching }
+                    _ = settled()
+                    // A row with an older address-only label does not undo it.
+                    expect(DeviceOverlayCopy.statusLines(
+                               rows: [row("lastGood", label: address, reason: "busy")], peers: [], inFlight: true,
+                               retryPending: false, names: ["aaaaaaaaaaaaaaaa": "Studio Mac"], now: now)
+                               == [c.gettingUsage.localized("Studio Mac")],
+                           "DR2B2 (D1) a page row that still carries the address is named by the learned name in the status line")
+                    // The owner clears the name: the next page says so.
+                    fake.set { $0.remoteLabel = nil }
+                    overlay.manualRefresh()
+                    _ = pump { overlay.displayName(of: peerRow) == address }
+                    _ = settled()
+                    expect(overlay.displayName(of: peerRow) == address,
+                           "DR2B2 (D1) a later page row without a name drops the learned name")
+                    overlay.popoverClosed()
+                }
+
+                // Two overlapping peer reads: only the newest result is applied.
+                // A late, older list without a just-linked device must not drop
+                // it from the selection (it was already marked seen and would
+                // never be ticked again).
+                do {
+                    let fake = SA3DFakeSource()
+                    let suite = UserDefaults(suiteName: "com.nyanako.tokenbar.selftest.dr2b2-generation")!
+                    suite.removePersistentDomain(forName: "com.nyanako.tokenbar.selftest.dr2b2-generation")
+                    let overlay = makeModel(fake, suite).deviceOverlay
+                    let readA = overlay.beginPeersReadForTesting()
+                    let readB = overlay.beginPeersReadForTesting()
+                    overlay.deliverPeersForTesting(.success([bare]), generation: readB)
+                    let afterB = overlay.stored.peers
+                    overlay.deliverPeersForTesting(.success([]), generation: readA)
+                    expect(afterB == [peerA] && overlay.stored.peers == [peerA]
+                               && overlay.selectablePeers.map(\.producerStatic) == [peerA]
+                               && overlay.includesRemote,
+                           "DR2B2 an older peer read that finishes after a newer one is ignored: the new device stays listed and ticked")
+                    // Control: the newest read's own result still applies.
+                    let readC = overlay.beginPeersReadForTesting()
+                    overlay.deliverPeersForTesting(.success([]), generation: readC)
+                    expect(overlay.selectablePeers.isEmpty && overlay.stored.peers.isEmpty,
+                           "DR2B2 control: the newest peer read's list is applied, including one that drops a device")
+                    // And a read superseded before it returns is ignored too.
+                    let readD = overlay.beginPeersReadForTesting()
+                    _ = overlay.beginPeersReadForTesting()
+                    overlay.deliverPeersForTesting(.success([bare]), generation: readD)
+                    expect(overlay.selectablePeers.isEmpty,
+                           "DR2B2 a read that was superseded while still in flight is not applied")
+                    suite.removePersistentDomain(forName: "com.nyanako.tokenbar.selftest.dr2b2-generation")
+                }
+
+                // A model-level in-flight pass reads everAnswered from the page.
+                do {
+                    let fake = SA3DFakeSource()
+                    fake.set {
+                        $0.peers = .success([named]); $0.remoteState = "unavailable"
+                        $0.remoteLabel = "Studio Mac"; $0.remoteEverAnswered = false
+                    }
+                    let overlay = makeModel(fake, freshSuite()).deviceOverlay
+                    overlay.refreshPeers()
+                    _ = pump { overlay.selectablePeers.count == 1 }
+                    overlay.togglePeer(peerA)
+                    DeviceOverlayState.resetSingleFlightForTesting()
+                    overlay.ensure(view: .overview, year: nil, clients: nil)
+                    _ = pump { fake.get(\.refreshStarted) >= 1 }
+                    _ = settled()
+                    fake.set { $0.holdRefresh = true }
+                    overlay.manualRefresh()
+                    _ = pump { fake.get(\.refreshStarted) >= 3 }
+                    expect(overlay.refreshing
+                               && overlay.statusLines(for: .overview, year: nil, clients: nil) == [first],
+                           "DR2B2 in flight, a device whose page row says it never answered shows the first-scan sentence")
+                    fake.set { $0.holdRefresh = false; $0.remoteEverAnswered = true }
+                    fake.release()
+                    _ = pump { !overlay.refreshing }
+                    _ = settled()
+                    overlay.popoverClosed()
+                }
+
+                // The name is the owner's free text: never a format string,
+                // never a key, whatever it holds.
+                let hostile = "A%@ %d %lld\u{202E}B"
+                let hostileLines = [
+                    c.statusLine(row("lastGood", label: hostile, reason: "unreachable"), name: c.name(of: row("lastGood", label: hostile)),
+                                 inFlight: false, retryPending: false, now: now),
+                    c.statusLine(row("unavailable", label: hostile, answered: false), name: hostile,
+                                 inFlight: true, retryPending: false, now: now),
+                ] + lines([row("fresh", label: hostile, incomplete: true)])
+                expect(hostileLines.count == 3 && hostileLines.allSatisfy { $0.contains(hostile) },
+                       "DR2B2 a name with %@, %d and a bidi character appears literally in the status lines")
+                let hostilePeer = peer(peerA, label: hostile)
+                expect(c.name(of: hostilePeer) == hostile
+                           && c.menuTitle(selectedCount: 1, local: false, peerName: c.name(of: hostilePeer)) == hostile
+                           && DeviceTotals.rows(devices: [row("fresh", label: hostile)], clientIds: [])[0].name == hostile
+                           && DevicesSettingsView.nameLine(hostilePeer) == hostile
+                           && lines([], peers: [(id: "cccccccccccccccc", name: c.name(of: hostilePeer))])
+                               == [c.noDataYet.localized(hostile)],
+                       "DR2B2 the same name is shown unchanged by the menu, the card, the linked list and the fallback line")
+
+                // Copy: the approved zh-Hant sentences, and every new key
+                // resolves in both languages.
+                func zh(_ key: String, _ locale: String = "zh-Hant") -> String? {
+                    AppLanguage.localizedString(key, locale: locale, bundle: .tokenBarResources)
+                }
+                expect(zh(c.gettingUsageFirstScan) == "◌ 正在向 %@ 取得用量…首次需要掃描紀錄，約 1 分鐘"
+                           && zh(c.costIncomplete) == "%@ 的費用可能不完整（那台的價格資料不齊）。token 與訊息數已合計。"
+                           && zh(DevicesCopy.deviceNameHint) == "已連結的裝置會看到這個名稱。"
+                           && zh(DevicesCopy.scopeBody)?.contains("這台 Mac 的裝置名稱（有設定的話）也會送給已連結的裝置。") == true
+                           && DevicesCopy.scopeBody.contains("device name"),
+                       "DR2B2 the zh-Hant sentences are the approved copy")
+                expect([c.gettingUsageFirstScan, c.costIncomplete, DevicesCopy.deviceNameHint, DevicesCopy.scopeBody].allSatisfy { key in
+                           ["zh-Hant", "zh-Hans"].allSatisfy { zh(key, $0) != nil && zh(key, $0) != key }
+                       } && zh(c.costIncomplete, "zh-Hans")?.contains("%@") == true,
+                       "DR2B2 the new strings have zh-Hant and zh-Hans values")
             }
 
             // (7) The main menu has an Edit menu whose items carry the
@@ -24951,6 +25305,10 @@ final class SA3DFakeSource: UsageDataSource, @unchecked Sendable {
         var remoteState = "fresh"
         /// The device row's `reason` (DR-2a), over every page kind.
         var remoteReason: String?
+        /// The device row's `label` (DR-2b2); nil is the address.
+        var remoteLabel: String?
+        var remoteCostIncomplete = false
+        var remoteEverAnswered = true
         /// The page's `saturated` flag.
         var saturated = false
         /// A page kind's own device state, over `remoteState`.
@@ -25018,10 +25376,12 @@ final class SA3DFakeSource: UsageDataSource, @unchecked Sendable {
 
     private func devices(_ kind: String) -> String {
         let state = get(\.remoteStateByKind)[kind] ?? get(\.remoteState)
+        let label = String(decoding: try! JSONEncoder().encode(get(\.remoteLabel) ?? "10.0.0.2:47000"), as: UTF8.self)
         return """
         [{"id":"local","label":null,"state":"local","lastSuccessAt":null},
-         {"id":"aaaaaaaaaaaaaaaa","label":"10.0.0.2:47000","state":"\(state)","lastSuccessAt":1700000000,
-          "reason":\(get(\.remoteReason).map { "\"\($0)\"" } ?? "null")}]
+         {"id":"aaaaaaaaaaaaaaaa","label":\(label),"address":"10.0.0.2:47000","state":"\(state)","lastSuccessAt":1700000000,
+          "reason":\(get(\.remoteReason).map { "\"\($0)\"" } ?? "null"),
+          "costIncomplete":\(get(\.remoteCostIncomplete)),"everAnswered":\(get(\.remoteEverAnswered))}]
         """
     }
 

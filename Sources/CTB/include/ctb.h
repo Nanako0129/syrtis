@@ -406,7 +406,10 @@ char *tb_remote_pair_claim(const char *pair_url);
 // the agent was restarted on another identity meanwhile; nothing was written.
 char *tb_remote_pair_poll(int64_t handle);
 // [{producerStatic, fingerprint, nodeLabel?, host, port, createdAt, expiresAt,
-// state}]; host and port are the address on the claimed Pair URL.
+// state}]; host and port are the address on the claimed Pair URL; nodeLabel is
+// the name the producer last sent (the agent checked it; absent until its first
+// answer, and when it set none or one the agent refuses). It is the owner's
+// free text: display it only as data.
 char *tb_remote_peers(void);
 char *tb_remote_peer_remove(const char *producer_static);
 
@@ -417,9 +420,11 @@ char *tb_remote_peer_remove(const char *producer_static);
 // (this process's own zone; the core cannot check it, and another zone would
 // merge two zones' hour slots and dates); mode = "cached"
 // (no connection) or "refresh". Data = the existing payload plus
-// devices:[{id ("local" or the 16-hex fingerprint), label (host:port or null),
+// devices:[{id ("local" or the 16-hex fingerprint), label (a producer's row: the
+// name that producer sent, else its host:port; null on the local row),
 // state (local|fresh|lastGood|stale|unavailable|overLimit|refused|
-// invalidReply|incompatible), lastSuccessAt (Unix s or null)}] (an unreadable peer store
+// invalidReply|incompatible; incompatible is also the producer answering code 6,
+// a report schema other than this app's), lastSuccessAt (Unix s or null)}] (an unreadable peer store
 // adds {id:"peers", state:"unavailable"}), duplicateWarning, saturated,
 // remoteRangeLimited. Local only: the existing data plus those keys (a local-only
 // row has exactly the four fields above).
@@ -429,6 +434,12 @@ char *tb_remote_peer_remove(const char *producer_static);
 // device's part of the merged page as [{client, messages, tokens, costUsd}],
 // one per client, taken before the sum; null when none of it was merged and
 // on hourly and agents pages). The rows' totals add up to the page's totals.
+// Producers' rows (not the local one, not the unreadable-store one) also have
+// address (the record's host:port, always, whatever the name), costIncomplete
+// (true only when the body this page merged, fresh or cached, said the
+// producer's price table was missing or corrupt; false when no body was merged)
+// and everAnswered (the producer ever gave this receiver a body; read from the
+// receiver cache, so false again after the entry is evicted or removed).
 // Must never be written to the dashboard snapshot.
 char *tb_graph_devices(const char *year, const char *devices_json, const char *timezone,
                        const char *mode);

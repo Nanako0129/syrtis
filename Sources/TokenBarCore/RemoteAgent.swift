@@ -106,6 +106,9 @@ public struct RemotePaired: Decodable, Equatable, Sendable {
 public struct RemotePeer: Decodable, Equatable, Sendable {
     public let producerStatic: String
     public let fingerprint: String
+    /// The name the producer last sent (the agent has checked it; nil until
+    /// its first answer). Its owner's free text: display only as a format
+    /// argument or `Text(verbatim:)`.
     public let nodeLabel: String?
     /// The producer's address, from the offer this receiver claimed.
     public let host: String
@@ -147,6 +150,9 @@ public enum DeviceFetchMode: String, Sendable {
 /// this app run.
 public struct RemoteDevice: Decodable, Equatable, Sendable {
     public let id: String
+    /// What names the device on screen: the name its owner gave it, else its
+    /// `address`. The owner's free text: display it only as a format argument
+    /// or `Text(verbatim:)`, never as a localization key.
     public let label: String?
     public let state: String
     public let lastSuccessAt: Int64?
@@ -157,10 +163,21 @@ public struct RemoteDevice: Decodable, Equatable, Sendable {
     /// This device's part of the merged page, one entry per client; absent
     /// or null when none of it was merged (and on a page that carries none).
     public let totals: [DeviceClientTotal]?
+    /// The producer's `host:port` as stored when it was linked, whatever its
+    /// name. Absent on this Mac's row.
+    public let address: String?
+    /// The body this page merged for the device said its price table was
+    /// missing or corrupt, so its cost may be low. False when no body was
+    /// merged (and from a core that predates it).
+    public let costIncomplete: Bool
+    /// The device has ever answered this Mac. Absent (a core that predates
+    /// it) reads as true: no first-scan claim is made.
+    public let everAnswered: Bool
 
     public init(
         id: String, label: String?, state: String, lastSuccessAt: Int64?,
-        reason: String? = nil, totals: [DeviceClientTotal]? = nil
+        reason: String? = nil, totals: [DeviceClientTotal]? = nil,
+        address: String? = nil, costIncomplete: Bool = false, everAnswered: Bool = true
     ) {
         self.id = id
         self.label = label
@@ -168,6 +185,26 @@ public struct RemoteDevice: Decodable, Equatable, Sendable {
         self.lastSuccessAt = lastSuccessAt
         self.reason = reason
         self.totals = totals
+        self.address = address
+        self.costIncomplete = costIncomplete
+        self.everAnswered = everAnswered
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id, label, state, lastSuccessAt, reason, totals, address, costIncomplete, everAnswered
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(String.self, forKey: .id)
+        label = try c.decodeIfPresent(String.self, forKey: .label)
+        state = try c.decode(String.self, forKey: .state)
+        lastSuccessAt = try c.decodeIfPresent(Int64.self, forKey: .lastSuccessAt)
+        reason = try c.decodeIfPresent(String.self, forKey: .reason)
+        totals = try c.decodeIfPresent([DeviceClientTotal].self, forKey: .totals)
+        address = try c.decodeIfPresent(String.self, forKey: .address)
+        costIncomplete = try c.decodeIfPresent(Bool.self, forKey: .costIncomplete) ?? false
+        everAnswered = try c.decodeIfPresent(Bool.self, forKey: .everAnswered) ?? true
     }
 }
 

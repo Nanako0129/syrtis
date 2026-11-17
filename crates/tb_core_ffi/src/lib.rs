@@ -2248,8 +2248,8 @@ mod remote_ffi {
         })
     }
 
-    /// Data `[{producerStatic, fingerprint, nodeLabel, createdAt, expiresAt,
-    /// state}]`.
+    /// Data `[{producerStatic, fingerprint, nodeLabel, host, port, createdAt,
+    /// expiresAt, state}]`; `nodeLabel` is the name the producer last sent.
     #[no_mangle]
     pub extern "C" fn tb_remote_peers() -> *mut c_char {
         run("tb_remote_peers", || AGENT.peers())
