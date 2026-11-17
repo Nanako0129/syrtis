@@ -23111,10 +23111,16 @@ enum SelfTest {
                        "DR2B2 (D2) a successful link makes the dashboard read its peer list at once: the new device is listed and ticked")
                 let beforeRemove = dashSource.get(\.peerCalls)
                 dashSource.set { $0.peers = .success([]) }
+                // The link model lists the new device in its own refresh, which
+                // may land after `.linked` shows.
+                let listedForRemoval = pumpUntil { !linkModel.peers.isEmpty }
                 if let peer = linkModel.peers.first { run { await linkModel.removePeer(peer) } }
-                expect(pumpUntil { dashSource.get(\.peerCalls) > beforeRemove }
-                           && pumpUntil { dash.deviceOverlay.selectablePeers.isEmpty },
-                       "DR2B2 (D2) removing a linked device makes the dashboard read its peer list at once")
+                let readAfterRemove = pumpUntil { dashSource.get(\.peerCalls) > beforeRemove }
+                let emptiedAfterRemove = pumpUntil { dash.deviceOverlay.selectablePeers.isEmpty }
+                expect(listedForRemoval && readAfterRemove && emptiedAfterRemove,
+                       "DR2B2 (D2) removing a linked device makes the dashboard read its peer list at once"
+                           + " (listed \(listedForRemoval), read \(readAfterRemove), emptied \(emptiedAfterRemove),"
+                           + " manageError \(linkModel.manageError ?? "-"))")
                 let beforeOther = dashSource.get(\.peerCalls)
                 run { await linkModel.refresh() }
                 pumpFor(0.2)
@@ -24008,6 +24014,141 @@ enum SelfTest {
                            ["zh-Hant", "zh-Hans"].allSatisfy { zh(key, $0) != nil && zh(key, $0) != key }
                        },
                        "DR2A (7, e) the Edit menu titles have zh-Hant and zh-Hans values")
+            }
+
+            // DR-2c: the short status (dot + phrase, no name) in the menu, the
+            // per-device card and Settings.
+            do {
+                typealias C = DeviceOverlayCopy
+                let now = Date(timeIntervalSince1970: 1_700_000_000 + 300)
+                let age = Format.relativeTime(1_700_000_000, now: now)
+                let fp = "aaaaaaaaaaaaaaaa"
+                func row(_ state: String, reason: String? = nil, at: Int64? = 1_700_000_000, id: String = fp) -> RemoteDevice {
+                    RemoteDevice(id: id, label: "Studio Mac", state: state, lastSuccessAt: at, reason: reason)
+                }
+                func short(_ d: RemoteDevice?, selected: Bool = true, inFlight: Bool = false) -> (dot: C.ShortDot, text: String) {
+                    C.shortStatus(device: d, selected: selected, inFlight: inFlight, now: now)
+                }
+                // One case per row of the table, in its order.
+                let table: [(String, RemoteDevice?, Bool, Bool, C.ShortDot, String)] = [
+                    ("not selected wins over everything", row("fresh"), false, true, .grey, C.shortNotIncluded.localized),
+                    ("in flight", row("fresh"), true, true, .progress, C.shortUpdating.localized),
+                    ("fresh with time", row("fresh"), true, false, .green, C.shortConnectedAt.localized(age)),
+                    ("fresh without time", row("fresh", at: nil), true, false, .green, C.shortConnected.localized),
+                    ("stopped", row("lastGood", reason: "stopped"), true, false, .grey, C.shortStopped.localized),
+                    ("refused", row("refused"), true, false, .grey, C.shortRefused.localized),
+                    ("incompatible", row("incompatible"), true, false, .orange, C.shortIncompatible.localized),
+                    ("invalidReply", row("invalidReply"), true, false, .orange, C.shortUnusable.localized),
+                    ("overLimit", row("overLimit"), true, false, .orange, C.shortUnusable.localized),
+                    ("unreachable, lastGood with time", row("lastGood", reason: "unreachable"), true, false, .orange,
+                     C.shortUnreachable.localized(C.tailFrom.localized(age))),
+                    ("timeout, lastGood without time", row("lastGood", reason: "timeout", at: nil), true, false, .orange,
+                     C.shortUnreachable.localized(C.tailEarlier.localized)),
+                    ("unreachable, stale", row("stale", reason: "unreachable", at: nil), true, false, .orange,
+                     C.shortUnreachable.localized(C.tailEarlier.localized)),
+                    ("unreachable, no data", row("unavailable", reason: "unreachable", at: nil), true, false, .orange,
+                     C.shortUnreachable.localized(C.tailNone.localized)),
+                    ("busy, lastGood with time", row("lastGood", reason: "busy"), true, false, .orange,
+                     C.shortBusy.localized(C.tailFrom.localized(age))),
+                    ("busy, no data", row("unavailable", reason: "busy", at: nil), true, false, .orange,
+                     C.shortBusy.localized(C.tailNone.localized)),
+                    ("error, lastGood with time", row("lastGood", reason: "error"), true, false, .orange,
+                     C.shortError.localized(C.tailFrom.localized(age))),
+                    ("error, no data", row("unavailable", reason: "error", at: nil), true, false, .orange,
+                     C.shortError.localized(C.tailNone.localized)),
+                    ("stale without reason", row("stale", at: nil), true, false, .orange, C.shortEarlier.localized),
+                    ("lastGood without time or reason", row("lastGood", at: nil), true, false, .orange, C.shortEarlier.localized),
+                    ("lastGood with time, no reason", row("lastGood"), true, false, .orange, C.shortFrom.localized(age)),
+                    ("fresh, older than connectedFor", row("fresh", at: 1_700_000_000 - 600), true, false, .grey,
+                     C.shortFrom.localized(Format.relativeTime(1_700_000_000 - 600, now: now))),
+                    ("unavailable, no reason", row("unavailable", at: nil), true, false, .orange, C.shortNoData.localized),
+                    ("no row, selected", nil, true, false, .orange, C.shortNoData.localized),
+                    ("no row, in flight", nil, true, true, .progress, C.shortUpdating.localized),
+                ]
+                for (name, device, selected, inFlight, dot, text) in table {
+                    let got = short(device, selected: selected, inFlight: inFlight)
+                    expect(got.dot == dot && got.text == text, "DR2C shortStatus table: \(name) (got \(got.dot) \(got.text))")
+                }
+                // The three tails are three different phrases; the text never holds a name.
+                let tails = [C.tailFrom.localized(age), C.tailEarlier.localized, C.tailNone.localized]
+                expect(Set(tails).count == 3 && table.allSatisfy { !$0.5.contains("Studio Mac") },
+                       "DR2C the three tail variants differ and no phrase carries the device name")
+
+                // zh-Hant is the approved copy, and every new key has both Chinese values.
+                func zh(_ key: String, _ locale: String = "zh-Hant") -> String? {
+                    AppLanguage.localizedString(key, locale: locale, bundle: .tokenBarResources)
+                }
+                expect(zh(C.shortNotIncluded) == "未納入" && zh(C.shortUpdating) == "更新中…"
+                           && zh(C.shortConnectedAt) == "已連線 · %@更新" && zh(C.shortConnected) == "已連線"
+                           && zh(C.shortStopped) == "已停止分享" && zh(C.shortRefused) == "已拒絕 · 到設定的裝置查看"
+                           && zh(C.shortIncompatible) == "需要更新版本" && zh(C.shortUnusable) == "資料無法使用"
+                           && zh(C.shortUnreachable) == "連不上 · %@" && zh(C.shortBusy) == "暫時忙碌 · %@"
+                           && zh(C.shortError) == "無法回應 · %@" && zh(C.shortEarlier) == "顯示先前的資料"
+                           && zh(C.shortNoData) == "還沒有資料" && zh(C.tailFrom) == "顯示 %@的資料"
+                           && zh(C.tailEarlier) == "顯示先前的資料" && zh(C.tailNone) == "還沒有資料",
+                       "DR2C zh-Hant short statuses are the approved copy")
+                expect([C.shortNotIncluded, C.shortUpdating, C.shortConnectedAt, C.shortConnected, C.shortStopped,
+                        C.shortRefused, C.shortIncompatible, C.shortUnusable, C.shortUnreachable, C.shortBusy,
+                        C.shortError, C.shortEarlier, C.shortNoData, C.tailFrom, C.tailEarlier, C.tailNone].allSatisfy { key in
+                            C.all.contains(key) && ["zh-Hant", "zh-Hans"].allSatisfy { zh(key, $0) != nil && zh(key, $0) != key }
+                        },
+                       "DR2C every short-status key is in DeviceOverlayCopy.all with zh-Hant and zh-Hans values")
+
+                // Worst row: a device on two pages gets its worst non-fresh row, else its first.
+                let rows = [row("fresh"), row("lastGood", reason: "busy"), row("unavailable", reason: "unreachable", at: nil),
+                            row("fresh", id: "bbbbbbbbbbbbbbbb")]
+                expect(C.worstRow(id: fp, in: rows)?.state == "unavailable"
+                           && C.worstRow(id: fp, in: rows.reversed())?.state == "unavailable"
+                           && C.worstRow(id: "bbbbbbbbbbbbbbbb", in: rows)?.state == "fresh"
+                           && C.worstRow(id: "cccccccccccccccc", in: rows) == nil,
+                       "DR2C worst row: the least data wins, as in the status line")
+
+                // Menu, card and Settings read the same string for the same input.
+                let linked = peer(peerA)
+                let snap = DeviceOverlaySnapshot(
+                    rows: [row("fresh"), row("lastGood", reason: "unreachable")], selection: [fp: true], inFlight: false, names: [:])
+                let direct = short(C.worstRow(id: fp, in: snap.rows))
+                let menuText = snap.shortStatus(fingerprint: fp, now: now)
+                let cardText = short(snap.rows[1])
+                let settingsText = snap.settingsStatus(for: linked, now: now)
+                expect(menuText == direct && settingsText.map { $0 == direct } == true && cardText == direct
+                           && direct.text == C.shortUnreachable.localized(C.tailFrom.localized(age)),
+                       "DR2C menu, card and Settings obtain the identical (dot, text) for the same device input")
+                // Settings: nothing for a selected device without a result, nothing for one the dashboard
+                // does not offer; a device that is not selected still says so.
+                let none = DeviceOverlaySnapshot(rows: [], selection: [fp: true], inFlight: true, names: [:])
+                let out = DeviceOverlaySnapshot(rows: [], selection: [fp: false], inFlight: false, names: [:])
+                expect(none.settingsStatus(for: linked, now: now) == nil
+                           && DeviceOverlaySnapshot().settingsStatus(for: linked, now: now) == nil
+                           && out.settingsStatus(for: linked, now: now)?.text == C.shortNotIncluded.localized
+                           && none.shortStatus(fingerprint: fp, now: now).text == C.shortUpdating.localized,
+                       "DR2C Settings shows no status without a result for a selected device (no made-up state)")
+                // Settings and the menu name a device by the same rule.
+                expect(C.displayName(of: peer(peerA, label: "Old"), learned: [fp: "New"]) == "New"
+                           && C.displayName(of: peer(peerA, label: "Old"), learned: [:]) == "Old"
+                           && DevicesSettingsView.nameLine(peer(peerA, label: "Old"), learned: [fp: "New"]) == "New"
+                           && DevicesSettingsView.nameLine(peer(peerA)) == nil,
+                       "DR2C Settings uses the learned name first, like the menu")
+
+                // The overlay publishes what it learned to the model Settings observes.
+                do {
+                    let fake = SA3DFakeSource()
+                    fake.set { $0.peers = .success([linked]) }
+                    let overlay = makeModel(fake, freshSuite()).deviceOverlay
+                    overlay.refreshPeers()
+                    _ = pump { overlay.selectablePeers.count == 1 }
+                    overlay.togglePeer(peerA)
+                    DeviceOverlayState.resetSingleFlightForTesting()
+                    overlay.ensure(view: .overview, year: nil, clients: nil)
+                    _ = pump { overlay.graph?.data != nil && !overlay.fetching }
+                    let published = DevicesModel.shared.overlay
+                    expect(published == overlay.snapshot && published.selection[fp] == true
+                               && C.worstRow(id: fp, in: published.rows) != nil
+                               && published.settingsStatus(for: linked, now: now) != nil,
+                           "DR2C the overlay's result reaches DevicesModel.shared (what Settings reads)")
+                    _ = settled()
+                    overlay.popoverClosed()
+                }
             }
 
             // DR-2b2: the device's own name in the four places, the cost

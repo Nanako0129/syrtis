@@ -3021,17 +3021,22 @@ extension DeviceOverlayResult {
     /// Of the models overlay's own report.
     private(set) var modelsColors = ModelColorMap(report: nil)
 
-    @ObservationIgnored private var wanted: [DeviceOverlayKind: DeviceOverlayKey] = [:]
+    // Which pages count for the short status follows `wanted`, so a change
+    // here (another lens, the popover closing) is published even when it
+    // starts no fetch.
+    @ObservationIgnored private var wanted: [DeviceOverlayKind: DeviceOverlayKey] = [:] {
+        didSet { if wanted != oldValue { republishIfActive() } }
+    }
     /// Whether a refresh this model started has not finished (the process-wide
     /// guard below says whether any model has one). Observable: the header's
     /// refresh button spins and the status line says "getting usage" from it.
-    private(set) var refreshing = false
+    private(set) var refreshing = false { didSet { republishIfActive() } }
     /// Cached loads (this Mac's share is computed there, which can take a cold
     /// scan) that have not yet handed over to their refresh, and a refresh
     /// queued behind another in the process. Observable, with `refreshing`:
     /// until a lens's pages are fresh, "pending" is part of "in flight".
-    private(set) var cachedLoads = 0
-    private(set) var queuedRefresh = false
+    private(set) var cachedLoads = 0 { didSet { republishIfActive() } }
+    private(set) var queuedRefresh = false { didSet { republishIfActive() } }
     /// A refresh for the lens on screen is pending or running.
     var fetching: Bool { refreshing || cachedLoads > 0 || queuedRefresh }
     /// Bumped when the scan roots change: a refresh that began under an older
@@ -3159,7 +3164,38 @@ extension DeviceOverlayResult {
     private func selectionChanged() {
         persist()
         if !includesRemote { clearOverlays() }
+        publish()
     }
+
+    // MARK: Short status
+
+    /// What the three short-status places read: the rows of the pages held for
+    /// the lens on screen (every held page while none is wanted, as when the
+    /// popover is closed), who is selected, and whether a refresh is running.
+    var snapshot: DeviceOverlaySnapshot {
+        func rows<P>(_ slot: DeviceOverlaySlot<P>?, _ kind: DeviceOverlayKind) -> [RemoteDevice] {
+            guard let slot, wanted.isEmpty || wanted[kind] == slot.key else { return [] }
+            return slot.data?.devices ?? []
+        }
+        return DeviceOverlaySnapshot(
+            rows: rows(graph, .graph) + rows(models, .models) + rows(hourly, .hourly) + rows(agents, .agents),
+            selection: Dictionary(
+                selectablePeers.map { ($0.fingerprint, isSelected(peer: $0.producerStatic)) },
+                uniquingKeysWith: { first, _ in first }),
+            inFlight: fetching, names: learnedNames)
+    }
+
+    /// Whether this instance has ever published. The popover's does (on its
+    /// first result or selection change); the Settings window's own model
+    /// never fetches, so it must not overwrite what the popover published.
+    @ObservationIgnored private var publishes = false
+
+    private func publish() {
+        publishes = true
+        DevicesModel.shared.overlayChanged(snapshot)
+    }
+
+    private func republishIfActive() { if publishes { publish() } }
 
     private func persistSeen(_ seen: Set<String>) {
         seenPeers = seen
@@ -3184,6 +3220,7 @@ extension DeviceOverlayResult {
         statsMemo = nil
         refreshedAt = [:]
         cancelRetry()
+        republishIfActive()
     }
 
     // MARK: Peers
@@ -3249,6 +3286,7 @@ extension DeviceOverlayResult {
             selectablePeers = []
         }
         if !includesRemote { clearOverlays() }
+        republishIfActive()
     }
 
     // MARK: Fetching
@@ -3542,7 +3580,7 @@ extension DeviceOverlayResult {
     /// The one place a linked device's name is chosen: the newest name a page
     /// reported, else the peer list's, else its address.
     func displayName(of peer: RemotePeer) -> String {
-        learnedNames[peer.fingerprint] ?? DeviceOverlayCopy.name(of: peer)
+        DeviceOverlayCopy.displayName(of: peer, learned: learnedNames)
     }
 
     /// The same for a `devices` row.
@@ -3553,6 +3591,7 @@ extension DeviceOverlayResult {
     /// A cached miss changes nothing (a refresh follows); a refresh miss keeps
     /// the last good answer for this key and says so.
     private func store(_ result: Result<DeviceOverlayResult, Error>, for key: DeviceOverlayKey, mode: DeviceFetchMode) {
+        defer { publish() }
         switch result {
         case .success(let value):
             // A cached answer never replaces a page the slot already holds for

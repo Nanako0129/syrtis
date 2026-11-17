@@ -57,6 +57,25 @@ enum DeviceOverlayCopy {
     static let perDevice = "Per device"
     static let updatedAt = "Updated %@"
 
+    // DR-2c: the short status, one phrase per device (see `shortStatus`).
+    static let shortNotIncluded = "Not included"
+    static let shortUpdating = "Updating…"
+    static let shortConnectedAt = "Connected · updated %@"
+    static let shortConnected = "Connected"
+    static let shortStopped = "Stopped sharing"
+    static let shortRefused = "Refused · check Devices in Settings"
+    static let shortIncompatible = "Needs an update"
+    static let shortUnusable = "Data can't be used"
+    static let shortUnreachable = "Can't reach · %@"
+    static let shortBusy = "Busy for now · %@"
+    static let shortError = "Can't answer · %@"
+    static let shortEarlier = "Showing earlier data"
+    static let shortNoData = "No data yet"
+    static let shortFrom = "Showing data from %@"
+    static let tailFrom = "showing data from %@"
+    static let tailEarlier = "showing earlier data"
+    static let tailNone = "no data yet"
+
     static let all = [
         menuHelp, thisMac, deviceCount, otherDevices, loading, failedNoData, keptLast,
         modelsHidden, lastGood, stale, unavailable, overLimit, refused, invalidReply, incompatible,
@@ -64,6 +83,9 @@ enum DeviceOverlayCopy {
         gettingUsage, gettingUsageFirstScan, costIncomplete, unreachableData, unreachableNoData, busyData, busyDataRetry, busyNoData,
         busyNoDataRetry, stopped, errorData, errorNoData, noDataYet, combined, thisMacLive,
         quotaThisMacOnly, thisMacOnly, windowUsageThisMacOnly, perDevice, updatedAt,
+        shortNotIncluded, shortUpdating, shortConnectedAt, shortConnected, shortStopped, shortRefused,
+        shortIncompatible, shortUnusable, shortUnreachable, shortBusy, shortError, shortEarlier,
+        shortNoData, shortFrom, tailFrom, tailEarlier, tailNone,
     ]
 
     /// What names a device in a line: the label the core gave (the owner's
@@ -96,6 +118,81 @@ enum DeviceOverlayCopy {
     /// lines under the lens. The range note only when the page reports it.
     static func explanations(rangeLimited: Bool) -> [String] {
         [duplicate.localized] + (rangeLimited ? [Self.rangeLimited.localized] : [])
+    }
+
+    /// The dot in front of a short status. Never the only signal: the text
+    /// carries the state.
+    enum ShortDot: Equatable { case green, orange, grey, progress }
+
+    /// One device in one short phrase, no name: the single source for the
+    /// device menu, the per-device card and Settings → linked devices.
+    /// `device` is the device's row (the worst one when several pages list it;
+    /// see `worstRow`), nil when no page has listed it. The conditions are
+    /// tested in the order of the DR-2c table.
+    static func shortStatus(
+        device: RemoteDevice?, selected: Bool, inFlight: Bool, now: Date
+    ) -> (dot: ShortDot, text: String) {
+        if !selected { return (.grey, shortNotIncluded.localized) }
+        if inFlight { return (.progress, shortUpdating.localized) }
+        let at = device?.lastSuccessAt.flatMap { $0 >= 0 ? UInt64($0) : nil }
+        let state = device?.state
+        if state == "fresh" {
+            guard let at else { return (.green, shortConnected.localized) }
+            let age = Format.relativeTime(at, now: now)
+            // A fresh row older than two polls (the popover is closed, so
+            // nothing asks) no longer says the device is connected.
+            if now.timeIntervalSince1970 - Double(at) > connectedFor {
+                return (.grey, shortFrom.localized(age))
+            }
+            return (.green, shortConnectedAt.localized(age))
+        }
+        if device?.reason == "stopped" { return (.grey, shortStopped.localized) }
+        if state == "refused" { return (.grey, shortRefused.localized) }
+        if state == "incompatible" { return (.orange, shortIncompatible.localized) }
+        if state == "invalidReply" || state == "overLimit" { return (.orange, shortUnusable.localized) }
+        // Older data exists (lastGood, stale); how old is known only for a
+        // lastGood with a time.
+        let tail: String = {
+            switch state {
+            case "lastGood"?:
+                return at.map { tailFrom.localized(Format.relativeTime($0, now: now)) } ?? tailEarlier.localized
+            case "stale"?: return tailEarlier.localized
+            default: return tailNone.localized
+            }
+        }()
+        switch device?.reason {
+        case "unreachable"?, "timeout"?: return (.orange, shortUnreachable.localized(tail))
+        case "busy"?: return (.orange, shortBusy.localized(tail))
+        case "error"?: return (.orange, shortError.localized(tail))
+        default: break
+        }
+        if state == "lastGood", let at {
+            return (.orange, shortFrom.localized(Format.relativeTime(at, now: now)))
+        }
+        if state == "stale" || state == "lastGood" { return (.orange, shortEarlier.localized) }
+        return (.orange, shortNoData.localized)
+    }
+
+    /// How long a fresh answer still reads as "Connected": two polls of the
+    /// open popover (`DeviceOverlayState.remotePollSeconds`, 300 s). An older
+    /// answer means nothing is asking (the popover is closed) and the device's
+    /// state is not known.
+    static let connectedFor: TimeInterval = 600
+
+    /// Of the rows `rows` holds for device `id`, the one to describe: the
+    /// worst non-fresh one by `severity` (the status line's rule), else the
+    /// first row. Nil when no row is for `id`.
+    static func worstRow(id: String, in rows: [RemoteDevice]) -> RemoteDevice? {
+        let mine = rows.filter { $0.id == id }
+        let bad = mine.filter { $0.state != "fresh" }
+        return bad.min { (severity.firstIndex(of: $0.state) ?? 0) < (severity.firstIndex(of: $1.state) ?? 0) }
+            ?? mine.first
+    }
+
+    /// The name shown for a linked device: the newest name a page reported
+    /// (`learned`, by fingerprint), else the peer list's, else its address.
+    static func displayName(of peer: RemotePeer, learned: [String: String]) -> String {
+        learned[peer.fingerprint] ?? name(of: peer)
     }
 
     /// A producer's address as the core labels it: IPv6 hosts in brackets.
@@ -220,6 +317,98 @@ enum DeviceOverlayCopy {
     }
 }
 
+/// What the overlay knows about its devices, in the shape the three places
+/// that show a short status read it. The overlay publishes one to
+/// `DevicesModel.shared` so Settings (a separate window with a model of its
+/// own) shows what the dashboard last learned, and never anything of its own.
+struct DeviceOverlaySnapshot: Equatable {
+    /// The `devices` rows of the pages the overlay holds for the lens on screen.
+    var rows: [RemoteDevice] = []
+    /// Whether each listed device is selected, by fingerprint.
+    var selection: [String: Bool] = [:]
+    var inFlight = false
+    var names: [String: String] = [:]
+
+    func shortStatus(fingerprint: String, now: Date) -> (dot: DeviceOverlayCopy.ShortDot, text: String) {
+        DeviceOverlayCopy.shortStatus(
+            device: DeviceOverlayCopy.worstRow(id: fingerprint, in: rows),
+            selected: selection[fingerprint] ?? false, inFlight: inFlight, now: now)
+    }
+
+    /// Settings shows nothing for a device this process has no result for
+    /// (no state is made up), or one the dashboard does not offer.
+    func settingsStatus(
+        for peer: RemotePeer, now: Date
+    ) -> (dot: DeviceOverlayCopy.ShortDot, text: String)? {
+        guard let selected = selection[peer.fingerprint] else { return nil }
+        if selected, DeviceOverlayCopy.worstRow(id: peer.fingerprint, in: rows) == nil { return nil }
+        return shortStatus(fingerprint: peer.fingerprint, now: now)
+    }
+}
+
+/// A short status: a small dot, then the phrase. The dot is a symbol (filled
+/// for connected or trouble, hollow for not shown, dotted while updating) in
+/// the state's colour, hidden from accessibility.
+struct DeviceShortStatusView: View {
+    let status: (dot: DeviceOverlayCopy.ShortDot, text: String)
+    /// In a menu: AppKit draws a symbol as a template there and drops its
+    /// colour (seen on screen: every dot grey), so the dot is a drawn,
+    /// non-template image instead.
+    var inMenu = false
+
+    /// Side of the menu's drawn dot, the cap height of the menu's text.
+    private static let menuDotSide: CGFloat = 9
+
+    private static func menuDot(_ dot: DeviceOverlayCopy.ShortDot) -> NSImage {
+        let side = menuDotSide
+        let image = NSImage(size: NSSize(width: side, height: side), flipped: false) { rect in
+            let circle = NSBezierPath(ovalIn: rect.insetBy(dx: 1, dy: 1))
+            switch dot {
+            case .green: NSColor.systemGreen.setFill(); circle.fill()
+            case .orange: NSColor.systemOrange.setFill(); circle.fill()
+            case .grey, .progress:
+                NSColor.secondaryLabelColor.setStroke()
+                circle.lineWidth = 1
+                if dot == .progress { circle.setLineDash([1.5, 1.5], count: 2, phase: 0) }
+                circle.stroke()
+            }
+            return true
+        }
+        image.isTemplate = false
+        return image
+    }
+
+    /// Symbol and colour per dot. Orange is the colour of the other state
+    /// notices in Settings; grey is `.secondary`, so a device the lens leaves
+    /// out reads as quieter than one with trouble.
+    private var symbol: (name: String, color: Color) {
+        switch status.dot {
+        case .green: ("circle.fill", .green)
+        case .orange: ("circle.fill", .orange)
+        case .grey: ("circle", .secondary)
+        case .progress: ("circle.dotted", .secondary)
+        }
+    }
+
+    var body: some View {
+        // `Label` so a menu, which draws only a title and an icon, shows both.
+        Label {
+            Text(verbatim: status.text)
+        } icon: {
+            if inMenu {
+                Image(nsImage: Self.menuDot(status.dot)).accessibilityHidden(true)
+            } else {
+                Image(systemName: symbol.name)
+                    .foregroundStyle(symbol.color)
+                    .imageScale(.small)
+                    .accessibilityHidden(true)
+            }
+        }
+        .font(.caption2)
+        .foregroundStyle(.secondary)
+    }
+}
+
 /// The device menu's button text: one line, cut with an ellipsis past
 /// `maxWidth`. The title can be another device's own name (up to 128 bytes).
 struct DeviceMenuTitle: View {
@@ -280,6 +469,11 @@ struct DeviceSelectionMenu: View {
                         Text(verbatim: overlay.displayName(of: peer))
                     }
                     .disabled(!overlay.canToggle(local: false, peer: peer.producerStatic))
+                    // Under the name: a disabled row, the only second line a menu has.
+                    DeviceShortStatusView(
+                        status: overlay.snapshot.shortStatus(fingerprint: peer.fingerprint, now: Date()),
+                        inMenu: true)
+                        .disabled(true)
                 }
             } label: {
                 DeviceMenuTitle(title: title)
@@ -378,7 +572,9 @@ struct DeviceOverlayLens: View {
                                 payload: page.payload, clientIds: ids,
                                 turnClientIds: PopoverView.supportedTurnClients(ids),
                                 colors: localColors, onExpand: onExpand)
-                            DeviceTotalsCard(devices: page.devices, clientIds: ids, names: overlay.learnedNames)
+                            DeviceTotalsCard(
+                                devices: page.devices, clientIds: ids, names: overlay.learnedNames,
+                                statusRows: overlay.snapshot.rows, inFlight: overlay.fetching)
                         }
                     case .monthly:
                         VStack(spacing: Self.blockSpacing) {
@@ -386,7 +582,9 @@ struct DeviceOverlayLens: View {
                                 payload: page.payload, clientIds: ids,
                                 turnClientIds: PopoverView.supportedTurnClients(ids),
                                 colors: localColors, onExpand: onExpand)
-                            DeviceTotalsCard(devices: page.devices, clientIds: ids, names: overlay.learnedNames)
+                            DeviceTotalsCard(
+                                devices: page.devices, clientIds: ids, names: overlay.learnedNames,
+                                statusRows: overlay.snapshot.rows, inFlight: overlay.fetching)
                         }
                     default:
                         if let stats = overlay.stats(selecting: Set(ids)) {

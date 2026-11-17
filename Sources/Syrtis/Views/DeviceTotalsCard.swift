@@ -69,6 +69,12 @@ struct DeviceTotalsCard: View {
     let devices: [RemoteDevice]
     let clientIds: [String]
     var names: [String: String] = [:]
+    /// The rows the short status reads (`DeviceOverlaySnapshot.rows`: every
+    /// page of the lens on screen), so the card says what the menu and
+    /// Settings say; nil reads `devices`.
+    var statusRows: [RemoteDevice]?
+    /// Whether a refresh is running (`DeviceOverlayState.fetching`).
+    var inFlight = false
     var now: Date = Date()
 
     var body: some View {
@@ -82,9 +88,16 @@ struct DeviceTotalsCard: View {
                                 .font(.caption.weight(.medium))
                                 .lineLimit(1)
                                 .truncationMode(.middle)
-                            Text(verbatim: Self.detail(row, now: now))
+                            // The short status below carries the time for another device.
+                            Text(verbatim: Self.detail(row, now: now, showsUpdated: row.isLocal))
                                 .font(.caption2)
                                 .foregroundStyle(.secondary)
+                            // This Mac has no status; a listed device is a selected one.
+                            if !row.isLocal {
+                                DeviceShortStatusView(status: DeviceOverlayCopy.shortStatus(
+                                    device: DeviceOverlayCopy.worstRow(id: row.id, in: statusRows ?? devices), selected: true,
+                                    inFlight: inFlight, now: now))
+                            }
                         }
                         Spacer(minLength: 8)
                         Text(verbatim: row.cost.map(Format.usd) ?? "—")
@@ -99,7 +112,7 @@ struct DeviceTotalsCard: View {
     /// air keeps neighbouring rows from reading as one.
     private static let rowSpacing: CGFloat = 8
 
-    static func detail(_ row: DeviceTotals.Row, now: Date) -> String {
+    static func detail(_ row: DeviceTotals.Row, now: Date, showsUpdated: Bool = true) -> String {
         var parts: [String] = []
         if let messages = row.messages, let tokens = row.tokens {
             // Grouped like the Monthly rows: the same key, the same `.formatted()`.
@@ -108,7 +121,7 @@ struct DeviceTotalsCard: View {
         } else {
             parts.append("—")
         }
-        if let at = row.updatedAt, at >= 0 {
+        if showsUpdated, let at = row.updatedAt, at >= 0 {
             parts.append(DeviceOverlayCopy.updatedAt.localized(
                 Format.relativeTime(UInt64(at), now: now)))
         }
