@@ -764,7 +764,6 @@ enum DevicesCopy {
     static let revoke = "Revoke"
     static let revokeTitle = "Revoke access for %@?"
     static let revokeMessage = "That device can no longer read this Mac's usage."
-    static let expiresOn = "Expires %@"
     static let cancel = "Cancel"
 
     // (B) Scan scope
@@ -867,7 +866,7 @@ enum DevicesCopy {
         apply, unreachableLine, publicAddress, portRangeLine, nameTooLong, addressRefused,
         createInvitation, invitationReady, expiresIn, copy, copiedLine, cancelInvitation,
         offerNeedsSharing, offerNeedsAddress, requests, compareCode, approve, reject, approveEffect,
-        requestExpired, grantsHeader, revoke, revokeTitle, revokeMessage, expiresOn, cancel,
+        requestExpired, grantsHeader, revoke, revokeTitle, revokeMessage, cancel,
         scopeSection, scopeSummary, scopeBody, homeFolder, configFolder, dataFolder, addedFolders,
         excludedFolders, openCodeDatabases, clients, envRoots, scopeApprovedLine, needsApproval,
         approveScope, scopeChanged, linkedSection, linkedSummary, noLinked, remove, removeTitle,

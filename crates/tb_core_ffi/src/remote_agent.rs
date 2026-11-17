@@ -143,6 +143,11 @@ pub(crate) struct RemoteAgent {
     /// closes.
     #[cfg(test)]
     listen_pause: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    /// Test seam: runs after every `Runtime::pull` in [`Self::pull_peer`]
+    /// (counts the pulls; can revoke the grant between a code-2 refusal and
+    /// its Grant status).
+    #[cfg(test)]
+    pub(crate) after_pull: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 /// The process's agent, behind the `tb_remote_*` entry points.
@@ -731,11 +736,18 @@ impl RemoteAgent {
 
     /// `Runtime::pull` of one producer, under the agent's read lock for the
     /// whole fetch: other calls go on beside it, and a restart (write lock)
-    /// waits until it ends, so it never writes into a newer agent. A fresh pull stamps [`last_success_at`]. A refusal
-    /// with error code 2 (`CheckGrantStatus`) asks Grant status once and
-    /// stores the answer (`revoked` / `expired`: `PeerStore::set_state`;
-    /// `active`: `PeerStore::update_grant`); the pull is not retried. `None`:
-    /// no agent runs.
+    /// waits until it ends, so it never writes into a newer agent. A fresh
+    /// pull stamps [`last_success_at`]. A refusal with error code 2
+    /// (`CheckGrantStatus`) asks Grant status once and stores the answer
+    /// ([`check_grant`]). Only when that answer was `active` and stored
+    /// (`PeerStore::update_grant` succeeded) is the pull retried, once, with
+    /// the refreshed record, under the same read lock; the retry's result is
+    /// returned, a second code 2 included, as is. A code-2 refusal takes no
+    /// token from the producer's per-grant limit (`spec/report-peer-v1.md`,
+    /// "Limits"), so the retry is not refused as `busy` for it. Since DR-3a
+    /// every approval that revokes renumbers the other devices' grants, so
+    /// without the retry each of them showed "stopped" until the next poll.
+    /// `None`: no agent runs.
     pub(crate) fn pull_peer(
         &self,
         producer: &[u8; 32],
@@ -743,15 +755,28 @@ impl RemoteAgent {
     ) -> Option<Result<Fetched, PullError>> {
         let running = read(&self.running);
         let current = running.as_ref()?;
-        let result = current.agent.runtime().pull(producer, query);
-        match &result {
-            Ok(_) => {
-                if let Ok(now) = current.inputs.clock.os_now_seconds() {
-                    lock(&self.last_success).insert(last_success_key(producer, query), now);
+        let runtime = current.agent.runtime();
+        let pull = || {
+            let result = runtime.pull(producer, query);
+            #[cfg(test)]
+            {
+                let hook = lock(&self.after_pull).clone();
+                if let Some(hook) = hook {
+                    hook();
                 }
             }
-            Err(PullError::Fetch(FetchError::CheckGrantStatus)) => check_grant(current, producer),
-            Err(_) => {}
+            result
+        };
+        let mut result = pull();
+        if matches!(result, Err(PullError::Fetch(FetchError::CheckGrantStatus)))
+            && check_grant(current, producer)
+        {
+            result = pull();
+        }
+        if result.is_ok() {
+            if let Ok(now) = current.inputs.clock.os_now_seconds() {
+                lock(&self.last_success).insert(last_success_key(producer, query), now);
+            }
         }
         Some(result)
     }
@@ -812,22 +837,24 @@ fn last_success_key(producer: &[u8; 32], query: &ReportQuery) -> String {
 
 /// Deferred item (4): one Grant status request for the producer's record,
 /// built from that record (host, port, responder static), and the answer
-/// stored. Any failure changes nothing.
-fn check_grant(current: &Running, producer: &[u8; 32]) {
+/// stored. Any failure changes nothing. True only when the answer was
+/// `active` and `update_grant` stored it: the record now carries the
+/// grant's current `authEpoch`, so a pull is worth retrying.
+fn check_grant(current: &Running, producer: &[u8; 32]) -> bool {
     let runtime = current.agent.runtime();
     let Some(record) = runtime.peers().peers().ok().and_then(|peers| {
         peers
             .into_iter()
             .find(|peer| peer.responder_static == *producer)
     }) else {
-        return;
+        return false;
     };
     let Ok(identity) = runtime
         .store()
         .state()
         .and_then(|state| StaticKey::from_state(&state))
     else {
-        return;
+        return false;
     };
     let ledger = MemoryLedger::default();
     let client = PairingClient {
@@ -847,20 +874,28 @@ fn check_grant(current: &Running, producer: &[u8; 32]) {
         claimed_at: Duration::ZERO,
     };
     let Ok(answer) = client.grant_status(&claimed, record.grant_id) else {
-        return;
+        return false;
     };
     let peers = runtime.peers();
-    let _ = match answer.state {
-        GrantStatus::Revoked => peers.set_state(producer, &record.grant_id, PeerState::Revoked),
-        GrantStatus::Expired => peers.set_state(producer, &record.grant_id, PeerState::Expired),
-        GrantStatus::Active => peers.update_grant(
-            producer,
-            &record.grant_id,
-            answer.auth_epoch,
-            answer.source_scope_generation,
-            answer.expires_at_ms,
-        ),
-    };
+    match answer.state {
+        GrantStatus::Revoked => {
+            let _ = peers.set_state(producer, &record.grant_id, PeerState::Revoked);
+            false
+        }
+        GrantStatus::Expired => {
+            let _ = peers.set_state(producer, &record.grant_id, PeerState::Expired);
+            false
+        }
+        GrantStatus::Active => peers
+            .update_grant(
+                producer,
+                &record.grant_id,
+                answer.auth_epoch,
+                answer.source_scope_generation,
+                answer.expires_at_ms,
+            )
+            .is_ok(),
+    }
 }
 
 fn start_agent(inputs: &Inputs) -> Result<Agent, String> {

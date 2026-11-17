@@ -249,10 +249,7 @@ struct DevicesSettingsView: View {
         if !active.isEmpty {
             caption(DevicesCopy.grantsHeader)
             ForEach(active, id: \.grantId) { grant in
-                panel.row(grant.peerFingerprint) {
-                    Text(DevicesCopy.expiresOn.localized(Self.date(grant.expiresAt)))
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
+                panel.row(Self.grantLine(grant)) {
                     Button(DevicesCopy.revoke.localized) { revokeTarget = grant }
                         .controlSize(.small)
                 }
@@ -354,7 +351,7 @@ struct DevicesSettingsView: View {
                         DeviceShortStatusView(status: status).padding(.horizontal, 10)
                     }
                 }
-                panel.hint("\(peer.fingerprint) · " + DevicesCopy.expiresOn.localized(Self.date(peer.expiresAt)))
+                panel.hint(Self.fingerprintLine(peer))
                     .padding(.horizontal, 10)
             }
             caption(DevicesCopy.linkAnother)
@@ -464,10 +461,12 @@ struct DevicesSettingsView: View {
         paths.keys.sorted().flatMap { client in paths[client, default: []].map { "\(client): \($0)" } }
     }
 
-    static func date(_ unixMs: Int64) -> String {
-        Date(timeIntervalSince1970: TimeInterval(unixMs) / 1000)
-            .formatted(date: .abbreviated, time: .shortened)
-    }
+    /// The text of a "can access this Mac" row (beside Revoke) and the last
+    /// line of a linked device: the fingerprint only. DR-3b: a grant lasts
+    /// 100 years and access ends by revoke or re-pairing, so no expiry date
+    /// is shown (`expiresAt` is still decoded).
+    static func grantLine(_ grant: RemoteGrant) -> String { grant.peerFingerprint }
+    static func fingerprintLine(_ peer: RemotePeer) -> String { peer.fingerprint }
 
     static func remaining(until unixMs: Int64, now: Date) -> String {
         let seconds = max(0, Int((TimeInterval(unixMs) / 1000 - now.timeIntervalSince1970).rounded(.up)))
