@@ -139,8 +139,8 @@ enum DeviceOverlayCopy {
         if state == "fresh" {
             guard let at else { return (.green, shortConnected.localized) }
             let age = Format.relativeTime(at, now: now)
-            // A fresh row nobody has asked about for a while (the popover is
-            // closed, so nothing polls) no longer says the device is connected.
+            // A fresh row older than two polls (the popover is closed, so
+            // nothing asks) no longer says the device is connected.
             if now.timeIntervalSince1970 - Double(at) > connectedFor {
                 return (.grey, shortFrom.localized(age))
             }
@@ -173,9 +173,10 @@ enum DeviceOverlayCopy {
         return (.orange, shortNoData.localized)
     }
 
-    /// How long a fresh answer still reads as "Connected". The open popover
-    /// asks again every minute, so an answer ten minutes old means nothing is
-    /// asking (the popover is closed) and the device's state is not known.
+    /// How long a fresh answer still reads as "Connected": two polls of the
+    /// open popover (`DeviceOverlayState.remotePollSeconds`, 300 s). An older
+    /// answer means nothing is asking (the popover is closed) and the device's
+    /// state is not known.
     static let connectedFor: TimeInterval = 600
 
     /// Of the rows `rows` holds for device `id`, the one to describe: the
@@ -350,6 +351,32 @@ struct DeviceOverlaySnapshot: Equatable {
 /// the state's colour, hidden from accessibility.
 struct DeviceShortStatusView: View {
     let status: (dot: DeviceOverlayCopy.ShortDot, text: String)
+    /// In a menu: AppKit draws a symbol as a template there and drops its
+    /// colour (seen on screen: every dot grey), so the dot is a drawn,
+    /// non-template image instead.
+    var inMenu = false
+
+    /// Side of the menu's drawn dot, the cap height of the menu's text.
+    private static let menuDotSide: CGFloat = 9
+
+    private static func menuDot(_ dot: DeviceOverlayCopy.ShortDot) -> NSImage {
+        let side = menuDotSide
+        let image = NSImage(size: NSSize(width: side, height: side), flipped: false) { rect in
+            let circle = NSBezierPath(ovalIn: rect.insetBy(dx: 1, dy: 1))
+            switch dot {
+            case .green: NSColor.systemGreen.setFill(); circle.fill()
+            case .orange: NSColor.systemOrange.setFill(); circle.fill()
+            case .grey, .progress:
+                NSColor.secondaryLabelColor.setStroke()
+                circle.lineWidth = 1
+                if dot == .progress { circle.setLineDash([1.5, 1.5], count: 2, phase: 0) }
+                circle.stroke()
+            }
+            return true
+        }
+        image.isTemplate = false
+        return image
+    }
 
     /// Symbol and colour per dot. Orange is the colour of the other state
     /// notices in Settings; grey is `.secondary`, so a device the lens leaves
@@ -368,10 +395,14 @@ struct DeviceShortStatusView: View {
         Label {
             Text(verbatim: status.text)
         } icon: {
-            Image(systemName: symbol.name)
-                .foregroundStyle(symbol.color)
-                .imageScale(.small)
-                .accessibilityHidden(true)
+            if inMenu {
+                Image(nsImage: Self.menuDot(status.dot)).accessibilityHidden(true)
+            } else {
+                Image(systemName: symbol.name)
+                    .foregroundStyle(symbol.color)
+                    .imageScale(.small)
+                    .accessibilityHidden(true)
+            }
         }
         .font(.caption2)
         .foregroundStyle(.secondary)
@@ -440,7 +471,8 @@ struct DeviceSelectionMenu: View {
                     .disabled(!overlay.canToggle(local: false, peer: peer.producerStatic))
                     // Under the name: a disabled row, the only second line a menu has.
                     DeviceShortStatusView(
-                        status: overlay.snapshot.shortStatus(fingerprint: peer.fingerprint, now: Date()))
+                        status: overlay.snapshot.shortStatus(fingerprint: peer.fingerprint, now: Date()),
+                        inMenu: true)
                         .disabled(true)
                 }
             } label: {
