@@ -24203,6 +24203,26 @@ enum SelfTest {
                            && DevicesSettingsView.address(named) == "10.0.0.2:47000",
                        "DR2B2 linked devices: the name on its own line only when there is one; the address stays")
 
+                // DR-3b: grants last 100 years; neither list shows a date.
+                do {
+                    let grant = try! JSONDecoder().decode(RemoteGrant.self, from: Data(#"""
+                        {"grantId":"\#(String(repeating: "1", count: 32))","peerFingerprint":"0123456789abcdef",
+                         "createdAt":1,"expiresAt":4102444800000,"state":"active"}
+                        """#.utf8))
+                    let shown = Date(timeIntervalSince1970: 4_102_444_800).formatted(date: .abbreviated, time: .shortened)
+                    let texts = [DevicesSettingsView.grantLine(grant), DevicesSettingsView.fingerprintLine(named)]
+                    expect(texts == ["0123456789abcdef", String(peerA.prefix(16))]
+                               && texts.allSatisfy { !$0.contains(shown) && !$0.contains("Expires") && !$0.contains("到期") },
+                           "DR3B grant rows and linked-device rows show the fingerprint only, no expiry date")
+                    expect(!DevicesCopy.all.contains("Expires %@")
+                               && ["zh-Hant", "zh-Hans"].allSatisfy {
+                                   AppLanguage.localizedString("Expires %@", locale: $0, bundle: .tokenBarResources) == nil
+                                       // Control: the table itself is readable.
+                                       && AppLanguage.localizedString(DevicesCopy.revoke, locale: $0, bundle: .tokenBarResources) != nil
+                               },
+                           "DR3B the expiry copy key is gone from DevicesCopy.all and from both translations")
+                }
+
                 // The model wires the peer's name into the status line.
                 do {
                     let fake = SA3DFakeSource()

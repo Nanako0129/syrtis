@@ -772,13 +772,12 @@
 "Check that the other device shows the same code." = "請確認對方螢幕上的代碼相同。";
 "Approve" = "核准";
 "Reject" = "拒絕";
-"Approving lets that device read this Mac's usage totals in the approved scan scope for 30 days, until you revoke it or it expires." = "核准後，該裝置可以讀取這台 Mac 在已核准掃描範圍內的用量彙總，期限 30 天，直到你撤銷或到期為止。";
+"Approving lets that device read this Mac's usage totals in the approved scan scope until you revoke it." = "核准後，該裝置可以讀取這台 Mac 在已核准掃描範圍內的用量彙總，直到你撤銷為止。";
 "This request has expired." = "這個請求已經過期。";
 "Devices with access" = "可存取的裝置";
 "Revoke" = "撤銷";
 "Revoke access for %@?" = "要撤銷 %@ 的存取權嗎？";
 "That device can no longer read this Mac's usage." = "該裝置將無法再讀取這台 Mac 的用量。";
-"Expires %@" = "%@ 到期";
 "Scan scope" = "掃描範圍";
 "What sharing reads, and what it sends." = "分享會讀取哪些資料、送出哪些內容。";
 "Sharing sends usage totals: token counts, cost, message and turn counts, and duration, grouped by day and hour (with the time-zone offset) and by client, model, provider and agent name. Those names are sent exactly as recorded on this Mac. Conversation content is not sent, and there are no fields for file paths or accounts. This Mac's device name, if you set one, is also sent to the devices linked to it. Clients that a Syrtis update adds support for are included automatically." = "分享送出的是用量彙總：token 數、費用、訊息數與回合數，以及耗時，依日與小時（含時區位移）以及用戶端、模型、供應商與 agent 的名稱分組。這些名稱會照這台 Mac 上的紀錄原樣送出。不會送出對話內容，也沒有檔案路徑或帳號的欄位。這台 Mac 的裝置名稱（有設定的話）也會送給已連結的裝置。Syrtis 更新後新支援的用戶端會自動納入。";

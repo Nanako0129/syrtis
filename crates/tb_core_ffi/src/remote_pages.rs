@@ -3773,60 +3773,81 @@ mod tests {
         assert_eq!(day(&page, "2025-03-10")["tokenBreakdown"]["input"], 100);
     }
 
-    /// Deferred item (4): a refusal with code 2 after another grant's revoke
-    /// renumbered this one's `authEpoch` asks Grant status once (`active`)
-    /// and stores the new epoch; this call is `refused`, the next is fresh.
+    /// Counts `receiver`'s pulls in `pull_peer`; `then` runs after each one
+    /// with its 1-based number.
+    fn count_pulls(
+        receiver: &RemoteAgent,
+        then: impl Fn(usize) + Send + Sync + 'static,
+    ) -> Arc<AtomicUsize> {
+        let pulls = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&pulls);
+        *receiver.after_pull.lock().unwrap() = Some(Arc::new(move || {
+            then(counter.fetch_add(1, Ordering::SeqCst) + 1);
+        }));
+        pulls
+    }
+
+    /// The receiver's record of producer `ka`.
+    fn record_of(agent: &RemoteAgent, ka: &[u8; 32]) -> PeerRecord {
+        agent
+            .peer_records()
+            .unwrap()
+            .into_iter()
+            .find(|r| r.responder_static == *ka)
+            .unwrap()
+    }
+
+    /// DR-3b (a), (d): producer A with receivers R and O. O pairs again:
+    /// A's approval revokes O's older grant in the same commit (DR-3a), so
+    /// A lists exactly one active grant for O, and the revoke renumbers R's
+    /// `authEpoch`. R's next refresh is refused with code 2, asks Grant
+    /// status (`active`), stores the new epoch and pulls again once: the
+    /// page is `fresh` (with its time) on that same call, after two pulls.
+    /// Before DR-3b this call was `refused` and only the next was fresh.
     #[test]
-    fn check_grant_status_updates_the_record() {
-        if !in_child("check_grant_status_updates_the_record") {
+    fn a_re_pairing_elsewhere_is_fresh_on_the_next_pull() {
+        if !in_child("a_re_pairing_elsewhere_is_fresh_on_the_next_pull") {
             return;
         }
         let clock = TestClock::new();
-        let (a_home, r_home, s_home) = (TempHome::new(), TempHome::new(), TempHome::new());
+        let (a_home, r_home, o_home) = (TempHome::new(), TempHome::new(), TempHome::new());
         let context = crate::LocalSourceContext::for_home(PathBuf::from("/nonexistent-sa3b"));
         let a = producer(&a_home.0, &clock);
         let receiver = agent_at(&r_home.0, &clock);
-        let second = agent_at(&s_home.0, &clock);
+        let other = agent_at(&o_home.0, &clock);
         let ka = pair(&a, &receiver);
-        pair(&a, &second);
-        let epoch = |agent: &RemoteAgent| {
-            agent
-                .peer_records()
-                .unwrap()
-                .iter()
-                .find(|r| r.responder_static == ka)
-                .unwrap()
-                .auth_epoch
-        };
-        let before = epoch(&receiver);
-        let other = a
-            .grants()
-            .unwrap()
-            .as_array()
-            .unwrap()
+        pair(&a, &other);
+        let before = record_of(&receiver, &ka).auth_epoch;
+        let o_old = hex_encode(&record_of(&other, &ka).grant_id);
+        let grants = |agent: &RemoteAgent| agent.grants().unwrap().as_array().unwrap().clone();
+        let o_print = grants(&a)
             .iter()
-            .map(|g| g["grantId"].as_str().unwrap().to_owned())
-            .find(|id| {
-                let record = second.peer_records().unwrap();
-                hex_encode(&record[0].grant_id) == *id
+            .find(|g| g["grantId"] == o_old.as_str())
+            .unwrap()["peerFingerprint"]
+            .clone();
+
+        pair(&a, &other);
+        let o_new = hex_encode(&record_of(&other, &ka).grant_id);
+        assert_ne!(o_new, o_old);
+        let of_o: Vec<(String, String)> = grants(&a)
+            .iter()
+            .filter(|g| g["peerFingerprint"] == o_print)
+            .map(|g| {
+                (
+                    g["grantId"].as_str().unwrap().to_owned(),
+                    g["state"].as_str().unwrap().to_owned(),
+                )
             })
-            .unwrap();
-        a.revoke(&other).unwrap();
-        clock.advance(61);
-        let page = agents(&call(
-            &receiver,
-            &context,
-            false,
-            &[ka],
-            "UTC",
-            Mode::Refresh,
-        ))
-        .unwrap();
-        assert_eq!(states(&page), [(fingerprint(&ka), "refused".into())]);
-        assert!(
-            epoch(&receiver) > before,
-            "Grant status did not update the record"
+            .collect();
+        assert_eq!(
+            of_o.iter().filter(|(_, state)| state == "active").count(),
+            1,
+            "{of_o:?}"
         );
+        assert!(of_o.contains(&(o_new, "active".into())), "{of_o:?}");
+        assert!(of_o.contains(&(o_old, "revoked".into())), "{of_o:?}");
+
+        let pulls = count_pulls(&receiver, |_| {});
         clock.advance(61);
         let page = agents(&call(
             &receiver,
@@ -3838,6 +3859,55 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(states(&page), [(fingerprint(&ka), "fresh".into())]);
+        assert!(page["devices"][0]["lastSuccessAt"].is_i64());
+        assert_eq!(pulls.load(Ordering::SeqCst), 2, "one refusal, one retry");
+        assert!(
+            record_of(&receiver, &ka).auth_epoch > before,
+            "Grant status did not update the record"
+        );
+    }
+
+    /// DR-3b (c): a code-2 refusal whose Grant status answers `revoked` (A
+    /// revokes R's grant between R's pull and its Grant status, through the
+    /// test seam) stays `refused`, marks the record revoked and is not
+    /// retried: one pull.
+    #[test]
+    fn grant_status_revoked_is_refused_without_a_retry() {
+        if !in_child("grant_status_revoked_is_refused_without_a_retry") {
+            return;
+        }
+        let clock = TestClock::new();
+        let (a_home, r_home, o_home) = (TempHome::new(), TempHome::new(), TempHome::new());
+        let context = crate::LocalSourceContext::for_home(PathBuf::from("/nonexistent-sa3b"));
+        let a = producer(&a_home.0, &clock);
+        let receiver = agent_at(&r_home.0, &clock);
+        let other = agent_at(&o_home.0, &clock);
+        let ka = pair(&a, &receiver);
+        pair(&a, &other);
+        // Renumbers R's `authEpoch`: R's next pull is refused with code 2.
+        a.revoke(&hex_encode(&record_of(&other, &ka).grant_id))
+            .unwrap();
+        let r_grant = hex_encode(&record_of(&receiver, &ka).grant_id);
+        let producer = Arc::clone(&a);
+        let pulls = count_pulls(&receiver, move |n| {
+            if n == 1 {
+                producer.revoke(&r_grant).unwrap();
+            }
+        });
+        clock.advance(61);
+        let page = agents(&call(
+            &receiver,
+            &context,
+            false,
+            &[ka],
+            "UTC",
+            Mode::Refresh,
+        ))
+        .unwrap();
+        assert_eq!(states(&page), [(fingerprint(&ka), "refused".into())]);
+        assert_eq!(page["devices"][0]["reason"], "stopped");
+        assert_eq!(pulls.load(Ordering::SeqCst), 1, "retried");
+        assert_eq!(record_of(&receiver, &ka).state, PeerState::Revoked);
     }
 
     /// The producer's pricing copy older than an hour (by the dataset's own
