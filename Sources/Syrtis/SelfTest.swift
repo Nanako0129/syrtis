@@ -23121,6 +23121,43 @@ enum SelfTest {
                        "DR2B2 (D2) removing a linked device makes the dashboard read its peer list at once"
                            + " (listed \(listedForRemoval), read \(readAfterRemove), emptied \(emptiedAfterRemove),"
                            + " manageError \(linkModel.manageError ?? "-"))")
+                // A checked device whose grant stops (revoked) leaves the menu;
+                // linked again, it is checked again. One the user unchecked is not.
+                do {
+                    let relinkSuite = UserDefaults(suiteName: "com.nyanako.tokenbar.selftest.relink")!
+                    relinkSuite.removePersistentDomain(forName: "com.nyanako.tokenbar.selftest.relink")
+                    let source = SA3DFakeSource()
+                    func listed(_ state: String) -> RemotePeer {
+                        try! JSONDecoder().decode(RemotePeer.self, from: Data(#"""
+                            {"producerStatic":"\#(SA3CFakeClient.producerA)","fingerprint":"\#(SA3CFakeClient.fingerprintA)",
+                             "nodeLabel":null,"host":"10.0.0.2","port":47000,"createdAt":1,"expiresAt":4102444800000,"state":"\#(state)"}
+                            """#.utf8))
+                    }
+                    source.set { $0.peers = .success([listed("active")]) }
+                    let overlay = DashboardModel(
+                        cachesSnapshot: false, source: source, initialYear: nil, buildIdentity: nil,
+                        deviceDefaults: relinkSuite, peerNotifications: NotificationCenter()).deviceOverlay
+                    func reload(_ state: String) {
+                        source.set { $0.peers = .success([listed(state)]) }
+                        let before = source.get(\.peerCalls)
+                        overlay.refreshPeers()
+                        _ = pumpUntil { source.get(\.peerCalls) > before }
+                        pumpFor(0.1)
+                    }
+                    overlay.refreshPeers()
+                    let ticked = pumpUntil { overlay.includesRemote }
+                    reload("revoked")
+                    let gone = overlay.selectablePeers.isEmpty && !overlay.includesRemote
+                    reload("active")
+                    expect(ticked && gone && overlay.includesRemote,
+                           "FOLLOWUP a checked device that was revoked is checked again when it is linked again")
+                    overlay.togglePeer(SA3CFakeClient.producerA)
+                    let unticked = !overlay.includesRemote
+                    reload("revoked")
+                    reload("active")
+                    expect(unticked && overlay.selectablePeers.count == 1 && !overlay.includesRemote,
+                           "FOLLOWUP a device the user unchecked stays unchecked through a revoke and a new link")
+                }
                 let beforeOther = dashSource.get(\.peerCalls)
                 run { await linkModel.refresh() }
                 pumpFor(0.2)
