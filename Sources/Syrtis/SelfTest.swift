@@ -23137,12 +23137,11 @@ enum SelfTest {
                     let overlay = DashboardModel(
                         cachesSnapshot: false, source: source, initialYear: nil, buildIdentity: nil,
                         deviceDefaults: relinkSuite, peerNotifications: NotificationCenter()).deviceOverlay
+                    // Delivered through the seam: applied before the next line runs.
                     func reload(_ state: String) {
                         source.set { $0.peers = .success([listed(state)]) }
-                        let before = source.get(\.peerCalls)
-                        overlay.refreshPeers()
-                        _ = pumpUntil { source.get(\.peerCalls) > before }
-                        pumpFor(0.1)
+                        overlay.deliverPeersForTesting(
+                            .success([listed(state)]), generation: overlay.beginPeersReadForTesting())
                     }
                     overlay.refreshPeers()
                     let ticked = pumpUntil { overlay.includesRemote }
@@ -23157,6 +23156,20 @@ enum SelfTest {
                     reload("active")
                     expect(unticked && overlay.selectablePeers.count == 1 && !overlay.includesRemote,
                            "FOLLOWUP a device the user unchecked stays unchecked through a revoke and a new link")
+                    // A second instance (the Settings window's) loaded while the
+                    // device was still checked must not undo that.
+                    overlay.togglePeer(SA3CFakeClient.producerA)
+                    let stale = DashboardModel(
+                        cachesSnapshot: false, source: source, initialYear: nil, buildIdentity: nil,
+                        deviceDefaults: relinkSuite, peerNotifications: NotificationCenter()).deviceOverlay
+                    overlay.togglePeer(SA3CFakeClient.producerA)
+                    stale.deliverPeersForTesting(.success([listed("revoked")]), generation: stale.beginPeersReadForTesting())
+                    let fresh = DashboardModel(
+                        cachesSnapshot: false, source: source, initialYear: nil, buildIdentity: nil,
+                        deviceDefaults: relinkSuite, peerNotifications: NotificationCenter()).deviceOverlay
+                    fresh.deliverPeersForTesting(.success([listed("active")]), generation: fresh.beginPeersReadForTesting())
+                    expect(!fresh.includesRemote && fresh.selectablePeers.count == 1,
+                           "FOLLOWUP an instance loaded before the device was unchecked does not make it checked again")
                 }
                 let beforeOther = dashSource.get(\.peerCalls)
                 run { await linkModel.refresh() }

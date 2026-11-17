@@ -3290,8 +3290,17 @@ extension DeviceOverlayResult {
             let known = Set(selectablePeers.map(\.producerStatic))
             var kept = stored.peers.filter(known.contains)
             // Checked devices that are no longer active: forgotten as "seen",
-            // so they are checked again when they come back.
-            let dropped = stored.peers.filter { !known.contains($0) }
+            // so they are checked again when they come back. Read from what is
+            // persisted, not from this instance's copy: the Settings window
+            // has an instance of its own, loaded before the popover's last
+            // change, and a device unchecked there since must stay seen.
+            let persisted = defaults.data(forKey: Self.selectionKey)
+                .flatMap { try? JSONDecoder().decode(StoredDeviceSelection.self, from: $0) }
+            let dropped = (persisted ?? stored).peers.filter { !known.contains($0) }
+            if let data = defaults.data(forKey: Self.seenPeersKey),
+               let seen = try? JSONDecoder().decode([String].self, from: data) {
+                seenPeers = Set(seen)
+            }
             // A device never offered before is checked on arrival, once; the
             // first list after an upgrade only records what already exists.
             let ids = selectablePeers.map(\.producerStatic)
@@ -3300,7 +3309,9 @@ extension DeviceOverlayResult {
                 for id in ids where !next.contains(id) && kept.count < Self.maxSelectedPeers {
                     kept.append(id)
                 }
-                next.formUnion(ids)
+                // Seen once it is checked: a device the cap kept out is
+                // checked on a later list, when a slot is free.
+                next.formUnion(kept)
                 if next != seen { persistSeen(next) }
             } else {
                 persistSeen(Set(ids))
