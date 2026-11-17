@@ -196,7 +196,7 @@ Popover 的 Overview、Graph（Stats、Daily、Monthly）、Models、Hourly、Ag
 - Devices 頁的畫面、深淺色與「減少透明度」下的對比、關閉 Settings 視窗時是否觸發 `onDisappear`，以及與第二台機器的實際配對，都還沒有實機觀察；selftest 只驅動 model。
 - 四頁的裝置選擇還沒有畫面（`SA-3d`）；`refresh` 對真實網路（非 loopback）與真實 session 量的耗時沒有量測。
 - Grant status 回 `revoked`／`expired` 的分支只經程式閱讀：producer 對被撤銷或到期的 grant 直接回錯誤碼 3／4，測試做不出錯誤碼 2 之後又是 `revoked` 的時序。
-- 分享端完全沒有價格表、價格表無法解析、或 `timestamp` 在未來（時鐘偏差）時，它分享出去的 cost 為 0，接收端狀態列會說「費用可能不完整」（DR-2b，`costIncomplete`）。沒有提示的是 `Stale`（仍計價、可能落後）與價格表缺某個模型的價格（該模型 cost 為 0，診斷沒有這一種）。這句提示的畫面沒有實機看過。
+- 分享端完全沒有價格表、價格表無法解析、或 `timestamp` 在未來（時鐘偏差）時，不自帶 cost 的 client 分享出去的 cost 為 0，接收端狀態列會說「費用可能不完整」（DR-2b，`costIncomplete`）。沒有提示的是 `Stale`（仍計價、可能落後）與價格表缺某個模型的價格（該模型 cost 為 0，診斷沒有這一種）。這句提示的畫面沒有實機看過。
 - 選了 producer 時本機那一份每次重新掃描（不經 `GRAPH_CACHE`），比只選本機慢。
 
 ## 驗證
