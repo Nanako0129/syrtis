@@ -873,6 +873,7 @@
 "Can't answer · %@" = "無法回應 · %@";
 "Showing earlier data" = "顯示先前的資料";
 "No data yet" = "還沒有資料";
+"Showing data from %@" = "顯示 %@的資料";
 "showing data from %@" = "顯示 %@的資料";
 "showing earlier data" = "顯示先前的資料";
 "no data yet" = "還沒有資料";

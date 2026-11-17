@@ -901,6 +901,7 @@ struct PopoverView: View {
                         DeviceTotalsCard(
                             devices: page.devices, clientIds: overviewMerge?.clientIds ?? [],
                             names: model.deviceOverlay.learnedNames,
+                            statusRows: model.deviceOverlay.snapshot.rows,
                             inFlight: model.deviceOverlay.fetching)
                             .padding(.top, Self.totalsCardGap)
                     }

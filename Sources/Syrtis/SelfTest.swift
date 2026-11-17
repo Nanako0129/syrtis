@@ -23111,10 +23111,16 @@ enum SelfTest {
                        "DR2B2 (D2) a successful link makes the dashboard read its peer list at once: the new device is listed and ticked")
                 let beforeRemove = dashSource.get(\.peerCalls)
                 dashSource.set { $0.peers = .success([]) }
+                // The link model lists the new device in its own refresh, which
+                // may land after `.linked` shows.
+                let listedForRemoval = pumpUntil { !linkModel.peers.isEmpty }
                 if let peer = linkModel.peers.first { run { await linkModel.removePeer(peer) } }
-                expect(pumpUntil { dashSource.get(\.peerCalls) > beforeRemove }
-                           && pumpUntil { dash.deviceOverlay.selectablePeers.isEmpty },
-                       "DR2B2 (D2) removing a linked device makes the dashboard read its peer list at once")
+                let readAfterRemove = pumpUntil { dashSource.get(\.peerCalls) > beforeRemove }
+                let emptiedAfterRemove = pumpUntil { dash.deviceOverlay.selectablePeers.isEmpty }
+                expect(listedForRemoval && readAfterRemove && emptiedAfterRemove,
+                       "DR2B2 (D2) removing a linked device makes the dashboard read its peer list at once"
+                           + " (listed \(listedForRemoval), read \(readAfterRemove), emptied \(emptiedAfterRemove),"
+                           + " manageError \(linkModel.manageError ?? "-"))")
                 let beforeOther = dashSource.get(\.peerCalls)
                 run { await linkModel.refresh() }
                 pumpFor(0.2)
@@ -24052,6 +24058,9 @@ enum SelfTest {
                      C.shortError.localized(C.tailNone.localized)),
                     ("stale without reason", row("stale", at: nil), true, false, .orange, C.shortEarlier.localized),
                     ("lastGood without time or reason", row("lastGood", at: nil), true, false, .orange, C.shortEarlier.localized),
+                    ("lastGood with time, no reason", row("lastGood"), true, false, .orange, C.shortFrom.localized(age)),
+                    ("fresh, older than connectedFor", row("fresh", at: 1_700_000_000 - 600), true, false, .grey,
+                     C.shortFrom.localized(Format.relativeTime(1_700_000_000 - 600, now: now))),
                     ("unavailable, no reason", row("unavailable", at: nil), true, false, .orange, C.shortNoData.localized),
                     ("no row, selected", nil, true, false, .orange, C.shortNoData.localized),
                     ("no row, in flight", nil, true, true, .progress, C.shortUpdating.localized),

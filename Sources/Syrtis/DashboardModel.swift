@@ -3021,7 +3021,12 @@ extension DeviceOverlayResult {
     /// Of the models overlay's own report.
     private(set) var modelsColors = ModelColorMap(report: nil)
 
-    @ObservationIgnored private var wanted: [DeviceOverlayKind: DeviceOverlayKey] = [:]
+    // Which pages count for the short status follows `wanted`, so a change
+    // here (another lens, the popover closing) is published even when it
+    // starts no fetch.
+    @ObservationIgnored private var wanted: [DeviceOverlayKind: DeviceOverlayKey] = [:] {
+        didSet { if wanted != oldValue { republishIfActive() } }
+    }
     /// Whether a refresh this model started has not finished (the process-wide
     /// guard below says whether any model has one). Observable: the header's
     /// refresh button spins and the status line says "getting usage" from it.

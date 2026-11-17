@@ -71,6 +71,7 @@ enum DeviceOverlayCopy {
     static let shortError = "Can't answer · %@"
     static let shortEarlier = "Showing earlier data"
     static let shortNoData = "No data yet"
+    static let shortFrom = "Showing data from %@"
     static let tailFrom = "showing data from %@"
     static let tailEarlier = "showing earlier data"
     static let tailNone = "no data yet"
@@ -84,7 +85,7 @@ enum DeviceOverlayCopy {
         quotaThisMacOnly, thisMacOnly, windowUsageThisMacOnly, perDevice, updatedAt,
         shortNotIncluded, shortUpdating, shortConnectedAt, shortConnected, shortStopped, shortRefused,
         shortIncompatible, shortUnusable, shortUnreachable, shortBusy, shortError, shortEarlier,
-        shortNoData, tailFrom, tailEarlier, tailNone,
+        shortNoData, shortFrom, tailFrom, tailEarlier, tailNone,
     ]
 
     /// What names a device in a line: the label the core gave (the owner's
@@ -136,8 +137,14 @@ enum DeviceOverlayCopy {
         let at = device?.lastSuccessAt.flatMap { $0 >= 0 ? UInt64($0) : nil }
         let state = device?.state
         if state == "fresh" {
-            return (.green, at.map { shortConnectedAt.localized(Format.relativeTime($0, now: now)) }
-                ?? shortConnected.localized)
+            guard let at else { return (.green, shortConnected.localized) }
+            let age = Format.relativeTime(at, now: now)
+            // A fresh row nobody has asked about for a while (the popover is
+            // closed, so nothing polls) no longer says the device is connected.
+            if now.timeIntervalSince1970 - Double(at) > connectedFor {
+                return (.grey, shortFrom.localized(age))
+            }
+            return (.green, shortConnectedAt.localized(age))
         }
         if device?.reason == "stopped" { return (.grey, shortStopped.localized) }
         if state == "refused" { return (.grey, shortRefused.localized) }
@@ -159,9 +166,17 @@ enum DeviceOverlayCopy {
         case "error"?: return (.orange, shortError.localized(tail))
         default: break
         }
+        if state == "lastGood", let at {
+            return (.orange, shortFrom.localized(Format.relativeTime(at, now: now)))
+        }
         if state == "stale" || state == "lastGood" { return (.orange, shortEarlier.localized) }
         return (.orange, shortNoData.localized)
     }
+
+    /// How long a fresh answer still reads as "Connected". The open popover
+    /// asks again every minute, so an answer ten minutes old means nothing is
+    /// asking (the popover is closed) and the device's state is not known.
+    static let connectedFor: TimeInterval = 600
 
     /// Of the rows `rows` holds for device `id`, the one to describe: the
     /// worst non-fresh one by `severity` (the status line's rule), else the
@@ -527,7 +542,7 @@ struct DeviceOverlayLens: View {
                                 colors: localColors, onExpand: onExpand)
                             DeviceTotalsCard(
                                 devices: page.devices, clientIds: ids, names: overlay.learnedNames,
-                                inFlight: overlay.fetching)
+                                statusRows: overlay.snapshot.rows, inFlight: overlay.fetching)
                         }
                     case .monthly:
                         VStack(spacing: Self.blockSpacing) {
@@ -537,7 +552,7 @@ struct DeviceOverlayLens: View {
                                 colors: localColors, onExpand: onExpand)
                             DeviceTotalsCard(
                                 devices: page.devices, clientIds: ids, names: overlay.learnedNames,
-                                inFlight: overlay.fetching)
+                                statusRows: overlay.snapshot.rows, inFlight: overlay.fetching)
                         }
                     default:
                         if let stats = overlay.stats(selecting: Set(ids)) {

@@ -69,6 +69,10 @@ struct DeviceTotalsCard: View {
     let devices: [RemoteDevice]
     let clientIds: [String]
     var names: [String: String] = [:]
+    /// The rows the short status reads (`DeviceOverlaySnapshot.rows`: every
+    /// page of the lens on screen), so the card says what the menu and
+    /// Settings say; nil reads `devices`.
+    var statusRows: [RemoteDevice]?
     /// Whether a refresh is running (`DeviceOverlayState.fetching`).
     var inFlight = false
     var now: Date = Date()
@@ -90,7 +94,7 @@ struct DeviceTotalsCard: View {
                             // This Mac has no status; a listed device is a selected one.
                             if !row.isLocal {
                                 DeviceShortStatusView(status: DeviceOverlayCopy.shortStatus(
-                                    device: devices.first { $0.id == row.id }, selected: true,
+                                    device: DeviceOverlayCopy.worstRow(id: row.id, in: statusRows ?? devices), selected: true,
                                     inFlight: inFlight, now: now))
                             }
                         }
