@@ -40,6 +40,13 @@ struct WindowUsageCard: View {
         } else if parts[1].hasPrefix(parts[0] + " "), parts[1].hasSuffix(" Limit"),
                   parts[1].count > parts[0].count + 1 + " Limit".count {
             bucket = String(parts[1].dropFirst(parts[0].count + 1).dropLast(" Limit".count))
+        } else if parts[1].hasSuffix(" Limit") {
+            // The local language-server summary names the bucket without
+            // "Remaining": "Gemini Models · Weekly Limit". Only the two known
+            // cadences are shortened; an unfamiliar bucket keeps its name.
+            let stripped = String(parts[1].dropLast(" Limit".count))
+            guard stripped == "Weekly" || stripped == "Five Hour" else { return label.localized }
+            bucket = stripped
         } else {
             return label.localized
         }

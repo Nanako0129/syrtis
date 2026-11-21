@@ -7,15 +7,17 @@
 //! 1. **Local IDE API (`cli`)** — when Antigravity is running, find its
 //!    `language_server` process (carrying a `--csrf_token`), discover its
 //!    listening ports with platform-native process tools, and call the local
-//!    Connect-RPC `GetUserStatus` over loopback TLS. Live, no token refresh,
-//!    no disk writes.
+//!    Connect-RPC `RetrieveUserQuotaSummary` and `GetUserStatus` over loopback
+//!    TLS. The summary carries the grouped weekly and family buckets; the
+//!    status carries the authenticated identity and the per-model fallback.
+//!    Live, no token refresh, no disk writes.
 //! 2. **OAuth remote (`oauth`)** — otherwise read the shared Google creds under
 //!    `GEMINI_CLI_HOME` (falling back to `~/.gemini`), refresh against Google
 //!    (client id/secret scanned from the installed Antigravity.app binary, with
 //!    the `agy` CLI as a fallback when the IDE is not installed), and
 //!    hit the `cloudcode-pa.googleapis.com` Code Assist quota endpoints.
 //!
-//! Both yield per-model "remaining fraction + reset" which map to `UsageWindow`s.
+//! Both yield "remaining fraction + reset" values which map to `UsageWindow`s.
 
 use crate::agent_account_scope::{
     self, AccountScope, AccountScopeError, AuthoritativeIdKind, HistoryScope, RefreshCheckpoint,
@@ -52,6 +54,12 @@ pub(crate) const ANTIGRAVITY_UNCONFIGURED_ERROR: &str =
 const ANTIGRAVITY_AUTH_EXPIRED: &str = "Antigravity Google auth expired. Re-login in Antigravity.";
 
 const LANG_SERVICE: &str = "/exa.language_server_pb.LanguageServerService/GetUserStatus";
+/// The local language server's grouped quota summary. `GetUserStatus` carries
+/// one `quotaInfo` per model (the visible 5-hour allowance); the weekly,
+/// Claude/GPT and Argon buckets live here. CodexBar reads the same method before
+/// falling back to model quotas (`AntigravityStatusProbe.fetchSnapshot`).
+const LANG_QUOTA_SUMMARY: &str =
+    "/exa.language_server_pb.LanguageServerService/RetrieveUserQuotaSummary";
 const CODE_ASSIST_BASE: &str = "https://cloudcode-pa.googleapis.com/v1internal";
 /// `retrieveUserQuotaSummary` only; see `code_assist_url`.
 const CODE_ASSIST_DAILY_BASE: &str = "https://daily-cloudcode-pa.googleapis.com/v1internal";
@@ -776,7 +784,7 @@ async fn fetch_local_ide(now: DateTime<Utc>) -> Result<Fetched, String> {
         .timeout(std::time::Duration::from_secs(8))
         .build()
         .map_err(|e| format!("build Antigravity local client: {e}"))?;
-    let body = json!({
+    let identity_body = json!({
         "metadata": {
             "ideName": "antigravity",
             "extensionName": "antigravity",
@@ -784,33 +792,19 @@ async fn fetch_local_ide(now: DateTime<Utc>) -> Result<Fetched, String> {
             "locale": "en",
         }
     });
+    let summary_body = json!({ "forceRefresh": true });
 
     let mut last_err = "Antigravity local IDE API not reachable".to_string();
     for (port, csrf) in local_api_candidates(processes) {
-        let url = format!("https://127.0.0.1:{port}{LANG_SERVICE}");
-        let resp = client
-            .post(&url)
-            .header("X-Codeium-Csrf-Token", &csrf)
-            .header("Connect-Protocol-Version", "1")
-            .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .json(&body)
-            .send()
-            .await;
-        let resp = match resp {
-            Ok(r) => r,
-            Err(e) => {
-                last_err = format!("local request failed: {e}");
-                continue;
-            }
-        };
-        if !resp.status().is_success() {
-            last_err = format!("local API returned {}", resp.status().as_u16());
-            continue;
-        }
-        let Ok(text) = resp.text().await else {
-            continue;
-        };
-        match parse_user_status(&text, now) {
+        // Both requests are needed: the summary normally supplies the windows,
+        // and GetUserStatus supplies the authenticated identity (or the model
+        // fallback when the summary is unavailable). They are loopback calls,
+        // so running them together keeps the route inside the client's budget.
+        let (summary, status) = tokio::join!(
+            local_post(&client, port, &csrf, LANG_QUOTA_SUMMARY, &summary_body),
+            local_post(&client, port, &csrf, LANG_SERVICE, &identity_body),
+        );
+        match local_quota_result(summary, status, now) {
             Ok(mut fetched) if !fetched.windows.is_empty() => {
                 fetched.account_scope = resolve_local_account_scope(fetched.identity.as_ref());
                 fetched.history_scope = resolve_local_history_scope(fetched.identity.as_ref());
@@ -822,11 +816,93 @@ async fn fetch_local_ide(now: DateTime<Utc>) -> Result<Fetched, String> {
                     .map(ProviderCacheBinding::primary);
                 return Ok(fetched);
             }
-            Ok(_) => last_err = "local API returned no model quotas".to_string(),
-            Err(e) => last_err = e,
+            Ok(_) => last_err = "local API returned no quota windows".to_string(),
+            Err(error) => last_err = error,
         }
     }
     Err(last_err)
+}
+
+/// One Connect-RPC POST to the Antigravity language server. The CSRF token and
+/// protocol headers are shared by `GetUserStatus`, `RetrieveUserQuotaSummary`
+/// and the extension-server candidates.
+async fn local_post(
+    client: &reqwest::Client,
+    port: u16,
+    csrf: &str,
+    path: &str,
+    body: &Value,
+) -> Result<String, String> {
+    let response = local_request(client, port, csrf, path, body)
+        .send()
+        .await
+        .map_err(|error| format!("local request failed: {error}"))?;
+    if !response.status().is_success() {
+        return Err(format!(
+            "local API returned {}",
+            response.status().as_u16()
+        ));
+    }
+    response
+        .text()
+        .await
+        .map_err(|error| format!("local response failed: {error}"))
+}
+
+fn local_request(
+    client: &reqwest::Client,
+    port: u16,
+    csrf: &str,
+    path: &str,
+    body: &Value,
+) -> reqwest::RequestBuilder {
+    client
+        .post(format!("https://127.0.0.1:{port}{path}"))
+        .header("X-Codeium-Csrf-Token", csrf)
+        .header("Connect-Protocol-Version", "1")
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .json(body)
+}
+
+/// The local route's windows. `RetrieveUserQuotaSummary` is the grouped view
+/// (one Gemini 5-hour and weekly bucket, one Claude/GPT pair, and Argon when
+/// the account has it); `GetUserStatus` supplies the authenticated identity
+/// and is also the fallback when the summary is unsupported or unusable. The
+/// summary wins because its groups are the shared pools: the per-model configs
+/// fold several effort variants (High/Medium/Low) onto one 5-hour bucket, which
+/// would otherwise render as duplicate bars.
+fn local_quota_result(
+    summary: Result<String, String>,
+    status: Result<String, String>,
+    now: DateTime<Utc>,
+) -> Result<Fetched, String> {
+    let summary_windows = summary.ok().and_then(|body| {
+        let windows = windows_from_quota_summary(&body, now);
+        (!windows.is_empty()).then_some(windows)
+    });
+    let status = status.and_then(|body| parse_user_status(&body, now));
+    match (summary_windows, status) {
+        (Some(windows), Ok(mut fetched)) => {
+            fetched.windows = windows;
+            Ok(fetched)
+        }
+        // A summary without an identity is still a usable card; the account
+        // scope stays untrusted, which is how every non-authoritative route
+        // already behaves.
+        (Some(windows), Err(_)) => Ok(Fetched {
+            agy_login_marker: None,
+            bound_account_key: None,
+            source: "cli".to_string(),
+            identity: None,
+            account_scope: Err(AccountScopeError::NoTrustedEvidence),
+            history_scope: Err(AccountScopeError::NoTrustedEvidence),
+            cache_binding: None,
+            windows,
+        }),
+        (None, Ok(fetched)) if !fetched.windows.is_empty() => Ok(fetched),
+        (None, Ok(_)) => Err("local API returned no model quotas".to_string()),
+        (None, Err(error)) => Err(error),
+    }
 }
 
 fn local_api_candidates(processes: Vec<(ProcInfo, Vec<u16>)>) -> Vec<(u16, String)> {
@@ -4491,6 +4567,188 @@ mod tests {
         assert_eq!(fetched.windows.len(), 1);
         assert_eq!(fetched.windows[0].label_for_test(), "Gemini 3 Pro");
         assert!((fetched.windows[0].remaining_for_test() - 42.0).abs() < 0.01);
+    }
+
+    /// The local IDE's three visible Gemini 3.8 Flash effort variants. They
+    /// share one 5-hour bucket, which is why the grouped summary must win.
+    fn local_user_status_with_effort_variants() -> String {
+        json!({
+            "userStatus": {
+                "email": "local@example.com",
+                "userTier": { "name": "Pro" },
+                "cascadeModelConfigData": {
+                    "clientModelConfigs": [
+                        {
+                            "label": "Gemini 3.8 Flash (High)",
+                            "modelOrAlias": { "model": "gemini-3.8-flash-high" },
+                            "quotaInfo": {
+                                "remainingFraction": 0.99,
+                                "resetTime": "2026-11-04T12:28:00Z"
+                            }
+                        },
+                        {
+                            "label": "Gemini 3.8 Flash (Medium)",
+                            "modelOrAlias": { "model": "gemini-3.8-flash" },
+                            "quotaInfo": {
+                                "remainingFraction": 0.99,
+                                "resetTime": "2026-11-04T12:28:00Z"
+                            }
+                        },
+                        {
+                            "label": "Gemini 3.8 Flash (Low)",
+                            "modelOrAlias": { "model": "gemini-3.8-flash-low" },
+                            "quotaInfo": {
+                                "remainingFraction": 0.99,
+                                "resetTime": "2026-11-04T12:28:00Z"
+                            }
+                        }
+                    ]
+                }
+            }
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn local_summary_replaces_per_model_effort_variants() {
+        let now = DateTime::parse_from_rfc3339("2026-11-04T08:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let fetched = local_quota_result(
+            Ok(three_group_summary().to_string()),
+            Ok(local_user_status_with_effort_variants()),
+            now,
+        )
+        .unwrap();
+
+        assert_eq!(fetched.source, "cli");
+        assert_eq!(
+            fetched.identity.as_ref().unwrap().email.as_deref(),
+            Some("local@example.com")
+        );
+        let keys: Vec<&str> = fetched
+            .windows
+            .iter()
+            .map(|window| window.pace_window_key_for_test().unwrap())
+            .collect();
+        assert_eq!(keys, THREE_GROUP_IDS);
+        assert!(fetched
+            .windows
+            .iter()
+            .any(|window| window.label_for_test().contains("Weekly")));
+        assert!(fetched
+            .windows
+            .iter()
+            .any(|window| window.label_for_test().contains("Gemini 4 Argon")));
+    }
+
+    #[test]
+    fn local_summary_survives_a_failed_identity_request() {
+        let now = DateTime::parse_from_rfc3339("2026-11-04T08:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let fetched = local_quota_result(
+            Ok(three_group_summary().to_string()),
+            Err("status failed".to_string()),
+            now,
+        )
+        .unwrap();
+
+        assert_eq!(fetched.source, "cli");
+        assert!(fetched.identity.is_none());
+        assert!(fetched.account_scope.is_err());
+        assert_eq!(fetched.windows.len(), 5);
+    }
+
+    #[test]
+    fn local_model_quotas_remain_the_fallback_when_the_summary_is_unusable() {
+        let now = DateTime::parse_from_rfc3339("2026-11-04T08:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        for summary in [
+            Err("summary unavailable".to_string()),
+            Ok("{}".to_string()),
+            Ok("not json".to_string()),
+        ] {
+            let fetched =
+                local_quota_result(summary, Ok(local_user_status_with_effort_variants()), now)
+                    .unwrap();
+
+            assert_eq!(
+                fetched.identity.as_ref().unwrap().email.as_deref(),
+                Some("local@example.com")
+            );
+            let keys: Vec<&str> = fetched
+                .windows
+                .iter()
+                .map(|window| window.pace_window_key_for_test().unwrap())
+                .collect();
+            assert_eq!(
+                keys,
+                [
+                    "model.gemini-3.8-flash-high.v1",
+                    "model.gemini-3.8-flash.v1",
+                    "model.gemini-3.8-flash-low.v1",
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn local_quota_summary_request_uses_the_language_server_path() {
+        let client = reqwest::Client::new();
+        let request = local_request(
+            &client,
+            43123,
+            "csrf-token",
+            LANG_QUOTA_SUMMARY,
+            &json!({ "forceRefresh": true }),
+        )
+        .build()
+        .unwrap();
+
+        assert_eq!(request.method(), reqwest::Method::POST);
+        assert_eq!(
+            request.url().as_str(),
+            "https://127.0.0.1:43123/exa.language_server_pb.LanguageServerService/RetrieveUserQuotaSummary"
+        );
+        assert_eq!(
+            request
+                .headers()
+                .get("X-Codeium-Csrf-Token")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "csrf-token"
+        );
+        assert_eq!(
+            request
+                .headers()
+                .get("Connect-Protocol-Version")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "1"
+        );
+        let body = request.body().unwrap().as_bytes().unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(body).unwrap(),
+            json!({ "forceRefresh": true })
+        );
+    }
+
+    #[test]
+    fn local_quota_result_reports_the_status_error_when_both_sources_fail() {
+        let now = DateTime::parse_from_rfc3339("2026-11-04T08:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let error = local_quota_result(
+            Err("summary 404".to_string()),
+            Err("status 500".to_string()),
+            now,
+        )
+        .unwrap_err();
+        assert_eq!(error, "status 500");
     }
 
     #[test]
