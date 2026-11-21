@@ -128,6 +128,172 @@ enum DiscordPresence {
         strictBool(wholeDollarsKey, defaults: defaults) ? .wholeDollars : .banded
     }
 
+    /// Opt-in: also count the other devices selected in the dashboard. Default
+    /// off, strict Bool, same reader as the other two switches.
+    static let includeDevicesKey = "tokenbar.discord.includeDevices"
+
+    static func includeDevices(defaults: UserDefaults = .standard) -> Bool {
+        strictBool(includeDevicesKey, defaults: defaults)
+    }
+
+    /// The peers the dashboard has selected (`tokenbar.dashboard.deviceSelection`,
+    /// JSON `{local, peers}`; the key is `DeviceOverlayState.selectionKey`):
+    /// deduplicated, sorted, at most the core's limit of 16. Missing or
+    /// undecodable means none. `local` is ignored on purpose: Discord always
+    /// counts this Mac.
+    /// Copies of `DeviceOverlayState.selectionKey` and `.maxSelectedPeers`
+    /// (main-actor isolated there, and this is nonisolated); a selftest pins
+    /// that they are equal.
+    static let dashboardSelectionKey = "tokenbar.dashboard.deviceSelection"
+    static let maxSelectedPeers = 16
+
+    static func selectedPeers(defaults: UserDefaults = .standard) -> [String] {
+        guard let data = defaults.data(forKey: dashboardSelectionKey),
+              let stored = try? JSONDecoder().decode(StoredDeviceSelection.self, from: data)
+        else { return [] }
+        return Array(Set(stored.peers).sorted().prefix(maxSelectedPeers))
+    }
+
+    /// Which graph Discord is built from, and when to ask the core for a merged
+    /// one. Pure: `AppDelegate` calls it and carries out its decision.
+    ///
+    /// Merging this Mac with other devices happens ONLY in the core
+    /// (`UsageDataSource.graphDevices`); nothing here adds or splices numbers.
+    /// The tray title, client trays and `lastGraph` never see `merged`.
+    enum DeviceMerge {
+        /// Same value as `DeviceOverlayState.remotePollSeconds`, for the same
+        /// reason: a producer grants a burst of 2 requests per grant and refills
+        /// one per 60 s.
+        static let refreshSeconds: TimeInterval = 300
+
+        struct State {
+            /// The merged `UsagePayload` only. The per-device rows are dropped:
+            /// their label and address are the other owner's free text.
+            var merged: UsagePayload?
+            /// The peers `merged` was fetched for.
+            var mergedPeers: [String] = []
+            var generation: UInt64 = 0
+            var lastRefresh: Date?
+            var inFlight = false
+            // The inputs last seen, so any change bumps `generation`.
+            var includeDevices = false
+            var discordOn = false
+            var peers: [String] = []
+        }
+
+        struct Call: Equatable {
+            let mode: DeviceFetchMode
+            /// Always `local: true`, whatever the dashboard's own tick says.
+            let selection: DeviceSelection
+            let generation: UInt64
+        }
+
+        struct Decision {
+            /// What Discord is built from this moment (never the tray's input).
+            let graph: UsagePayload?
+            let call: Call?
+            let state: State
+        }
+
+        /// Merge is wanted: switched on, this process may connect (the
+        /// `makeDiscordClient` gate) and at least one other device is selected.
+        static func active(includeDevices: Bool, canConnect: Bool, peers: [String]) -> Bool {
+            includeDevices && canConnect && !peers.isEmpty
+        }
+
+        /// The inputs moved: a new generation, and the old result goes now.
+        static func observe(
+            _ state: State, includeDevices: Bool, discordOn: Bool, peers: [String]
+        ) -> State {
+            var next = state
+            if includeDevices != state.includeDevices || discordOn != state.discordOn
+                || peers != state.peers {
+                next.generation &+= 1
+                next.merged = nil
+                next.mergedPeers = []
+            }
+            next.includeDevices = includeDevices
+            next.discordOn = discordOn
+            next.peers = peers
+            return next
+        }
+
+        /// A linked device was removed or re-paired: drop the result at once.
+        static func invalidate(_ state: State) -> State {
+            var next = state
+            next.generation &+= 1
+            next.merged = nil
+            next.mergedPeers = []
+            return next
+        }
+
+        /// The graph to publish from, re-checked against the conditions of
+        /// the moment of publishing.
+        static func graph(
+            local: UsagePayload?, state: State, includeDevices: Bool, canConnect: Bool,
+            peers: [String]
+        ) -> UsagePayload? {
+            guard active(includeDevices: includeDevices, canConnect: canConnect, peers: peers),
+                  let merged = state.merged, state.mergedPeers == peers
+            else { return local }
+            return merged
+        }
+
+        static func decide(
+            local: UsagePayload?, state: State, includeDevices: Bool, discordOn: Bool,
+            canConnect: Bool, peers: [String], panelOpen: Bool, now: Date
+        ) -> Decision {
+            var next = observe(
+                state, includeDevices: includeDevices, discordOn: discordOn, peers: peers)
+            let wanted = active(includeDevices: includeDevices, canConnect: canConnect, peers: peers)
+            if !wanted { next.merged = nil; next.mergedPeers = [] }
+            let used = graph(
+                local: local, state: next, includeDevices: includeDevices,
+                canConnect: canConnect, peers: peers)
+            // One call at a time; a tick that finds one running is skipped.
+            guard wanted, !next.inFlight else {
+                return Decision(graph: used, call: nil, state: next)
+            }
+            // `refresh` pulls every device and blocks: only while the panel is
+            // closed (the dashboard keeps last-good fresh while it is open) and
+            // only every `refreshSeconds`. Otherwise `cached`: this Mac
+            // recomputed, each device's last good, no connection.
+            let due = next.lastRefresh.map { now.timeIntervalSince($0) >= refreshSeconds } ?? true
+            let mode: DeviceFetchMode = (!panelOpen && due) ? .refresh : .cached
+            if mode == .refresh { next.lastRefresh = now }
+            next.inFlight = true
+            return Decision(
+                graph: used,
+                call: Call(
+                    mode: mode, selection: DeviceSelection(local: true, peers: peers),
+                    generation: next.generation),
+                state: next)
+        }
+
+        /// A call came back. A result from an older generation is dropped; a
+        /// failure keeps whatever was there.
+        static func arrived(_ state: State, call: Call, payload: UsagePayload?) -> State {
+            var next = state
+            next.inFlight = false
+            if let payload, call.generation == state.generation {
+                next.merged = payload
+                next.mergedPeers = call.selection.peers
+            }
+            return next
+        }
+
+        /// Which direction did the set of other devices on the profile move.
+        /// Removing one retires earlier queued work (it counted a device that
+        /// is no longer wanted); adding one does not.
+        static func visibility(
+            previous: (active: Bool, peers: [String]), current: (active: Bool, peers: [String])
+        ) -> DiscordIPC.VisibilityChange {
+            let before = previous.active ? Set(previous.peers) : []
+            let after = current.active ? Set(current.peers) : []
+            return before.isSubset(of: after) ? .none : .reducing
+        }
+    }
+
     /// What the presence may be built from. The case ORDER is the published
     /// order: the first selected component becomes `details` and the rest join
     /// into `state`, so the default set reproduces exactly what was published

@@ -272,6 +272,8 @@
 "Include the client name" = "包含用戶端名稱";
 "Include cost" = "包含花費";
 "Untick everything to show nothing." = "全部取消勾選就不會顯示任何內容。";
+"Include other devices selected in the dashboard" = "計入儀表板選的其他裝置";
+"Other devices' usage for today updates about every 5 minutes." = "其他裝置的今日用量約每 5 分鐘更新一次。";
 "Show cost as a figure instead of a range" = "以金額而非級距顯示花費";
 "A range is shared by many people. A whole-dollar amount says more about you." = "級距是很多人共用的區間；整數美元金額會透露更多關於你的資訊。";
 "Whichever client you used most" = "用量最高的用戶端";

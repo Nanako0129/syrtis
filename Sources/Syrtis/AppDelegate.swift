@@ -58,6 +58,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// poll, publishing the previous agent's figures for up to five minutes.
     private var lastSelection = DiscordPresence.ClientSelection.mostUsed
 
+    /// The merged graph for Discord (`includeDevices`), with its bookkeeping.
+    /// Only `discordGraph()` reads it; the tray title, client trays and
+    /// `lastGraph` never do. All decisions live in `DiscordPresence.DeviceMerge`.
+    private var discordMerge = DiscordPresence.DeviceMerge.State()
+    private var peersObserver: NSObjectProtocol?
+
     private static func readIntervalMin() -> Int {
         max(1, UserDefaults.standard.object(forKey: intervalKey).flatMap { $0 as? Int } ?? 30)
     }
@@ -196,6 +202,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         lastCostStyle = DiscordPresence.costStyle()
         lastComponents = DiscordPresence.components()
         lastSelection = DiscordPresence.selection()
+        // A linked device was removed or re-paired: the merged result may
+        // count it, so it goes now and what replaces it retires queued work.
+        peersObserver = NotificationCenter.default.addObserver(
+            forName: DevicesModel.peersChanged, object: nil, queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let self, self.discordMerge.merged != nil else { return }
+                self.discordMerge = DiscordPresence.DeviceMerge.invalidate(self.discordMerge)
+                self.applyDiscordPresence(visibility: .reducing)
+            }
+        }
         applyDiscordPresence()
     }
 
@@ -391,9 +408,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// `trayTotals` folds the very same stripes with. Nothing is published
     /// before the first graph arrives.
     private func discordPayload() -> DiscordPresence.Payload? {
-        guard let lastGraph else { return nil }
+        guard let graph = discordGraph() else { return nil }
         return DiscordPresence.payload(
-            graph: lastGraph,
+            graph: graph,
             hidden: ClientRegistry.hiddenTabClients(),
             today: Format.todayKey(),
             // Read here and passed down. `DiscordPresence` performs no
@@ -402,6 +419,63 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             costStyle: DiscordPresence.costStyle(),
             components: DiscordPresence.components(),
             selection: DiscordPresence.selection())
+    }
+
+    /// This process may open a Discord connection: the `makeDiscordClient`
+    /// gate (`mayConnect` is its only condition), without building a client.
+    private static func discordMayConnect() -> Bool {
+        DiscordPresence.mayConnect(
+            arguments: CommandLine.arguments, enabled: DiscordPresence.enabled())
+    }
+
+    /// The graph Discord is built from right now: the merged one only while
+    /// every condition still holds at this moment, else this Mac's `lastGraph`.
+    private func discordGraph() -> UsagePayload? {
+        DiscordPresence.DeviceMerge.graph(
+            local: lastGraph, state: discordMerge,
+            includeDevices: DiscordPresence.includeDevices(),
+            canConnect: Self.discordMayConnect(),
+            peers: DiscordPresence.selectedPeers())
+    }
+
+    /// Per tick: decide, then carry the decision out. The call runs on its own
+    /// thread (`refresh` blocks per device) and never delays the local path.
+    private func runDiscordMerge() {
+        let decision = DiscordPresence.DeviceMerge.decide(
+            local: lastGraph, state: discordMerge,
+            includeDevices: DiscordPresence.includeDevices(),
+            discordOn: DiscordPresence.enabled(),
+            canConnect: Self.discordMayConnect(),
+            peers: DiscordPresence.selectedPeers(),
+            panelOpen: statusController?.isPopoverShown ?? false, now: Date())
+        discordMerge = decision.state
+        guard let call = decision.call else { return }
+        let source = usageSource
+        Task { [weak self] in
+            // Only the `UsagePayload`: the device rows are the other owner's text.
+            let payload = await Self.onOwnThread {
+                try source.graphDevices(year: nil, selection: call.selection, mode: call.mode).payload
+            }
+            guard let self else { return }
+            self.discordMerge = DiscordPresence.DeviceMerge.arrived(
+                self.discordMerge, call: call, payload: try? payload.get())
+            // An addition: no retire. Coalesced when nothing changed.
+            self.applyDiscordPresence()
+        }
+    }
+
+    /// Runs `body` on a `Thread` of its own (copy of `DeviceOverlayState`'s
+    /// private helper): a device call can block for a fetch deadline.
+    nonisolated private static func onOwnThread<T: Sendable>(
+        _ body: @escaping @Sendable () throws -> T
+    ) async -> Result<T, Error> {
+        await withCheckedContinuation { continuation in
+            Thread {
+                do { continuation.resume(returning: .success(try body())) } catch {
+                    continuation.resume(returning: .failure(error))
+                }
+            }.start()
+        }
     }
 
     private func scheduleDefaultsApply() {
@@ -461,9 +535,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let previousComponents = self.lastComponents
             let selection = DiscordPresence.selection()
             let previousSelection = self.lastSelection
+            // Watched here: the toggle and the dashboard's selection (raw, so
+            // a write of either reaches this pass). Changing one bumps the
+            // merge generation and drops the merged result at once.
+            let includeDevices = DiscordPresence.includeDevices()
+            let peers = DiscordPresence.selectedPeers()
+            let previousMerge = self.discordMerge
+            let mergeActive = includeDevices && discordEnabled && !peers.isEmpty
+            let wasMergeActive = previousMerge.includeDevices && previousMerge.discordOn
+                && !previousMerge.peers.isEmpty
+            self.discordMerge = DiscordPresence.DeviceMerge.observe(
+                previousMerge, includeDevices: includeDevices, discordOn: discordEnabled,
+                peers: peers)
+            let mergeChanged = self.discordMerge.generation != previousMerge.generation
             if hiddenChanged || discordEnabled != self.lastDiscordEnabled
                 || costStyle != previousCostStyle || components != previousComponents
-                || selection != previousSelection {
+                || selection != previousSelection || mergeChanged {
                 // The classification decides only whether earlier queued work
                 // is stale, NOT how fast this reaches the wire. Every change
                 // waits out the publish floor; the Settings copy states that
@@ -473,7 +560,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 // merely being slow.
                 // Today's actual contributors, so a hide of a client with no
                 // usage today is not mistaken for taking something down.
-                let contributors = self.lastGraph.map { graph in
+                let contributors = self.discordGraph().map { graph in
                     Set(graph.contributions.last { $0.date == Format.todayKey() }?
                         .clients.map(\.client) ?? [])
                 }
@@ -490,6 +577,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     .combined(with: AppDelegate.selectionChange(
                         previous: previousSelection, current: selection,
                         hidden: ClientRegistry.hiddenTabClients(ClientRegistry.parseIdSet(hiddenRaw))))
+                    .combined(with: DiscordPresence.DeviceMerge.visibility(
+                        previous: (wasMergeActive, previousMerge.peers),
+                        current: (mergeActive, peers)))
                 self.lastDiscordEnabled = discordEnabled
                 self.lastCostStyle = costStyle
                 self.lastComponents = components
@@ -517,6 +607,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         titleRefreshTask?.cancel()
         trayAnimator?.stop()
         if let defaultsObserver { NotificationCenter.default.removeObserver(defaultsObserver) }
+        if let peersObserver { NotificationCenter.default.removeObserver(peersObserver) }
         // Remove the status item / close the popover so ControlCenter tears
         // the menu-bar item down cleanly (avoids the ~40s RunningBoard
         // "waiting on exit context" stall seen on the 2026-06-16 quit).
@@ -641,6 +732,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 }
                 guard !Task.isCancelled else { break }
                 self.applyMenuBarState()
+                // After the local path above, so it never waits on a device.
+                self.runDiscordMerge()
                 // Republish on the same cadence the tray title refreshes on.
                 // The client coalesces an unchanged payload, so a cycle that
                 // moved no numbers costs nothing on the wire.

@@ -32,7 +32,10 @@ final class StatusItemController: NSObject {
     /// it read mouseExited or an undocumented type there, not the click.)
     private var isShowingQuotaMenu = false
 
-    private var isShown: Bool { glassPanel?.isShown ?? popover.isShown }
+    /// Read-only: whether the panel (macOS 27+) or the popover is on screen.
+    /// `AppDelegate` passes it to the Discord merge decision, which pulls from
+    /// other devices only while this is false.
+    var isPopoverShown: Bool { glassPanel?.isShown ?? popover.isShown }
 
     override init() {
         let defaults = UserDefaults.standard
@@ -223,7 +226,7 @@ final class StatusItemController: NSObject {
     }
 
     func showPopover() {
-        guard !isShown else { return }
+        guard !isPopoverShown else { return }
         let current = persistedRoute()
         switch ClientTray.popoverAnchor(
             mainVisible: statusItem.isVisible,
@@ -273,7 +276,7 @@ final class StatusItemController: NSObject {
     }
 
     private func presentPopover(from button: NSStatusBarButton, identity: String) {
-        guard !isShown else { return }
+        guard !isPopoverShown else { return }
         // Reinstall the live PopoverView so its .task loops start fresh
         // (the previous close swapped it for a static placeholder).
         host?.rootView = liveRoot()
@@ -352,7 +355,7 @@ final class StatusItemController: NSObject {
             individualItemVisibility: clientStatusItems.values.map(\.isVisible))
         if statusItem.isVisible != shouldShow {
             // A popover anchored to the main item cannot stay on a hidden button.
-            if !shouldShow, isShown, popoverAnchorIdentity == "main" { closePopover() }
+            if !shouldShow, isPopoverShown, popoverAnchorIdentity == "main" { closePopover() }
             statusItem.isVisible = shouldShow
         }
         // A hidden main item keeps its frames but runs no frame timer; quota
@@ -475,7 +478,7 @@ final class StatusItemController: NSObject {
         defaultsObserver = nil
         if let closeObserver { NotificationCenter.default.removeObserver(closeObserver) }
         closeObserver = nil
-        if isShown { closePopover() }
+        if isPopoverShown { closePopover() }
         glassPanel?.tearDown()
         for clientId in Array(clientStatusItems.keys) {
             removeClientItem(clientId)
