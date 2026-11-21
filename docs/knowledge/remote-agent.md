@@ -61,7 +61,7 @@ flowchart LR
 - **啟動時機**：`ExtraScanRoots.apply` 的 completion，也就是 scan registry 裝好之後；sharing 依 agent 儲存的狀態（新 root 為關），listener 只在儲存過 `bindHost` 時啟動。
 - **輸入快照**：`tb_remote_start` 每次呼叫都在 agent 的鎖內重新讀取掃描輸入（`LocalSourceContext::scanner_settings`：extra scan roots、OpenCode DB、Cursor 接管），算出 `ownerInputsSha256`。與執行中的 agent 相同就不動作；不同就停止並以新輸入啟動，新輸入在 owner 核准前 `scopeApproved` 為 false，既有 grant 的報表請求被拒。
 - **觸發重算的 setter**：`tb_set_extra_scan_paths` 成功之後（`ClaudeExtraRoots.install`，涵蓋 Claude、Pi、DSH 的 roots）與 `tb_set_cursor_sync` 成功之後（`CursorSync.coreSetConfig`）。launch 之前這兩處不啟動 agent。
-- **週期重算**：沒有 setter 的輸入（手改 tokscale `settings.json` 的 `opencodeDbPaths`）由 monitor thread 負責。啟動時保存的那個輸入函式（同一個 home override、同一組來源）每個週期（產品 5 分鐘）再跑一次，與 `tb_remote_start` 走同一段 `ensure`：摘要相同不動作，不同就重啟，scope 隨之變成未核准。所以 owner 移除的資料庫最多再被分享一個週期。輸入無法再建立時（例如 override home 不再安全）agent 會被停止，不繼續以舊範圍服務。monitor 每個 `RemoteAgent` 一條、只持有弱參照，與 start 共用同一把鎖。monitor thread 開不起來時 start 會停掉剛啟動的 agent 並回 `internal`，不留下一個不會重算輸入的 agent。
+- **週期重算**：沒有 setter 的輸入（手改 tokscale `settings.json` 的 `opencodeDbPaths`）由 monitor thread 負責。啟動時保存的那個輸入函式（同一個 home override、同一組來源）每個週期（產品 5 分鐘）再跑一次，與 `tb_remote_start` 走同一段 `ensure`：摘要相同不動作，不同就重啟，scope 隨之變成未核准。所以 owner 移除的資料庫最多再被分享一個週期。輸入無法再建立時（例如 override home 不再安全）agent 會被停止，不繼續以舊範圍服務。monitor 每個 `RemoteAgent` 一條、只持有弱參照，與 start 共用同一把鎖。monitor thread 開不起來時 start 會停掉剛啟動的 agent 並回 `internal`，不留下一個不會重算輸入的 agent。monitor 的每個週期只有 `tick()` 包在 `catch_unwind` 裡：某一個週期 panic（例如輸入函式 panic）時 payload 直接丟棄、不記錄也不計數，下一個週期照常執行；沒有這層保護時 thread 會結束、`monitor` 旗標卻仍為真，之後的 start 不會再開新的 monitor，agent 會以舊 scope 一直分享下去，改過的掃描輸入與價格表都不再被處理（Windows 版相同）。`tick` 與其呼叫的鎖都經 `lock`／`read`／`write` 這幾個容忍 poison 的函式取得，持有寫鎖時 panic 不會讓之後的呼叫跟著 panic 或卡住。`tb_remote_start` 的錯誤與執行狀態：agent 執行中而輸入無法建立（`make()` 失敗，快路徑或寫鎖路徑都算）時，start 會像 `tick` 一樣先停掉執行中的 agent（寫鎖下取出、鎖外丟棄，同 `stop`）再回同一個錯誤類別，所以「因輸入失敗而回錯誤」就代表沒有 agent 在執行，不會出現回報停止、實際仍分享最多一個 monitor 週期的狀況。輸入沒變的快路徑上，讀取狀態（`status_of`）失敗是另一回事：多半是暫時的，也與輸入無關，start 回那個錯誤、執行中的 agent 維持原樣。
 - **停止**：`applicationWillTerminate` 在背景 queue 呼叫 `tb_remote_stop`，最多等 2 秒。
 - **失敗**：啟動失敗（另一個行程持有 root 的 owner lock、root 不安全）只回 error envelope，App 其他功能不依賴 agent。`RemoteAgentLaunch` 以 `remote-agent` 類別的 Logger 記下失敗：只有純字母的類別字串以 public 記錄，其他一律記固定訊息。
 
@@ -209,6 +209,10 @@ Popover 的 Overview、Graph（Stats、Daily、Monthly）、Models、Hourly、Ag
 - 待核准列下方的核准說明（`DevicesCopy.approveEffect`，三語）寫「直到你撤銷為止」，不再提 30 天與到期。它沒有說核准會結束同一台先前的 grant（使用者 2026-11-17 選了一句版）。
 - 分享端完全沒有價格表、價格表無法解析、或 `timestamp` 在未來（時鐘偏差）時，不自帶 cost 的 client 分享出去的 cost 為 0，接收端狀態列會說「費用可能不完整」（DR-2b，`costIncomplete`）。沒有提示的是 `Stale`（仍計價、可能落後）與價格表缺某個模型的價格（該模型 cost 為 0，診斷沒有這一種）。這句提示的畫面沒有實機看過。
 - 選了 producer 時本機那一份每次重新掃描（不經 `GRAPH_CACHE`），比只選本機慢。
+- 以下三項由同一次審查找到，這次變更刻意不處理：
+  - `grants()` 會把 `expires_at_ms` 已過、但尚未被壓縮清掉的 grant 列為 active，雖然它已經不能讀取。grant 期限是 100 年，實務上不會發生。
+  - `pair_claim` 在整個網路 claim 期間持有全域 claims mutex，所以連不上的 producer 會讓其他 claim 與 poll 延遲到它的 deadline；一個從未被 poll 的 claim 會一直留在記憶體。
+  - `pair_poll` 使用 agent 當下的身分，所以 agent 以另一個身分重啟後，poll 回報的是 transport 或 unauthorized 錯誤，而不是 `identityChanged`；不會寫入任何東西。
 
 ## 驗證
 
@@ -223,6 +227,8 @@ Popover 的 Overview、Graph（Stats、Daily、Monthly）、Models、Hourly、Ag
 | pricing 複製與週期更新 | `remote_agent::tests::pricing_is_copied_at_start_and_again_when_the_source_is_newer` |
 | panic 只回固定類別 | `remote_agent::tests::a_panic_is_the_fixed_class_without_its_text` |
 | monitor 開不起來時不留下執行中的 agent | `remote_agent::tests::a_monitor_that_cannot_start_stops_the_agent` |
+| 一個週期 panic 後 monitor 仍處理之後的輸入變更 | `remote_agent::tests::the_monitor_survives_a_panicking_period` |
+| 輸入失敗的 start 不留下執行中的 agent、埠不再接受連線 | `remote_agent::tests::a_start_whose_inputs_fail_stops_the_running_agent` |
 | poll 等待期間換 home 重啟：`identityChanged`、新 home 的 peer store 沒有紀錄 | `remote_agent::tests::a_poll_that_ends_after_a_restart_on_another_home_writes_nothing` |
 | 根目錄判定、selftest 走同一條 start 路徑（在 fixture 子行程裡，含 sentinel 檢查；fixture root 以 0700 獨佔建立）、真正的 root 在 selftest 前後「不存在」或「存在且修改時間相同」（只比對這兩項；偵測不到對其下既有檔案的讀取或修改） | SelfTest 的 `SA3A` 案例 |
 | 只選本機：四個新入口的 data 與既有函式逐 byte 相同 | `remote_pages::tests::local_only_is_the_existing_output_byte_for_byte` |

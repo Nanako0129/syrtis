@@ -230,19 +230,39 @@ impl RemoteAgent {
         // Unchanged inputs need no restart: answered under the read lock, so
         // a repeated start does not wait behind an in-flight pull. A running
         // agent always has its monitor (a start that cannot spawn one stops
-        // the agent it started).
-        {
+        // the agent it started). Inputs that cannot be built any more stop
+        // the running agent, as `tick` does: an error caused by the inputs
+        // leaves no agent running. An error from reading the status below is
+        // not about the inputs and leaves the agent as it was.
+        let inputs_failed = {
             let running = read(&self.running);
-            if let Some(current) = running.as_ref() {
-                let inputs = make()?;
-                if unchanged(current, &inputs) {
-                    *lock(&current.make) = make;
-                    return status_of(current);
-                }
+            match running.as_ref() {
+                Some(current) => match make() {
+                    Ok(inputs) if unchanged(current, &inputs) => {
+                        *lock(&current.make) = make;
+                        return status_of(current);
+                    }
+                    Ok(_) => None,
+                    Err(error) => Some(error),
+                },
+                None => None,
             }
+        };
+        if let Some(error) = inputs_failed {
+            // The old agent is dropped outside the write guard, as in `stop`.
+            let old = write(&self.running).take();
+            drop(old);
+            return Err(error);
         }
         let mut running = write(&self.running);
-        ensure(&mut running, make)?;
+        if let Err(error) = ensure(&mut running, make) {
+            // `make` failed (the agent is still there) or the new agent could
+            // not start (nothing is): either way none is left running.
+            let old = running.take();
+            drop(running);
+            drop(old);
+            return Err(error);
+        }
         let current = running.as_ref().ok_or("internal")?;
         let period = current.inputs.pricing_period;
         let status = status_of(current);
@@ -278,7 +298,13 @@ impl RemoteAgent {
             .spawn(move || loop {
                 thread::sleep(period);
                 match agent.upgrade() {
-                    Some(agent) => agent.tick(),
+                    // A panicking period must not end the monitor: the agent
+                    // would keep sharing under its old scope for good.
+                    Some(agent) => {
+                        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            agent.tick()
+                        }));
+                    }
                     None => break,
                 }
             });
@@ -2345,6 +2371,64 @@ mod tests {
             Err(PullError::Fetch(FetchError::Internal)),
             "the old grant must not read the scope the owner removed"
         );
+    }
+
+    /// A panic in one monitor period must not end the monitor: a later
+    /// input change is still noticed.
+    #[test]
+    fn the_monitor_survives_a_panicking_period() {
+        let clock = TestClock::new();
+        let home = TempHome::new();
+        let agent = Arc::new(RemoteAgent::default());
+        let settings = Arc::new(Mutex::new(ScannerSettings::default()));
+        let panic_next = Arc::new(AtomicBool::new(false));
+        let (path, time) = (home.0.clone(), Arc::clone(&clock));
+        let (shared, flag) = (Arc::clone(&settings), Arc::clone(&panic_next));
+        agent
+            .start(Arc::new(move || {
+                if flag.swap(false, Ordering::SeqCst) {
+                    panic!("injected inputs panic");
+                }
+                Ok(inputs(&path, &time, lock(&shared).clone()))
+            }))
+            .unwrap();
+        let before = epoch(&agent);
+        panic_next.store(true, Ordering::SeqCst);
+        let deadline = Instant::now() + PERIOD * 50;
+        while panic_next.load(Ordering::SeqCst) {
+            assert!(Instant::now() < deadline, "no period ran");
+            thread::sleep(PERIOD / 4);
+        }
+        assert_eq!(epoch(&agent), before);
+        // The owner changes a scan input after the panicked period.
+        *lock(&settings) = claude_root(&home);
+        let deadline = Instant::now() + PERIOD * 50;
+        while epoch(&agent) == before {
+            assert!(
+                Instant::now() < deadline,
+                "the monitor ended with the panic"
+            );
+            thread::sleep(PERIOD / 4);
+        }
+    }
+
+    /// An error caused by the inputs leaves no agent running, on the fast
+    /// path (running, `make` fails) as `tick` does.
+    #[test]
+    fn a_start_whose_inputs_fail_stops_the_running_agent() {
+        let clock = TestClock::new();
+        let home = TempHome::new();
+        let agent = Arc::new(RemoteAgent::default());
+        start(&agent, &home, &clock, ScannerSettings::default());
+        let port = free_port();
+        agent.listen_configure("127.0.0.1", port, None).unwrap();
+        assert!(listening(port));
+        assert_eq!(
+            agent.start(Arc::new(|| Err("invalid".into()))),
+            Err("invalid".into())
+        );
+        assert_eq!(agent.status(), Ok(json!({"running": false})));
+        assert!(!listening(port), "the stopped agent still accepts");
     }
 
     /// Review fix: a monitor that cannot be spawned leaves no agent running

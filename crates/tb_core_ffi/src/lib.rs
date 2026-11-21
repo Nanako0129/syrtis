@@ -2081,7 +2081,9 @@ mod remote_ffi {
     /// restarts with them, and the new inputs need the owner's scope approval.
     /// The same re-check runs every 5 minutes on its own (a hand edit of the
     /// tokscale `settings.json` has no setter). Success data is the
-    /// `tb_remote_status` object.
+    /// `tb_remote_status` object. An error caused by the inputs (they cannot
+    /// be built, or the new agent cannot start) leaves no agent running; an
+    /// error from reading the status leaves a running agent as it was.
     ///
     /// # Safety
     /// `home_override` must be NULL or a valid NUL-terminated UTF-8 string.
