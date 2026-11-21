@@ -762,7 +762,7 @@
 "Syrtis can't listen on this address." = "Syrtis 無法監聽這個位址。";
 "Create invitation" = "建立邀請";
 "Invitation ready. Copy it and paste it on the other device." = "邀請已建立。請複製後貼到另一台裝置上。";
-"Expires in %@" = "%@ 後過期";
+"Expires in %@" = "剩餘 %@";
 "Copy" = "複製";
 "Copied" = "已複製";
 "Cancel invitation" = "取消邀請";

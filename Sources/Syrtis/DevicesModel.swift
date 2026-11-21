@@ -545,11 +545,22 @@ final class DevicesModel: ObservableObject, CustomStringConvertible, CustomDebug
         decideError = nil
         deciding.insert(pendingId)
         defer { deciding.remove(pendingId) }
+        let shownOffer = offer?.offerId
         let result = await call {
             approve ? try $0.approve(pendingId: pendingId) : try $0.reject(pendingId: pendingId)
         }
-        if case .failure(let error) = result {
+        switch result {
+        case .failure(let error):
             decideError = error.reason == "expired" ? DevicesCopy.requestExpired : DevicesCopy.genericFailure
+        case .success:
+            // An invitation works once, and the approved request used the
+            // one shown: keeping it on screen would offer a dead link to copy.
+            // Only the one that was on screen when the approval began: an
+            // invitation created while the call ran is a new one and stays.
+            // ponytail: not matched to the request's own invitation (the
+            // pending row does not carry it); a second invitation made before
+            // the approval, while the first request waits, is cleared too.
+            if approve, let shownOffer, offer?.offerId == shownOffer { clearOffer() }
         }
         await refresh()
     }
