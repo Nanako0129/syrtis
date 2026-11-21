@@ -772,7 +772,7 @@
 "Check that the other device shows the same code." = "請確認對方螢幕上的代碼相同。";
 "Approve" = "核准";
 "Reject" = "拒絕";
-"Approving lets that device read this Mac's usage totals in the approved scan scope until you revoke it." = "核准後，該裝置可以讀取這台 Mac 在已核准掃描範圍內的用量彙總，直到你撤銷為止。";
+"Approving lets that device read this Mac's usage totals in the approved scan scope until you revoke it. That device may show them combined with its own, including on its Discord status." = "核准後，該裝置可以讀取這台 Mac 在已核准掃描範圍內的用量彙總，直到你撤銷為止。該裝置可能會把它與自己的用量合併顯示，包括顯示在它的 Discord 狀態上。";
 "This request has expired." = "這個請求已經過期。";
 "Devices with access" = "可存取的裝置";
 "Revoke" = "撤銷";
