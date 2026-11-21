@@ -1774,7 +1774,7 @@ dependencies = [
 [[package]]
 name = "syrtis-agent"
 version = "0.1.0"
-source = "git+https://github.com/Nanako0129/Syrtis-Agent?rev=f5e09711375097b44f6332cabe182ee056ec8e08#f5e09711375097b44f6332cabe182ee056ec8e08"
+source = "git+https://github.com/Nanako0129/Syrtis-Agent?rev=36ce38283d4972d30e2696e5725cf78a9fef59ad#36ce38283d4972d30e2696e5725cf78a9fef59ad"
 dependencies = [
  "hmac",
  "libc",
