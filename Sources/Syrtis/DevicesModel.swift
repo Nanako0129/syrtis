@@ -545,6 +545,7 @@ final class DevicesModel: ObservableObject, CustomStringConvertible, CustomDebug
         decideError = nil
         deciding.insert(pendingId)
         defer { deciding.remove(pendingId) }
+        let shownOffer = offer?.offerId
         let result = await call {
             approve ? try $0.approve(pendingId: pendingId) : try $0.reject(pendingId: pendingId)
         }
@@ -554,11 +555,12 @@ final class DevicesModel: ObservableObject, CustomStringConvertible, CustomDebug
         case .success:
             // An invitation works once, and the approved request used the
             // one shown: keeping it on screen would offer a dead link to copy.
+            // Only the one that was on screen when the approval began: an
+            // invitation created while the call ran is a new one and stays.
             // ponytail: not matched to the request's own invitation (the
-            // pending row does not carry it); a second invitation made while
-            // the first waits for approval is cleared too. Match by id if
-            // that ever matters.
-            if approve { clearOffer() }
+            // pending row does not carry it); a second invitation made before
+            // the approval, while the first request waits, is cleared too.
+            if approve, let shownOffer, offer?.offerId == shownOffer { clearOffer() }
         }
         await refresh()
     }
