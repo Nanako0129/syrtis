@@ -2526,10 +2526,15 @@ mod tests {
         let first_done = Arc::new(AtomicBool::new(false));
         let second_ran = Arc::new(AtomicBool::new(false));
         let second_ran_inside = Arc::new(AtomicBool::new(false));
+        let second_submitting = Arc::new(AtomicBool::new(false));
 
         let first = {
-            let (other, first_waiting, first_done) =
-                (Arc::clone(&other), Arc::clone(&first_waiting), Arc::clone(&first_done));
+            let (other, first_waiting, first_done, second_submitting) = (
+                Arc::clone(&other),
+                Arc::clone(&first_waiting),
+                Arc::clone(&first_done),
+                Arc::clone(&second_submitting),
+            );
             std::thread::spawn(move || {
                 assert_eq!(unsafe { pthread_set_qos_class_self_np(QOS_CLASS_UTILITY, 0) }, 0);
                 guarded("tb_graph", || {
@@ -2537,9 +2542,16 @@ mod tests {
                     other.install(|| {
                         *first_waiting.0.lock().unwrap() = true;
                         first_waiting.1.notify_all();
-                        // Long enough for the second entry to be submitted
-                        // while this worker waits.
-                        std::thread::sleep(Duration::from_millis(500));
+                        // Stay here until the second entry is on its way in,
+                        // then long enough for its submission to land while
+                        // this worker still waits.
+                        let deadline = Instant::now() + Duration::from_secs(10);
+                        while !second_submitting.load(Ordering::SeqCst)
+                            && Instant::now() < deadline
+                        {
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                        std::thread::sleep(Duration::from_millis(300));
                     });
                     first_done.store(true, Ordering::SeqCst);
                     std::ptr::null_mut()
@@ -2547,19 +2559,28 @@ mod tests {
             })
         };
         let second = {
-            let (first_waiting, first_done, second_ran, second_ran_inside) = (
+            let (first_waiting, first_done, second_ran, second_ran_inside, second_submitting) = (
                 Arc::clone(&first_waiting),
                 Arc::clone(&first_done),
                 Arc::clone(&second_ran),
                 Arc::clone(&second_ran_inside),
+                Arc::clone(&second_submitting),
             );
             std::thread::spawn(move || {
                 assert_eq!(unsafe { pthread_set_qos_class_self_np(QOS_CLASS_UTILITY, 0) }, 0);
-                let mut waiting = first_waiting.0.lock().unwrap();
-                while !*waiting {
-                    waiting = first_waiting.1.wait(waiting).unwrap();
-                }
+                // Bounded: a first entry that never reached the other pool
+                // (its own assertion failed) must fail this test, not hang it.
+                let (waiting, timed_out) = first_waiting
+                    .1
+                    .wait_timeout_while(
+                        first_waiting.0.lock().unwrap(),
+                        Duration::from_secs(10),
+                        |waiting| !*waiting,
+                    )
+                    .unwrap();
+                assert!(!timed_out.timed_out(), "the first entry never reached the other pool");
                 drop(waiting);
+                second_submitting.store(true, Ordering::SeqCst);
                 guarded("tb_graph", || {
                     second_ran.store(true, Ordering::SeqCst);
                     second_ran_inside.store(!first_done.load(Ordering::SeqCst), Ordering::SeqCst);
