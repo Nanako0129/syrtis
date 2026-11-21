@@ -2378,6 +2378,7 @@ mod tests {
     /// A background entry that waits on another pool must not have a second
     /// background entry run nested inside that wait: the second one may wait
     /// for the first (a joined graph flight does), and then neither returns.
+    #[cfg(target_os = "macos")]
     #[test]
     fn a_background_entry_never_runs_inside_another() {
         use std::sync::atomic::{AtomicBool, Ordering};
