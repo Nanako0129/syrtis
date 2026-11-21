@@ -548,8 +548,17 @@ final class DevicesModel: ObservableObject, CustomStringConvertible, CustomDebug
         let result = await call {
             approve ? try $0.approve(pendingId: pendingId) : try $0.reject(pendingId: pendingId)
         }
-        if case .failure(let error) = result {
+        switch result {
+        case .failure(let error):
             decideError = error.reason == "expired" ? DevicesCopy.requestExpired : DevicesCopy.genericFailure
+        case .success:
+            // An invitation works once, and the approved request used the
+            // one shown: keeping it on screen would offer a dead link to copy.
+            // ponytail: not matched to the request's own invitation (the
+            // pending row does not carry it); a second invitation made while
+            // the first waits for approval is cleared too. Match by id if
+            // that ever matters.
+            if approve { clearOffer() }
         }
         await refresh()
     }

@@ -23236,6 +23236,15 @@ enum SelfTest {
             if let shownRow { run { await model.decide(shownRow, approve: false) } }
             expect(fake.get(\.rejected) == ["p-shown"], "SA3C Reject sends the shown row's pendingId")
 
+            // (2d) An approved request used the invitation on screen: it is
+            // put away. A rejected one leaves it (control).
+            run { await model.createOffer() }
+            if let shownRow { run { await model.decide(shownRow, approve: false) } }
+            let keptAfterReject = model.offer != nil
+            if let shownRow { run { await model.decide(shownRow, approve: true) } }
+            expect(keptAfterReject && model.offer == nil,
+                   "DEVICES approving a request puts the shown invitation away; rejecting one keeps it")
+
             // (4) The listen menu.
             let choices = ListenAddress.choices(from: [
                 "0.0.0.0", "::", "192.168.1.20", "fe80::1%en0", "fe80::2", "127.0.0.1", "::1",

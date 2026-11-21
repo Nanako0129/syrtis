@@ -761,7 +761,7 @@
 "Syrtis can't listen on this address." = "Syrtis 无法监听这个地址。";
 "Create invitation" = "创建邀请";
 "Invitation ready. Copy it and paste it on the other device." = "邀请已创建。请复制后粘贴到另一台设备上。";
-"Expires in %@" = "%@ 后过期";
+"Expires in %@" = "剩余 %@";
 "Copy" = "复制";
 "Copied" = "已复制";
 "Cancel invitation" = "取消邀请";
