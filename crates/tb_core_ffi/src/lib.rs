@@ -925,22 +925,106 @@ fn graph_cached(year: &str, max_age: Duration) -> Option<serde_json::Value> {
     None
 }
 
-fn graph_compute(year: &str) -> Result<serde_json::Value, String> {
-    // Probe before parsing: a source write or topology change that lands
-    // mid-compute changes the token, so the next aged-out read recomputes
-    // rather than serving a graph that missed it. The probe and the scan each
-    // build their options, so each reads settings.json itself: an edit between
-    // them can leave a token older than the data, which only costs one extra
-    // recompute at the next probe (the token then differs).
+/// One engine graph, before mapping, with the facts its freshness is judged by.
+#[derive(Clone)]
+pub(crate) struct RawGraph {
+    pub at: Instant,
+    pub token: u64,
+    pub generation: u64,
+    pub graph: Arc<tokscale_core::GraphResult>,
+}
+
+/// (home, env roots allowed, year) → the last engine graph computed for it.
+type RawGraphKey = (Option<PathBuf>, bool, String);
+static RAW_GRAPHS: LazyLock<Mutex<HashMap<RawGraphKey, RawGraph>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// The engine's graph for `year`, computed at most once for every caller that
+/// asks while it is fresh: `tb_graph` and `tb_refresh_graph` (which map it) and
+/// the device pages (which fold remote records into a copy). Before this the
+/// device page computed its own on every call. On a machine with a 530 MB
+/// Claude message cache that was about 4.5 s of CPU per call, twice per popover
+/// open, beside the graph `tb_graph` was computing from the same files
+/// (sampled 2026-11-21).
+///
+/// Fresh means computed under the current root generation and either within
+/// `ONESHOT_MAX_AGE_SECS` or with an unchanged source token, the rule
+/// `graph_cached` applies to the mapped payload. `force` skips the check and
+/// computes, for `tb_refresh_graph`'s promise of a read that starts after the
+/// call. One compute runs at a time: a caller that arrives during one waits
+/// for the lock and then finds its result.
+pub(crate) fn raw_graph(
+    context: &LocalSourceContext,
+    year: &str,
+    force: bool,
+) -> Result<RawGraph, String> {
+    static ONE_COMPUTE: Mutex<()> = Mutex::new(());
+    let key: RawGraphKey = (
+        context.home_dir.clone(),
+        context.use_env_roots,
+        year.trim().to_string(),
+    );
+    let _one = ONE_COMPUTE.lock().unwrap_or_else(|p| p.into_inner());
     let generation = ROOT_GENERATION.load(Ordering::SeqCst);
-    let context = LocalSourceContext::current();
-    let token =
-        tokscale_core::local_source_change_token(&context.parse_options(None, None)).unwrap_or(0);
-    let data = usage_graph::run(&context, year)?;
+    // Probed before the parse, as `graph_compute` always did: a write that
+    // lands mid-compute changes the token, so the next aged-out read recomputes.
+    let mut token = None;
+    if !force {
+        let hit = RAW_GRAPHS
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(&key)
+            .filter(|hit| hit.generation == generation)
+            .cloned();
+        if let Some(mut hit) = hit {
+            if hit.at.elapsed() <= Duration::from_secs(ONESHOT_MAX_AGE_SECS) {
+                return Ok(hit);
+            }
+            token =
+                tokscale_core::local_source_change_token(&context.parse_options(None, None)).ok();
+            if token == Some(hit.token) {
+                hit.at = Instant::now();
+                publish_raw_graph(key, hit.clone());
+                return Ok(hit);
+            }
+        }
+    }
+    let token = token.unwrap_or_else(|| {
+        tokscale_core::local_source_change_token(&context.parse_options(None, None)).unwrap_or(0)
+    });
+    let fresh = RawGraph {
+        graph: Arc::new(usage_graph::compute(context, year)?),
+        at: Instant::now(),
+        token,
+        generation,
+    };
+    // The caller still gets this graph when the roots moved meanwhile; it
+    // answers a request made before the move and is not kept.
+    publish_raw_graph(key, fresh.clone());
+    Ok(fresh)
+}
+
+/// Keep `entry` unless the root registry moved since it was computed. The
+/// generation is read inside the lock `invalidate_scan_caches` clears under,
+/// for the reason `publish_graph` gives.
+fn publish_raw_graph(key: RawGraphKey, entry: RawGraph) -> bool {
+    let mut graphs = RAW_GRAPHS.lock().unwrap_or_else(|p| p.into_inner());
+    if ROOT_GENERATION.load(Ordering::SeqCst) != entry.generation {
+        return false;
+    }
+    graphs.insert(key, entry);
+    true
+}
+
+fn graph_compute(year: &str, force: bool) -> Result<serde_json::Value, String> {
+    let raw = raw_graph(&LocalSourceContext::current(), year, force)?;
+    let data = usage_graph::to_payload((*raw.graph).clone())?;
     // The caller still gets this payload even when `publish_graph` refuses it.
     // It answers a request made before the roots changed, and the next call
-    // recomputes rather than serving it again.
-    publish_graph(year, generation, (Instant::now(), token, data.clone()));
+    // recomputes rather than serving it again. Stamped with the time the graph
+    // was computed, not now: a graph a device page computed 20 s ago must not
+    // be served as the payload for another 30 s.
+    publish_graph(year, raw.generation, (raw.at, raw.token, data.clone()));
     Ok(data)
 }
 
@@ -965,7 +1049,7 @@ fn graph_shared(year: &str, join: bool) -> Result<serde_json::Value, String> {
         year,
         join,
         ROOT_GENERATION.load(Ordering::SeqCst),
-        || graph_compute(year),
+        || graph_compute(year, !join),
     )
 }
 
@@ -1813,6 +1897,12 @@ fn invalidate_scan_caches() {
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .clear();
+    // The engine graphs the payloads above are mapped from. Same clear, same
+    // lock discipline (`publish_raw_graph`).
+    RAW_GRAPHS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .clear();
     // Third cache, same reason as the graph: `window_usage::cached` serves any
     // entry younger than `ONESHOT_MAX_AGE_SECS` without probing the token, so
     // the quota lens would keep folding a removed root's messages for up to
@@ -2373,6 +2463,50 @@ mod tests {
         for entry in ["tb_agent_usage", "tb_cursor_sync", "tb_tokens_per_min", "tb_usage_trace"] {
             assert_eq!(width_for(entry, QOS_CLASS_UTILITY), RAYON_THREADS, "{entry} at utility");
         }
+    }
+
+    /// The engine graph is computed once for callers inside the freshness
+    /// window, again on `force`, and again after the roots move.
+    #[test]
+    fn the_engine_graph_is_shared_until_forced_or_invalidated() {
+        let home = tempfile::tempdir().unwrap();
+        let context = LocalSourceContext::for_home(home.path().to_path_buf());
+        let first = raw_graph(&context, "", false).unwrap();
+        let second = raw_graph(&context, " ", false).unwrap();
+        assert!(
+            Arc::ptr_eq(&first.graph, &second.graph),
+            "a fresh graph was recomputed"
+        );
+        // Control: another home is another graph, so the equality above is not
+        // every call returning one object.
+        let other_home = tempfile::tempdir().unwrap();
+        let other = raw_graph(
+            &LocalSourceContext::for_home(other_home.path().to_path_buf()),
+            "",
+            false,
+        )
+        .unwrap();
+        assert!(!Arc::ptr_eq(&first.graph, &other.graph));
+        let forced = raw_graph(&context, "", true).unwrap();
+        assert!(
+            !Arc::ptr_eq(&first.graph, &forced.graph),
+            "force served the kept graph"
+        );
+        let after_force = raw_graph(&context, "", false).unwrap();
+        assert!(
+            Arc::ptr_eq(&forced.graph, &after_force.graph),
+            "the forced graph was not kept"
+        );
+        invalidate_scan_caches();
+        let after_move = raw_graph(&context, "", false).unwrap();
+        assert!(
+            !Arc::ptr_eq(&forced.graph, &after_move.graph),
+            "a root change kept the old graph"
+        );
+        assert!(
+            raw_graph(&context, "26", false).is_err(),
+            "an invalid year was accepted"
+        );
     }
 
     /// A background entry that waits on another pool must not have a second
