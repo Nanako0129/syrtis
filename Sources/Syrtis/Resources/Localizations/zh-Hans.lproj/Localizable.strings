@@ -271,6 +271,8 @@
 "Include the client name" = "包含客户端名称";
 "Include cost" = "包含费用";
 "Untick everything to show nothing." = "全部取消勾选就不会显示任何内容。";
+"Include other devices selected in the dashboard" = "计入仪表板所选的其他设备";
+"Other devices' usage for today updates about every 5 minutes." = "其他设备的今日用量约每 5 分钟更新一次。";
 "Show cost as a figure instead of a range" = "用具体金额而非区间显示费用";
 "A range is shared by many people. A whole-dollar amount says more about you." = "区间是很多人共用的范围；整数美元金额会透露更多关于你的信息。";
 "Whichever client you used most" = "用量最多的客户端";
@@ -771,7 +773,7 @@
 "Check that the other device shows the same code." = "请确认对方屏幕上的代码相同。";
 "Approve" = "批准";
 "Reject" = "拒绝";
-"Approving lets that device read this Mac's usage totals in the approved scan scope until you revoke it." = "批准后，该设备可以读取这台 Mac 在已批准扫描范围内的用量汇总，直到你撤销为止。";
+"Approving lets that device read this Mac's usage totals in the approved scan scope until you revoke it. That device may show them combined with its own, including on its Discord status." = "批准后，该设备可以读取这台 Mac 在已批准扫描范围内的用量汇总，直到你撤销为止。该设备可能会把它与自己的用量合并显示，包括显示在它的 Discord 状态上。";
 "This request has expired." = "这个请求已经过期。";
 "Devices with access" = "可访问的设备";
 "Revoke" = "撤销";

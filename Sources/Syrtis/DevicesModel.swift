@@ -769,7 +769,7 @@ enum DevicesCopy {
     static let compareCode = "Check that the other device shows the same code."
     static let approve = "Approve"
     static let reject = "Reject"
-    static let approveEffect = "Approving lets that device read this Mac's usage totals in the approved scan scope until you revoke it."
+    static let approveEffect = "Approving lets that device read this Mac's usage totals in the approved scan scope until you revoke it. That device may show them combined with its own, including on its Discord status."
     static let requestExpired = "This request has expired."
     static let grantsHeader = "Devices with access"
     static let revoke = "Revoke"

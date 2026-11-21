@@ -12072,6 +12072,290 @@ enum SelfTest {
             "A1 control: an ordinary run builds a client, reuses the one it was given rather "
                 + "than opening a second connection, and refuses when the switch is off")
 
+
+        // MARK: - D1: Discord counts the other devices picked in the dashboard
+        //
+        // Everything goes through `DiscordPresence.DeviceMerge`, the pure
+        // decision `AppDelegate` only carries out. The numbers that are merged
+        // come from the fake's `graphDevices` (the core's job in the app);
+        // nothing here adds a local and a remote value.
+        do {
+            let d1Peer = String(repeating: "a", count: 64)
+            let d1Remote = "codex"
+            // Local: claude 1,000 today. Merged: the same plus 7,000,000 on
+            // another device under a registered client id.
+            let d1Local = dpGraph(dpPayload(dpDay(
+                dpToday, 1_000, 1.0, dpStripe("claude", 1_000, 1.0))))
+            let d1MergedBody = dpPayload(dpDay(
+                dpToday, 7_001_000, 8.0,
+                dpStripe("claude", 1_000, 1.0) + "," + dpStripe(d1Remote, 7_000_000, 7.0)))
+            let d1NoTodayBody = dpPayload(dpDay(
+                "2026-08-03", 7_001_000, 8.0,
+                dpStripe("claude", 1_000, 1.0) + "," + dpStripe(d1Remote, 7_000_000, 7.0)))
+            let d1Merged = dpGraph(d1MergedBody)
+            func d1Pay(_ g: UsagePayload?) -> DiscordPresence.Payload? {
+                g.flatMap {
+                    DiscordPresence.payload(
+                        graph: $0, hidden: [], today: dpToday, costStyle: .banded,
+                        components: dpAllComponents)
+                }
+            }
+            let d1T0 = Date(timeIntervalSince1970: 1_800_000_000)
+            typealias M = DiscordPresence.DeviceMerge
+            func d1Decide(
+                _ st: M.State, on: Bool = true, discord: Bool = true, connect: Bool = true,
+                peers: [String]? = nil, panel: Bool = false, at: Date
+            ) -> M.Decision {
+                M.decide(
+                    local: d1Local, state: st, includeDevices: on, discordOn: discord,
+                    canConnect: connect, peers: peers ?? [d1Peer], panelOpen: panel, now: at)
+            }
+            /// Carries a call out against the fake, as `AppDelegate` does.
+            func d1Run(_ d: M.Decision, _ fake: D1DiscordFakeSource) -> M.State {
+                guard let call = d.call else { return d.state }
+                let payload = try? fake.graphDevices(
+                    year: nil, selection: call.selection, mode: call.mode).payload
+                return M.arrived(d.state, call: call, payload: payload)
+            }
+
+            // The controls of every "must not happen" below: an empty fixture
+            // would make them pass for nothing.
+            expect(d1Pay(d1Local)?.details != d1Pay(d1Merged)?.details
+                    && d1Pay(d1Merged) != nil && d1Pay(dpGraph(d1NoTodayBody)) == nil
+                    && DiscordPresence.dashboardSelectionKey == DeviceOverlayState.selectionKey
+                    && DiscordPresence.maxSelectedPeers == DeviceOverlayState.maxSelectedPeers,
+                "D1 fixture: the merged graph publishes a different figure than the local one, a graph "
+                    + "without a row for today publishes nothing, and the preference key and cap are the dashboard's")
+
+            // (1) default off: no call, Discord uses this Mac's graph.
+            let fake1 = D1DiscordFakeSource(body: d1MergedBody)
+            let off1 = d1Decide(M.State(), on: false, at: d1T0)
+            let on1 = d1Decide(M.State(), on: true, at: d1T0)
+            expect(off1.call == nil && off1.graph?.summary.totalTokens == d1Local.summary.totalTokens
+                    && d1Pay(off1.graph) == d1Pay(d1Local) && fake1.calls.isEmpty
+                    && on1.call != nil,
+                "D1 (1) includeDevices off: Discord is built from this Mac's graph and graphDevices is "
+                    + "not called, with peers selected; control: on, the same inputs make a call")
+
+            // (2) on with a peer: the payload is the one built from the merged graph.
+            let fake2 = D1DiscordFakeSource(body: d1MergedBody)
+            let first2 = d1Decide(M.State(), at: d1T0)
+            let st2 = d1Run(first2, fake2)
+            let used2 = d1Decide(st2, at: d1T0.addingTimeInterval(60))
+            expect(d1Pay(first2.graph) == d1Pay(d1Local)
+                    && d1Pay(used2.graph) != nil && d1Pay(used2.graph) != d1Pay(d1Local)
+                    && d1Pay(used2.graph) == d1Pay(d1Merged)
+                    && d1Pay(dpGraph(d1NoTodayBody)) == nil,
+                "D1 (2) on with a peer selected: the payload is built from the merged graph, "
+                    + "this Mac's until it arrives; control: a merged graph with no row for today "
+                    + "publishes nothing, so this cannot pass on an empty fixture")
+            // Discord switched off, or a peer-less selection: no call, local.
+            let offMaster = d1Decide(M.State(), discord: true, connect: false, at: d1T0)
+            let noPeers = d1Decide(M.State(), peers: [], at: d1T0)
+            expect(offMaster.call == nil && noPeers.call == nil
+                    && d1Pay(offMaster.graph) == d1Pay(d1Local) && d1Pay(noPeers.graph) == d1Pay(d1Local),
+                "D1 (2) control: with no connection allowed, or no peer selected, nothing is called")
+
+            // (3) throttle: refresh only with the panel closed and 300 s since the last one.
+            let fake3 = D1DiscordFakeSource(body: d1MergedBody)
+            var st3 = M.State()
+            var modes: [DeviceFetchMode] = []
+            for (offset, panel) in [(0.0, false), (60, false), (299, false), (300, false),
+                                    (359, false), (600, true), (900, true), (901, false)] {
+                let d = d1Decide(st3, panel: panel, at: d1T0.addingTimeInterval(offset))
+                modes.append(d.call?.mode ?? .cached)
+                st3 = d1Run(d, fake3)
+            }
+            expect(modes == [.refresh, .cached, .cached, .refresh, .cached, .cached, .cached, .refresh]
+                    && fake3.calls.count == 8,
+                "D1 (3) panel closed: refresh at the start and again after 300 s, cached in between; "
+                    + "panel open and 300 s over: still cached (calls: \(modes))")
+
+            // (4) failure: keep the last merged result; never succeeded: this Mac's graph.
+            let fake4 = D1DiscordFakeSource(body: d1MergedBody)
+            var st4 = d1Run(d1Decide(M.State(), at: d1T0), fake4)
+            fake4.setFail(true)
+            st4 = d1Run(d1Decide(st4, at: d1T0.addingTimeInterval(400)), fake4)
+            let kept4 = d1Decide(st4, at: d1T0.addingTimeInterval(401))
+            let never4 = d1Run(d1Decide(M.State(), at: d1T0), fake4)
+            let neverUsed4 = d1Decide(never4, at: d1T0.addingTimeInterval(1))
+            expect(d1Pay(kept4.graph) == d1Pay(d1Merged) && d1Pay(neverUsed4.graph) == d1Pay(d1Local)
+                    && !st4.inFlight && fake4.calls.count == 3,
+                "D1 (4) graphDevices fails: the last merged result is kept; never succeeded: this "
+                    + "Mac's graph; control: the same state with the fake working is the merged one")
+
+            // (5) the peers change: a new generation, the old result is not used.
+            let peerB = String(repeating: "b", count: 64)
+            let before5 = d1Run(d1Decide(M.State(), at: d1T0), fake2)
+            let after5 = d1Decide(before5, peers: [d1Peer, peerB], at: d1T0.addingTimeInterval(1))
+            expect(after5.state.generation != before5.generation && after5.state.merged == nil
+                    && d1Pay(after5.graph) == d1Pay(d1Local)
+                    && d1Pay(d1Decide(before5, at: d1T0.addingTimeInterval(1)).graph) == d1Pay(d1Merged),
+                "D1 (5) peers change: the generation advances and the result fetched for the old peers "
+                    + "is not used; control: unchanged peers keep using it")
+
+            // (6) untick: retiring, and the next payload is this Mac alone.
+            let mergedState6 = d1Run(d1Decide(M.State(), at: d1T0), fake2)
+            let unticked = d1Decide(mergedState6, on: false, at: d1T0.addingTimeInterval(1))
+            let retire6 = M.visibility(previous: (true, [d1Peer]), current: (false, [d1Peer]))
+            let add6 = M.visibility(previous: (false, [d1Peer]), current: (true, [d1Peer]))
+            let drop6 = M.visibility(previous: (true, [d1Peer, peerB]), current: (true, [d1Peer]))
+            let grow6 = M.visibility(previous: (true, [d1Peer]), current: (true, [d1Peer, peerB]))
+            expect(retire6.retires && drop6.retires && !add6.retires && !grow6.retires
+                    && d1Pay(unticked.graph) == d1Pay(d1Local) && d1Pay(unticked.graph) != d1Pay(d1Merged)
+                    && unticked.call == nil,
+                "D1 (6) unticking, or unselecting a device, retires queued work and the next payload is "
+                    + "this Mac alone; ticking or adding one does not retire (control)")
+
+            // (7) strict Bool.
+            let suite7 = "syrtis.selftest.d1.\(UUID().uuidString)"
+            let ud7 = UserDefaults(suiteName: suite7)!
+            defer { ud7.removePersistentDomain(forName: suite7) }
+            let absent7 = DiscordPresence.includeDevices(defaults: ud7)
+            ud7.set("true", forKey: DiscordPresence.includeDevicesKey)
+            let string7 = DiscordPresence.includeDevices(defaults: ud7)
+            ud7.set(1, forKey: DiscordPresence.includeDevicesKey)
+            let int7 = DiscordPresence.includeDevices(defaults: ud7)
+            // Removed first: NSNumber(1) == NSNumber(true), so writing true over
+            // an integer 1 can keep the integer.
+            ud7.removeObject(forKey: DiscordPresence.includeDevicesKey)
+            ud7.set(true, forKey: DiscordPresence.includeDevicesKey)
+            expect(!absent7 && !string7 && !int7 && DiscordPresence.includeDevices(defaults: ud7),
+                "D1 (7) includeDevices is a strict Bool: absent, the string \"true\" and the integer 1 "
+                    + "are off; control: a real true is on")
+
+            // (8) always this Mac plus the persisted peers; no tray graph in the output.
+            let ud8 = UserDefaults(suiteName: suite7)!
+            ud8.set(Data(#"{"local":false,"peers":["\#(peerB)","\#(d1Peer)","\#(peerB)"]}"#.utf8),
+                forKey: DiscordPresence.dashboardSelectionKey)
+            let persisted8 = DiscordPresence.selectedPeers(defaults: ud8)
+            let many = (0..<20).map { String(format: "%064x", $0) }
+            ud8.set(Data(#"{"local":true,"peers":[\#(many.map { "\"\($0)\"" }.joined(separator: ","))]}"#.utf8),
+                forKey: DiscordPresence.dashboardSelectionKey)
+            let capped8 = DiscordPresence.selectedPeers(defaults: ud8)
+            let call8 = d1Decide(M.State(), peers: persisted8, at: d1T0).call
+            expect(persisted8 == [d1Peer, peerB].sorted() && call8?.selection.local == true
+                    && call8?.selection.peers == persisted8 && capped8.count == 16
+                    && capped8 == Array(many.prefix(16))
+                    && d1Pay(d1Decide(M.State(), at: d1T0).graph) == d1Pay(d1Local),
+                "D1 (8) the selection sent is local: true plus the persisted peers, sorted and "
+                    + "deduplicated, at most 16, though the dashboard stored local: false; the decision "
+                    + "carries only the graph Discord uses, never one for the tray")
+
+            // (9) a result in flight when the box is unticked is dropped.
+            let fake9 = D1DiscordFakeSource(body: d1MergedBody)
+            let started9 = d1Decide(M.State(), at: d1T0)
+            let unticked9 = d1Decide(started9.state, on: false, at: d1T0.addingTimeInterval(1))
+            let landed9 = d1Run(
+                M.Decision(graph: nil, call: started9.call, state: unticked9.state), fake9)
+            let reticked9 = d1Decide(landed9, on: true, at: d1T0.addingTimeInterval(2))
+            expect(started9.call != nil && landed9.merged == nil && !landed9.inFlight
+                    && d1Pay(reticked9.graph) == d1Pay(d1Local) && fake9.calls.count == 1
+                    && d1Run(started9, fake9).merged != nil,
+                "D1 (9) a result that arrives after the box was unticked is dropped; control: the same "
+                    + "result arriving with nothing changed is kept")
+
+            // (10) a refresh in flight: the next tick is skipped, the local path unaffected.
+            let fake10 = D1DiscordFakeSource(body: d1MergedBody)
+            fake10.setHoldRefresh(true)
+            let started10 = d1Decide(M.State(), at: d1T0)
+            let done10 = DispatchSemaphore(value: 0)
+            nonisolated(unsafe) var landed10 = M.State()
+            Thread {
+                landed10 = d1Run(started10, fake10)
+                done10.signal()
+            }.start()
+            // Bounded: a decision that makes no call, or a call that never
+            // returns, fails the assertion below instead of hanging the run.
+            var waited10 = 0
+            while fake10.calls.isEmpty && waited10 < 5_000 { usleep(1_000); waited10 += 1 }
+            let entered10 = !fake10.calls.isEmpty
+            let during10 = d1Decide(started10.state, at: d1T0.addingTimeInterval(400))
+            fake10.release()
+            let finished10 = done10.wait(timeout: .now() + 5) == .success
+            expect(entered10 && finished10
+                    && started10.call?.mode == .refresh && during10.call == nil && fake10.calls.count == 1
+                    && d1Pay(during10.graph) == d1Pay(d1Local)
+                    && d1Decide(landed10, at: d1T0.addingTimeInterval(401)).call != nil,
+                "D1 (10) while a refresh is held in flight, the next tick's decision is to skip it "
+                    + "(one call in total) and this Mac's graph is still what Discord uses; control: once "
+                    + "it returns the next tick calls again")
+
+            // (11) what the other device sends cannot reach the public text.
+            let hostile = dpPayload(dpDay(
+                dpToday, Int64.max, 1e308,
+                dpStripe("cc-mirror/ZZSECRET", Int64.max, 1e308) + "," + dpStripe("claude", 2_000, 2.0)))
+            let fake11 = D1DiscordFakeSource(body: hostile)
+            let st11 = d1Run(d1Decide(M.State(), at: d1T0), fake11)
+            let used11 = d1Decide(st11, at: d1T0.addingTimeInterval(1))
+            let text11 = d1Pay(used11.graph)?.fields.values.joined(separator: "|") ?? ""
+            let leaked11 = String(describing: st11).contains("ZZLABEL")
+            let costOnly = DiscordPresence.payload(
+                graph: used11.graph!, hidden: [], today: dpToday, costStyle: .wholeDollars,
+                components: [.cost, .client, .tokens])
+            // The figures are the registered client's alone: the unregistered
+            // stripe adds nothing to the tokens or the cost, and the payload
+            // is there (a nil payload would pass every "does not contain").
+            let allowed11 = DiscordPresence.payload(
+                // 2,000 and $2: not this Mac's 1,000 and $1, so a fallback to the
+                // local graph cannot pass for the merged one.
+                graph: dpGraph(dpPayload(dpDay(dpToday, 2_000, 2.0, dpStripe("claude", 2_000, 2.0)))),
+                hidden: [], today: dpToday, costStyle: .wholeDollars,
+                components: [.cost, .client, .tokens])
+            expect(st11.merged != nil && String(describing: st11.merged!.contributions).contains("ZZSECRET")
+                    && costOnly != nil && costOnly == allowed11
+                    && costOnly != DiscordPresence.payload(
+                        graph: d1Local, hidden: [], today: dpToday, costStyle: .wholeDollars,
+                        components: [.cost, .client, .tokens])
+                    && !leaked11
+                    && !text11.contains("ZZSECRET") && !text11.contains("ZZLABEL")
+                    && !(costOnly?.fields.values.joined().contains("ZZ") ?? false),
+                "D1 (11) a device label and an unregistered client id with Int64.max tokens and a 1e308 "
+                    + "cost reach neither the public text nor the kept state (no crash); control: the "
+                    + "merged graph does hold the unregistered id")
+
+            // (13) a device removed while the first call is still in flight:
+            // nothing has merged yet, and the late result must not be taken.
+            // `invalidate` is what the peers-changed observer runs.
+            let fake13 = D1DiscordFakeSource(body: d1MergedBody)
+            let started13 = d1Decide(M.State(), at: d1T0)
+            let removed13 = M.invalidate(started13.state)
+            let landed13 = d1Run(
+                M.Decision(graph: nil, call: started13.call, state: removed13), fake13)
+            expect(started13.call != nil && started13.state.merged == nil && started13.state.inFlight
+                    && landed13.merged == nil && !landed13.inFlight
+                    && d1Run(started13, fake13).merged != nil,
+                "D1 (13) a device removed while the first call is in flight: the late result is "
+                    + "dropped and the call no longer counts as in flight; control: without the removal "
+                    + "it is kept")
+
+            // (14) the check at publish time, on a state that still holds a
+            // merged result: the box off, no connection, or other peers.
+            let held14 = d1Run(d1Decide(M.State(), at: d1T0), D1DiscordFakeSource(body: d1MergedBody))
+            let pick14: (Bool, Bool, [String]) -> DiscordPresence.Payload? = { include, connect, peers in
+                d1Pay(M.graph(
+                    local: d1Local, state: held14, includeDevices: include, canConnect: connect,
+                    peers: peers))
+            }
+            expect(held14.merged != nil
+                    && pick14(true, true, held14.mergedPeers) == d1Pay(d1Merged)
+                    && pick14(false, true, held14.mergedPeers) == d1Pay(d1Local)
+                    && pick14(true, false, held14.mergedPeers) == d1Pay(d1Local)
+                    && pick14(true, true, held14.mergedPeers + [peerB]) == d1Pay(d1Local)
+                    && d1Pay(d1Merged) != d1Pay(d1Local),
+                "D1 (14) at publish time a held merged result is used only with the box on, a "
+                    + "connection allowed and the same devices; otherwise this Mac's graph (control: "
+                    + "with all three it is the merged one)")
+
+            // (12) test arguments never pull.
+            let gated12 = AppDelegate.makeDiscordClient(
+                arguments: ["Syrtis", "--icon-gallery"], enabled: true) != nil
+            let ordinary12 = AppDelegate.makeDiscordClient(arguments: ["Syrtis"], enabled: true) != nil
+            expect(d1Decide(M.State(), connect: gated12, at: d1T0).call == nil
+                    && d1Decide(M.State(), connect: ordinary12, at: d1T0).call != nil,
+                "D1 (12) under --icon-gallery the decision is not to call; control: an ordinary start calls")
+        }
+
         // A15b — which visibility change retires earlier work. Getting this
         // backwards is not cosmetic: it would retire work an unhide leaves
         // perfectly valid while letting a hide's stale payload through — the
@@ -25528,6 +25812,75 @@ final class SA3CFakePasteboard: DevicesPasteboard {
     func clear() {
         changeCount += 1
         text = nil
+    }
+}
+
+/// D1: a source whose only live call is `graphDevices`. It records every call,
+/// can fail, and can hold a `refresh` until released. The body it returns is
+/// whatever graph JSON the test set, wrapped with a device row that carries a
+/// recognisable label (the other owner's free text).
+final class D1DiscordFakeSource: UsageDataSource, @unchecked Sendable {
+    let allowsQuotaCachePersistence = false
+    struct Call: Equatable {
+        let mode: DeviceFetchMode
+        let local: Bool
+        let peers: [String]
+    }
+    struct Failure: Error {}
+
+    private let lock = NSLock()
+    private var _calls: [Call] = []
+    private var _body: String
+    private var _fail = false
+    private var _holdRefresh = false
+    private let gate = DispatchSemaphore(value: 0)
+    private let inner = DashboardModelTestSource(failingGraphYear: "")
+
+    init(body: String) { _body = body }
+
+    var calls: [Call] { lock.withLock { _calls } }
+    func setBody(_ body: String) { lock.withLock { _body = body } }
+    func setFail(_ fail: Bool) { lock.withLock { _fail = fail } }
+    func setHoldRefresh(_ hold: Bool) { lock.withLock { _holdRefresh = hold } }
+    func release() { gate.signal() }
+
+    func graph(year: String?, priority: TaskPriority) async throws -> UsagePayload {
+        try await inner.graph(year: year, priority: priority)
+    }
+    func refreshGraph(year: String?, priority: TaskPriority) async throws -> UsagePayload {
+        try await inner.refreshGraph(year: year, priority: priority)
+    }
+    func modelReport(year: String?, priority: TaskPriority) async throws -> ModelReport {
+        try await inner.modelReport(year: year, priority: priority)
+    }
+    func hourlyReport(year: String?, clients: [String]?, priority: TaskPriority) async throws -> HourlyReport {
+        try await inner.hourlyReport(year: year, clients: clients, priority: priority)
+    }
+    func agentsReport(year: String?, clients: [String]?, priority: TaskPriority) async throws -> AgentsReport {
+        try await inner.agentsReport(year: year, clients: clients, priority: priority)
+    }
+    func agentUsage() async throws -> AgentUsagePayload { try await inner.agentUsage() }
+    func usageTrace(windowSecs: Int64) async throws -> [TraceBucket] { try await inner.usageTrace(windowSecs: windowSecs) }
+    func tokensPerMin() async throws -> Double { try await inner.tokensPerMin() }
+
+    func graphDevices(
+        year: String?, selection: DeviceSelection, mode: DeviceFetchMode
+    ) throws -> DeviceAwarePayload<UsagePayload> {
+        let (hold, fail, body) = lock.withLock { () -> (Bool, Bool, String) in
+            _calls.append(Call(mode: mode, local: selection.local, peers: selection.peers))
+            return (mode == .refresh && _holdRefresh, _fail, _body)
+        }
+        if hold { gate.wait() }
+        if fail { throw Failure() }
+        // `body` is one JSON object; the device fields go inside it.
+        let json = """
+        {"ok":true,"data":\(body.dropLast()),"devices":[
+          {"id":"local","label":null,"state":"local","lastSuccessAt":null},
+          {"id":"aaaaaaaaaaaaaaaa","label":"ZZLABEL","address":"10.0.0.2:47000","state":"fresh","lastSuccessAt":1700000000,
+           "reason":null,"costIncomplete":false,"everAnswered":true}],
+         "duplicateWarning":true,"saturated":false,"remoteRangeLimited":false}}
+        """
+        return try TBCore.decodeEnvelope(Data(json.utf8))
     }
 }
 
