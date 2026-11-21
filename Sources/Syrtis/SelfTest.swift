@@ -12265,11 +12265,16 @@ enum SelfTest {
                 landed10 = d1Run(started10, fake10)
                 done10.signal()
             }.start()
-            while fake10.calls.isEmpty { usleep(1_000) }
+            // Bounded: a decision that makes no call, or a call that never
+            // returns, fails the assertion below instead of hanging the run.
+            var waited10 = 0
+            while fake10.calls.isEmpty && waited10 < 5_000 { usleep(1_000); waited10 += 1 }
+            let entered10 = !fake10.calls.isEmpty
             let during10 = d1Decide(started10.state, at: d1T0.addingTimeInterval(400))
             fake10.release()
-            done10.wait()
-            expect(started10.call?.mode == .refresh && during10.call == nil && fake10.calls.count == 1
+            let finished10 = done10.wait(timeout: .now() + 5) == .success
+            expect(entered10 && finished10
+                    && started10.call?.mode == .refresh && during10.call == nil && fake10.calls.count == 1
                     && d1Pay(during10.graph) == d1Pay(d1Local)
                     && d1Decide(landed10, at: d1T0.addingTimeInterval(401)).call != nil,
                 "D1 (10) while a refresh is held in flight, the next tick's decision is to skip it "
@@ -12279,7 +12284,7 @@ enum SelfTest {
             // (11) what the other device sends cannot reach the public text.
             let hostile = dpPayload(dpDay(
                 dpToday, Int64.max, 1e308,
-                dpStripe("cc-mirror/ZZSECRET", Int64.max, 1e308) + "," + dpStripe("claude", 1_000, 1.0)))
+                dpStripe("cc-mirror/ZZSECRET", Int64.max, 1e308) + "," + dpStripe("claude", 2_000, 2.0)))
             let fake11 = D1DiscordFakeSource(body: hostile)
             let st11 = d1Run(d1Decide(M.State(), at: d1T0), fake11)
             let used11 = d1Decide(st11, at: d1T0.addingTimeInterval(1))
@@ -12288,13 +12293,59 @@ enum SelfTest {
             let costOnly = DiscordPresence.payload(
                 graph: used11.graph!, hidden: [], today: dpToday, costStyle: .wholeDollars,
                 components: [.cost, .client, .tokens])
+            // The figures are the registered client's alone: the unregistered
+            // stripe adds nothing to the tokens or the cost, and the payload
+            // is there (a nil payload would pass every "does not contain").
+            let allowed11 = DiscordPresence.payload(
+                // 2,000 and $2: not this Mac's 1,000 and $1, so a fallback to the
+                // local graph cannot pass for the merged one.
+                graph: dpGraph(dpPayload(dpDay(dpToday, 2_000, 2.0, dpStripe("claude", 2_000, 2.0)))),
+                hidden: [], today: dpToday, costStyle: .wholeDollars,
+                components: [.cost, .client, .tokens])
             expect(st11.merged != nil && String(describing: st11.merged!.contributions).contains("ZZSECRET")
+                    && costOnly != nil && costOnly == allowed11
+                    && costOnly != DiscordPresence.payload(
+                        graph: d1Local, hidden: [], today: dpToday, costStyle: .wholeDollars,
+                        components: [.cost, .client, .tokens])
                     && !leaked11
                     && !text11.contains("ZZSECRET") && !text11.contains("ZZLABEL")
                     && !(costOnly?.fields.values.joined().contains("ZZ") ?? false),
                 "D1 (11) a device label and an unregistered client id with Int64.max tokens and a 1e308 "
                     + "cost reach neither the public text nor the kept state (no crash); control: the "
                     + "merged graph does hold the unregistered id")
+
+            // (13) a device removed while the first call is still in flight:
+            // nothing has merged yet, and the late result must not be taken.
+            // `invalidate` is what the peers-changed observer runs.
+            let fake13 = D1DiscordFakeSource(body: d1MergedBody)
+            let started13 = d1Decide(M.State(), at: d1T0)
+            let removed13 = M.invalidate(started13.state)
+            let landed13 = d1Run(
+                M.Decision(graph: nil, call: started13.call, state: removed13), fake13)
+            expect(started13.call != nil && started13.state.merged == nil && started13.state.inFlight
+                    && landed13.merged == nil && !landed13.inFlight
+                    && d1Run(started13, fake13).merged != nil,
+                "D1 (13) a device removed while the first call is in flight: the late result is "
+                    + "dropped and the call no longer counts as in flight; control: without the removal "
+                    + "it is kept")
+
+            // (14) the check at publish time, on a state that still holds a
+            // merged result: the box off, no connection, or other peers.
+            let held14 = d1Run(d1Decide(M.State(), at: d1T0), D1DiscordFakeSource(body: d1MergedBody))
+            let pick14: (Bool, Bool, [String]) -> DiscordPresence.Payload? = { include, connect, peers in
+                d1Pay(M.graph(
+                    local: d1Local, state: held14, includeDevices: include, canConnect: connect,
+                    peers: peers))
+            }
+            expect(held14.merged != nil
+                    && pick14(true, true, held14.mergedPeers) == d1Pay(d1Merged)
+                    && pick14(false, true, held14.mergedPeers) == d1Pay(d1Local)
+                    && pick14(true, false, held14.mergedPeers) == d1Pay(d1Local)
+                    && pick14(true, true, held14.mergedPeers + [peerB]) == d1Pay(d1Local)
+                    && d1Pay(d1Merged) != d1Pay(d1Local),
+                "D1 (14) at publish time a held merged result is used only with the box on, a "
+                    + "connection allowed and the same devices; otherwise this Mac's graph (control: "
+                    + "with all three it is the merged one)")
 
             // (12) test arguments never pull.
             let gated12 = AppDelegate.makeDiscordClient(

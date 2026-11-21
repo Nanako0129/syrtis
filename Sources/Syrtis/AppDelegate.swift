@@ -204,11 +204,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         lastSelection = DiscordPresence.selection()
         // A linked device was removed or re-paired: the merged result may
         // count it, so it goes now and what replaces it retires queued work.
+        // Also with no merged result yet: a call started before the removal
+        // would otherwise return under the same generation and be accepted.
         peersObserver = NotificationCenter.default.addObserver(
             forName: DevicesModel.peersChanged, object: nil, queue: .main
         ) { [weak self] _ in
             MainActor.assumeIsolated {
-                guard let self, self.discordMerge.merged != nil else { return }
+                guard let self else { return }
                 self.discordMerge = DiscordPresence.DeviceMerge.invalidate(self.discordMerge)
                 self.applyDiscordPresence(visibility: .reducing)
             }
@@ -560,10 +562,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 // merely being slow.
                 // Today's actual contributors, so a hide of a client with no
                 // usage today is not mistaken for taking something down.
-                let contributors = self.discordGraph().map { graph in
-                    Set(graph.contributions.last { $0.date == Format.todayKey() }?
+                // From the graph that was being published before this pass as
+                // well as the one in use now. `observe` above may already have
+                // dropped the merged result (a device added in the same pass
+                // as a hide), and a client with usage only on another device
+                // is in no local graph: read from the current graph alone, its
+                // hide would not count as taking something down.
+                let todayClients: (UsagePayload?) -> Set<String> = { graph in
+                    Set(graph?.contributions.last { $0.date == Format.todayKey() }?
                         .clients.map(\.client) ?? [])
                 }
+                let outgoing = wasMergeActive
+                    ? (previousMerge.merged ?? self.lastGraph) : self.lastGraph
+                let current = self.discordGraph()
+                let contributors: Set<String>? = (outgoing == nil && current == nil)
+                    ? nil : todayClients(outgoing).union(todayClients(current))
                 let change = AppDelegate.visibilityChange(
                     previousHiddenRaw: previousHiddenRaw, hiddenRaw: hiddenRaw,
                     previousSelection: previousSelection, selection: selection,
