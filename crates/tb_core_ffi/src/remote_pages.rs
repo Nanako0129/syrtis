@@ -1349,7 +1349,8 @@ pub(crate) fn graph(call: &Call<'_>) -> Result<Value, String> {
         return call.local_only(data);
     }
     let mut graph = if call.selection.local {
-        crate::usage_graph::compute(call.context, call.year)?
+        // A copy of the shared graph: the fold below writes into it.
+        (*crate::raw_graph(call.context, call.year, crate::RawGraphReuse::Fresh)?.graph).clone()
     } else {
         crate::usage_graph::normalize_year(call.year)?;
         empty_graph()
