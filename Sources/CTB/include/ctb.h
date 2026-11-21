@@ -366,8 +366,9 @@ char *tb_cursor_sync(int32_t user_initiated);
 // tb_remote_start: home_override NULL = the directory-service home and the
 // frozen agent root; otherwise that absolute directory (created 0700) with a
 // short root. Already running with the same scan inputs: no restart. Changed
-// inputs: restart, and the new inputs need tb_remote_scope_approve. Data: the
-// status object below.
+// inputs: restart, and the new inputs need tb_remote_scope_approve. An error
+// caused by the inputs leaves no agent running; an error from reading the
+// status leaves a running agent as it was. Data: the status object below.
 char *tb_remote_start(const char *home_override);
 // Data {"running":false}.
 char *tb_remote_stop(void);
