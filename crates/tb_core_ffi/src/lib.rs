@@ -934,6 +934,23 @@ pub(crate) struct RawGraph {
     pub graph: Arc<tokscale_core::GraphResult>,
 }
 
+/// What a caller of [`raw_graph`] accepts in place of a new compute.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RawGraphReuse {
+    /// A graph checked within `ONESHOT_MAX_AGE_SECS`, or an older one whose
+    /// source token is unchanged: the rule `graph_cached` applies to the
+    /// mapped payload. For the device pages.
+    Fresh,
+    /// Only a graph whose source token is unchanged now, whatever its age.
+    /// For `tb_graph` after `graph_cached` declined its payload: that may be
+    /// because the sources changed, and a graph inside its age window would
+    /// otherwise be mapped and served as the answer to that change.
+    Unchanged,
+    /// Nothing: compute. For `tb_refresh_graph`'s promise of a read that
+    /// starts after the call.
+    Never,
+}
+
 /// (home, env roots allowed, year) → the last engine graph computed for it.
 type RawGraphKey = (Option<PathBuf>, bool, String);
 static RAW_GRAPHS: LazyLock<Mutex<HashMap<RawGraphKey, RawGraph>>> =
@@ -947,16 +964,14 @@ static RAW_GRAPHS: LazyLock<Mutex<HashMap<RawGraphKey, RawGraph>>> =
 /// open, beside the graph `tb_graph` was computing from the same files
 /// (sampled 2026-11-21).
 ///
-/// Fresh means computed under the current root generation and either within
-/// `ONESHOT_MAX_AGE_SECS` or with an unchanged source token, the rule
-/// `graph_cached` applies to the mapped payload. `force` skips the check and
-/// computes, for `tb_refresh_graph`'s promise of a read that starts after the
-/// call. One compute runs at a time: a caller that arrives during one waits
-/// for the lock and then finds its result.
+/// A kept graph must have been computed under the current root generation.
+/// Beyond that, `reuse` says what the caller accepts; see [`RawGraphReuse`].
+/// One compute runs at a time: a caller that arrives during one waits for the
+/// lock and then finds its result.
 pub(crate) fn raw_graph(
     context: &LocalSourceContext,
     year: &str,
-    force: bool,
+    reuse: RawGraphReuse,
 ) -> Result<RawGraph, String> {
     static ONE_COMPUTE: Mutex<()> = Mutex::new(());
     let key: RawGraphKey = (
@@ -969,7 +984,7 @@ pub(crate) fn raw_graph(
     // Probed before the parse, as `graph_compute` always did: a write that
     // lands mid-compute changes the token, so the next aged-out read recomputes.
     let mut token = None;
-    if !force {
+    if reuse != RawGraphReuse::Never {
         let hit = RAW_GRAPHS
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -977,7 +992,9 @@ pub(crate) fn raw_graph(
             .filter(|hit| hit.generation == generation)
             .cloned();
         if let Some(mut hit) = hit {
-            if hit.at.elapsed() <= Duration::from_secs(ONESHOT_MAX_AGE_SECS) {
+            if reuse == RawGraphReuse::Fresh
+                && hit.at.elapsed() <= Duration::from_secs(ONESHOT_MAX_AGE_SECS)
+            {
                 return Ok(hit);
             }
             token =
@@ -1017,7 +1034,12 @@ fn publish_raw_graph(key: RawGraphKey, entry: RawGraph) -> bool {
 }
 
 fn graph_compute(year: &str, force: bool) -> Result<serde_json::Value, String> {
-    let raw = raw_graph(&LocalSourceContext::current(), year, force)?;
+    let reuse = if force {
+        RawGraphReuse::Never
+    } else {
+        RawGraphReuse::Unchanged
+    };
+    let raw = raw_graph(&LocalSourceContext::current(), year, reuse)?;
     let data = usage_graph::to_payload((*raw.graph).clone())?;
     // The caller still gets this payload even when `publish_graph` refuses it.
     // It answers a request made before the roots changed, and the next call
@@ -2471,8 +2493,8 @@ mod tests {
     fn the_engine_graph_is_shared_until_forced_or_invalidated() {
         let home = tempfile::tempdir().unwrap();
         let context = LocalSourceContext::for_home(home.path().to_path_buf());
-        let first = raw_graph(&context, "", false).unwrap();
-        let second = raw_graph(&context, " ", false).unwrap();
+        let first = raw_graph(&context, "", RawGraphReuse::Fresh).unwrap();
+        let second = raw_graph(&context, " ", RawGraphReuse::Fresh).unwrap();
         assert!(
             Arc::ptr_eq(&first.graph, &second.graph),
             "a fresh graph was recomputed"
@@ -2483,28 +2505,48 @@ mod tests {
         let other = raw_graph(
             &LocalSourceContext::for_home(other_home.path().to_path_buf()),
             "",
-            false,
+            RawGraphReuse::Fresh,
         )
         .unwrap();
         assert!(!Arc::ptr_eq(&first.graph, &other.graph));
-        let forced = raw_graph(&context, "", true).unwrap();
+        // `Unchanged` reuses the kept graph while the sources are as they were
+        // and computes once they are not, inside the age window `Fresh` still
+        // accepts.
+        let unchanged = raw_graph(&context, "", RawGraphReuse::Unchanged).unwrap();
+        assert!(Arc::ptr_eq(&first.graph, &unchanged.graph), "unchanged sources were recomputed");
+        let project = home.path().join(".claude/projects/p");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(
+            project.join("s.jsonl"),
+            r#"{"type":"assistant","timestamp":"2024-12-01T09:00:00.000Z","requestId":"req_a","message":{"id":"msg_a","model":"claude-3-5-sonnet","usage":{"input_tokens":1,"output_tokens":2}}}"#,
+        )
+        .unwrap();
+        let still_fresh = raw_graph(&context, "", RawGraphReuse::Fresh).unwrap();
+        assert!(Arc::ptr_eq(&first.graph, &still_fresh.graph));
+        let changed = raw_graph(&context, "", RawGraphReuse::Unchanged).unwrap();
+        assert!(
+            !Arc::ptr_eq(&first.graph, &changed.graph),
+            "changed sources were answered with the kept graph"
+        );
+        let first = changed;
+        let forced = raw_graph(&context, "", RawGraphReuse::Never).unwrap();
         assert!(
             !Arc::ptr_eq(&first.graph, &forced.graph),
             "force served the kept graph"
         );
-        let after_force = raw_graph(&context, "", false).unwrap();
+        let after_force = raw_graph(&context, "", RawGraphReuse::Fresh).unwrap();
         assert!(
             Arc::ptr_eq(&forced.graph, &after_force.graph),
             "the forced graph was not kept"
         );
         invalidate_scan_caches();
-        let after_move = raw_graph(&context, "", false).unwrap();
+        let after_move = raw_graph(&context, "", RawGraphReuse::Fresh).unwrap();
         assert!(
             !Arc::ptr_eq(&forced.graph, &after_move.graph),
             "a root change kept the old graph"
         );
         assert!(
-            raw_graph(&context, "26", false).is_err(),
+            raw_graph(&context, "26", RawGraphReuse::Fresh).is_err(),
             "an invalid year was accepted"
         );
     }
