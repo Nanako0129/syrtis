@@ -411,7 +411,8 @@ static RAYON_INIT: LazyLock<()> = LazyLock::new(|| {
 /// One worker for the CPU-bound scan entries in `BACKGROUND_SCAN_ENTRIES`, when
 /// their caller runs at utility or background QoS (the tray title graph, the
 /// popover's 60 s poll of the graph and reports). Those calls serialize on this
-/// one worker: a second one queues until the first finishes. Everything else
+/// one worker: a second one waits in `run_on_caller_pool`, on its own thread,
+/// until the first finishes. Everything else
 /// keeps the caller's thread and the global pool, including `tb_agent_usage` and
 /// `tb_cursor_sync` (network, up to tens of seconds) and the live-rate tail tick
 /// (about 1 s of CPU per 30 s, which must not wait behind a graph).
@@ -499,6 +500,17 @@ fn run_on_caller_pool(name: &str, body: impl FnOnce() -> *mut c_char) -> *mut c_
                 }
             }
             let job = AssertSend(body);
+            // One job in the pool at a time, queued here on the caller's
+            // thread instead of in the pool. A rayon worker that waits on
+            // another pool (the scan does, on the scanner's own pool) runs
+            // whatever else is queued on its own pool meanwhile, nested on
+            // the same stack. A second `tb_graph` run that way joined the
+            // flight the frames below it were leading and waited for it for
+            // ever; every later utility call then queued behind a worker
+            // that never came back (seen in a running app, 2026-11-21).
+            // With nothing queued in the pool there is nothing to run nested.
+            static GATE: Mutex<()> = Mutex::new(());
+            let _one_at_a_time = GATE.lock().unwrap_or_else(|p| p.into_inner());
             return pool.install(move || job.run()).0;
         }
     }
@@ -2361,6 +2373,74 @@ mod tests {
         for entry in ["tb_agent_usage", "tb_cursor_sync", "tb_tokens_per_min", "tb_usage_trace"] {
             assert_eq!(width_for(entry, QOS_CLASS_UTILITY), RAYON_THREADS, "{entry} at utility");
         }
+    }
+
+    /// A background entry that waits on another pool must not have a second
+    /// background entry run nested inside that wait: the second one may wait
+    /// for the first (a joined graph flight does), and then neither returns.
+    #[test]
+    fn a_background_entry_never_runs_inside_another() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        extern "C" {
+            fn pthread_set_qos_class_self_np(qos_class: u32, relative_priority: i32) -> i32;
+        }
+        const QOS_CLASS_UTILITY: u32 = 0x11;
+        // Stands in for the scanner's pool.
+        let other = Arc::new(rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap());
+        let first_waiting = Arc::new((Mutex::new(false), Condvar::new()));
+        let first_done = Arc::new(AtomicBool::new(false));
+        let second_ran = Arc::new(AtomicBool::new(false));
+        let second_ran_inside = Arc::new(AtomicBool::new(false));
+
+        let first = {
+            let (other, first_waiting, first_done) =
+                (Arc::clone(&other), Arc::clone(&first_waiting), Arc::clone(&first_done));
+            std::thread::spawn(move || {
+                assert_eq!(unsafe { pthread_set_qos_class_self_np(QOS_CLASS_UTILITY, 0) }, 0);
+                guarded("tb_graph", || {
+                    assert_eq!(rayon::current_num_threads(), 1, "not on the background pool");
+                    other.install(|| {
+                        *first_waiting.0.lock().unwrap() = true;
+                        first_waiting.1.notify_all();
+                        // Long enough for the second entry to be submitted
+                        // while this worker waits.
+                        std::thread::sleep(Duration::from_millis(500));
+                    });
+                    first_done.store(true, Ordering::SeqCst);
+                    std::ptr::null_mut()
+                });
+            })
+        };
+        let second = {
+            let (first_waiting, first_done, second_ran, second_ran_inside) = (
+                Arc::clone(&first_waiting),
+                Arc::clone(&first_done),
+                Arc::clone(&second_ran),
+                Arc::clone(&second_ran_inside),
+            );
+            std::thread::spawn(move || {
+                assert_eq!(unsafe { pthread_set_qos_class_self_np(QOS_CLASS_UTILITY, 0) }, 0);
+                let mut waiting = first_waiting.0.lock().unwrap();
+                while !*waiting {
+                    waiting = first_waiting.1.wait(waiting).unwrap();
+                }
+                drop(waiting);
+                guarded("tb_graph", || {
+                    second_ran.store(true, Ordering::SeqCst);
+                    second_ran_inside.store(!first_done.load(Ordering::SeqCst), Ordering::SeqCst);
+                    std::ptr::null_mut()
+                });
+            })
+        };
+        first.join().unwrap();
+        second.join().unwrap();
+        // Control: the second entry did run, so the assertion below is about
+        // when, not whether.
+        assert!(second_ran.load(Ordering::SeqCst));
+        assert!(
+            !second_ran_inside.load(Ordering::SeqCst),
+            "the second entry ran while the first was still waiting on another pool"
+        );
     }
 
     /// Nothing calls `isolate_test_config` but the loader, so a platform that
