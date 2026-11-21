@@ -46,5 +46,11 @@
   "name": "zz-extra",
   "source": "registry+https://github.com/rust-lang/crates.io-index",
   "version": "1.0.0"
+ },
+ {
+  "checksum": "0000000000000000000000000000000000000000000000000000000000000008",
+  "name": "windows-sys",
+  "source": "registry+https://github.com/rust-lang/crates.io-index",
+  "version": "0.61.2"
  }
 ]
