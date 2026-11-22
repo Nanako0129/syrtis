@@ -2,8 +2,10 @@
 //!
 //! Factory's documented Analytics API (`/api/v1/analytics/cost/me/query`) is
 //! Enterprise-only and reports consumption without an allowance, so it cannot
-//! draw a quota card. The Droid CLI itself reads `/api/billing/limits` at
-//! startup; that endpoint accepts a Factory API key and reports, per tier
+//! draw a quota card. `/api/billing/limits` is not in Factory's public
+//! documentation (the contributor reports that the Droid CLI reads it at
+//! startup; this repository has not verified that). It accepts a Factory API
+//! key and reports, per tier
 //! (`standard`, `core`), a five-hour, weekly and monthly window as a
 //! used-percent with a `windowEnd`. Each present window maps to one
 //! `UsageWindow`.
@@ -515,7 +517,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_keychain_read_that_does_not_finish_is_terminal_and_killed() {
+    async fn a_keychain_read_that_does_not_finish_is_terminal() {
         // Stand-in for a `security` stuck on an unanswered prompt.
         let started = std::time::Instant::now();
         let outcome =
