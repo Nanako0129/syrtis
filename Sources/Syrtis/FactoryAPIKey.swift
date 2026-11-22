@@ -4,8 +4,10 @@ import Foundation
 ///
 /// The key lives in the login Keychain and is written, read and deleted only
 /// through `/usr/bin/security`. An item created by that tool lists it as a
-/// trusted application, so the core's read (also `/usr/bin/security`) raises
-/// no authorization dialog. A `SecItem` write from this process would make the
+/// trusted application, so the core's read (also `/usr/bin/security`) is
+/// expected to raise no authorization dialog. That has not been exercised with
+/// a real key, and an item whose access control was changed afterwards can
+/// still make macOS ask. A `SecItem` write from this process would make the
 /// app the trusted one instead, and the core's read would then prompt.
 ///
 /// The key reaches `security` on stdin through its interactive mode, never on
@@ -20,8 +22,8 @@ enum FactoryAPIKey {
     /// The name Keychain Access shows; the Settings copy quotes it.
     static let keychainLabel = "Factory API key for Syrtis"
     private static let securityTool = "/usr/bin/security"
-    /// No `security` call here involves a prompt, so one still running after
-    /// this long is wedged; it is terminated and the call reports failure.
+    /// No `security` call here is expected to wait on a prompt, so one still
+    /// running after this long is terminated and the call reports failure.
     private static let securityTimeout: TimeInterval = 10
     /// `security(1)` exit status for "The specified item could not be found".
     private static let itemNotFound: Int32 = 44

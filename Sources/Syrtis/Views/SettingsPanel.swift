@@ -158,6 +158,7 @@ struct SettingsPanel: View {
     @State private var factoryKeyStatus: FactoryAPIKey.Status = .absent
     @State private var factoryKeyBusy = false
     @State private var factoryKeyMessage: String?
+    @State private var factoryKeyStatusRequest = 0
     /// 0 = auto (≈60% of the screen). The popover's drag handle writes the
     /// same key, so the two stay in sync.
     @AppStorage(PopoverChrome.heightKey) private var popoverHeight = 0.0
@@ -1144,7 +1145,12 @@ struct SettingsPanel: View {
     }
 
     private func reloadFactoryKeyStatus() async {
+        // Only the latest request may land: the page's first load can still be
+        // out when a Save or Remove has already reloaded.
+        factoryKeyStatusRequest += 1
+        let request = factoryKeyStatusRequest
         let status = await FactoryAPIKey.loadStatus()
+        guard request == factoryKeyStatusRequest else { return }
         factoryKeyStatus = status
         factoryKeyMessage = status == .unreadable ? AccountsCopy.factoryUnreadable : nil
     }

@@ -15,8 +15,10 @@
 //! release. Instead the user pastes a Factory API key into Settings → Accounts
 //! → Factory, which stores it in the login Keychain under [`KEYCHAIN_SERVICE`]
 //! and [`KEYCHAIN_ACCOUNT`] through `/usr/bin/security` (`FactoryAPIKey.swift`); reading it back
-//! through the same tool raises no authorization dialog. With no such item the
-//! provider is absent and no card is published.
+//! through the same tool is expected to raise no authorization dialog (not
+//! exercised with a real key; the read is bounded either way, see
+//! [`KEYCHAIN_READ_TIMEOUT`]). With no such item the provider is absent and no
+//! card is published.
 //!
 //! Window rules follow `agent_opencode_go.rs` and `provider-quota-pace.md`: an
 //! out-of-range or non-finite percent and an already-expired `windowEnd` drop
@@ -293,10 +295,7 @@ fn map_tiers(tiers: &Tiers, now: DateTime<Utc>) -> Vec<UsageWindow> {
         (&tiers.standard, "Standard", "standard"),
         (&tiers.core, "Core", "core"),
     ] {
-        let Some(tier) = raw
-            .as_deref()
-            .and_then(|raw| serde_json::from_str::<TierWindows>(raw.get()).ok())
-        else {
+        let Some(tier) = raw.as_deref().and_then(decode_object::<TierWindows>) else {
             continue;
         };
         for (raw, label, key, contract_seconds) in [
@@ -315,6 +314,15 @@ fn map_tiers(tiers: &Tiers, now: DateTime<Utc>) -> Vec<UsageWindow> {
     windows
 }
 
+/// Only a JSON object is one of this payload's structs: a derived struct also
+/// decodes from an array, taking its fields by position.
+fn decode_object<T: serde::de::DeserializeOwned>(raw: &RawValue) -> Option<T> {
+    if !raw.get().trim_start().starts_with('{') {
+        return None;
+    }
+    serde_json::from_str(raw.get()).ok()
+}
+
 fn map_window(
     raw: Option<&RawValue>,
     label: String,
@@ -322,7 +330,7 @@ fn map_window(
     contract_seconds: Option<i64>,
     now: DateTime<Utc>,
 ) -> Option<UsageWindow> {
-    let window: Window = serde_json::from_str(raw?.get()).ok()?;
+    let window: Window = decode_object(raw?)?;
     let percent = window.used_percent?;
     // Absent or `null` is an idle window: kept, no reset. Anything else must be
     // a parseable datetime, or the window is invalid evidence and drops.
@@ -476,6 +484,22 @@ mod tests {
         let labels: Vec<_> = windows.iter().map(|w| w.label_for_test()).collect();
         assert_eq!(labels, ["Standard 5h"], "an absent end is kept, an unparseable one drops");
         assert_eq!(windows[0].resets_at_for_test(), None);
+    }
+
+    #[test]
+    fn array_shaped_tiers_and_windows_drop() {
+        let body = r#"{
+            "limits": {
+                "standard": [{"usedPercent": 30, "windowEnd": "2026-11-15T00:00:00.000Z"}, null, null],
+                "core": {
+                    "weekly":  [20, "2026-11-15T00:00:00.000Z"],
+                    "monthly": {"usedPercent": 45, "windowEnd": "2026-11-15T00:00:00.000Z"}
+                }
+            }
+        }"#;
+        let windows = decode_limits_response(body, now()).unwrap();
+        let labels: Vec<_> = windows.iter().map(|w| w.label_for_test()).collect();
+        assert_eq!(labels, ["Core Monthly"]);
     }
 
     #[test]
