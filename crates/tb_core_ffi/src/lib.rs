@@ -411,7 +411,8 @@ static RAYON_INIT: LazyLock<()> = LazyLock::new(|| {
 /// One worker for the CPU-bound scan entries in `BACKGROUND_SCAN_ENTRIES`, when
 /// their caller runs at utility or background QoS (the tray title graph, the
 /// popover's 60 s poll of the graph and reports). Those calls serialize on this
-/// one worker: a second one queues until the first finishes. Everything else
+/// one worker: a second one waits in `run_on_caller_pool`, on its own thread,
+/// until the first finishes. Everything else
 /// keeps the caller's thread and the global pool, including `tb_agent_usage` and
 /// `tb_cursor_sync` (network, up to tens of seconds) and the live-rate tail tick
 /// (about 1 s of CPU per 30 s, which must not wait behind a graph).
@@ -499,6 +500,17 @@ fn run_on_caller_pool(name: &str, body: impl FnOnce() -> *mut c_char) -> *mut c_
                 }
             }
             let job = AssertSend(body);
+            // One job in the pool at a time, queued here on the caller's
+            // thread instead of in the pool. A rayon worker that waits on
+            // another pool (the scan does, on the scanner's own pool) runs
+            // whatever else is queued on its own pool meanwhile, nested on
+            // the same stack. A second `tb_graph` run that way joined the
+            // flight the frames below it were leading and waited for it for
+            // ever; every later utility call then queued behind a worker
+            // that never came back (seen in a running app, 2026-11-21).
+            // With nothing queued in the pool there is nothing to run nested.
+            static GATE: Mutex<()> = Mutex::new(());
+            let _one_at_a_time = GATE.lock().unwrap_or_else(|p| p.into_inner());
             return pool.install(move || job.run()).0;
         }
     }
@@ -913,22 +925,128 @@ fn graph_cached(year: &str, max_age: Duration) -> Option<serde_json::Value> {
     None
 }
 
-fn graph_compute(year: &str) -> Result<serde_json::Value, String> {
-    // Probe before parsing: a source write or topology change that lands
-    // mid-compute changes the token, so the next aged-out read recomputes
-    // rather than serving a graph that missed it. The probe and the scan each
-    // build their options, so each reads settings.json itself: an edit between
-    // them can leave a token older than the data, which only costs one extra
-    // recompute at the next probe (the token then differs).
+/// One engine graph, before mapping, with the facts its freshness is judged by.
+#[derive(Clone)]
+pub(crate) struct RawGraph {
+    pub at: Instant,
+    pub token: u64,
+    pub generation: u64,
+    pub graph: Arc<tokscale_core::GraphResult>,
+}
+
+/// What a caller of [`raw_graph`] accepts in place of a new compute.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RawGraphReuse {
+    /// A graph checked within `ONESHOT_MAX_AGE_SECS`, or an older one whose
+    /// source token is unchanged: the rule `graph_cached` applies to the
+    /// mapped payload. For the device pages.
+    Fresh,
+    /// Only a graph whose source token is unchanged now, whatever its age.
+    /// For `tb_graph` after `graph_cached` declined its payload: that may be
+    /// because the sources changed, and a graph inside its age window would
+    /// otherwise be mapped and served as the answer to that change.
+    Unchanged,
+    /// Nothing: compute. For `tb_refresh_graph`'s promise of a read that
+    /// starts after the call.
+    Never,
+}
+
+/// (home, env roots allowed, year) → the last engine graph computed for it.
+type RawGraphKey = (Option<PathBuf>, bool, String);
+static RAW_GRAPHS: LazyLock<Mutex<HashMap<RawGraphKey, RawGraph>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// The engine's graph for `year`, computed at most once for every caller that
+/// asks while it is fresh: `tb_graph` and `tb_refresh_graph` (which map it) and
+/// the device pages (which fold remote records into a copy). Before this the
+/// device page computed its own on every call. On a machine with a 530 MB
+/// Claude message cache that was about 4.5 s of CPU per call, twice per popover
+/// open, beside the graph `tb_graph` was computing from the same files
+/// (sampled 2026-11-21).
+///
+/// A kept graph must have been computed under the current root generation.
+/// Beyond that, `reuse` says what the caller accepts; see [`RawGraphReuse`].
+/// One compute runs at a time: a caller that arrives during one waits for the
+/// lock and then finds its result.
+pub(crate) fn raw_graph(
+    context: &LocalSourceContext,
+    year: &str,
+    reuse: RawGraphReuse,
+) -> Result<RawGraph, String> {
+    static ONE_COMPUTE: Mutex<()> = Mutex::new(());
+    let key: RawGraphKey = (
+        context.home_dir.clone(),
+        context.use_env_roots,
+        year.trim().to_string(),
+    );
+    let _one = ONE_COMPUTE.lock().unwrap_or_else(|p| p.into_inner());
     let generation = ROOT_GENERATION.load(Ordering::SeqCst);
-    let context = LocalSourceContext::current();
-    let token =
-        tokscale_core::local_source_change_token(&context.parse_options(None, None)).unwrap_or(0);
-    let data = usage_graph::run(&context, year)?;
+    // Probed before the parse, as `graph_compute` always did: a write that
+    // lands mid-compute changes the token, so the next aged-out read recomputes.
+    let mut token = None;
+    if reuse != RawGraphReuse::Never {
+        let hit = RAW_GRAPHS
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(&key)
+            .filter(|hit| hit.generation == generation)
+            .cloned();
+        if let Some(mut hit) = hit {
+            if reuse == RawGraphReuse::Fresh
+                && hit.at.elapsed() <= Duration::from_secs(ONESHOT_MAX_AGE_SECS)
+            {
+                return Ok(hit);
+            }
+            token =
+                tokscale_core::local_source_change_token(&context.parse_options(None, None)).ok();
+            if token == Some(hit.token) {
+                hit.at = Instant::now();
+                publish_raw_graph(key, hit.clone());
+                return Ok(hit);
+            }
+        }
+    }
+    let token = token.unwrap_or_else(|| {
+        tokscale_core::local_source_change_token(&context.parse_options(None, None)).unwrap_or(0)
+    });
+    let fresh = RawGraph {
+        graph: Arc::new(usage_graph::compute(context, year)?),
+        at: Instant::now(),
+        token,
+        generation,
+    };
+    // The caller still gets this graph when the roots moved meanwhile; it
+    // answers a request made before the move and is not kept.
+    publish_raw_graph(key, fresh.clone());
+    Ok(fresh)
+}
+
+/// Keep `entry` unless the root registry moved since it was computed. The
+/// generation is read inside the lock `invalidate_scan_caches` clears under,
+/// for the reason `publish_graph` gives.
+fn publish_raw_graph(key: RawGraphKey, entry: RawGraph) -> bool {
+    let mut graphs = RAW_GRAPHS.lock().unwrap_or_else(|p| p.into_inner());
+    if ROOT_GENERATION.load(Ordering::SeqCst) != entry.generation {
+        return false;
+    }
+    graphs.insert(key, entry);
+    true
+}
+
+fn graph_compute(year: &str, force: bool) -> Result<serde_json::Value, String> {
+    let reuse = if force {
+        RawGraphReuse::Never
+    } else {
+        RawGraphReuse::Unchanged
+    };
+    let raw = raw_graph(&LocalSourceContext::current(), year, reuse)?;
+    let data = usage_graph::to_payload((*raw.graph).clone())?;
     // The caller still gets this payload even when `publish_graph` refuses it.
     // It answers a request made before the roots changed, and the next call
-    // recomputes rather than serving it again.
-    publish_graph(year, generation, (Instant::now(), token, data.clone()));
+    // recomputes rather than serving it again. Stamped with the time the graph
+    // was computed, not now: a graph a device page computed 20 s ago must not
+    // be served as the payload for another 30 s.
+    publish_graph(year, raw.generation, (raw.at, raw.token, data.clone()));
     Ok(data)
 }
 
@@ -953,7 +1071,7 @@ fn graph_shared(year: &str, join: bool) -> Result<serde_json::Value, String> {
         year,
         join,
         ROOT_GENERATION.load(Ordering::SeqCst),
-        || graph_compute(year),
+        || graph_compute(year, !join),
     )
 }
 
@@ -1801,6 +1919,12 @@ fn invalidate_scan_caches() {
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .clear();
+    // The engine graphs the payloads above are mapped from. Same clear, same
+    // lock discipline (`publish_raw_graph`).
+    RAW_GRAPHS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .clear();
     // Third cache, same reason as the graph: `window_usage::cached` serves any
     // entry younger than `ONESHOT_MAX_AGE_SECS` without probing the token, so
     // the quota lens would keep folding a removed root's messages for up to
@@ -2081,7 +2205,9 @@ mod remote_ffi {
     /// restarts with them, and the new inputs need the owner's scope approval.
     /// The same re-check runs every 5 minutes on its own (a hand edit of the
     /// tokscale `settings.json` has no setter). Success data is the
-    /// `tb_remote_status` object.
+    /// `tb_remote_status` object. An error caused by the inputs (they cannot
+    /// be built, or the new agent cannot start) leaves no agent running; an
+    /// error from reading the status leaves a running agent as it was.
     ///
     /// # Safety
     /// `home_override` must be NULL or a valid NUL-terminated UTF-8 string.
@@ -2359,6 +2485,160 @@ mod tests {
         for entry in ["tb_agent_usage", "tb_cursor_sync", "tb_tokens_per_min", "tb_usage_trace"] {
             assert_eq!(width_for(entry, QOS_CLASS_UTILITY), RAYON_THREADS, "{entry} at utility");
         }
+    }
+
+    /// The engine graph is computed once for callers inside the freshness
+    /// window, again on `force`, and again after the roots move.
+    #[test]
+    fn the_engine_graph_is_shared_until_forced_or_invalidated() {
+        let home = tempfile::tempdir().unwrap();
+        let context = LocalSourceContext::for_home(home.path().to_path_buf());
+        let first = raw_graph(&context, "", RawGraphReuse::Fresh).unwrap();
+        let second = raw_graph(&context, " ", RawGraphReuse::Fresh).unwrap();
+        assert!(
+            Arc::ptr_eq(&first.graph, &second.graph),
+            "a fresh graph was recomputed"
+        );
+        // Control: another home is another graph, so the equality above is not
+        // every call returning one object.
+        let other_home = tempfile::tempdir().unwrap();
+        let other = raw_graph(
+            &LocalSourceContext::for_home(other_home.path().to_path_buf()),
+            "",
+            RawGraphReuse::Fresh,
+        )
+        .unwrap();
+        assert!(!Arc::ptr_eq(&first.graph, &other.graph));
+        // `Unchanged` reuses the kept graph while the sources are as they were
+        // and computes once they are not, inside the age window `Fresh` still
+        // accepts.
+        let unchanged = raw_graph(&context, "", RawGraphReuse::Unchanged).unwrap();
+        assert!(Arc::ptr_eq(&first.graph, &unchanged.graph), "unchanged sources were recomputed");
+        let project = home.path().join(".claude/projects/p");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(
+            project.join("s.jsonl"),
+            r#"{"type":"assistant","timestamp":"2024-12-01T09:00:00.000Z","requestId":"req_a","message":{"id":"msg_a","model":"claude-3-5-sonnet","usage":{"input_tokens":1,"output_tokens":2}}}"#,
+        )
+        .unwrap();
+        let still_fresh = raw_graph(&context, "", RawGraphReuse::Fresh).unwrap();
+        assert!(Arc::ptr_eq(&first.graph, &still_fresh.graph));
+        let changed = raw_graph(&context, "", RawGraphReuse::Unchanged).unwrap();
+        assert!(
+            !Arc::ptr_eq(&first.graph, &changed.graph),
+            "changed sources were answered with the kept graph"
+        );
+        let first = changed;
+        let forced = raw_graph(&context, "", RawGraphReuse::Never).unwrap();
+        assert!(
+            !Arc::ptr_eq(&first.graph, &forced.graph),
+            "force served the kept graph"
+        );
+        let after_force = raw_graph(&context, "", RawGraphReuse::Fresh).unwrap();
+        assert!(
+            Arc::ptr_eq(&forced.graph, &after_force.graph),
+            "the forced graph was not kept"
+        );
+        invalidate_scan_caches();
+        let after_move = raw_graph(&context, "", RawGraphReuse::Fresh).unwrap();
+        assert!(
+            !Arc::ptr_eq(&forced.graph, &after_move.graph),
+            "a root change kept the old graph"
+        );
+        assert!(
+            raw_graph(&context, "26", RawGraphReuse::Fresh).is_err(),
+            "an invalid year was accepted"
+        );
+    }
+
+    /// A background entry that waits on another pool must not have a second
+    /// background entry run nested inside that wait: the second one may wait
+    /// for the first (a joined graph flight does), and then neither returns.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_background_entry_never_runs_inside_another() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        extern "C" {
+            fn pthread_set_qos_class_self_np(qos_class: u32, relative_priority: i32) -> i32;
+        }
+        const QOS_CLASS_UTILITY: u32 = 0x11;
+        // Stands in for the scanner's pool.
+        let other = Arc::new(rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap());
+        let first_waiting = Arc::new((Mutex::new(false), Condvar::new()));
+        let first_done = Arc::new(AtomicBool::new(false));
+        let second_ran = Arc::new(AtomicBool::new(false));
+        let second_ran_inside = Arc::new(AtomicBool::new(false));
+        let second_submitting = Arc::new(AtomicBool::new(false));
+
+        let first = {
+            let (other, first_waiting, first_done, second_submitting) = (
+                Arc::clone(&other),
+                Arc::clone(&first_waiting),
+                Arc::clone(&first_done),
+                Arc::clone(&second_submitting),
+            );
+            std::thread::spawn(move || {
+                assert_eq!(unsafe { pthread_set_qos_class_self_np(QOS_CLASS_UTILITY, 0) }, 0);
+                guarded("tb_graph", || {
+                    assert_eq!(rayon::current_num_threads(), 1, "not on the background pool");
+                    other.install(|| {
+                        *first_waiting.0.lock().unwrap() = true;
+                        first_waiting.1.notify_all();
+                        // Stay here until the second entry is on its way in,
+                        // then long enough for its submission to land while
+                        // this worker still waits.
+                        let deadline = Instant::now() + Duration::from_secs(10);
+                        while !second_submitting.load(Ordering::SeqCst)
+                            && Instant::now() < deadline
+                        {
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                        std::thread::sleep(Duration::from_millis(300));
+                    });
+                    first_done.store(true, Ordering::SeqCst);
+                    std::ptr::null_mut()
+                });
+            })
+        };
+        let second = {
+            let (first_waiting, first_done, second_ran, second_ran_inside, second_submitting) = (
+                Arc::clone(&first_waiting),
+                Arc::clone(&first_done),
+                Arc::clone(&second_ran),
+                Arc::clone(&second_ran_inside),
+                Arc::clone(&second_submitting),
+            );
+            std::thread::spawn(move || {
+                assert_eq!(unsafe { pthread_set_qos_class_self_np(QOS_CLASS_UTILITY, 0) }, 0);
+                // Bounded: a first entry that never reached the other pool
+                // (its own assertion failed) must fail this test, not hang it.
+                let (waiting, timed_out) = first_waiting
+                    .1
+                    .wait_timeout_while(
+                        first_waiting.0.lock().unwrap(),
+                        Duration::from_secs(10),
+                        |waiting| !*waiting,
+                    )
+                    .unwrap();
+                assert!(!timed_out.timed_out(), "the first entry never reached the other pool");
+                drop(waiting);
+                second_submitting.store(true, Ordering::SeqCst);
+                guarded("tb_graph", || {
+                    second_ran.store(true, Ordering::SeqCst);
+                    second_ran_inside.store(!first_done.load(Ordering::SeqCst), Ordering::SeqCst);
+                    std::ptr::null_mut()
+                });
+            })
+        };
+        first.join().unwrap();
+        second.join().unwrap();
+        // Control: the second entry did run, so the assertion below is about
+        // when, not whether.
+        assert!(second_ran.load(Ordering::SeqCst));
+        assert!(
+            !second_ran_inside.load(Ordering::SeqCst),
+            "the second entry ran while the first was still waiting on another pool"
+        );
     }
 
     /// Nothing calls `isolate_test_config` but the loader, so a platform that

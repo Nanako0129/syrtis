@@ -1774,7 +1774,7 @@ dependencies = [
 [[package]]
 name = "syrtis-agent"
 version = "0.1.0"
-source = "git+https://github.com/Nanako0129/Syrtis-Agent?rev=d25607504e4731ad009a9961673794287b6d72e0#d25607504e4731ad009a9961673794287b6d72e0"
+source = "git+https://github.com/Nanako0129/Syrtis-Agent?rev=36ce38283d4972d30e2696e5725cf78a9fef59ad#36ce38283d4972d30e2696e5725cf78a9fef59ad"
 dependencies = [
  "hmac",
  "libc",
@@ -1784,6 +1784,7 @@ dependencies = [
  "snow",
  "tokscale-core",
  "unicode-normalization",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

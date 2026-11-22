@@ -13,6 +13,7 @@ dependencies = [
  "snow",
  "tokscale-core 3.0.0 (git+https://github.com/Nanako0129/tokscale-core?rev=e156#e156)",
  "unicode-normalization",
+ "windows-sys",
 ]
 
 [[package]]
@@ -65,3 +66,9 @@ version = "3.0.0"
 name = "tokscale-core"
 version = "3.0.0"
 source = "git+https://github.com/Nanako0129/tokscale-core?rev=e156#e156"
+
+[[package]]
+name = "windows-sys"
+version = "0.61.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0000000000000000000000000000000000000000000000000000000000000008"
