@@ -12,7 +12,7 @@
 //! session encrypted under a Keychain key Syrtis would have to ask the user to
 //! release. Instead the user pastes a Factory API key into Settings → Accounts
 //! → Factory, which stores it in the login Keychain under [`KEYCHAIN_SERVICE`]
-//! through `/usr/bin/security` (`FactoryAPIKey.swift`); reading it back
+//! and [`KEYCHAIN_ACCOUNT`] through `/usr/bin/security` (`FactoryAPIKey.swift`); reading it back
 //! through the same tool raises no authorization dialog. With no such item the
 //! provider is absent and no card is published.
 //!
@@ -36,9 +36,12 @@ use serde_json::{value::RawValue, Value};
 
 const LIMITS_URL: &str = "https://api.factory.ai/api/billing/limits";
 
-/// Login-Keychain service holding the Factory API key. Written by the Settings
-/// field (`FactoryAPIKey.keychainService` in Swift, the same literal).
-pub(crate) const KEYCHAIN_SERVICE: &str = "Syrtis Factory API Key";
+/// Login-Keychain service and account of the Factory API key item. Written by
+/// the Settings field (`FactoryAPIKey.keychainService` / `keychainAccount` in
+/// Swift, the same literals). Every read, write and delete names both, so no
+/// other item that happens to share the service can be picked up.
+pub(crate) const KEYCHAIN_SERVICE: &str = "com.nyanako.tokenbar.factory-api-key";
+pub(crate) const KEYCHAIN_ACCOUNT: &str = "factory";
 
 /// `security(1)` exit status for "The specified item could not be found".
 const SECURITY_ITEM_NOT_FOUND: i32 = 44;
@@ -68,27 +71,52 @@ pub(crate) struct FactoryData {
 /// Keychain, is terminal so the card says why instead of silently vanishing.
 #[cfg(target_os = "macos")]
 pub(crate) async fn factory_credential() -> FactoryCredentialLoad {
-    let output = tokio::process::Command::new("/usr/bin/security")
-        .args(["find-generic-password", "-s", KEYCHAIN_SERVICE, "-w"])
+    let mut command = tokio::process::Command::new("/usr/bin/security");
+    command.args([
+        "find-generic-password",
+        "-s",
+        KEYCHAIN_SERVICE,
+        "-a",
+        KEYCHAIN_ACCOUNT,
+        "-w",
+    ]);
+    credential_from_command(command, KEYCHAIN_READ_TIMEOUT).await
+}
+
+/// Same bound as `macos_safe_storage::Key::from_keychain`: an unanswered
+/// Keychain prompt (or a wedged `security`) must not hold the combined quota
+/// poll, which waits for every provider.
+#[cfg(target_os = "macos")]
+const KEYCHAIN_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(25);
+
+/// Runs the Keychain read `command` with a time limit; split from
+/// [`factory_credential`] so tests can drive it with a stand-in program
+/// instead of the real `security`. On expiry the child is killed (it is
+/// dropped with `kill_on_drop`) and the read is terminal.
+#[cfg(any(target_os = "macos", test))]
+async fn credential_from_command(
+    mut command: tokio::process::Command,
+    limit: std::time::Duration,
+) -> FactoryCredentialLoad {
+    let unreadable = || {
+        FactoryCredentialLoad::Terminal(
+            "Factory API key could not be read from the Keychain.".to_string(),
+        )
+    };
+    let future = command
         .stdin(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
-        .output()
-        .await;
-    let output = match output {
-        Ok(output) => output,
-        Err(_) => {
-            return FactoryCredentialLoad::Terminal(
-                "Factory API key could not be read from the Keychain.".to_string(),
-            )
-        }
+        .kill_on_drop(true)
+        .output();
+    let output = match tokio::time::timeout(limit, future).await {
+        Ok(Ok(output)) => output,
+        Ok(Err(_)) | Err(_) => return unreadable(),
     };
     if output.status.code() == Some(SECURITY_ITEM_NOT_FOUND) {
         return FactoryCredentialLoad::Absent;
     }
     if !output.status.success() {
-        return FactoryCredentialLoad::Terminal(
-            "Factory API key could not be read from the Keychain.".to_string(),
-        );
+        return unreadable();
     }
     let key = String::from_utf8_lossy(&output.stdout).trim().to_string();
     if key.is_empty() {
@@ -104,7 +132,13 @@ pub(crate) async fn factory_credential() -> FactoryCredentialLoad {
 
 #[derive(Debug, Deserialize)]
 struct LimitsResponse {
-    #[serde(default, rename = "hasActiveSubscription")]
+    // A non-bool value is read as absent so it cannot fail the whole decode
+    // when the tiers are usable.
+    #[serde(
+        default,
+        rename = "hasActiveSubscription",
+        deserialize_with = "deserialize_optional_bool"
+    )]
     has_active_subscription: Option<bool>,
     #[serde(default)]
     limits: Option<Tiers>,
@@ -134,26 +168,21 @@ struct TierWindows {
 struct Window {
     #[serde(default, rename = "usedPercent")]
     used_percent: Option<f64>,
-    // `windowEnd` is `null` for a window with no activity yet; any non-string
-    // value is treated the same way rather than failing the row.
-    #[serde(
-        default,
-        rename = "windowEnd",
-        deserialize_with = "deserialize_optional_string"
-    )]
-    window_end: Option<String>,
+    // Absent or `null` for a window with no activity yet (kept, no reset).
+    // Kept raw so a present value that is not a datetime string can drop the
+    // window instead of passing as an idle one; see `map_window`.
+    #[serde(default, rename = "windowEnd")]
+    window_end: Option<Value>,
 }
 
-fn deserialize_optional_string<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+fn deserialize_optional_bool<'de, D>(deserializer: D) -> Result<Option<bool>, D::Error>
 where
     D: Deserializer<'de>,
 {
-    Ok(
-        Option::<Value>::deserialize(deserializer)?.and_then(|value| match value {
-            Value::String(value) => Some(value),
-            _ => None,
-        }),
-    )
+    Ok(match Option::<Value>::deserialize(deserializer)? {
+        Some(Value::Bool(value)) => Some(value),
+        _ => None,
+    })
 }
 
 /// Reads the clock after the response arrives (see `agent_opencode_go::fetch`):
@@ -293,7 +322,13 @@ fn map_window(
 ) -> Option<UsageWindow> {
     let window: Window = serde_json::from_str(raw?.get()).ok()?;
     let percent = window.used_percent?;
-    let resets_at = window.window_end.as_deref().and_then(parse_datetime);
+    // Absent or `null` is an idle window: kept, no reset. Anything else must be
+    // a parseable datetime, or the window is invalid evidence and drops.
+    let resets_at = match window.window_end {
+        None | Some(Value::Null) => None,
+        Some(Value::String(end)) => Some(parse_datetime(&end)?),
+        Some(_) => return None,
+    };
     // An expired window end is invalid evidence (provider-quota-pace.md):
     // drop it rather than emit a card dated to a cycle that already ended.
     if resets_at.is_some_and(|reset| reset <= now) {
@@ -408,6 +443,7 @@ mod tests {
                     "monthly":  {"usedPercent": 30, "windowEnd": "2026-11-01T00:00:00Z"}
                 },
                 "core": {
+                    "fiveHour": {"usedPercent": 10, "windowEnd": null},
                     "weekly":   {"usedPercent": 40, "windowEnd": {"unexpected": true}},
                     "monthly":  {"usedPercent": 1e400}
                 }
@@ -417,13 +453,38 @@ mod tests {
         let labels: Vec<_> = windows.iter().map(|w| w.label_for_test()).collect();
         assert_eq!(
             labels,
-            ["Core Weekly"],
-            "out-of-range, wrong-typed, expired and non-finite drop"
+            ["Core 5h"],
+            "out-of-range, wrong-typed, expired, non-finite and non-string-end drop; a null end is kept"
         );
         assert_eq!(windows[0].resets_at_for_test(), None);
-        assert!(!serde_json::to_string(&windows[0])
-            .unwrap()
-            .contains("unexpected"));
+    }
+
+    #[test]
+    fn a_window_end_that_is_not_a_datetime_drops_the_window() {
+        let body = r#"{
+            "limits": {
+                "standard": {
+                    "fiveHour": {"usedPercent": 10},
+                    "weekly":   {"usedPercent": 20, "windowEnd": "next tuesday"},
+                    "monthly":  {"usedPercent": 30, "windowEnd": 1794546000}
+                }
+            }
+        }"#;
+        let windows = decode_limits_response(body, now()).unwrap();
+        let labels: Vec<_> = windows.iter().map(|w| w.label_for_test()).collect();
+        assert_eq!(labels, ["Standard 5h"], "an absent end is kept, an unparseable one drops");
+        assert_eq!(windows[0].resets_at_for_test(), None);
+    }
+
+    #[test]
+    fn a_wrong_typed_subscription_flag_does_not_fail_usable_tiers() {
+        let body = r#"{
+            "hasActiveSubscription": "yes",
+            "limits": {"core": {"weekly": {"usedPercent": 45, "windowEnd": "2026-11-15T00:00:00.000Z"}}}
+        }"#;
+        let windows = decode_limits_response(body, now()).unwrap();
+        let labels: Vec<_> = windows.iter().map(|w| w.label_for_test()).collect();
+        assert_eq!(labels, ["Core Weekly"]);
     }
 
     #[test]
@@ -440,10 +501,49 @@ mod tests {
     }
 
     #[test]
-    fn keychain_service_is_the_name_the_settings_field_writes() {
-        // `FactoryAPIKey.keychainService` in Swift writes this item; SelfTest
-        // pins the same literal on that side.
-        assert_eq!(KEYCHAIN_SERVICE, "Syrtis Factory API Key");
+    fn keychain_item_is_the_one_the_settings_field_writes() {
+        // `FactoryAPIKey.keychainService` / `keychainAccount` in Swift write
+        // this item; SelfTest pins the same literals on that side.
+        assert_eq!(KEYCHAIN_SERVICE, "com.nyanako.tokenbar.factory-api-key");
+        assert_eq!(KEYCHAIN_ACCOUNT, "factory");
+    }
+
+    fn shell(script: &str) -> tokio::process::Command {
+        let mut command = tokio::process::Command::new("/bin/sh");
+        command.args(["-c", script]);
+        command
+    }
+
+    #[tokio::test]
+    async fn a_keychain_read_that_does_not_finish_is_terminal_and_killed() {
+        // Stand-in for a `security` stuck on an unanswered prompt.
+        let started = std::time::Instant::now();
+        let outcome =
+            credential_from_command(shell("exec sleep 30"), std::time::Duration::from_millis(200)).await;
+        assert!(
+            matches!(&outcome, FactoryCredentialLoad::Terminal(message)
+                if message == "Factory API key could not be read from the Keychain."),
+            "a timed-out read must be terminal"
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    }
+
+    #[tokio::test]
+    async fn keychain_read_exit_statuses_map_to_absent_terminal_and_present() {
+        let limit = std::time::Duration::from_secs(10);
+        assert!(matches!(
+            credential_from_command(shell("exit 44"), limit).await,
+            FactoryCredentialLoad::Absent
+        ));
+        assert!(matches!(
+            credential_from_command(shell("exit 51"), limit).await,
+            FactoryCredentialLoad::Terminal(_)
+        ));
+        assert!(matches!(
+            credential_from_command(shell("echo fk-fixture"), limit).await,
+            FactoryCredentialLoad::Present(FactoryCredential { ref request_token })
+                if request_token == "fk-fixture"
+        ));
     }
 
     #[test]

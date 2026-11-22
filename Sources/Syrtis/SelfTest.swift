@@ -17901,17 +17901,21 @@ enum SelfTest {
             "ACCOUNTS-PAGE Antigravity details keep the keychain / token-service / revoke facts and Claude details keep the CLAUDE_CONFIG_DIR instructions")
 
         // Factory ⓘ: where the key is stored, that it is not logged, where it
-        // is sent and how much it can do. The Keychain service is the literal
-        // `agent_factory::KEYCHAIN_SERVICE` reads; a rename on either side
-        // leaves the card absent with the key saved.
+        // is sent and how much it can do. The Keychain service and account are
+        // the literals `agent_factory::KEYCHAIN_SERVICE` / `KEYCHAIN_ACCOUNT`
+        // read; a rename on either side leaves the card absent with the key
+        // saved. The copy names the item by the label Keychain Access shows.
         let factoryInfo = AccountsCopy.factoryDetails.joined(separator: "\n")
         expect(
-            FactoryAPIKey.keychainService == "Syrtis Factory API Key"
-                && ["login Keychain", "Syrtis Factory API Key", "doesn't log", "api.factory.ai",
-                    "app.factory.ai/settings/api-keys", "act as your Factory account"]
+            FactoryAPIKey.keychainService == "com.nyanako.tokenbar.factory-api-key"
+                && FactoryAPIKey.keychainAccount == "factory"
+                && ["login Keychain", FactoryAPIKey.keychainLabel, "doesn't log", "api.factory.ai",
+                    "each time the quota refreshes", "app.factory.ai/settings/api-keys",
+                    "act as your Factory account"]
                     .allSatisfy(factoryInfo.contains)
+                && !factoryInfo.contains("Droid makes when it starts")
                 && AccountsCopy.translated.contains(AccountsCopy.factorySummary),
-            "ACCOUNTS-PAGE Factory details state the Keychain item, logging, destination and scope of the key")
+            "ACCOUNTS-PAGE Factory details state the Keychain item, logging, destination, timing and scope of the key")
         expect(
             FactoryAPIKey.isWellFormed("fk-" + String(repeating: "a", count: 40))
                 && FactoryAPIKey.isWellFormed("  fk-" + String(repeating: "A1_", count: 10) + "\n")

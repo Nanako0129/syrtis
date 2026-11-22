@@ -12,10 +12,17 @@ import Foundation
 /// argv, so it does not appear in the process table. It is never written to
 /// `UserDefaults`, a log, or a file.
 enum FactoryAPIKey {
-    /// Must equal `agent_factory::KEYCHAIN_SERVICE`; SelfTest pins the literal.
-    static let keychainService = "Syrtis Factory API Key"
+    /// Must equal `agent_factory::KEYCHAIN_SERVICE` / `KEYCHAIN_ACCOUNT`;
+    /// SelfTest pins the literals. Every call names both, so an unrelated item
+    /// sharing the service is never read, overwritten or deleted.
+    static let keychainService = "com.nyanako.tokenbar.factory-api-key"
     static let keychainAccount = "factory"
+    /// The name Keychain Access shows; the Settings copy quotes it.
+    static let keychainLabel = "Factory API key for Syrtis"
     private static let securityTool = "/usr/bin/security"
+    /// No `security` call here involves a prompt, so one still running after
+    /// this long is wedged; it is terminated and the call reports failure.
+    private static let securityTimeout: TimeInterval = 10
     /// `security(1)` exit status for "The specified item could not be found".
     private static let itemNotFound: Int32 = 44
 
@@ -39,25 +46,25 @@ enum FactoryAPIKey {
         await Task.detached(priority: .userInitiated) { status() }.value
     }
 
-    /// Saves `key` (replacing any stored one) and reports whether the item is
-    /// present afterwards. Success is read back from the Keychain rather than
-    /// taken from the exit status, because the item being there is what the
-    /// Droid card depends on.
+    /// Saves `key` (replacing any stored one) and reports success only when
+    /// `security -i` exited 0 and the item is present afterwards: the exit
+    /// status says this write worked, the read-back says the item the Droid
+    /// card depends on is there.
     static func store(_ key: String) async -> Bool {
         let trimmed = key.trimmingCharacters(in: .whitespacesAndNewlines)
         guard isWellFormed(trimmed) else { return false }
         return await Task.detached(priority: .userInitiated) {
             let command = "add-generic-password -U -s \"\(keychainService)\" -a \"\(keychainAccount)\" "
-                + "-l \"\(keychainService)\" -w \"\(trimmed)\"\n"
-            _ = runSecurity(["-i"], stdin: command)
-            return status() == .present
+                + "-l \"\(keychainLabel)\" -w \"\(trimmed)\"\n"
+            let exitStatus = runSecurity(["-i"], stdin: command)
+            return exitStatus == 0 && status() == .present
         }.value
     }
 
     /// Deletes the stored key and reports whether it is gone afterwards.
     static func clear() async -> Bool {
         await Task.detached(priority: .userInitiated) {
-            _ = runSecurity(["delete-generic-password", "-s", keychainService])
+            _ = runSecurity(["delete-generic-password", "-s", keychainService, "-a", keychainAccount])
             return status() == .absent
         }.value
     }
@@ -73,13 +80,15 @@ enum FactoryAPIKey {
 
     private static func status() -> Status {
         // Attributes only (no `-w`), so the secret never leaves the Keychain here.
-        switch runSecurity(["find-generic-password", "-s", keychainService]) {
+        switch runSecurity(["find-generic-password", "-s", keychainService, "-a", keychainAccount]) {
         case 0: return .present
         case itemNotFound: return .absent
         default: return .unreadable
         }
     }
 
+    /// The exit status, or nil when `security` could not start or did not
+    /// finish within `securityTimeout` (it is terminated then).
     private static func runSecurity(_ arguments: [String], stdin: String? = nil) -> Int32? {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: securityTool)
@@ -88,16 +97,31 @@ enum FactoryAPIKey {
         process.standardError = FileHandle.nullDevice
         let input = Pipe()
         process.standardInput = stdin == nil ? FileHandle.nullDevice : input
+        let exited = DispatchSemaphore(value: 0)
+        process.terminationHandler = { _ in exited.signal() }
         do {
             try process.run()
         } catch {
             return nil
         }
         if let stdin {
-            input.fileHandleForWriting.write(Data(stdin.utf8))
-            try? input.fileHandleForWriting.close()
+            let writer = input.fileHandleForWriting
+            // If `security` exits before reading, the write must fail with
+            // EPIPE rather than raise SIGPIPE, whose default action would
+            // terminate the app. The throwing write reports it instead of
+            // raising an Objective-C exception.
+            _ = fcntl(writer.fileDescriptor, F_SETNOSIGPIPE, 1)
+            do {
+                try writer.write(contentsOf: Data(stdin.utf8))
+            } catch {
+                // The exit status (or the timeout) below reports the failure.
+            }
+            try? writer.close()
         }
-        process.waitUntilExit()
+        guard exited.wait(timeout: .now() + securityTimeout) == .success else {
+            process.terminate()
+            return nil
+        }
         return process.terminationStatus
     }
 }

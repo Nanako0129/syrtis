@@ -1738,7 +1738,7 @@ pub(crate) const QUOTA_PROVIDERS: &[QuotaProvider] = &[
         fetch: |id| provider_fetch(async move { fetch_opencode_go(id).await.into_iter().collect() }),
     },
     // Droid only appears when the login Keychain holds a Factory API key under
-    // `agent_factory::KEYCHAIN_SERVICE`.
+    // `agent_factory::KEYCHAIN_SERVICE` / `KEYCHAIN_ACCOUNT`.
     QuotaProvider {
         id: ProviderId::Droid,
         fetch: |id| provider_fetch(async move { fetch_droid(id).await.into_iter().collect() }),

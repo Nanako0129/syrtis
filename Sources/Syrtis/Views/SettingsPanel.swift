@@ -2063,8 +2063,8 @@ enum AccountsCopy {
     static let factory = "Factory"
     static let factorySummary = "A Factory API key shows Droid's plan limits."
     static let factoryDetails = [
-        "Create an API key in Factory's settings (app.factory.ai/settings/api-keys) and paste it here. Syrtis stores it in your login Keychain as Syrtis Factory API Key and doesn't log it.",
-        "To show the limits, Syrtis sends the key to api.factory.ai, the same request Droid makes when it starts. The key can act as your Factory account, so delete it in Factory's settings when you no longer need it.",
+        "Create an API key in Factory's settings (app.factory.ai/settings/api-keys) and paste it here. Syrtis stores it in your login Keychain as Factory API key for Syrtis and doesn't log it.",
+        "To show the limits, Syrtis sends the key to api.factory.ai each time the quota refreshes. The key can act as your Factory account, so delete it in Factory's settings when you no longer need it.",
     ]
     static let factoryPlaceholder = "Paste API key"
     static let factorySave = "Save"
