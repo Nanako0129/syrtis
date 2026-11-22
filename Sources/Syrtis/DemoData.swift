@@ -543,7 +543,8 @@ enum DemoData {
                     "updatedAt": updated,
                     "windows": windows,
                 ] as [String: Any]
-            }            // The `opencode` client carries the OpenCode Go subscription quota:
+            }
+            // The `opencode` client carries the OpenCode Go subscription quota:
             // rolling/weekly/monthly percent windows (ported from mana.bar).
             // Give it those three so the demo card matches the real provider
             // shape instead of the generic session/weekly fixture.
