@@ -23,10 +23,15 @@ struct StatsView: View {
     /// Forwarded to the attribution card so a terminal nil report reads as
     /// unavailable rather than as a request still in flight.
     var reportLoading = false
+    /// SA-3d: set while the selected devices' model report has not arrived.
+    /// The favorite-model row and the attribution card are then replaced by
+    /// this fixed line; this Mac's own report is never shown in their place.
+    var modelsUnavailableNote: String?
 
     /// The same rows the tab's Models list shows, so the two agree.
     private var favorite: ModelReportEntry? {
-        (modelReport?.tabEntries(clientIds: clientIds) ?? []).favoriteRow
+        modelsUnavailableNote != nil
+            ? nil : (modelReport?.tabEntries(clientIds: clientIds) ?? []).favoriteRow
     }
 
     var body: some View {
@@ -35,9 +40,16 @@ struct StatsView: View {
                 payload: payload, clientIds: clientIds, stats: stats, colors: colors,
                 year: year)
             summaryCard
-            UsageAttributionBreakdownCard(
-                report: modelReport, reportYear: modelYear, clientIds: clientIds,
-                singleClient: singleClient, reportLoading: reportLoading)
+            if let modelsUnavailableNote {
+                Text(verbatim: modelsUnavailableNote)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            } else {
+                UsageAttributionBreakdownCard(
+                    report: modelReport, reportYear: modelYear, clientIds: clientIds,
+                    singleClient: singleClient, reportLoading: reportLoading)
+            }
         }
     }
 

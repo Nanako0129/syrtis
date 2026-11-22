@@ -75,6 +75,18 @@ public struct RemoteGrant: Decodable, Equatable, Sendable {
     public let state: String
 }
 
+/// `tb_remote_pair_destination`: the address a Pair URL would connect to,
+/// shown to the owner before the claim connects.
+public struct RemotePairDestination: Decodable, Equatable, Sendable {
+    public let host: String
+    public let port: Int
+
+    public init(host: String, port: Int) {
+        self.host = host
+        self.port = port
+    }
+}
+
 /// `tb_remote_pair_claim`: compare `sas` with the producer's screen.
 public struct RemoteClaim: Decodable, Equatable, Sendable {
     public let handle: Int64
@@ -94,7 +106,13 @@ public struct RemotePaired: Decodable, Equatable, Sendable {
 public struct RemotePeer: Decodable, Equatable, Sendable {
     public let producerStatic: String
     public let fingerprint: String
+    /// The name the producer last sent (the agent has checked it; nil until
+    /// its first answer). Its owner's free text: display only as a format
+    /// argument or `Text(verbatim:)`.
     public let nodeLabel: String?
+    /// The producer's address, from the offer this receiver claimed.
+    public let host: String
+    public let port: Int
     public let createdAt: Int64
     public let expiresAt: Int64
     public let state: String
@@ -126,21 +144,93 @@ public enum DeviceFetchMode: String, Sendable {
 
 /// One `devices` row. `id` is `local`, `peers` (the peer store could not be
 /// read) or a producer's 16-hex fingerprint; `state` is one of `local`,
-/// `fresh`, `lastGood`, `stale`, `unavailable`, `refused`, `invalidReply`,
-/// `incompatible`; `lastSuccessAt` is Unix seconds of the last fresh pull in
+/// `fresh`, `lastGood`, `stale`, `unavailable`, `overLimit` (its reply was
+/// over the record or memory limits and is left out whole), `refused`,
+/// `invalidReply`, `incompatible`; `lastSuccessAt` is Unix seconds of the last fresh pull in
 /// this app run.
 public struct RemoteDevice: Decodable, Equatable, Sendable {
     public let id: String
+    /// What names the device on screen: the name its owner gave it, else its
+    /// `address`. The owner's free text: display it only as a format argument
+    /// or `Text(verbatim:)`, never as a localization key.
     public let label: String?
     public let state: String
     public let lastSuccessAt: Int64?
+    /// Why the last pull failed, when `state` alone does not say:
+    /// `unreachable`, `timeout`, `busy`, `stopped` or `error`. Absent for a
+    /// pull that did not fail that way (and from a core that predates it).
+    public let reason: String?
+    /// This device's part of the merged page, one entry per client; absent
+    /// or null when none of it was merged (and on a page that carries none).
+    public let totals: [DeviceClientTotal]?
+    /// The producer's `host:port` as stored when it was linked, whatever its
+    /// name. Absent on this Mac's row.
+    public let address: String?
+    /// The body this page merged for the device said its price table was
+    /// missing or corrupt, so its cost may be low. False when no body was
+    /// merged (and from a core that predates it).
+    public let costIncomplete: Bool
+    /// The device has ever answered this Mac. Absent (a core that predates
+    /// it) reads as true: no first-scan claim is made.
+    public let everAnswered: Bool
+
+    public init(
+        id: String, label: String?, state: String, lastSuccessAt: Int64?,
+        reason: String? = nil, totals: [DeviceClientTotal]? = nil,
+        address: String? = nil, costIncomplete: Bool = false, everAnswered: Bool = true
+    ) {
+        self.id = id
+        self.label = label
+        self.state = state
+        self.lastSuccessAt = lastSuccessAt
+        self.reason = reason
+        self.totals = totals
+        self.address = address
+        self.costIncomplete = costIncomplete
+        self.everAnswered = everAnswered
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id, label, state, lastSuccessAt, reason, totals, address, costIncomplete, everAnswered
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(String.self, forKey: .id)
+        label = try c.decodeIfPresent(String.self, forKey: .label)
+        state = try c.decode(String.self, forKey: .state)
+        lastSuccessAt = try c.decodeIfPresent(Int64.self, forKey: .lastSuccessAt)
+        reason = try c.decodeIfPresent(String.self, forKey: .reason)
+        totals = try c.decodeIfPresent([DeviceClientTotal].self, forKey: .totals)
+        address = try c.decodeIfPresent(String.self, forKey: .address)
+        costIncomplete = try c.decodeIfPresent(Bool.self, forKey: .costIncomplete) ?? false
+        everAnswered = try c.decodeIfPresent(Bool.self, forKey: .everAnswered) ?? true
+    }
+}
+
+/// One client's share of a device's part of a merged page (`totals` of a
+/// `devices` row, graph and models pages). The core computes these; the app
+/// only adds the clients on screen.
+public struct DeviceClientTotal: Decodable, Equatable, Sendable {
+    public let client: String
+    public let messages: Int64
+    public let tokens: Int64
+    public let costUsd: Double
+
+    public init(client: String, messages: Int64, tokens: Int64, costUsd: Double) {
+        self.client = client
+        self.messages = messages
+        self.tokens = tokens
+        self.costUsd = costUsd
+    }
 }
 
 /// A page payload with paired devices folded in by the core, and the device
 /// rows. Deliberately not the page's own type (`UsagePayload`,
-/// `ModelReport`, …): data that may hold another machine's usage must never
-/// reach `SnapshotStore` or replace the local payload the tray and the
-/// snapshot use.
+/// `ModelReport`, …), so a signature mismatch flags a mix-up. `payload` is a
+/// public field, so this does not stop a caller from handing it to
+/// `SnapshotStore` or the tray's local payload: that holds because callers do
+/// not pass it to `apply`, and the SA3D selftest guards it.
 public struct DeviceAwarePayload<Payload: Decodable & Sendable>: Decodable, Sendable {
     public let payload: Payload
     public let devices: [RemoteDevice]

@@ -311,6 +311,15 @@ private struct DashboardSnapshot {
     /// finishes, and must not roll back the next popover's fresher snapshot.
     private static var lastSnapshot: DashboardSnapshot?
 
+    /// Test seam (not `#if DEBUG`: the bundled selftest uses it): what the
+    /// reopen cache holds.
+    static var lastSnapshotForTesting: (payload: UsagePayload, knownYears: [String], modelReport: ModelReport?)? {
+        lastSnapshot.map { ($0.payload, $0.knownYears, $0.modelReport) }
+    }
+
+    /// Test seam: the process-wide hourly cache's reports.
+    static var hourlyCacheForTesting: [HourlyReport] { Array(hourlyCache.values) }
+
     /// The union scan, held across popover reopens like `lastSnapshot` is.
     /// `@State` on PopoverView does not survive the view being rebuilt, so an
     /// instance property here would make every reopen pay the full scan again
@@ -437,10 +446,14 @@ private struct DashboardSnapshot {
         source: any UsageDataSource = UsageDataSources.current,
         initialYear: String? = DashboardModel.resolveYear(),
         buildIdentity: BuildIdentity? = BuildIdentity.shipping(),
-        snapshotDirectory: @autoclosure () -> URL? = SnapshotStore.defaultDirectory()
+        snapshotDirectory: @autoclosure () -> URL? = SnapshotStore.defaultDirectory(),
+        deviceDefaults: UserDefaults = .standard,
+        peerNotifications: NotificationCenter = .default
     ) {
         self.cachesSnapshot = cachesSnapshot
         self.source = source
+        self.deviceOverlay = DeviceOverlayState(
+            source: source, defaults: deviceDefaults, notifications: peerNotifications)
         self.year = initialYear
         self.buildIdentity = buildIdentity
         self.resolvedSnapshotDirectory =
@@ -587,6 +600,9 @@ private struct DashboardSnapshot {
         Array(Set(defaults.stringArray(forKey: Self.localRecordClientsKey) ?? [])
             .union(stats?.presentClients ?? [])).sorted()
     }
+    /// SA-3d: the pages of the selected devices, merged by the core. Never
+    /// read into any property below: see `DeviceOverlayState`.
+    let deviceOverlay: DeviceOverlayState
     private(set) var payload: UsagePayload?
     private(set) var stats: UsageStats?
     private(set) var modelReport: ModelReport?
@@ -953,6 +969,7 @@ private struct DashboardSnapshot {
         guard !refreshing else { return }
         refreshing = true
         defer { refreshing = false }
+        deviceOverlay.manualRefresh()
         await reload(force: true, kind: .manual)
     }
 
@@ -1324,6 +1341,9 @@ private struct DashboardSnapshot {
             // Sleep first: load()'s initial fetch already covers t=0.
             try? await Task.sleep(for: .seconds(60))
             if Task.isCancelled { break }
+            // SA-3d: which devices can be chosen follows the local poll. Reads
+            // the peer list only; nothing of it reaches the local data below.
+            deviceOverlay.refreshPeers()
             // Don't race an in-flight manual Refresh or year switch.
             guard !refreshing else { continue }
             let year = self.year
@@ -2885,5 +2905,913 @@ private struct DashboardSnapshot {
     /// filtering follows the same policy as the tray and live-session card.
     func tokensPerMin() async -> Double? {
         try? await LiveRate.current(source: source)
+    }
+}
+
+// MARK: - Dashboard device selection (SA-3d)
+
+/// Which device-aware page an overlay holds.
+enum DeviceOverlayKind: Hashable, Sendable {
+    case graph, models, hourly, agents
+}
+
+/// What an overlay was fetched for. A response lands only while its key is
+/// still the one the lens wants; a slot is shown only while its key is the
+/// one the lens wants now.
+struct DeviceOverlayKey: Hashable, Sendable {
+    let kind: DeviceOverlayKind
+    /// "" = all time.
+    let year: String
+    /// Hourly and Agents only; nil = every client. Sorted and unique.
+    let clients: [String]?
+    let local: Bool
+    /// Sorted `producerStatic` values.
+    let peers: [String]
+
+    var selection: DeviceSelection { DeviceSelection(local: local, peers: peers) }
+    var yearArgument: String? { year.isEmpty ? nil : year }
+}
+
+/// One overlay: the core's merged page for `key`, kept beside (never in place
+/// of) the local data. `failed`: the last refresh for this key failed; `data`
+/// is then the last good answer, or nil when there never was one.
+struct DeviceOverlaySlot<Payload: Decodable & Sendable>: Sendable {
+    let key: DeviceOverlayKey
+    var data: DeviceAwarePayload<Payload>?
+    var failed: Bool
+}
+
+/// The persisted choice (`tokenbar.dashboard.deviceSelection`, JSON). Peers
+/// are `producerStatic` values.
+struct StoredDeviceSelection: Codable, Equatable, Sendable {
+    var local = true
+    var peers: [String] = []
+}
+
+private enum DeviceOverlayResult: Sendable {
+    case graph(DeviceAwarePayload<UsagePayload>)
+    case models(DeviceAwarePayload<ModelReport>)
+    case hourly(DeviceAwarePayload<HourlyReport>)
+    case agents(DeviceAwarePayload<AgentsReport>)
+}
+
+extension DeviceOverlayResult {
+    fileprivate var devices: [RemoteDevice] {
+        switch self {
+        case .graph(let p): p.devices
+        case .models(let p): p.devices
+        case .hourly(let p): p.devices
+        case .agents(let p): p.devices
+        }
+    }
+}
+
+/// The device overlay of the dashboard's Graph (Stats, Daily, Monthly), Models,
+/// Hourly and Agents lenses.
+///
+/// Isolation, by construction: this type holds the core's merged pages and
+/// nothing else. It has no access to `DashboardModel`'s private state, and
+/// `DashboardModel` never reads these values into `apply(payload:)`, `payload`,
+/// `stats`, `knownYears`, `tokenbar.localRecordClients`, `modelReport`,
+/// `colors`, `hourly`, `hourlyCache`, `agents`, the snapshot or the tray's
+/// `lastGraph`. Merging across sources happens in the core
+/// (`remote_pages.rs`); nothing here adds, subtracts or splices a local value
+/// with a remote one. What it derives is from one overlay payload at a time
+/// (`UsageStats`, client slices, `ModelColorMap`), with its own instances.
+@MainActor @Observable final class DeviceOverlayState {
+    static let selectionKey = "tokenbar.dashboard.deviceSelection"
+    /// Peers this app has already offered for selection (JSON array of
+    /// `producerStatic`). Apart from `selectionKey` so an older selection
+    /// decodes unchanged. A device the user unchecked stays in it, so it is
+    /// never checked again for them. A device that was checked when it stopped
+    /// being active (its grant was revoked or expired) leaves it, so linking it
+    /// again checks it again: that is how the user gets it back.
+    static let seenPeersKey = "tokenbar.dashboard.deviceSeenPeers"
+    /// A key refreshed this recently is not asked for again when a lens comes
+    /// on screen: a producer grants a burst of 2 and refills one per 60 s, and
+    /// Overview and Stats share the same two keys. A manual refresh, a poll and
+    /// a retry still ask. Seam: tests shorten it.
+    static var freshWindowSeconds: Double = 60
+    /// How often the lens on screen is refreshed from the producers. A producer
+    /// grants a burst of 2 requests and refills one per 60 s, and the Stats
+    /// lens asks for two pages per refresh, so a faster poll would only be
+    /// answered with last-good data and a refusal.
+    static let remotePollSeconds: Double = 300
+    /// One delayed retry after a refresh that left a selected device without
+    /// new data. A producer refills one request per 60 s, so a request spent
+    /// in a burst is available again a little over a minute later; the 5 s
+    /// margin covers the refill granularity. Seam: a test shortens it.
+    static var retryDelaySeconds: Double = 65
+    /// The core refuses more than 16 producers in one call.
+    static let maxSelectedPeers = 16
+    private static let order: [DeviceOverlayKind] = [.graph, .models, .hourly, .agents]
+
+    @ObservationIgnored private let source: any UsageDataSource
+    @ObservationIgnored private let defaults: UserDefaults
+
+    private(set) var stored: StoredDeviceSelection
+    /// Producers the last successful `remotePeers()` listed as active. Empty
+    /// when the list could not be read: the menu hides and only this Mac's own
+    /// path runs.
+    private(set) var selectablePeers: [RemotePeer] = []
+    private(set) var graph: DeviceOverlaySlot<UsagePayload>?
+    private(set) var models: DeviceOverlaySlot<ModelReport>?
+    private(set) var hourly: DeviceOverlaySlot<HourlyReport>?
+    private(set) var agents: DeviceOverlaySlot<AgentsReport>?
+    /// Of the graph overlay's own payload, as `apply` builds it for the local one.
+    private(set) var graphStats: UsageStats?
+    /// Of the models overlay's own report.
+    private(set) var modelsColors = ModelColorMap(report: nil)
+
+    // Which pages count for the short status follows `wanted`, so a change
+    // here (another lens, the popover closing) is published even when it
+    // starts no fetch.
+    @ObservationIgnored private var wanted: [DeviceOverlayKind: DeviceOverlayKey] = [:] {
+        didSet {
+            guard wanted != oldValue else { return }
+            wantedRevision += 1
+            republishIfActive()
+        }
+    }
+    /// Observable stand-in for `wanted` (which is not observed): `fetching`
+    /// reads it, so a view redraws when the lens on screen changes.
+    private var wantedRevision = 0
+    /// Whether a refresh this model started has not finished (the process-wide
+    /// guard below says whether any model has one). Observable: the header's
+    /// refresh button spins and the status line says "getting usage" from it.
+    private(set) var refreshing = false { didSet { republishIfActive() } }
+    /// Cached loads (this Mac's share is computed there, which can take a cold
+    /// scan) that have not yet handed over to their refresh, and a refresh
+    /// queued behind another in the process. Observable, with `refreshing`:
+    /// until a lens's pages are fresh, "pending" is part of "in flight".
+    /// Keyed by load, with the keys the load was started for: a load for a
+    /// lens that is no longer on screen is not "in flight" for the one that
+    /// is (its result is dropped when it arrives, as `runOnce` always did).
+    private var cachedLoadKeys: [Int: [DeviceOverlayKey]] = [:] { didSet { republishIfActive() } }
+    @ObservationIgnored private var nextCachedLoad = 0
+    /// The cached loads whose keys are still the ones wanted.
+    var cachedLoads: Int {
+        _ = wantedRevision
+        return cachedLoadKeys.values.filter { $0.allSatisfy { wanted[$0.kind] == $0 } }.count
+    }
+    private(set) var queuedRefresh = false { didSet { republishIfActive() } }
+    /// A refresh for the lens on screen is pending or running.
+    var fetching: Bool { refreshing || cachedLoads > 0 || queuedRefresh }
+    /// Bumped when the scan roots change: a refresh that began under an older
+    /// one must not count as recent.
+    @ObservationIgnored private var rootsEpoch = 0
+    /// When each key's last refresh was stored (see `freshWindowSeconds`).
+    @ObservationIgnored private var refreshedAt: [DeviceOverlayKey: Date] = [:]
+    @ObservationIgnored private var lastRootsGeneration: Int?
+    /// Peers already offered once; see `seenPeersKey`. Nil until the first
+    /// successful peer list when an older selection exists without the key.
+    @ObservationIgnored private var seenPeers: Set<String>?
+    /// The one delayed retry this model may have pending.
+    @ObservationIgnored private var retryTask: Task<Void, Never>? {
+        didSet { retryArmed = retryTask != nil }
+    }
+    /// Observable twin of `retryTask`: the status line says "will be retried"
+    /// from it, and must redraw when the retry fires or is dropped.
+    private(set) var retryArmed = false
+    /// The keys that retry will ask for again.
+    @ObservationIgnored private var retryKeys: [DeviceOverlayKey] = []
+    /// The overlay's own memo for a client slice of `graphStats`; not
+    /// `DashboardModel.stats(selecting:)`'s, which keys on `generatedAt` and
+    /// would collide with the local payload's.
+    @ObservationIgnored private var statsMemo: (key: DeviceOverlayKey, selected: Set<String>, value: UsageStats)?
+
+    /// Removes the notification observer when the overlay state goes away
+    /// (the state's own deinit cannot touch its main-actor properties).
+    private final class PeerChangeObserver {
+        private let center: NotificationCenter
+        private let token: NSObjectProtocol
+        init(center: NotificationCenter, token: NSObjectProtocol) {
+            self.center = center
+            self.token = token
+        }
+        deinit { center.removeObserver(token) }
+    }
+    @ObservationIgnored private var peerObserver: PeerChangeObserver?
+
+    /// The newest real name the core has reported for each linked device, by
+    /// the 16-hex id of a `devices` row (= `RemotePeer.fingerprint`): learned
+    /// from every page stored, dropped when a later row says the device has
+    /// no name. The peer record only gets a name after its first pull, which
+    /// is after the peer list was read, so the list's `nodeLabel` lags a
+    /// page's row; every place that shows a device name asks `displayName`.
+    private(set) var learnedNames: [String: String] = [:]
+
+    init(
+        source: any UsageDataSource, defaults: UserDefaults = .standard,
+        notifications: NotificationCenter = .default
+    ) {
+        self.source = source
+        self.defaults = defaults
+        let storedData = defaults.data(forKey: Self.selectionKey)
+        stored = storedData
+            .flatMap { try? JSONDecoder().decode(StoredDeviceSelection.self, from: $0) }
+            ?? StoredDeviceSelection()
+        if let data = defaults.data(forKey: Self.seenPeersKey),
+           let seen = try? JSONDecoder().decode([String].self, from: data) {
+            seenPeers = Set(seen)
+        } else if storedData == nil {
+            // Nothing chosen before: every device that appears is new.
+            seenPeers = []
+        }
+        // else: a selection from before this key existed. The first successful
+        // list marks its devices seen without checking them (see `peersArrived`).
+        let token = notifications.addObserver(
+            forName: DevicesModel.peersChanged, object: nil, queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { self?.refreshPeers() }
+        }
+        peerObserver = PeerChangeObserver(center: notifications, token: token)
+    }
+
+    // MARK: Selection
+
+    /// The selection that reaches the core, or nil when only this Mac is
+    /// chosen (or the peer list is unknown): then no `*Devices` call is made.
+    var effective: DeviceSelection? {
+        let known = Set(selectablePeers.map(\.producerStatic))
+        let chosen = stored.peers.filter(known.contains).sorted().prefix(Self.maxSelectedPeers)
+        return chosen.isEmpty ? nil : DeviceSelection(local: stored.local, peers: Array(chosen))
+    }
+
+    var includesRemote: Bool { effective != nil }
+
+    /// Changes whenever the lens has to ask again.
+    var signature: String {
+        effective.map { "\($0.local)|\($0.peers.joined(separator: ","))" } ?? "-"
+    }
+
+    /// Sources currently chosen among those that can be chosen.
+    var selectedCount: Int {
+        let known = Set(selectablePeers.map(\.producerStatic))
+        return (stored.local ? 1 : 0) + stored.peers.filter(known.contains).count
+    }
+
+    func isSelected(peer: String) -> Bool { stored.peers.contains(peer) }
+
+    /// Chosen devices that can be chosen (not counting this Mac).
+    var selectedPeerCount: Int {
+        let known = Set(selectablePeers.map(\.producerStatic))
+        return stored.peers.filter(known.contains).count
+    }
+
+    /// The last selected source cannot be unchecked, and no more than
+    /// `maxSelectedPeers` devices can be checked: `effective` would drop the
+    /// extra one silently, so it would look checked and not be asked.
+    func canToggle(local: Bool, peer: String? = nil) -> Bool {
+        let selected = peer.map(isSelected(peer:)) ?? stored.local
+        if selected { return selectedCount > 1 }
+        return peer == nil || selectedPeerCount < Self.maxSelectedPeers
+    }
+
+    func toggleLocal() {
+        guard canToggle(local: true) else { return }
+        stored.local.toggle()
+        selectionChanged()
+    }
+
+    func togglePeer(_ id: String) {
+        guard canToggle(local: false, peer: id) else { return }
+        if let index = stored.peers.firstIndex(of: id) {
+            stored.peers.remove(at: index)
+        } else {
+            stored.peers.append(id)
+        }
+        selectionChanged()
+    }
+
+    private func selectionChanged() {
+        persist()
+        if !includesRemote { clearOverlays() }
+        publish()
+    }
+
+    // MARK: Short status
+
+    /// What the three short-status places read: the rows of the pages held for
+    /// the lens on screen (every held page while none is wanted, as when the
+    /// popover is closed), who is selected, and whether a refresh is running.
+    var snapshot: DeviceOverlaySnapshot {
+        func rows<P>(_ slot: DeviceOverlaySlot<P>?, _ kind: DeviceOverlayKind) -> [RemoteDevice] {
+            guard let slot, wanted.isEmpty || wanted[kind] == slot.key else { return [] }
+            return slot.data?.devices ?? []
+        }
+        return DeviceOverlaySnapshot(
+            rows: rows(graph, .graph) + rows(models, .models) + rows(hourly, .hourly) + rows(agents, .agents),
+            selection: Dictionary(
+                selectablePeers.map { ($0.fingerprint, isSelected(peer: $0.producerStatic)) },
+                uniquingKeysWith: { first, _ in first }),
+            inFlight: fetching, names: learnedNames)
+    }
+
+    /// Whether this instance has ever published. The popover's does (on its
+    /// first result or selection change); the Settings window's own model
+    /// never fetches, so it must not overwrite what the popover published.
+    @ObservationIgnored private var publishes = false
+
+    private func publish() {
+        publishes = true
+        DevicesModel.shared.overlayChanged(snapshot)
+    }
+
+    private func republishIfActive() { if publishes { publish() } }
+
+    private func persistSeen(_ seen: Set<String>) {
+        seenPeers = seen
+        if let data = try? JSONEncoder().encode(seen.sorted()) {
+            defaults.set(data, forKey: Self.seenPeersKey)
+        }
+    }
+
+    private func persist() {
+        if let data = try? JSONEncoder().encode(stored) {
+            defaults.set(data, forKey: Self.selectionKey)
+        }
+    }
+
+    /// Back to this Mac alone: every overlay goes, and a response still in
+    /// flight finds nothing wanted.
+    private func clearOverlays() {
+        wanted = [:]
+        graph = nil; models = nil; hourly = nil; agents = nil
+        graphStats = nil
+        modelsColors = ModelColorMap(report: nil)
+        statsMemo = nil
+        refreshedAt = [:]
+        cancelRetry()
+        republishIfActive()
+    }
+
+    // MARK: Peers
+
+    /// Reads the peer list on a thread of its own. Only a successful read can
+    /// drop a stored peer that is no longer listed; a failed one leaves the
+    /// stored choice alone and hides the menu, so a stopped agent does not
+    /// forget the user's selection.
+    ///
+    /// Reads can overlap (the poll, the popover opening, and a link or removal
+    /// in Settings all start one). Each read takes the next generation and only
+    /// the newest read's result is applied: an older list arriving late would
+    /// drop a just-linked device from the selection while `seenPeers` keeps it,
+    /// and it would never be ticked again.
+    func refreshPeers() {
+        let source = self.source
+        let generation = beginPeersRead()
+        Task {
+            let result = await Self.onOwnThread { try source.remotePeers() }
+            self.peersArrived(result, generation: generation)
+        }
+    }
+
+    @ObservationIgnored private var peersGeneration = 0
+
+    private func beginPeersRead() -> Int {
+        peersGeneration += 1
+        return peersGeneration
+    }
+
+    /// Test seams for the ordering of two reads.
+    func beginPeersReadForTesting() -> Int { beginPeersRead() }
+    func deliverPeersForTesting(_ result: Result<[RemotePeer], Error>, generation: Int) {
+        peersArrived(result, generation: generation)
+    }
+
+    private func peersArrived(_ result: Result<[RemotePeer], Error>, generation: Int) {
+        guard generation == peersGeneration else { return }
+        switch result {
+        case .success(let list):
+            selectablePeers = list.filter { $0.state == "active" }
+            let listed = Set(list.map(\.fingerprint))
+            learnedNames = learnedNames.filter { listed.contains($0.key) }
+            let known = Set(selectablePeers.map(\.producerStatic))
+            var kept = stored.peers.filter(known.contains)
+            // Checked devices that are no longer active: forgotten as "seen",
+            // so they are checked again when they come back. Read from what is
+            // persisted, not from this instance's copy: the Settings window
+            // has an instance of its own, loaded before the popover's last
+            // change, and a device unchecked there since must stay seen.
+            let persisted = defaults.data(forKey: Self.selectionKey)
+                .flatMap { try? JSONDecoder().decode(StoredDeviceSelection.self, from: $0) }
+            let dropped = (persisted ?? stored).peers.filter { !known.contains($0) }
+            if let data = defaults.data(forKey: Self.seenPeersKey),
+               let seen = try? JSONDecoder().decode([String].self, from: data) {
+                seenPeers = Set(seen)
+            }
+            // A device never offered before is checked on arrival, once; the
+            // first list after an upgrade only records what already exists.
+            let ids = selectablePeers.map(\.producerStatic)
+            if let seen = seenPeers {
+                var next = seen.subtracting(dropped)
+                // `kept` is this instance's copy and may already hold a device
+                // another instance has just forgotten: never list it twice (the
+                // core refuses a selection with a repeated key).
+                for id in ids
+                where !next.contains(id) && !kept.contains(id) && kept.count < Self.maxSelectedPeers {
+                    kept.append(id)
+                }
+                // Every listed device is seen from here on, checked or not: one
+                // the 16-device cap kept out is the user's to check by hand.
+                next.formUnion(ids)
+                if next != seen { persistSeen(next) }
+            } else {
+                persistSeen(Set(ids))
+            }
+            if kept != stored.peers {
+                stored.peers = kept
+                if kept.isEmpty { stored.local = true }
+                persist()
+            }
+        case .failure:
+            selectablePeers = []
+        }
+        if !includesRemote { clearOverlays() }
+        republishIfActive()
+    }
+
+    // MARK: Fetching
+
+    static func kinds(for view: AppView) -> [DeviceOverlayKind] {
+        switch view {
+        case .daily, .monthly: return [.graph]
+        // Overview and Stats share the same two keys (graph and models, no
+        // clients), so moving between them asks the producers once.
+        case .overview, .stats: return [.graph, .models]
+        case .models: return [.models]
+        case .hourly: return [.hourly]
+        case .agents: return [.agents]
+        case .quota: return []
+        }
+    }
+
+    /// Hourly's and Agents' `clients` argument. A single-client tab sends its
+    /// slice. Overview sends nil while nothing is hidden, else the registry's
+    /// ids minus the hidden ones (not this Mac's present list: a client only a
+    /// remote device used must still be asked for).
+    static func clientsArgument(singleClient: String?, hidden: Set<String>) -> [String]? {
+        if let singleClient { return ClientRegistry.tabSlice(singleClient) }
+        let hiddenAll = ClientRegistry.hiddenTabClients(hidden)
+        return hiddenAll.isEmpty ? nil : ClientRegistry.allIds.filter { !hiddenAll.contains($0) }
+    }
+
+    func key(
+        _ kind: DeviceOverlayKind, year: String?, clients: [String]?
+    ) -> DeviceOverlayKey? {
+        guard let selection = effective else { return nil }
+        let carriesClients = kind == .hourly || kind == .agents
+        return DeviceOverlayKey(
+            kind: kind, year: year ?? "",
+            clients: carriesClients ? clients.map { Array(Set($0)).sorted() } : nil,
+            local: selection.local, peers: selection.peers)
+    }
+
+    /// Declares what the lens on screen needs and starts the loads: for each
+    /// page without an overlay for its key, one `cached` call (shown at once),
+    /// then a `refresh`. Overview and Quota need none. Safe to call on every
+    /// change of lens, year, client slice or selection.
+    /// `rootsGeneration`: the scan-roots generation the caller is on. When it
+    /// changed since the last call, this Mac's share of every page is stale,
+    /// so the visible keys are asked again whatever the 60 s window says.
+    func ensure(view: AppView, year: String?, clients: [String]?, rootsGeneration: Int? = nil) {
+        if let generation = rootsGeneration {
+            if let last = lastRootsGeneration, last != generation {
+                refreshedAt = [:]
+                rootsEpoch += 1
+            }
+            lastRootsGeneration = generation
+        }
+        var next: [DeviceOverlayKind: DeviceOverlayKey] = [:]
+        for kind in Self.kinds(for: view) {
+            if let key = key(kind, year: year, clients: clients) { next[kind] = key }
+        }
+        wanted = next
+        let keys = Self.order.compactMap { next[$0] }
+        guard !keys.isEmpty else { return }
+        let missing = keys.filter { currentKey(of: $0.kind) != $0 }
+        guard !missing.isEmpty else { return scheduleRefresh(notRecentlyRefreshed(keys)) }
+        nextCachedLoad += 1
+        let load = nextCachedLoad
+        cachedLoadKeys[load] = keys
+        Task {
+            defer { self.cachedLoadKeys[load] = nil }
+            for key in missing { await self.runOnce(key, .cached) }
+            // Only while these are still the keys on screen: a stale request
+            // would replace a newer pending one, which `finishRefresh` then
+            // drops, leaving the newest lens without its refresh.
+            guard keys.allSatisfy({ self.wanted[$0.kind] == $0 }) else { return }
+            self.scheduleRefresh(self.notRecentlyRefreshed(keys))
+        }
+    }
+
+    /// Of `keys`, those not refreshed within `freshWindowSeconds`. Only a lens
+    /// coming on screen filters; the page it shows is the slot already held.
+    private func notRecentlyRefreshed(_ keys: [DeviceOverlayKey]) -> [DeviceOverlayKey] {
+        let now = Date()
+        return keys.filter { key in
+            refreshedAt[key].map { now.timeIntervalSince($0) >= Self.freshWindowSeconds } ?? true
+        }
+    }
+
+    /// The popover closed: nothing is on screen, so a refresh in flight stops
+    /// issuing its remaining pages and a pending one is skipped. The slots
+    /// stay. A reopened popover calls `ensure` again (its `.task(id:)`).
+    func popoverClosed() {
+        wanted = [:]
+        cancelRetry()
+    }
+
+    private func currentKey(of kind: DeviceOverlayKind) -> DeviceOverlayKey? {
+        switch kind {
+        case .graph: graph?.key
+        case .models: models?.key
+        case .hourly: hourly?.key
+        case .agents: agents?.key
+        }
+    }
+
+    /// The poll's tick: refresh the lens on screen. A tick while a refresh
+    /// runs is skipped.
+    func pollOnce() {
+        guard effective != nil, !Self.refreshInFlight, !wanted.isEmpty else { return }
+        // A poll never arms a retry: an offline device would otherwise cost a
+        // second refresh after every tick.
+        startRefresh(Self.order.compactMap { wanted[$0] }, armsRetry: false)
+    }
+
+    func manualRefresh() {
+        guard effective != nil, !wanted.isEmpty else { return }
+        scheduleRefresh(Self.order.compactMap { wanted[$0] })
+    }
+
+    /// Mounted by the popover, so it ends with it.
+    func pollLoop() async {
+        while !Task.isCancelled {
+            try? await Task.sleep(for: .seconds(Self.remotePollSeconds))
+            if Task.isCancelled { break }
+            pollOnce()
+        }
+    }
+
+    // One `refresh` at a time in the whole process: a refresh can hold the
+    // agent's read lock for up to 145 s per producer, and a second one would
+    // only queue behind the first on the core's own mutex. A trigger during a
+    // refresh keeps only the newest request and runs it once afterwards.
+    private struct PendingRefresh {
+        weak var owner: DeviceOverlayState?
+        var keys: [DeviceOverlayKey]
+        var isRetry = false
+    }
+    private static var refreshInFlight = false
+    private static var pendingRefresh: PendingRefresh?
+
+    /// Test seam: whether a refresh is running anywhere in the process.
+    static var refreshInFlightForTesting: Bool { refreshInFlight }
+
+    /// Test seam: forget the process-wide guard between cases.
+    static func resetSingleFlightForTesting() {
+        refreshInFlight = false
+        pendingRefresh = nil
+        retryEpoch += 1  // every retry armed so far finds itself void when it wakes
+    }
+
+    /// Test seam: whether this model has a retry armed and not yet fired.
+    var retryPendingForTesting: Bool { retryTask != nil }
+
+    private static var retryEpoch = 0
+
+    private func scheduleRefresh(_ keys: [DeviceOverlayKey], isRetry: Bool = false) {
+        guard !keys.isEmpty else { return }
+        if Self.refreshInFlight {
+            // A retry never replaces a pending request of the user's.
+            if isRetry, let pending = Self.pendingRefresh, !pending.isRetry { return }
+            Self.pendingRefresh?.owner?.queuedRefresh = false
+            Self.pendingRefresh = PendingRefresh(owner: self, keys: keys, isRetry: isRetry)
+            queuedRefresh = true
+            return
+        }
+        startRefresh(keys, armsRetry: !isRetry, isRetry: isRetry)
+    }
+
+    /// `armsRetry`: only a refresh the user asked for (lens shown, selection,
+    /// manual) may arm a retry; a poll refresh and a retry never do.
+    private func startRefresh(_ keys: [DeviceOverlayKey], armsRetry: Bool, isRetry: Bool = false) {
+        Self.refreshInFlight = true
+        refreshing = true
+        queuedRefresh = false
+        Task {
+            var stored: [(key: DeviceOverlayKey, noAnswer: Bool, busy: Bool)] = []
+            for key in keys {
+                if case .stored(let noAnswer, let busy) = await self.runOnce(key, .refresh) {
+                    stored.append((key, noAnswer, busy))
+                }
+            }
+            // A completed refresh of a retry's keys makes that retry moot.
+            if self.retryKeys.contains(where: { k in stored.contains { $0.key == k } }) {
+                self.cancelRetry()
+            }
+            // Only what this refresh stored decides; the retry asks only for
+            // the pages that came back without new data (one producer
+            // request is refilled in 65 s).
+            let again = stored.filter(\.noAnswer).map(\.key)
+            if armsRetry, !again.isEmpty {
+                self.scheduleRetry(again)
+            } else if !isRetry, stored.contains(where: \.busy) {
+                // A busy producer asked for a pause: say "again in a minute"
+                // only because it is armed, for a poll's refresh too, and only
+                // once (the retry itself arms none).
+                self.scheduleRetry(stored.filter(\.busy).map(\.key))
+            }
+            self.refreshing = false
+            Self.finishRefresh()
+        }
+    }
+
+    private func cancelRetry() {
+        retryTask?.cancel()
+        retryTask = nil
+        retryKeys = []
+    }
+
+    private func scheduleRetry(_ keys: [DeviceOverlayKey]) {
+        cancelRetry()
+        retryKeys = keys
+        let epoch = Self.retryEpoch
+        retryTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(Self.retryDelaySeconds))
+            guard !Task.isCancelled, let self else { return }
+            // Armed no longer, whether or not it still runs: a retry voided
+            // by the process-wide reset must not keep the sentence up.
+            self.retryTask = nil
+            self.retryKeys = []
+            guard epoch == Self.retryEpoch else { return }
+            guard keys.allSatisfy({ self.wanted[$0.kind] == $0 }) else { return }
+            self.scheduleRefresh(keys, isRetry: true)
+        }
+    }
+
+    private static func finishRefresh() {
+        refreshInFlight = false
+        guard let next = pendingRefresh else { return }
+        pendingRefresh = nil
+        next.owner?.queuedRefresh = false
+        if let owner = next.owner, next.keys.allSatisfy({ owner.wanted[$0.kind] == $0 }) {
+            owner.startRefresh(next.keys, armsRetry: !next.isRetry, isRetry: next.isRetry)
+        }
+    }
+
+    private enum RunOutcome {
+        case dropped, failed
+        /// `noAnswer`: a selected device is `lastGood`, `stale` or
+        /// `unavailable` on the page just stored. Refused, invalid and
+        /// incompatible are not: asking again cannot change them. `busy`: a
+        /// device answered that it is busy.
+        case stored(noAnswer: Bool, busy: Bool)
+    }
+
+    @discardableResult
+    private func runOnce(_ key: DeviceOverlayKey, _ mode: DeviceFetchMode) async -> RunOutcome {
+        guard wanted[key.kind] == key else { return .dropped }
+        let epoch = rootsEpoch
+        let source = self.source
+        let result = await Self.onOwnThread { try Self.fetch(source, key, mode) }
+        guard wanted[key.kind] == key else { return .dropped }
+        store(result, for: key, mode: mode)
+        guard case .success(let value) = result else { return .failed }
+        // Only a refresh that brought every selected device back fresh counts
+        // against the request budget; a failed or busy one may be asked again.
+        if mode == .refresh, epoch == rootsEpoch,
+           value.devices.allSatisfy({ $0.state == "fresh" || $0.state == "local" }) {
+            refreshedAt[key] = Date()
+        }
+        return .stored(
+            noAnswer: value.devices.contains {
+                ["lastGood", "stale", "unavailable"].contains($0.state)
+            },
+            busy: value.devices.contains { $0.reason == "busy" })
+    }
+
+    nonisolated private static func fetch(
+        _ source: any UsageDataSource, _ key: DeviceOverlayKey, _ mode: DeviceFetchMode
+    ) throws -> DeviceOverlayResult {
+        let (year, selection) = (key.yearArgument, key.selection)
+        switch key.kind {
+        case .graph:
+            return .graph(try source.graphDevices(year: year, selection: selection, mode: mode))
+        case .models:
+            return .models(
+                try source.modelReportDevices(year: year, selection: selection, mode: mode))
+        case .hourly:
+            return .hourly(try source.hourlyReportDevices(
+                year: year, clients: key.clients, selection: selection, mode: mode))
+        case .agents:
+            return .agents(try source.agentsReportDevices(
+                year: year, clients: key.clients, selection: selection, mode: mode))
+        }
+    }
+
+    /// A row has a real name when the core's label is not the address it falls
+    /// back to (rows without an address, from a core that predates it, say
+    /// nothing).
+    private func learnNames(_ rows: [RemoteDevice]) {
+        for row in rows where row.id != "local" && row.id != "peers" {
+            if let label = row.label, let address = row.address, label != address {
+                learnedNames[row.id] = label
+            } else if row.address != nil {
+                learnedNames[row.id] = nil
+            }
+        }
+    }
+
+    /// The one place a linked device's name is chosen: the newest name a page
+    /// reported, else the peer list's, else its address.
+    func displayName(of peer: RemotePeer) -> String {
+        DeviceOverlayCopy.displayName(of: peer, learned: learnedNames)
+    }
+
+    /// The same for a `devices` row.
+    func displayName(of device: RemoteDevice) -> String {
+        learnedNames[device.id] ?? DeviceOverlayCopy.name(of: device)
+    }
+
+    /// A cached miss changes nothing (a refresh follows); a refresh miss keeps
+    /// the last good answer for this key and says so.
+    private func store(_ result: Result<DeviceOverlayResult, Error>, for key: DeviceOverlayKey, mode: DeviceFetchMode) {
+        defer { publish() }
+        switch result {
+        case .success(let value):
+            // A cached answer never replaces a page the slot already holds for
+            // this key: a refresh may have stored one while the cached call
+            // ran. A slot a failed refresh left without a page takes the
+            // cached page and stays marked failed.
+            let held = currentKey(of: key.kind) == key
+            let hasPage: Bool
+            switch key.kind {
+            case .graph: hasPage = graph?.data != nil
+            case .models: hasPage = models?.data != nil
+            case .hourly: hasPage = hourly?.data != nil
+            case .agents: hasPage = agents?.data != nil
+            }
+            guard mode == .refresh || !(held && hasPage) else { return }
+            let failed = mode == .cached && held
+            switch value {
+            case .graph(let page):
+                learnNames(page.devices)
+                graph = .init(key: key, data: page, failed: failed)
+                graphStats = UsageStats(payload: page.payload, selectedClients: Set(page.payload.summary.clients))
+                statsMemo = nil
+            case .models(let page):
+                learnNames(page.devices)
+                models = .init(key: key, data: page, failed: failed)
+                modelsColors = ModelColorMap(report: page.payload)
+            case .hourly(let page):
+                learnNames(page.devices)
+                hourly = .init(key: key, data: page, failed: failed)
+            case .agents(let page):
+                learnNames(page.devices)
+                agents = .init(key: key, data: page, failed: failed)
+            }
+        case .failure:
+            guard mode == .refresh else { return }
+            switch key.kind {
+            case .graph: graph = .init(key: key, data: graph?.key == key ? graph?.data : nil, failed: true)
+            case .models: models = .init(key: key, data: models?.key == key ? models?.data : nil, failed: true)
+            case .hourly: hourly = .init(key: key, data: hourly?.key == key ? hourly?.data : nil, failed: true)
+            case .agents: agents = .init(key: key, data: agents?.key == key ? agents?.data : nil, failed: true)
+            }
+        }
+    }
+
+    /// The tab's client set for the overlay page of `kind`: the single
+    /// client's slice, else the clients that page itself holds minus the
+    /// hidden ones. Deliberately not intersected with this Mac's present
+    /// clients: a client only a remote device used belongs on Overview.
+    func displayClients(
+        _ kind: DeviceOverlayKind, singleClient: String?, hiddenRaw: String, orderRaw: String
+    ) -> [String] {
+        if let singleClient { return ClientRegistry.tabSlice(singleClient) }
+        let present: [String]
+        switch kind {
+        case .graph: present = graphStats?.presentClients ?? []
+        case .models: present = Set(models?.data?.payload.entries.map(\.client) ?? []).sorted()
+        case .hourly: present = Set(hourly?.data?.payload.entries.flatMap(\.clients) ?? []).sorted()
+        case .agents: present = Set(agents?.data?.payload.entries.flatMap(\.clients) ?? []).sorted()
+        }
+        return ClientRegistry.displayClients(present: present, hiddenRaw: hiddenRaw, orderRaw: orderRaw)
+    }
+
+    /// What a lens may show from `slot`: the page only while the slot is for
+    /// the key the lens wants now. After a year or client change the previous
+    /// key's page is not shown while the new one loads.
+    func visible<P>(
+        _ slot: DeviceOverlaySlot<P>?, _ kind: DeviceOverlayKind, year: String?, clients: [String]?
+    ) -> (page: DeviceAwarePayload<P>?, failed: Bool) {
+        guard let slot, slot.key == key(kind, year: year, clients: clients) else { return (nil, false) }
+        return (slot.data, slot.failed)
+    }
+
+    /// Whether a page the lens on screen shows reports `remoteRangeLimited`.
+    func rangeLimited(for view: AppView, year: String?, clients: [String]?) -> Bool {
+        Self.kinds(for: view).contains { kind in
+            switch kind {
+            case .graph: visible(graph, kind, year: year, clients: clients).page?.remoteRangeLimited == true
+            case .models: visible(models, kind, year: year, clients: clients).page?.remoteRangeLimited == true
+            case .hourly: visible(hourly, kind, year: year, clients: clients).page?.remoteRangeLimited == true
+            case .agents: visible(agents, kind, year: year, clients: clients).page?.remoteRangeLimited == true
+            }
+        }
+    }
+
+    /// The status line's sentences for the lens on screen: one per selected
+    /// device that is not fresh, from the pages the lens shows (see
+    /// `DeviceOverlayCopy.statusLines`). Empty when every device is fresh.
+    func statusLines(
+        for view: AppView, year: String?, clients: [String]?, now: Date = Date()
+    ) -> [String] {
+        guard let selection = effective, !Self.kinds(for: view).isEmpty else { return [] }
+        var rows: [RemoteDevice] = []
+        for kind in Self.kinds(for: view) {
+            switch kind {
+            case .graph: rows += visible(graph, kind, year: year, clients: clients).page?.devices ?? []
+            case .models: rows += visible(models, kind, year: year, clients: clients).page?.devices ?? []
+            case .hourly: rows += visible(hourly, kind, year: year, clients: clients).page?.devices ?? []
+            case .agents: rows += visible(agents, kind, year: year, clients: clients).page?.devices ?? []
+            }
+        }
+        let peers = selection.peers.compactMap { id in
+            selectablePeers.first { $0.producerStatic == id }
+        }.map { (id: $0.fingerprint, name: displayName(of: $0)) }
+        return DeviceOverlayCopy.statusLines(
+            rows: rows, peers: peers, inFlight: fetching, retryPending: retryArmed,
+            names: learnedNames, now: now)
+    }
+
+    /// What Overview shows while devices other than this Mac are selected: the
+    /// overlay's own graph (with its own stats for the clients on screen) and
+    /// models pages, or nil for a page that has not arrived (the cards then
+    /// show a loading line; this Mac's own data is never the stand-in).
+    /// `localColors` only shades models when the models page is missing, as
+    /// the Stats overlay does.
+    func overviewMerge(
+        year: String?, singleClient: String?, hiddenRaw: String, orderRaw: String,
+        localColors: ModelColorMap
+    ) -> OverviewMerge? {
+        guard includesRemote else { return nil }
+        let graphPage = visible(graph, .graph, year: year, clients: nil)
+        let modelsPage = visible(models, .models, year: year, clients: nil)
+        let ids = displayClients(
+            .graph, singleClient: singleClient, hiddenRaw: hiddenRaw, orderRaw: orderRaw)
+        return OverviewMerge(
+            deviceCount: selectedCount,
+            graph: graphPage.page.flatMap { page in
+                stats(selecting: Set(ids)).map { (page.payload, $0) }
+            },
+            models: modelsPage.page?.payload,
+            colors: modelsPage.page == nil ? localColors : modelsColors,
+            clientIds: ids,
+            modelClientIds: displayClients(
+                .models, singleClient: singleClient, hiddenRaw: hiddenRaw, orderRaw: orderRaw),
+            graphFailed: graphPage.failed && graphPage.page == nil,
+            modelsFailed: modelsPage.failed && modelsPage.page == nil,
+            keptLast: (graphPage.failed && graphPage.page != nil)
+                || (modelsPage.failed && modelsPage.page != nil),
+            saturated: graphPage.page?.saturated == true || modelsPage.page?.saturated == true)
+    }
+
+    /// What the Stats lens' model sections get: the models overlay's report
+    /// for the current key, or nothing and a fixed line while it has not
+    /// arrived. This Mac's own `modelReport` is never the fallback.
+    func statsModels(year: String?) -> (report: ModelReport?, note: String?) {
+        if let slot = models, slot.key == key(.models, year: year, clients: nil), let page = slot.data {
+            return (page.payload, nil)
+        }
+        return (nil, DeviceOverlayCopy.modelsHidden.localized)
+    }
+
+    /// `UsageStats` for a client slice of the graph overlay (its own memo).
+    func stats(selecting selected: Set<String>) -> UsageStats? {
+        guard let slot = graph, let full = graphStats, let page = slot.data else { return nil }
+        if selected == Set(full.presentClients) { return full }
+        if let memo = statsMemo, memo.key == slot.key, memo.selected == selected { return memo.value }
+        let computed = UsageStats(payload: page.payload, selectedClients: selected)
+        statsMemo = (slot.key, selected, computed)
+        return computed
+    }
+
+    /// Runs `body` on a `Thread` of its own: a device call can block for a
+    /// fetch deadline, and neither the main actor nor the cooperative pool
+    /// should wait on it.
+    nonisolated private static func onOwnThread<T: Sendable>(
+        _ body: @escaping @Sendable () throws -> T
+    ) async -> Result<T, Error> {
+        await withCheckedContinuation { continuation in
+            Thread {
+                do { continuation.resume(returning: .success(try body())) } catch {
+                    continuation.resume(returning: .failure(error))
+                }
+            }.start()
+        }
     }
 }

@@ -11,7 +11,8 @@ Three rules, all read from files, none inferred:
 2. Cargo.lock holds exactly one tokscale-core, and it is the path (vendored)
    one.
 3. Every package in the lock closure of the agent's non-engine dependencies
-   (snow, hmac, sha2, serde, serde_json, unicode-normalization, libc) equals,
+   (snow, hmac, sha2, serde, serde_json, unicode-normalization, libc,
+   windows-sys) equals,
    by (name, version, source, checksum), an entry of the agent's
    tests/fixtures/v1/runtime/storage/cargo-lock-baseline.json at that rev, so
    the crypto dependencies the agent reviewed are the ones this binary ships.
@@ -33,7 +34,12 @@ from pathlib import Path
 
 AGENT = "syrtis-agent"
 ENGINE = "tokscale-core"
-AGENT_ROOTS = ("snow", "hmac", "sha2", "serde", "serde_json", "unicode-normalization", "libc")
+# windows-sys: declared for Windows only by the agent since its Windows
+# storage slice (Syrtis-Agent PR 36). Cargo.lock is host-independent, so it is
+# a direct dependency here too, and its closure is checked like the others.
+AGENT_ROOTS = (
+    "snow", "hmac", "sha2", "serde", "serde_json", "unicode-normalization", "libc", "windows-sys",
+)
 BASELINE = Path("tests/fixtures/v1/runtime/storage/cargo-lock-baseline.json")
 
 

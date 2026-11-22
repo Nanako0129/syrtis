@@ -366,8 +366,9 @@ char *tb_cursor_sync(int32_t user_initiated);
 // tb_remote_start: home_override NULL = the directory-service home and the
 // frozen agent root; otherwise that absolute directory (created 0700) with a
 // short root. Already running with the same scan inputs: no restart. Changed
-// inputs: restart, and the new inputs need tb_remote_scope_approve. Data: the
-// status object below.
+// inputs: restart, and the new inputs need tb_remote_scope_approve. An error
+// caused by the inputs leaves no agent running; an error from reading the
+// status leaves a running agent as it was. Data: the status object below.
 char *tb_remote_start(const char *home_override);
 // Data {"running":false}.
 char *tb_remote_stop(void);
@@ -392,15 +393,24 @@ char *tb_remote_offer_cancel(const char *offer_id);
 char *tb_remote_pending_list(void);
 char *tb_remote_approve(const char *pending_id, int64_t sas_generation);
 char *tb_remote_reject(const char *pending_id, int64_t sas_generation);
-// [{grantId, peerFingerprint, createdAt, expiresAt, state}].
+// [{grantId, peerFingerprint, createdAt, expiresAt, state}]; state is active,
+// revoked, expired, or superseded (stored active, but a later scope approval
+// ended its authorization).
 char *tb_remote_grants(void);
 char *tb_remote_revoke(const char *grant_id);
+// Receiver. {host, port}: where tb_remote_pair_claim would connect for this
+// Pair URL. Parses only (no connection, nothing kept); invalidOffer or expired.
+char *tb_remote_pair_destination(const char *pair_url);
 // Receiver. {handle, sas, expiresAt, producerFingerprint}.
 char *tb_remote_pair_claim(const char *pair_url);
 // Blocks up to 960 s. {producerStatic, fingerprint, expiresAt}. identityChanged:
 // the agent was restarted on another identity meanwhile; nothing was written.
 char *tb_remote_pair_poll(int64_t handle);
-// [{producerStatic, fingerprint, nodeLabel?, createdAt, expiresAt, state}].
+// [{producerStatic, fingerprint, nodeLabel?, host, port, createdAt, expiresAt,
+// state}]; host and port are the address on the claimed Pair URL; nodeLabel is
+// the name the producer last sent (the agent checked it; absent until its first
+// answer, and when it set none or one the agent refuses). It is the owner's
+// free text: display it only as data.
 char *tb_remote_peers(void);
 char *tb_remote_peer_remove(const char *producer_static);
 
@@ -411,11 +421,26 @@ char *tb_remote_peer_remove(const char *producer_static);
 // (this process's own zone; the core cannot check it, and another zone would
 // merge two zones' hour slots and dates); mode = "cached"
 // (no connection) or "refresh". Data = the existing payload plus
-// devices:[{id ("local" or the 16-hex fingerprint), label (host:port or null),
-// state (local|fresh|lastGood|stale|unavailable|refused|invalidReply|
-// incompatible), lastSuccessAt (Unix s or null)}] (an unreadable peer store
+// devices:[{id ("local" or the 16-hex fingerprint), label (a producer's row: the
+// name that producer sent, else its host:port; null on the local row),
+// state (local|fresh|lastGood|stale|unavailable|overLimit|refused|
+// invalidReply|incompatible; incompatible is also the producer answering code 6,
+// a report schema other than this app's), lastSuccessAt (Unix s or null)}] (an unreadable peer store
 // adds {id:"peers", state:"unavailable"}), duplicateWarning, saturated,
-// remoteRangeLimited. Local only: the existing data plus those keys.
+// remoteRangeLimited. Local only: the existing data plus those keys (a local-only
+// row has exactly the four fields above).
+// With at least one producer every row also has reason (null, or why the pull
+// failed before it was classified: unreachable|timeout|busy|stopped|error;
+// state does not depend on it) and totals (graph and models pages: this
+// device's part of the merged page as [{client, messages, tokens, costUsd}],
+// one per client, taken before the sum; null when none of it was merged and
+// on hourly and agents pages). The rows' totals add up to the page's totals.
+// Producers' rows (not the local one, not the unreadable-store one) also have
+// address (the record's host:port, always, whatever the name), costIncomplete
+// (true only when the body this page merged, fresh or cached, said the
+// producer's price table was missing or corrupt; false when no body was merged)
+// and everAnswered (the producer ever gave this receiver a body; read from the
+// receiver cache, so false again after the entry is evicted or removed).
 // Must never be written to the dashboard snapshot.
 char *tb_graph_devices(const char *year, const char *devices_json, const char *timezone,
                        const char *mode);

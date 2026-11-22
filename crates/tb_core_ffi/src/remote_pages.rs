@@ -21,7 +21,7 @@
 //! reaches `GRAPH_CACHE` or any snapshot.
 
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     sync::{LazyLock, Mutex, PoisonError},
     time::Duration,
 };
@@ -37,7 +37,8 @@ use syrtis_agent::{
         decode_response, AgentsRecord, Endpoint, GraphRecord, HourlyRecord, ModelsRecord,
         ReportRecord, MAX_RANGE_DAYS,
     },
-    report_peer::{decode_reservation, Records, ReportQuery},
+    report_peer::{decode_reservation, FetchError, Records, ReportQuery},
+    runtime::PullError,
     security::{decode_fixed_hex, MemoryLedger, MemoryReservation},
 };
 
@@ -170,10 +171,23 @@ pub(crate) enum Got {
 pub(crate) struct Pulled {
     pub peer: [u8; 32],
     pub grant: [u8; 16],
-    pub label: Option<String>,
+    /// The record's `host:port` (`None`: no such record).
+    pub address: Option<String>,
+    /// The name the producer last gave (`PeerRecord::node_label`, already
+    /// checked by the agent), read after the pull so a first answer's name is
+    /// the one shown.
+    pub name: Option<String>,
     pub got: Got,
+    /// The body this page used, fresh or cached, said the producer's price
+    /// table was missing or corrupt (`false`: it did not, or no body).
+    pub cost_incomplete: bool,
+    /// [`RemoteAgent::ever_answered`].
+    pub ever_answered: bool,
     /// [`RemoteAgent::last_success_at`] after the pull.
     pub last_success: Option<i64>,
+    /// Why the pull failed, before `merge::classify` folds the failures
+    /// together (see [`reason_of`]); `None` when it did not fail that way.
+    pub reason: Option<&'static str>,
 }
 
 /// The remote side of a page.
@@ -187,9 +201,8 @@ fn fingerprint(key: &[u8; 32]) -> String {
     syrtis_agent::security::hex_encode(&Sha256::digest(key)[..8])
 }
 
-/// The producer's address as the receiver stored it at pairing (the
-/// producer cannot change it later).
-fn label(record: &PeerRecord) -> String {
+/// The producer's address as the receiver stored it at pairing.
+fn address(record: &PeerRecord) -> String {
     if record.host.contains(':') {
         format!("[{}]:{}", record.host, record.port)
     } else {
@@ -197,12 +210,150 @@ fn label(record: &PeerRecord) -> String {
     }
 }
 
-fn device(id: String, label: Option<String>, state: &str, last_success: Option<i64>) -> Value {
-    json!({"id": id, "label": label, "state": state, "lastSuccessAt": last_success})
+/// A producer's `devices` row. `label` is what the screens show: the name
+/// the producer gave, else the address (producers' rows also carry the
+/// address on its own, see [`assemble`]). `reason` says why the pull failed when
+/// the state alone does not (`unreachable`, `timeout`, `busy`, `stopped`,
+/// `error`); `totals` is that producer's part of the merged page, one entry
+/// per client, and `null` when no part of it was merged.
+fn device(
+    id: String,
+    label: Option<String>,
+    state: &str,
+    last_success: Option<i64>,
+    reason: Option<&str>,
+    totals: Option<Value>,
+) -> Value {
+    json!({"id": id, "label": label, "state": state, "lastSuccessAt": last_success,
+           "reason": reason, "totals": totals})
 }
 
-pub(crate) fn local_device() -> Value {
-    device("local".into(), None, "local", None)
+/// The local row. Without producers it is the four keys the local-only
+/// output has always had; with them it also carries the local `totals`.
+pub(crate) fn local_device(totals: Option<Value>) -> Value {
+    match totals {
+        None => json!({"id": "local", "label": null, "state": "local", "lastSuccessAt": null}),
+        Some(totals) => device("local".into(), None, "local", None, None, Some(totals)),
+    }
+}
+
+/// One client's share of a device's part of a page.
+#[derive(Default)]
+struct ClientTotal {
+    messages: i64,
+    tokens: i64,
+    cost: f64,
+}
+
+type ByClient = BTreeMap<String, ClientTotal>;
+
+fn add_total(by: &mut ByClient, client: &str, messages: i64, tokens: i64, cost: f64) {
+    let total = by.entry(client.to_owned()).or_default();
+    total.messages = total.messages.saturating_add(messages);
+    total.tokens = total.tokens.saturating_add(tokens);
+    total.cost += cost;
+}
+
+fn totals_value(by: ByClient) -> Value {
+    Value::Array(
+        by.into_iter()
+            .map(|(client, t)| {
+                json!({"client": client, "messages": t.messages, "tokens": t.tokens,
+                       "costUsd": t.cost})
+            })
+            .collect(),
+    )
+}
+
+fn breakdown_total(t: &tokscale_core::TokenBreakdown) -> i64 {
+    [t.input, t.output, t.cache_read, t.cache_write, t.reasoning]
+        .into_iter()
+        .fold(0, i64::saturating_add)
+}
+
+/// The local graph's per-client totals, taken before any producer is folded.
+pub(crate) fn graph_totals(graph: &tokscale_core::GraphResult) -> Value {
+    let mut by = ByClient::new();
+    for day in &graph.contributions {
+        for c in &day.clients {
+            add_total(
+                &mut by,
+                &c.client,
+                i64::from(c.messages),
+                breakdown_total(&c.tokens),
+                c.cost,
+            );
+        }
+    }
+    totals_value(by)
+}
+
+/// The local model report's per-client totals, taken before the fold.
+pub(crate) fn models_totals(report: &tokscale_core::ModelReport) -> Value {
+    let mut by = ByClient::new();
+    for e in &report.entries {
+        let tokens = [e.input, e.output, e.cache_read, e.cache_write, e.reasoning]
+            .into_iter()
+            .fold(0, i64::saturating_add);
+        add_total(
+            &mut by,
+            &e.client,
+            i64::from(e.message_count),
+            tokens,
+            e.cost,
+        );
+    }
+    totals_value(by)
+}
+
+/// One producer's per-client totals from its admitted records (graph and
+/// models pages; the other two pages carry none).
+fn records_totals(records: &Records) -> Option<Value> {
+    let mut by = ByClient::new();
+    let as_i64 = |v: u64| i64::try_from(v).unwrap_or(i64::MAX);
+    match records {
+        Records::Graph(rs) => rs.iter().for_each(|r| {
+            add_total(
+                &mut by,
+                &r.client,
+                as_i64(r.message_count),
+                as_i64(r.total_tokens),
+                usd(r.cost_nano_usd),
+            )
+        }),
+        Records::Models(rs) => rs.iter().for_each(|r| {
+            add_total(
+                &mut by,
+                &r.client,
+                as_i64(r.message_count),
+                as_i64(r.total_tokens),
+                usd(r.cost_nano_usd),
+            )
+        }),
+        Records::Hourly(_) | Records::Agents(_) => return None,
+    }
+    Some(totals_value(by))
+}
+
+/// The failure a pull ended in, before `merge::classify` folds it into
+/// three classes: the distinction the status line needs. Failures with no
+/// line of their own (too large, no memory, invalid query, protocol, invalid
+/// body) have none.
+fn reason_of(error: &PullError) -> Option<&'static str> {
+    match error {
+        PullError::NoPeer => Some("stopped"),
+        PullError::Fetch(error) => match error {
+            FetchError::Transport(_) => Some("unreachable"),
+            FetchError::Timeout => Some("timeout"),
+            FetchError::Busy | FetchError::TooMany => Some("busy"),
+            FetchError::Revoked
+            | FetchError::Expired
+            | FetchError::Unusable
+            | FetchError::CheckGrantStatus => Some("stopped"),
+            FetchError::Internal | FetchError::Rejected => Some("error"),
+            _ => None,
+        },
+    }
 }
 
 /// Pulls (or reads the last good body of) every selected producer, one at a
@@ -231,27 +382,44 @@ pub(crate) fn gather(
             .as_ref()
             .ok()
             .and_then(|all| all.iter().find(|r| r.responder_static == *peer));
-        let got = match &records {
-            Err(_) => Got::Unavailable,
-            Ok(_) if !accepted => Got::Incompatible,
-            Ok(all) if record.is_some_and(|record| superseded(record, all)) => Got::Superseded,
+        let (got, reason, cost_incomplete) = match &records {
+            Err(_) => (Got::Unavailable, None, false),
+            Ok(_) if !accepted => (Got::Incompatible, None, false),
+            Ok(all) if record.is_some_and(|record| superseded(record, all)) => {
+                (Got::Superseded, None, false)
+            }
             Ok(_) => fetch(agent, peer, mode, query),
         };
         pulled.push(Pulled {
             peer: *peer,
             grant: record.map_or([0; 16], |record| record.grant_id),
-            label: record.map(label),
+            address: record.map(address),
+            name: None,
             got,
+            cost_incomplete,
+            ever_answered: agent.ever_answered(peer),
             last_success: agent.last_success_at(peer, query),
+            reason,
         });
+    }
+    // A successful pull stores the producer's current name on its record, so
+    // the names are read after the loop, not from the read before it.
+    if let Ok(after) = agent.peer_records() {
+        for item in &mut pulled {
+            item.name = after
+                .iter()
+                .find(|r| r.responder_static == item.peer)
+                .and_then(|r| r.node_label.clone());
+        }
     }
     let mut remote = assemble(query, pulled);
     if records.is_err() {
         // Deferred item (2): an unreadable peer store is said, not shown as
         // "no devices".
-        remote
-            .devices
-            .insert(0, device("peers".into(), None, "unavailable", None));
+        remote.devices.insert(
+            0,
+            device("peers".into(), None, "unavailable", None, None, None),
+        );
     }
     remote
 }
@@ -269,39 +437,73 @@ fn superseded(record: &PeerRecord, all: &[PeerRecord]) -> bool {
     })
 }
 
-fn fetch(agent: &RemoteAgent, peer: &[u8; 32], mode: Mode, query: &ReportQuery) -> Got {
-    let cached = || {
-        Got::Cached(
-            agent
-                .last_good_peer(peer, query)
-                .and_then(|body| decode(query.endpoint, body.body())),
-        )
+fn fetch(
+    agent: &RemoteAgent,
+    peer: &[u8; 32],
+    mode: Mode,
+    query: &ReportQuery,
+) -> (Got, Option<&'static str>, bool) {
+    let cached = || match agent
+        .last_good_peer(peer, query)
+        .and_then(|body| decode(query.endpoint, body.body()))
+    {
+        Some((report, incomplete)) => (Got::Cached(Some(report)), incomplete),
+        None => (Got::Cached(None), false),
     };
     match mode {
-        Mode::Cached => cached(),
+        Mode::Cached => {
+            let (got, incomplete) = cached();
+            (got, None, incomplete)
+        }
         Mode::Refresh => match agent.pull_peer(peer, query) {
-            None => Got::Unavailable,
-            Some(Ok(fetched)) => Got::Fresh(Report {
-                records: fetched.records,
-                saturated: fetched.saturated,
-            }),
-            Some(Err(error)) => match classify(error) {
-                FailureClass::NoAnswer => cached(),
-                class => Got::Failed(class),
-            },
+            None => (Got::Unavailable, None, false),
+            Some(Ok(fetched)) => (
+                Got::Fresh(Report {
+                    records: fetched.records,
+                    saturated: fetched.saturated,
+                }),
+                None,
+                fetched.cost_incomplete,
+            ),
+            Some(Err(error)) => failed(error, cached),
         },
     }
 }
 
+/// What a failed pull leaves: code 6 (the producer does not speak this
+/// receiver's report schema) is the `incompatible` state, not a failure the
+/// status line explains; no answer falls back to the last good body (read
+/// through `cached`); anything else is `merge::classify`'s class.
+fn failed(
+    error: PullError,
+    cached: impl FnOnce() -> (Got, bool),
+) -> (Got, Option<&'static str>, bool) {
+    if matches!(error, PullError::Fetch(FetchError::Incompatible)) {
+        return (Got::Incompatible, None, false);
+    }
+    let reason = reason_of(&error);
+    match classify(error) {
+        FailureClass::NoAnswer => {
+            let (got, incomplete) = cached();
+            (got, reason, incomplete)
+        }
+        class => (Got::Failed(class), reason, false),
+    }
+}
+
 /// A cached body, decoded by the frozen decoder after its decode cost is
-/// reserved; `None` when the reservation or the decode fails.
-fn decode(endpoint: Endpoint, body: &[u8]) -> Option<Report> {
-    fn typed<R: ReportRecord>(body: &[u8], wrap: fn(Vec<R>) -> Records) -> Option<Report> {
+/// reserved, with its `costIncomplete`; `None` when the reservation or the
+/// decode fails.
+fn decode(endpoint: Endpoint, body: &[u8]) -> Option<(Report, bool)> {
+    fn typed<R: ReportRecord>(body: &[u8], wrap: fn(Vec<R>) -> Records) -> Option<(Report, bool)> {
         let response = decode_response::<R>(body, None).ok()?;
-        Some(Report {
-            records: wrap(response.records),
-            saturated: response.saturated,
-        })
+        Some((
+            Report {
+                records: wrap(response.records),
+                saturated: response.saturated,
+            },
+            response.cost_incomplete,
+        ))
     }
     let cost = decode_reservation(body, endpoint).ok()?;
     let _reservation = LEDGER.reserve(cost)?;
@@ -338,10 +540,17 @@ pub(crate) fn assemble(query: &ReportQuery, pulled: Vec<Pulled>) -> Remote {
     /// A `devices` row before the merge outcome is known.
     struct Row {
         peer: [u8; 32],
-        label: Option<String>,
+        name: Option<String>,
+        address: Option<String>,
+        cost_incomplete: bool,
+        ever_answered: bool,
         fixed: Option<&'static str>,
         last_success: Option<i64>,
+        reason: Option<&'static str>,
     }
+    // Each admitted producer's own totals, kept beside the records `combine`
+    // sums so the rows can be checked against the merged page.
+    let mut totals: HashMap<[u8; 32], Value> = HashMap::new();
     let mut rows = Vec::with_capacity(pulled.len());
     for item in pulled {
         let fixed = match &item.got {
@@ -352,9 +561,13 @@ pub(crate) fn assemble(query: &ReportQuery, pulled: Vec<Pulled>) -> Remote {
         };
         rows.push(Row {
             peer: item.peer,
-            label: item.label.clone(),
+            name: item.name.clone(),
+            address: item.address.clone(),
+            cost_incomplete: item.cost_incomplete,
+            ever_answered: item.ever_answered,
             fixed,
             last_success: item.last_success,
+            reason: item.reason,
         });
         let data = match item.got {
             Got::Fresh(report) => PeerData::Fresh(report),
@@ -366,7 +579,12 @@ pub(crate) fn assemble(query: &ReportQuery, pulled: Vec<Pulled>) -> Remote {
         };
         if let PeerData::Fresh(report) | PeerData::LastGood(report) = &data {
             match admit(query, &report.records, &mut total) {
-                Ok(reservation) => held.push(reservation),
+                Ok(reservation) => {
+                    held.push(reservation);
+                    if let Some(value) = records_totals(&report.records) {
+                        totals.insert(item.peer, value);
+                    }
+                }
                 Err(refusal) => {
                     refused.insert(item.peer, refusal);
                     continue;
@@ -391,13 +609,17 @@ pub(crate) fn assemble(query: &ReportQuery, pulled: Vec<Pulled>) -> Remote {
         .map(
             |Row {
                  peer,
-                 label,
+                 name,
+                 address,
+                 cost_incomplete,
+                 ever_answered,
                  fixed,
                  last_success,
+                 reason,
              }| {
                 let state = fixed.unwrap_or_else(|| match refused.get(&peer) {
                     Some(Refusal::OutOfRange) => "invalidReply",
-                    Some(Refusal::Limit) => "unavailable",
+                    Some(Refusal::Limit) => "overLimit",
                     None => state_of(status.get(&peer).copied(), last_success),
                 });
                 let last_success = if state == "stale" && fixed.is_none() {
@@ -405,7 +627,27 @@ pub(crate) fn assemble(query: &ReportQuery, pulled: Vec<Pulled>) -> Remote {
                 } else {
                     last_success
                 };
-                device(fingerprint(&peer), label, state, last_success)
+                // Only a part `combine` summed has totals.
+                let merged = matches!(state, "fresh" | "lastGood" | "stale") && fixed.is_none();
+                // The name is the producer's own free text; the address is the
+                // fallback and is always kept in its own field.
+                let label = name.or_else(|| address.clone());
+                let mut row = device(
+                    fingerprint(&peer),
+                    label,
+                    state,
+                    last_success,
+                    reason,
+                    if merged { totals.remove(&peer) } else { None },
+                );
+                // Producers' rows only: `address` is the record's `host:port`
+                // whatever the name; `costIncomplete` is true only when the
+                // body this page merged said so; `everAnswered` is whether
+                // this producer ever gave this receiver a body.
+                row["address"] = json!(address);
+                row["costIncomplete"] = json!(merged && cost_incomplete);
+                row["everAnswered"] = json!(ever_answered);
+                row
             },
         )
         .collect();
@@ -1071,10 +1313,10 @@ impl Call<'_> {
         usize::from(self.selection.local) + self.selection.peers.len()
     }
 
-    fn devices(&self, remote: Vec<Value>) -> Vec<Value> {
+    fn devices(&self, remote: Vec<Value>, local_totals: Option<Value>) -> Vec<Value> {
         let mut devices = Vec::with_capacity(remote.len() + 1);
         if self.selection.local {
-            devices.push(local_device());
+            devices.push(local_device(local_totals));
         }
         devices.extend(remote);
         devices
@@ -1082,7 +1324,7 @@ impl Call<'_> {
 
     /// Only the local source: the existing body, then the new keys.
     fn local_only(&self, data: Value) -> Result<Value, String> {
-        decorate(data, self.devices(Vec::new()), 1, false, false)
+        decorate(data, self.devices(Vec::new(), None), 1, false, false)
     }
 
     /// The remote part of a page, when any producer is selected.
@@ -1107,11 +1349,13 @@ pub(crate) fn graph(call: &Call<'_>) -> Result<Value, String> {
         return call.local_only(data);
     }
     let mut graph = if call.selection.local {
-        crate::usage_graph::compute(call.context, call.year)?
+        // A copy of the shared graph: the fold below writes into it.
+        (*crate::raw_graph(call.context, call.year, crate::RawGraphReuse::Fresh)?.graph).clone()
     } else {
         crate::usage_graph::normalize_year(call.year)?;
         empty_graph()
     };
+    let local_totals = call.selection.local.then(|| graph_totals(&graph));
     let (remote, limited) = call.remote(Endpoint::Graph)?;
     let mut saturated = remote.saturated;
     if let Some(Records::Graph(records)) = &remote.records {
@@ -1120,7 +1364,7 @@ pub(crate) fn graph(call: &Call<'_>) -> Result<Value, String> {
     let data = crate::usage_graph::to_payload(graph)?;
     decorate(
         data,
-        call.devices(remote.devices),
+        call.devices(remote.devices, local_totals),
         call.sources(),
         saturated,
         limited,
@@ -1146,6 +1390,7 @@ pub(crate) fn models(call: &Call<'_>) -> Result<Value, String> {
             processing_time_ms: 0,
         }
     };
+    let local_totals = call.selection.local.then(|| models_totals(&report));
     let (remote, limited) = call.remote(Endpoint::Models)?;
     let mut saturated = remote.saturated;
     let touched = match &remote.records {
@@ -1156,7 +1401,7 @@ pub(crate) fn models(call: &Call<'_>) -> Result<Value, String> {
     let data = models_payload(report, &touched, pricing.as_ref())?;
     decorate(
         data,
-        call.devices(remote.devices),
+        call.devices(remote.devices, local_totals),
         call.sources(),
         saturated,
         limited,
@@ -1208,7 +1453,7 @@ pub(crate) fn hourly(call: &Call<'_>) -> Result<Value, String> {
         .map_err(|e| format!("serialize hourly report: {e}"))?;
     decorate(
         data,
-        call.devices(remote.devices),
+        call.devices(remote.devices, None),
         call.sources(),
         saturated,
         limited,
@@ -1243,7 +1488,7 @@ pub(crate) fn agents(call: &Call<'_>) -> Result<Value, String> {
         .map_err(|e| format!("serialize agents report: {e}"))?;
     decorate(
         data,
-        call.devices(remote.devices),
+        call.devices(remote.devices, None),
         call.sources(),
         saturated,
         limited,
@@ -1444,7 +1689,11 @@ mod tests {
 
     /// A producer with sharing on, an approved scope and a listener.
     fn producer(home: &Path, clock: &Arc<TestClock>) -> Arc<RemoteAgent> {
-        let agent = agent_at(home, clock);
+        share(agent_at(home, clock))
+    }
+
+    /// Listener on, the disclosed scope approved, sharing on.
+    fn share(agent: Arc<RemoteAgent>) -> Arc<RemoteAgent> {
         agent
             .listen_configure("127.0.0.1", free_port(), None)
             .unwrap();
@@ -1726,13 +1975,230 @@ mod tests {
         Pulled {
             peer: [key; 32],
             grant: [key; 16],
-            label: Some(format!("10.0.0.{key}:4000")),
+            address: Some(format!("10.0.0.{key}:4000")),
+            name: None,
             got: Got::Fresh(Report {
                 records,
                 saturated: false,
             }),
+            cost_incomplete: false,
+            ever_answered: true,
             last_success: Some(7),
+            reason: None,
         }
+    }
+
+    /// DR-2b2: code 6 is the `incompatible` state with no reason and no
+    /// cached fallback; the other failures keep their class and reason.
+    #[test]
+    fn code_6_is_incompatible_and_other_failures_keep_their_class() {
+        let cached = || -> (Got, bool) { panic!("code 6 must not read the cache") };
+        let (got, reason, incomplete) = failed(PullError::Fetch(FetchError::Incompatible), cached);
+        assert!(matches!(got, Got::Incompatible));
+        assert_eq!((reason, incomplete), (None, false));
+        // Control: no answer falls back to the cache (and its flag); a
+        // rejection does not.
+        let (got, reason, incomplete) = failed(PullError::Fetch(FetchError::Timeout), || {
+            (Got::Cached(None), true)
+        });
+        assert!(matches!(got, Got::Cached(None)));
+        assert_eq!((reason, incomplete), (Some("timeout"), true));
+        let (got, reason, _) = failed(PullError::Fetch(FetchError::Rejected), cached);
+        assert!(matches!(got, Got::Failed(FailureClass::Refused)));
+        assert_eq!(reason, Some("error"));
+    }
+
+    /// DR-2b2: a row's `label` is the producer's name, else the address;
+    /// `address` is always the record's; `costIncomplete` counts only for a
+    /// part that was merged; `everAnswered` is passed through.
+    #[test]
+    fn dr2b2_label_address_and_flags_of_a_row() {
+        let named = |key: u8, name: Option<&str>, incomplete: bool| {
+            let mut item = pulled(key, Records::Graph(vec![graph_record("2025-03-10", 1, 0)]));
+            item.name = name.map(Into::into);
+            item.cost_incomplete = incomplete;
+            item
+        };
+        // Same name and state on two devices: two rows, told apart by id.
+        let mut refused = named(3, Some("Studio Mac"), true);
+        refused.got = Got::Failed(FailureClass::Refused);
+        let remote = assemble(
+            &graph_query(),
+            vec![
+                named(1, Some("Studio Mac"), true),
+                named(2, None, false),
+                refused,
+            ],
+        );
+        let rows = &remote.devices;
+        assert_eq!(rows[0]["label"], "Studio Mac");
+        assert_eq!(rows[0]["address"], "10.0.0.1:4000");
+        assert_eq!(rows[0]["costIncomplete"], true);
+        assert_eq!(rows[0]["everAnswered"], true);
+        assert_eq!(rows[1]["label"], "10.0.0.2:4000", "no name: the address");
+        assert_eq!(rows[1]["address"], "10.0.0.2:4000");
+        assert_eq!(rows[1]["costIncomplete"], false);
+        assert_ne!(rows[0]["id"], rows[1]["id"]);
+        assert_eq!(rows[2]["state"], "refused");
+        assert_eq!(rows[2]["costIncomplete"], false, "no part was merged");
+        // The local-only rows are unchanged.
+        assert_eq!(
+            local_device(None),
+            json!({"id": "local", "label": null, "state": "local", "lastSuccessAt": null})
+        );
+    }
+
+    /// DR-2a R3: every pull failure maps to the reason the status line needs,
+    /// and the failures without a line of their own have none.
+    #[test]
+    fn dr2a_reason_of_names_each_failure() {
+        let fetch = |e| reason_of(&PullError::Fetch(e));
+        let transport = FetchError::Transport(syrtis_agent::noise::NoiseError::Timeout);
+        assert_eq!(fetch(transport), Some("unreachable"));
+        assert_eq!(fetch(FetchError::Timeout), Some("timeout"));
+        assert_eq!(fetch(FetchError::Busy), Some("busy"));
+        assert_eq!(fetch(FetchError::TooMany), Some("busy"));
+        for stopped in [
+            FetchError::Revoked,
+            FetchError::Expired,
+            FetchError::Unusable,
+            FetchError::CheckGrantStatus,
+        ] {
+            assert_eq!(fetch(stopped), Some("stopped"));
+        }
+        assert_eq!(reason_of(&PullError::NoPeer), Some("stopped"));
+        assert_eq!(fetch(FetchError::Internal), Some("error"));
+        assert_eq!(fetch(FetchError::Rejected), Some("error"));
+        for none in [
+            FetchError::TooLarge,
+            FetchError::Memory,
+            FetchError::InvalidQuery,
+            FetchError::Protocol,
+            FetchError::Invalid,
+        ] {
+            assert_eq!(fetch(none), None);
+        }
+    }
+
+    /// DR-2a R1: each device row carries its part per client; the rows' sums
+    /// are the merged page's totals (graph and models), and a part that was
+    /// not merged has `null` totals.
+    #[test]
+    fn dr2a_device_totals_sum_to_the_merged_page() {
+        fn rec(date: &str, client: &str, input: u64, cost: u64) -> GraphRecord {
+            GraphRecord {
+                client: client.into(),
+                ..graph_record(date, input, cost)
+            }
+        }
+        let sum = |rows: &[&Value], key: &str| {
+            rows.iter()
+                .flat_map(|r| r.as_array().unwrap())
+                .map(|t| t[key].as_f64().unwrap())
+                .sum::<f64>()
+        };
+        // Graph. The local part is folded into an empty graph first.
+        let mut graph = empty_graph();
+        let mut saturated = false;
+        fold_graph(
+            &mut graph,
+            &[
+                rec("2025-03-10", "claude", 100, 2_000_000_000),
+                rec("2025-03-10", "codex", 40, 1_000_000_000),
+            ],
+            &mut saturated,
+        );
+        let local = graph_totals(&graph);
+        let remote = assemble(
+            &graph_query(),
+            vec![
+                pulled(
+                    1,
+                    Records::Graph(vec![
+                        rec("2025-03-10", "claude", 7, 500_000_000),
+                        rec("2025-03-11", "gemini", 9, 250_000_000),
+                    ]),
+                ),
+                pulled(2, Records::Graph(vec![rec("2025-03-12", "codex", 5, 0)])),
+                pulled(3, Records::Graph(vec![rec("2024-01-01", "codex", 99, 0)])),
+            ],
+        );
+        let Some(Records::Graph(records)) = &remote.records else {
+            panic!("no merged records")
+        };
+        fold_graph(&mut graph, records, &mut saturated);
+        let rows = [
+            &local,
+            &remote.devices[0]["totals"],
+            &remote.devices[1]["totals"],
+        ];
+        assert_eq!(remote.devices[2]["state"], "invalidReply");
+        assert_eq!(remote.devices[2]["totals"], Value::Null, "not merged");
+        let days = &graph.contributions;
+        assert_eq!(
+            sum(&rows, "tokens"),
+            days.iter().map(|d| d.totals.tokens as f64).sum::<f64>()
+        );
+        assert_eq!(
+            sum(&rows, "messages"),
+            days.iter()
+                .map(|d| f64::from(d.totals.messages))
+                .sum::<f64>()
+        );
+        assert!(
+            (sum(&rows, "costUsd") - days.iter().map(|d| d.totals.cost).sum::<f64>()).abs() < 1e-9
+        );
+        assert_eq!(remote.devices[0]["totals"][0]["client"], "claude");
+        assert_eq!(remote.devices[0]["totals"][0]["tokens"], 7);
+        assert_eq!(remote.devices[0]["totals"][1]["client"], "gemini");
+
+        // Models.
+        let models_query = ReportQuery {
+            endpoint: Endpoint::Models,
+            ..graph_query()
+        };
+        let mut report = tokscale_core::ModelReport {
+            entries: vec![model_usage("m", 1_000, 1.5)],
+            total_input: 0,
+            total_output: 0,
+            total_cache_read: 0,
+            total_cache_write: 0,
+            total_messages: 0,
+            total_cost: 0.0,
+            processing_time_ms: 0,
+        };
+        let local = models_totals(&report);
+        let mut other = models_record("m2", 70, 500_000_000);
+        other.client = "codex".into();
+        let remote = assemble(
+            &models_query,
+            vec![
+                pulled(
+                    1,
+                    Records::Models(vec![models_record("m", 30, 250_000_000)]),
+                ),
+                pulled(4, Records::Models(vec![other])),
+            ],
+        );
+        let Some(Records::Models(records)) = &remote.records else {
+            panic!("no merged records")
+        };
+        fold_models(&mut report, records, &mut saturated);
+        let rows = [
+            &local,
+            &remote.devices[0]["totals"],
+            &remote.devices[1]["totals"],
+        ];
+        assert_eq!(
+            sum(&rows, "tokens"),
+            report
+                .entries
+                .iter()
+                .map(|e| (e.input + e.output) as f64)
+                .sum::<f64>()
+        );
+        assert_eq!(sum(&rows, "messages"), f64::from(report.total_messages));
+        assert!((sum(&rows, "costUsd") - report.total_cost).abs() < 1e-9);
     }
 
     /// Acceptance (4) and (9b): a producer whose records lie outside the asked
@@ -1925,7 +2391,7 @@ mod tests {
             .iter()
             .map(|d| d["state"].as_str().unwrap().to_owned())
             .collect();
-        assert_eq!(rows, ["unavailable", "fresh"]);
+        assert_eq!(rows, ["overLimit", "fresh"]);
         let Some(Records::Graph(kept)) = remote.records else {
             panic!()
         };
@@ -1939,7 +2405,7 @@ mod tests {
             .iter()
             .map(|d| d["state"].as_str().unwrap().to_owned())
             .collect();
-        assert_eq!(rows, ["fresh", "fresh", "fresh", "fresh", "unavailable"]);
+        assert_eq!(rows, ["fresh", "fresh", "fresh", "fresh", "overLimit"]);
     }
 
     /// Acceptance (8): sums that pass the payload's integer width saturate
@@ -2518,6 +2984,29 @@ mod tests {
         assert_eq!(g["duplicateWarning"], true, "(5) two sources");
         assert_eq!(g["remoteRangeLimited"], false);
         assert!(g["devices"][1]["lastSuccessAt"].is_i64());
+        // DR-2a R1 through the real core: this Mac's totals (taken before the
+        // fold) and A's add up to the merged page.
+        let rows_sum = |key: &str| {
+            g["devices"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .flat_map(|d| d["totals"].as_array().expect("every merged row has totals"))
+                .map(|t| t[key].as_f64().unwrap())
+                .sum::<f64>()
+        };
+        let days_sum = |key: &str| {
+            g["contributions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|d| d["totals"][key].as_f64().unwrap())
+                .sum::<f64>()
+        };
+        assert_eq!(rows_sum("tokens"), days_sum("tokens"));
+        assert_eq!(rows_sum("messages"), days_sum("messages"));
+        assert!((rows_sum("costUsd") - days_sum("cost")).abs() < 1e-9);
+        assert!(rows_sum("tokens") > 0.0, "control: the page has usage");
         assert_eq!(
             g["devices"][1]["label"],
             format!("127.0.0.1:{}", a.status().unwrap()["bindPort"])
@@ -2695,12 +3184,280 @@ mod tests {
             Mode::Cached,
         ))
         .unwrap();
+        // The producer has no price table here, so its cached body carries
+        // `costIncomplete`, and the cache itself says it answered before.
+        let address = format!(
+            "127.0.0.1:{}",
+            stale["devices"][0]["label"]
+                .as_str()
+                .unwrap()
+                .rsplit(':')
+                .next()
+                .unwrap()
+        );
         assert_eq!(
             stale["devices"],
-            json!([{"id": fingerprint(&kb), "label": format!("127.0.0.1:{}", stale["devices"][0]["label"].as_str().unwrap().rsplit(':').next().unwrap()), "state": "stale", "lastSuccessAt": null}])
+            json!([{"id": fingerprint(&kb), "label": address, "address": address,
+                    "state": "stale", "lastSuccessAt": null, "reason": null,
+                    "costIncomplete": true, "everAnswered": true,
+                    "totals": [{"client": "claude", "costUsd": 0.0, "messages": 1, "tokens": 1100}]}])
         );
         assert_eq!(day(&stale, "2025-03-10")["tokenBreakdown"]["input"], 1000);
         drop(a);
+    }
+
+    /// One OpenCode message (an XdgData-rooted client) and one Antigravity
+    /// session line (a Config-rooted client, below `<config>/tokscale`), both
+    /// on 2025-03-10, with the given input counts.
+    fn write_xdg_clients(config: &Path, data: &Path, opencode: u64, antigravity: u64) {
+        let message = data.join("opencode/storage/message/ses_x/msg_x.json");
+        fs::create_dir_all(message.parent().unwrap()).unwrap();
+        fs::write(
+            message,
+            format!(r#"{{"id":"msg_x","sessionID":"ses_x","role":"assistant","modelID":"m-open","providerID":"anthropic","tokens":{{"input":{opencode},"output":41,"reasoning":0,"cache":{{"read":4,"write":1}}}},"time":{{"created":1741608000000.0}}}}"#),
+        )
+        .unwrap();
+        let session = config.join("tokscale/antigravity-cache/sessions/s.jsonl");
+        fs::create_dir_all(session.parent().unwrap()).unwrap();
+        fs::write(
+            session,
+            format!(r#"{{"type":"usage","sessionId":"s","timestamp":1741608000000,"modelId":"m-anti","input":{antigravity},"output":52}}"#) + "\n",
+        )
+        .unwrap();
+    }
+
+    /// DR-1e acceptance (a)–(d), through the app's own `inputs_from` with an
+    /// override home: the shared config and data dirs are `home/.config` and
+    /// `home/.local/share` (disclosed as such), so an OpenCode message under
+    /// `.local/share` and an Antigravity session under `.config/tokscale`
+    /// reach the shared graph. The child's `HOME` is another directory with
+    /// decoy fixtures of other counts: neither dir follows it.
+    #[test]
+    fn a_share_reaches_xdg_data_and_config_clients_below_the_home() {
+        if !in_child("a_share_reaches_xdg_data_and_config_clients_below_the_home") {
+            return;
+        }
+        let root = child_root().unwrap();
+        let clock = TestClock::new();
+        let env_home = root.join("home");
+        write_xdg_clients(
+            &env_home.join(".config"),
+            &env_home.join(".local/share"),
+            999,
+            888,
+        );
+        let p_home = root.join("p");
+        let (config, data) = (p_home.join(".config"), p_home.join(".local/share"));
+        write_xdg_clients(&config, &data, 410, 520);
+
+        let sources = crate::remote_agent::Sources {
+            context: crate::LocalSourceContext::current(),
+            pricing_source: root.join("config/cache"),
+            period: PERIOD,
+            clock: Arc::clone(&clock) as Arc<dyn Clock>,
+        };
+        let home = p_home.clone();
+        let agent = Arc::new(RemoteAgent::default());
+        agent
+            .start(Arc::new(move || {
+                crate::remote_agent::inputs_from(Some(&home), &sources)
+            }))
+            .unwrap();
+        // (c), and (d) since the decoy `$HOME` is elsewhere: disclosed as
+        // below the override home.
+        assert_eq!(std::env::var_os("HOME"), Some(env_home.into()), "control");
+        let disclosure = agent.scope_disclosure().unwrap();
+        assert_eq!(disclosure["configDir"], json!(config), "{disclosure}");
+        assert_eq!(disclosure["dataDir"], json!(data), "{disclosure}");
+        let producer = share(agent);
+
+        let r_home = root.join("r");
+        fs::create_dir_all(&r_home).unwrap();
+        let receiver = agent_at(&r_home, &clock);
+        let key = pair(&producer, &receiver);
+        clock.advance(61);
+        let context = crate::LocalSourceContext::current();
+        let g = graph(&call(
+            &receiver,
+            &context,
+            false,
+            &[key],
+            "UTC",
+            Mode::Refresh,
+        ))
+        .unwrap();
+        assert_eq!(states(&g), [(fingerprint(&key), "fresh".into())], "{g}");
+        let d10 = day(&g, "2025-03-10");
+        let input = |client: &str| {
+            d10["clients"]
+                .as_array()
+                .and_then(|rows| rows.iter().find(|r| r["client"] == client))
+                .map(|r| r["tokens"]["input"].clone())
+        };
+        // (a) XdgData root and (b) Config root, each the producer's count.
+        assert_eq!(input("opencode"), Some(json!(410)), "{d10}");
+        assert_eq!(input("antigravity"), Some(json!(520)), "{d10}");
+    }
+
+    /// DR-2a R3 through the real pull: a producer nobody listens for is
+    /// `unreachable` with no data; a pull past the producer's burst of two
+    /// inside its 60 s grant refill is `busy` and keeps the first pull's body
+    /// (`lastGood`, with its totals); a successful pull carries no reason,
+    /// and a cached call none either.
+    #[test]
+    fn dr2a_reasons_survive_the_classification() {
+        if !in_child("dr2a_reasons_survive_the_classification") {
+            return;
+        }
+        let root = child_root().unwrap();
+        let clock = TestClock::new();
+        let context = crate::LocalSourceContext::current();
+        let (a_home, r_home) = (root.join("pa"), root.join("r"));
+        write_session(
+            &a_home,
+            "a.jsonl",
+            &[claude(
+                "a1",
+                "2025-03-10T05:45:00.000Z",
+                "claude-3-5-sonnet",
+                7,
+                3,
+                false,
+            )],
+        );
+        fs::create_dir_all(&r_home).unwrap();
+        let a = producer(&a_home, &clock);
+        let receiver = agent_at(&r_home, &clock);
+        let ka = pair(&a, &receiver);
+        let dead = fake_peer(&receiver, 0xdd, free_port(), 1);
+        let reason_of_page = |peers: &[[u8; 32]], mode| {
+            let page = graph(&call(&receiver, &context, false, peers, "UTC", mode)).unwrap();
+            let row = page["devices"][0].clone();
+            (
+                row["state"].clone(),
+                row["reason"].clone(),
+                row["totals"].clone(),
+            )
+        };
+
+        let (state, reason, totals) = reason_of_page(&[dead], Mode::Refresh);
+        assert_eq!(
+            (state, reason, totals),
+            ("unavailable".into(), "unreachable".into(), Value::Null)
+        );
+        let (state, reason, totals) = reason_of_page(&[ka], Mode::Refresh);
+        assert_eq!((state, reason), ("fresh".into(), Value::Null));
+        assert_eq!(totals[0]["tokens"], 10);
+        // The grant allows a burst of two, then one a minute.
+        reason_of_page(&[ka], Mode::Refresh);
+        let (state, reason, totals) = reason_of_page(&[ka], Mode::Refresh);
+        assert_eq!((state, reason), ("lastGood".into(), "busy".into()));
+        assert_eq!(totals[0]["tokens"], 10, "the kept body is still merged");
+        let (_, reason, _) = reason_of_page(&[ka], Mode::Cached);
+        assert_eq!(reason, Value::Null);
+    }
+
+    /// DR-2b2 through the real pull. Before the first answer a row shows the
+    /// address and `everAnswered` is false; after it the row shows the name
+    /// the producer sent (stored on the record, so a cached call shows it
+    /// too), keeps the address in its own field, and `everAnswered` is true.
+    /// `costIncomplete` is true for a producer with no price table and false
+    /// once it has one; a producer nobody listens for has neither a name nor
+    /// the flag.
+    #[test]
+    fn dr2b2_rows_carry_the_name_the_address_and_the_flags() {
+        if !in_child("dr2b2_rows_carry_the_name_the_address_and_the_flags") {
+            return;
+        }
+        let root = child_root().unwrap();
+        let clock = TestClock::new();
+        let context = crate::LocalSourceContext::current();
+        let (a_home, r_home) = (TempHome::new(), root.join("r"));
+        write_session(
+            &a_home.0,
+            "a.jsonl",
+            &[claude(
+                "a1",
+                "2025-03-10T05:45:00.000Z",
+                "claude-3-5-sonnet",
+                1_000_000,
+                0,
+                false,
+            )],
+        );
+        fs::create_dir_all(&r_home).unwrap();
+        let a = agent_at(&a_home.0, &clock);
+        let port = free_port();
+        a.listen_configure("127.0.0.1", port, Some("Studio Mac".into()))
+            .unwrap();
+        let digest = a.scope_disclosure().unwrap()["ownerInputsSha256"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        a.scope_approve(&digest).unwrap();
+        a.sharing_set(true).unwrap();
+        let receiver = agent_at(&r_home, &clock);
+        let ka = pair(&a, &receiver);
+        let dead = fake_peer(&receiver, 0xdd, free_port(), 1);
+        let address = format!("127.0.0.1:{port}");
+        let row = |peer: [u8; 32], mode| {
+            let page = graph(&call(&receiver, &context, false, &[peer], "UTC", mode)).unwrap();
+            page["devices"][0].clone()
+        };
+
+        let before = row(ka, Mode::Cached);
+        assert_eq!(before["label"], address.as_str(), "{before}");
+        assert_eq!(before["address"], address.as_str());
+        assert_eq!(before["everAnswered"], false);
+        assert_eq!(before["costIncomplete"], false);
+
+        // No price table on the producer: its numbers say so.
+        clock.advance(61);
+        let first = row(ka, Mode::Refresh);
+        assert_eq!(first["state"], "fresh", "{first}");
+        assert_eq!(first["label"], "Studio Mac", "the name of this answer");
+        assert_eq!(first["address"], address.as_str());
+        assert_eq!(first["everAnswered"], true);
+        assert_eq!(first["costIncomplete"], true, "{first}");
+        // The name and the flag live on: a cached call has no connection.
+        let cached = row(ka, Mode::Cached);
+        assert_eq!(cached["label"], "Studio Mac");
+        assert_eq!(cached["everAnswered"], true);
+        assert_eq!(cached["costIncomplete"], true, "the cached body's flag");
+
+        // A price table on the producer clears the flag.
+        let source = a_home.dir("pricing-src");
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let dataset = |data: Value| json!({"timestamp": now, "data": data}).to_string();
+        fs::write(
+            source.join("pricing-litellm.json"),
+            dataset(json!({"claude-3-5-sonnet": {"input_cost_per_token": 0.000_001}})),
+        )
+        .unwrap();
+        fs::write(source.join("pricing-openrouter.json"), dataset(json!({}))).unwrap();
+        for name in crate::remote_agent::PRICING_FILES {
+            fs::File::options()
+                .write(true)
+                .open(source.join(name))
+                .unwrap()
+                .set_modified(SystemTime::now() + Duration::from_secs(10))
+                .unwrap();
+        }
+        std::thread::sleep(PERIOD * 5);
+        clock.advance(61);
+        let priced = row(ka, Mode::Refresh);
+        assert_eq!(priced["state"], "fresh", "{priced}");
+        assert_eq!(priced["costIncomplete"], false, "{priced}");
+
+        // A producer that never answered: address as label, no flag.
+        let unreachable = row(dead, Mode::Refresh);
+        assert_eq!(unreachable["state"], "unavailable", "{unreachable}");
+        assert_eq!(unreachable["label"], unreachable["address"]);
+        assert_eq!(unreachable["everAnswered"], false);
+        assert_eq!(unreachable["costIncomplete"], false);
     }
 
     /// Review fix 2: a producer that completes the handshake and then never
@@ -2784,6 +3541,126 @@ mod tests {
             .iter()
             .all(|r| r.responder_static != other));
         assert_ne!(states(&refreshed)[0].1, "fresh");
+    }
+
+    /// SA-3d deferred item 2: `op` (a stop, or a start whose inputs changed)
+    /// called while a pull is inside its fetch. Both take the agent's write
+    /// lock, so `op` must still be waiting while the producer stays silent,
+    /// and must finish (no deadlock) once the producer's session is dropped,
+    /// which ends the pull. The test releases the pull itself by closing the
+    /// session; it never waits out `FETCH_DEADLINE`.
+    fn op_waits_for_the_pull(
+        home: &Path,
+        op: impl FnOnce(Arc<RemoteAgent>, Arc<TestClock>) -> Value + Send + 'static,
+        check: impl FnOnce(&RemoteAgent, Value),
+    ) {
+        let clock = TestClock::new();
+        fs::create_dir_all(home).unwrap();
+        let receiver = agent_at(home, &clock);
+        let key = syrtis_agent::noise::StaticKey::generate().unwrap();
+        let silent = *key.public();
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (handshook, handshake) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let session = syrtis_agent::noise::accept(stream, &key);
+            handshook.send(session.is_ok()).unwrap();
+            let _ = released.recv_timeout(Duration::from_secs(60));
+            drop(session);
+            drop(listener);
+        });
+        fake_peer_as(&receiver, silent, 0x51, port, 1);
+        let pulling = Arc::clone(&receiver);
+        let refresh = std::thread::spawn(move || {
+            let context = crate::LocalSourceContext::current();
+            graph(&call(
+                &pulling,
+                &context,
+                false,
+                &[silent],
+                "UTC",
+                Mode::Refresh,
+            ))
+            .unwrap()
+        });
+        assert!(
+            handshake.recv_timeout(Duration::from_secs(10)).unwrap(),
+            "the refresh did not complete the handshake"
+        );
+        let operating = Arc::clone(&receiver);
+        let operation = std::thread::spawn(move || op(operating, clock));
+        std::thread::sleep(Duration::from_millis(400));
+        let early = operation.is_finished();
+        let pull_open = !refresh.is_finished();
+        release.send(()).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while !(operation.is_finished() && refresh.is_finished()) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "deadlock: the operation or the pull never ended"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        server.join().unwrap();
+        let refreshed = refresh.join().unwrap();
+        let result = operation.join().unwrap();
+        assert!(pull_open, "control: the pull had already ended");
+        assert!(
+            !early,
+            "the operation finished while the pull was in flight"
+        );
+        assert_ne!(states(&refreshed)[0].1, "fresh");
+        check(&receiver, result);
+    }
+
+    #[test]
+    fn stop_waits_for_a_pull_in_flight() {
+        if !in_child("stop_waits_for_a_pull_in_flight") {
+            return;
+        }
+        let root = child_root().unwrap();
+        op_waits_for_the_pull(
+            &root.join("r"),
+            |agent, _| agent.stop().unwrap(),
+            |agent, result| {
+                assert_eq!(result["running"], false);
+                assert_eq!(agent.status().unwrap()["running"], false);
+            },
+        );
+    }
+
+    #[test]
+    fn a_restart_waits_for_a_pull_in_flight() {
+        if !in_child("a_restart_waits_for_a_pull_in_flight") {
+            return;
+        }
+        let root = child_root().unwrap();
+        let home = root.join("r");
+        let extra = root.join("extra");
+        fs::create_dir_all(&extra).unwrap();
+        let changed = ScannerSettings {
+            extra_scan_paths: std::collections::BTreeMap::from([(
+                "claude".to_string(),
+                vec![extra],
+            )]),
+            ..ScannerSettings::default()
+        };
+        let restart_home = home.clone();
+        op_waits_for_the_pull(
+            &home,
+            move |agent, clock| {
+                let before = agent.scope_disclosure().unwrap()["ownerInputsSha256"].clone();
+                agent.start(make(&restart_home, &clock, changed)).unwrap();
+                json!({"before": before})
+            },
+            |agent, result| {
+                let after = agent.scope_disclosure().unwrap()["ownerInputsSha256"].clone();
+                assert_ne!(after, result["before"], "the inputs did not change");
+                assert_eq!(agent.status().unwrap()["running"], true);
+            },
+        );
     }
 
     /// Deferred items (3) and (9d): a record superseded by a newer one at the
@@ -2897,60 +3774,81 @@ mod tests {
         assert_eq!(day(&page, "2025-03-10")["tokenBreakdown"]["input"], 100);
     }
 
-    /// Deferred item (4): a refusal with code 2 after another grant's revoke
-    /// renumbered this one's `authEpoch` asks Grant status once (`active`)
-    /// and stores the new epoch; this call is `refused`, the next is fresh.
+    /// Counts `receiver`'s pulls in `pull_peer`; `then` runs after each one
+    /// with its 1-based number.
+    fn count_pulls(
+        receiver: &RemoteAgent,
+        then: impl Fn(usize) + Send + Sync + 'static,
+    ) -> Arc<AtomicUsize> {
+        let pulls = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&pulls);
+        *receiver.after_pull.lock().unwrap() = Some(Arc::new(move || {
+            then(counter.fetch_add(1, Ordering::SeqCst) + 1);
+        }));
+        pulls
+    }
+
+    /// The receiver's record of producer `ka`.
+    fn record_of(agent: &RemoteAgent, ka: &[u8; 32]) -> PeerRecord {
+        agent
+            .peer_records()
+            .unwrap()
+            .into_iter()
+            .find(|r| r.responder_static == *ka)
+            .unwrap()
+    }
+
+    /// DR-3b (a), (d): producer A with receivers R and O. O pairs again:
+    /// A's approval revokes O's older grant in the same commit (DR-3a), so
+    /// A lists exactly one active grant for O, and the revoke renumbers R's
+    /// `authEpoch`. R's next refresh is refused with code 2, asks Grant
+    /// status (`active`), stores the new epoch and pulls again once: the
+    /// page is `fresh` (with its time) on that same call, after two pulls.
+    /// Before DR-3b this call was `refused` and only the next was fresh.
     #[test]
-    fn check_grant_status_updates_the_record() {
-        if !in_child("check_grant_status_updates_the_record") {
+    fn a_re_pairing_elsewhere_is_fresh_on_the_next_pull() {
+        if !in_child("a_re_pairing_elsewhere_is_fresh_on_the_next_pull") {
             return;
         }
         let clock = TestClock::new();
-        let (a_home, r_home, s_home) = (TempHome::new(), TempHome::new(), TempHome::new());
+        let (a_home, r_home, o_home) = (TempHome::new(), TempHome::new(), TempHome::new());
         let context = crate::LocalSourceContext::for_home(PathBuf::from("/nonexistent-sa3b"));
         let a = producer(&a_home.0, &clock);
         let receiver = agent_at(&r_home.0, &clock);
-        let second = agent_at(&s_home.0, &clock);
+        let other = agent_at(&o_home.0, &clock);
         let ka = pair(&a, &receiver);
-        pair(&a, &second);
-        let epoch = |agent: &RemoteAgent| {
-            agent
-                .peer_records()
-                .unwrap()
-                .iter()
-                .find(|r| r.responder_static == ka)
-                .unwrap()
-                .auth_epoch
-        };
-        let before = epoch(&receiver);
-        let other = a
-            .grants()
-            .unwrap()
-            .as_array()
-            .unwrap()
+        pair(&a, &other);
+        let before = record_of(&receiver, &ka).auth_epoch;
+        let o_old = hex_encode(&record_of(&other, &ka).grant_id);
+        let grants = |agent: &RemoteAgent| agent.grants().unwrap().as_array().unwrap().clone();
+        let o_print = grants(&a)
             .iter()
-            .map(|g| g["grantId"].as_str().unwrap().to_owned())
-            .find(|id| {
-                let record = second.peer_records().unwrap();
-                hex_encode(&record[0].grant_id) == *id
+            .find(|g| g["grantId"] == o_old.as_str())
+            .unwrap()["peerFingerprint"]
+            .clone();
+
+        pair(&a, &other);
+        let o_new = hex_encode(&record_of(&other, &ka).grant_id);
+        assert_ne!(o_new, o_old);
+        let of_o: Vec<(String, String)> = grants(&a)
+            .iter()
+            .filter(|g| g["peerFingerprint"] == o_print)
+            .map(|g| {
+                (
+                    g["grantId"].as_str().unwrap().to_owned(),
+                    g["state"].as_str().unwrap().to_owned(),
+                )
             })
-            .unwrap();
-        a.revoke(&other).unwrap();
-        clock.advance(61);
-        let page = agents(&call(
-            &receiver,
-            &context,
-            false,
-            &[ka],
-            "UTC",
-            Mode::Refresh,
-        ))
-        .unwrap();
-        assert_eq!(states(&page), [(fingerprint(&ka), "refused".into())]);
-        assert!(
-            epoch(&receiver) > before,
-            "Grant status did not update the record"
+            .collect();
+        assert_eq!(
+            of_o.iter().filter(|(_, state)| state == "active").count(),
+            1,
+            "{of_o:?}"
         );
+        assert!(of_o.contains(&(o_new, "active".into())), "{of_o:?}");
+        assert!(of_o.contains(&(o_old, "revoked".into())), "{of_o:?}");
+
+        let pulls = count_pulls(&receiver, |_| {});
         clock.advance(61);
         let page = agents(&call(
             &receiver,
@@ -2962,12 +3860,63 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(states(&page), [(fingerprint(&ka), "fresh".into())]);
+        assert!(page["devices"][0]["lastSuccessAt"].is_i64());
+        assert_eq!(pulls.load(Ordering::SeqCst), 2, "one refusal, one retry");
+        assert!(
+            record_of(&receiver, &ka).auth_epoch > before,
+            "Grant status did not update the record"
+        );
     }
 
-    /// Deferred item (5), measured: the producer's pricing copy older than an
-    /// hour (by the dataset's own timestamp) is refused by the engine's remote
-    /// snapshot, and a client that records no cost of its own (Claude Code)
-    /// is then shared with cost 0. A fresh copy prices the same tokens.
+    /// DR-3b (c): a code-2 refusal whose Grant status answers `revoked` (A
+    /// revokes R's grant between R's pull and its Grant status, through the
+    /// test seam) stays `refused`, marks the record revoked and is not
+    /// retried: one pull.
+    #[test]
+    fn grant_status_revoked_is_refused_without_a_retry() {
+        if !in_child("grant_status_revoked_is_refused_without_a_retry") {
+            return;
+        }
+        let clock = TestClock::new();
+        let (a_home, r_home, o_home) = (TempHome::new(), TempHome::new(), TempHome::new());
+        let context = crate::LocalSourceContext::for_home(PathBuf::from("/nonexistent-sa3b"));
+        let a = producer(&a_home.0, &clock);
+        let receiver = agent_at(&r_home.0, &clock);
+        let other = agent_at(&o_home.0, &clock);
+        let ka = pair(&a, &receiver);
+        pair(&a, &other);
+        // Renumbers R's `authEpoch`: R's next pull is refused with code 2.
+        a.revoke(&hex_encode(&record_of(&other, &ka).grant_id))
+            .unwrap();
+        let r_grant = hex_encode(&record_of(&receiver, &ka).grant_id);
+        let producer = Arc::clone(&a);
+        let pulls = count_pulls(&receiver, move |n| {
+            if n == 1 {
+                producer.revoke(&r_grant).unwrap();
+            }
+        });
+        clock.advance(61);
+        let page = agents(&call(
+            &receiver,
+            &context,
+            false,
+            &[ka],
+            "UTC",
+            Mode::Refresh,
+        ))
+        .unwrap();
+        assert_eq!(states(&page), [(fingerprint(&ka), "refused".into())]);
+        assert_eq!(page["devices"][0]["reason"], "stopped");
+        assert_eq!(pulls.load(Ordering::SeqCst), 1, "retried");
+        assert_eq!(record_of(&receiver, &ka).state, PeerState::Revoked);
+    }
+
+    /// The producer's pricing copy older than an hour (by the dataset's own
+    /// timestamp) still prices what it shares: a client that records no cost
+    /// of its own (Claude Code) is priced by that copy (its price differs
+    /// from the fresh copy's here, so the cost tells which one was used).
+    /// Before engine PR 90 the remote snapshot refused such a copy and
+    /// the shared cost was 0 (measured here at the time).
     #[test]
     fn shared_cost_with_fresh_and_hour_old_pricing() {
         if !in_child("shared_cost_with_fresh_and_hour_old_pricing") {
@@ -2989,7 +3938,7 @@ mod tests {
             )],
         );
         let source = a_home.dir("pricing-src");
-        let write = |age: u64, bump: u64| {
+        let write = |age: u64, bump: u64, input_price: f64| {
             let now = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
@@ -2997,7 +3946,7 @@ mod tests {
             let dataset = |data: Value| json!({"timestamp": now - age, "data": data}).to_string();
             fs::write(
                 source.join("pricing-litellm.json"),
-                dataset(json!({"claude-3-5-sonnet": {"input_cost_per_token": 0.000001}})),
+                dataset(json!({"claude-3-5-sonnet": {"input_cost_per_token": input_price}})),
             )
             .unwrap();
             fs::write(source.join("pricing-openrouter.json"), dataset(json!({}))).unwrap();
@@ -3010,7 +3959,7 @@ mod tests {
                     .unwrap();
             }
         };
-        write(0, 0);
+        write(0, 0, 0.000_001);
         let a = producer(&a_home.0, &clock);
         let receiver = agent_at(&r_home.0, &clock);
         let ka = pair(&a, &receiver);
@@ -3027,11 +3976,13 @@ mod tests {
             page["totalCost"].as_f64().unwrap()
         };
         let fresh = cost("2025");
-        write(3_700, 10);
+        // A different price in the hour-old table: its cost shows that this
+        // table, not the fresh one copied before it, priced the report.
+        write(3_700, 10, 0.000_002);
         std::thread::sleep(PERIOD * 5);
         let stale = cost("2025");
         println!("SA3B-PRICING fresh={fresh} stale={stale}");
         assert!((fresh - 1.0).abs() < 1e-9, "fresh pricing: {fresh}");
-        assert_eq!(stale, 0.0, "hour-old pricing");
+        assert!((stale - 2.0).abs() < 1e-9, "hour-old pricing: {stale}");
     }
 }

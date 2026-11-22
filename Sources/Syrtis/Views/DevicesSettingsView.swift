@@ -1,0 +1,475 @@
+import SwiftUI
+import TokenBarCore
+
+/// The Settings "Devices" page (SA-3c). Built from `SettingsPanel`'s own
+/// layout helpers (`panel`), so it looks like the other pages; every action
+/// goes through `DevicesModel`, which only calls `TBCore.remote*`.
+struct DevicesSettingsView: View {
+    /// The page's sizes. Everything else is the shared Settings helpers.
+    private enum Layout {
+        /// Text fields sit in a `row`'s trailing side; the content column is
+        /// 354 pt wide (`SettingsWindowView`), so this leaves room for the
+        /// row's label.
+        static let fieldWidth: CGFloat = 170
+        /// Wide enough for an IPv4 address or a short IPv6 one; longer ones truncate.
+        static let addressMenuWidth: CGFloat = 230
+        /// A SAS code is compared digit by digit with the other screen:
+        /// monospaced and one step above the caption text around it.
+        static let sasFont = Font.system(.callout, design: .monospaced).weight(.semibold)
+        /// Space between the sub-blocks inside a section, the same as
+        /// `section`'s own spacing.
+        static let blockSpacing: CGFloat = 6
+    }
+
+    let panel: SettingsPanel
+    @ObservedObject private var model = DevicesModel.shared
+
+    @State private var host = ""
+    @State private var portText = ""
+    @State private var nodeName = ""
+    /// Fields are filled from the first running status, once per page.
+    @State private var seeded = false
+    @State private var addresses: [String] = []
+    /// The pasted invitation; handed to the model on Link and cleared.
+    @State private var pasted = ""
+    @State private var revokeTarget: RemoteGrant?
+    @State private var removeTarget: RemotePeer?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            shareSection()
+            if model.running {
+                scopeSection()
+                linkedSection()
+            }
+        }
+        .onAppear {
+            addresses = ListenAddress.interfaceAddresses()
+            model.pageAppeared()
+        }
+        .onDisappear { model.pageDisappeared() }
+        .onReceive(model.$status) { status in
+            guard !seeded, let status, status.running else { return }
+            host = status.bindHost ?? ""
+            portText = status.bindPort.map(String.init) ?? ""
+            nodeName = status.nodeLabel ?? ""
+            seeded = true
+        }
+        .alert(
+            DevicesCopy.revokeTitle.localized(revokeTarget?.peerFingerprint ?? ""),
+            isPresented: Binding(get: { revokeTarget != nil }, set: { if !$0 { revokeTarget = nil } }),
+            presenting: revokeTarget
+        ) { grant in
+            Button(DevicesCopy.revoke.localized, role: .destructive) {
+                Task { await model.revoke(grant) }
+            }
+            Button(DevicesCopy.cancel.localized, role: .cancel) {}
+        } message: { _ in
+            Text(DevicesCopy.revokeMessage.localized)
+        }
+        .alert(
+            DevicesCopy.removeTitle.localized(removeTarget.map(Self.address) ?? ""),
+            isPresented: Binding(get: { removeTarget != nil }, set: { if !$0 { removeTarget = nil } }),
+            presenting: removeTarget
+        ) { peer in
+            Button(DevicesCopy.remove.localized, role: .destructive) {
+                Task { await model.removePeer(peer) }
+            }
+            Button(DevicesCopy.cancel.localized, role: .cancel) {}
+        } message: { _ in
+            Text(DevicesCopy.removeMessage.localized)
+        }
+    }
+
+    // MARK: (A) Share this Mac
+
+    @ViewBuilder
+    private func shareSection() -> some View {
+        panel.infoSection(
+            DevicesCopy.shareSection, summary: DevicesCopy.shareSummary,
+            details: {
+                panel.hint(DevicesCopy.shareOffNote)
+                panel.hint(DevicesCopy.approveEffect)
+            }
+        ) {
+            panel.row(DevicesCopy.service) {
+                Text((model.running ? DevicesCopy.serviceRunning : DevicesCopy.serviceStopped).localized)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            if model.showsRetry {
+                notice(model.startFailure ?? DevicesCopy.notRunning)
+                Button(DevicesCopy.retry.localized) { Task { await model.retryStart() } }
+                    .controlSize(.small)
+                    .disabled(model.working)
+                    .padding(.horizontal, 10)
+            } else {
+                sharingControls()
+                addressControls()
+                invitationControls()
+                requestRows()
+                grantRows()
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func sharingControls() -> some View {
+        panel.toggleRow(
+            DevicesCopy.shareToggle,
+            isOn: Binding(
+                get: { model.sharingOn },
+                set: { next in Task { await model.setSharing(next) } }))
+            .disabled(!model.canToggleSharing)
+        panel.hint(DevicesCopy.shareOffNote)
+        if !model.scopeApproved, !model.sharingOn { notice(DevicesCopy.needsScope) }
+        if let line = model.sharingError { notice(line) }
+    }
+
+    @ViewBuilder
+    private func addressControls() -> some View {
+        panel.row(DevicesCopy.deviceName) {
+            TextField("", text: $nodeName)
+                .textFieldStyle(.roundedBorder)
+                .font(.caption)
+                .frame(width: Layout.fieldWidth)
+        }
+        panel.hint(DevicesCopy.deviceNameHint)
+            .padding(.horizontal, 10)
+        // A menu, not a radio list: one row however many addresses the Mac has.
+        panel.row(DevicesCopy.listenOn) {
+            // The configured address stays listed while another one is being
+            // tried, and a selection the list cannot offer (nothing set yet,
+            // or a stored value that is not an address) shows as "choose".
+            let offered = ListenAddress.choices(
+                from: addresses, keeping: [model.status?.bindHost ?? "", host])
+            Picker(DevicesCopy.listenOn.localized, selection: $host) {
+                if !offered.contains(host) { Text(DevicesCopy.chooseAddress.localized).tag(host) }
+                ForEach(offered, id: \.self) { address in
+                    if address == ListenAddress.localOnly {
+                        Text(DevicesCopy.localOnlyLabel.localized).tag(address)
+                    } else {
+                        Text(verbatim: address).tag(address)
+                    }
+                }
+            }
+            .labelsHidden()
+            .pickerStyle(.menu)
+            // A full-length IPv6 address must not widen the row past the column.
+            .frame(maxWidth: Layout.addressMenuWidth, alignment: .trailing)
+        }
+        panel.row(DevicesCopy.port) {
+            TextField("", text: $portText)
+                .textFieldStyle(.roundedBorder)
+                .font(.caption.monospacedDigit())
+                .frame(width: Layout.fieldWidth)
+        }
+        Button(DevicesCopy.apply.localized) {
+            let (host, port, name) = (host, Int(portText) ?? 0, nodeName)
+            // The field shows what is sent.
+            nodeName = DevicesModel.cleanedName(name) ?? ""
+            Task { await model.applyListen(host: host, port: port, nodeLabel: name) }
+        }
+        .controlSize(.small)
+        // Only an address the menu offers can be applied.
+        .disabled(!ListenAddress.choices(
+            from: addresses, keeping: [model.status?.bindHost ?? "", host]).contains(host))
+        .padding(.horizontal, 10)
+        if model.unreachable { notice(DevicesCopy.unreachableLine) }
+        if ListenAddress.mayBePublic(host) { notice(DevicesCopy.publicAddress) }
+        if let line = model.listenError { notice(line) }
+    }
+
+    @ViewBuilder
+    private func invitationControls() -> some View {
+        if let offer = model.offer {
+            panel.hint(DevicesCopy.invitationReady)
+            TimelineView(.periodic(from: .now, by: 1)) { context in
+                Text(DevicesCopy.expiresIn.localized(Self.remaining(until: offer.expiresAt, now: context.date)))
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.secondary)
+            }
+            .padding(.horizontal, 10)
+            HStack {
+                Button(DevicesCopy.copy.localized) { model.copyOffer() }
+                Button(DevicesCopy.cancelInvitation.localized) { model.clearOffer() }
+                if model.copied {
+                    Text(DevicesCopy.copiedLine.localized)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .controlSize(.small)
+            .padding(.horizontal, 10)
+        } else {
+            Button(DevicesCopy.createInvitation.localized) { Task { await model.createOffer() } }
+                .controlSize(.small)
+                .disabled(!model.sharingOn)
+                .padding(.horizontal, 10)
+        }
+        if let line = model.offerError { notice(line) }
+    }
+
+    @ViewBuilder
+    private func requestRows() -> some View {
+        if !model.pending.isEmpty {
+            caption(DevicesCopy.requests)
+            // Identity is the pending id; each button sends its own row's id
+            // (the one shown with this SAS), never an index.
+            ForEach(model.pending, id: \.pendingId) { request in
+                VStack(alignment: .leading, spacing: Layout.blockSpacing) {
+                    HStack {
+                        Text(request.sasCode)
+                            .font(Layout.sasFont)
+                            .textSelection(.enabled)
+                        Spacer()
+                        Button(DevicesCopy.reject.localized) {
+                            Task { await model.decide(request, approve: false) }
+                        }
+                        Button(DevicesCopy.approve.localized) {
+                            Task { await model.decide(request, approve: true) }
+                        }
+                    }
+                    .controlSize(.small)
+                    .disabled(model.deciding.contains(request.pendingId))
+                    panel.hint(DevicesCopy.compareCode)
+                    panel.hint(DevicesCopy.approveEffect)
+                }
+                .padding(.horizontal, 10)
+                .padding(.vertical, 7)
+                .glassCard(cornerRadius: 8)
+            }
+        }
+        if let line = model.decideError { notice(line) }
+    }
+
+    @ViewBuilder
+    private func grantRows() -> some View {
+        let active = model.grants.filter { $0.state == "active" }
+        if !active.isEmpty {
+            caption(DevicesCopy.grantsHeader)
+            ForEach(active, id: \.grantId) { grant in
+                panel.row(Self.grantLine(grant)) {
+                    Button(DevicesCopy.revoke.localized) { revokeTarget = grant }
+                        .controlSize(.small)
+                }
+            }
+        }
+        if let line = model.manageError { notice(line) }
+    }
+
+    // MARK: (B) Scan scope
+
+    @ViewBuilder
+    private func scopeSection() -> some View {
+        panel.section(DevicesCopy.scopeSection) {
+            panel.hint(DevicesCopy.scopeSummary)
+            panel.hint(DevicesCopy.scopeBody)
+            if let disclosure = model.disclosure {
+                pathList(DevicesCopy.homeFolder, [disclosure.home])
+                pathList(DevicesCopy.configFolder, [disclosure.configDir])
+                pathList(DevicesCopy.dataFolder, [disclosure.dataDir])
+                pathList(DevicesCopy.addedFolders, Self.flatten(disclosure.extraScanPaths))
+                pathList(DevicesCopy.excludedFolders, Self.flatten(disclosure.excludedScanPaths))
+                pathList(DevicesCopy.openCodeDatabases, disclosure.opencodeDbPaths)
+                pathList(DevicesCopy.clients, [disclosure.clients.joined(separator: ", ")])
+                if disclosure.envRootsSet {
+                    notice(DevicesCopy.envRoots.localized(Self.variableNames(disclosure.envRoots)))
+                }
+            }
+            if model.scopeApproved {
+                panel.hint(DevicesCopy.scopeApprovedLine)
+            } else {
+                notice(DevicesCopy.needsApproval)
+            }
+            // The digest of the disclosure this button was rendered with.
+            let shownDigest = model.disclosure?.ownerInputsSha256
+            Button(DevicesCopy.approveScope.localized) {
+                guard let shownDigest else { return }
+                Task { await model.approveScope(digest: shownDigest) }
+            }
+                .controlSize(.small)
+                .disabled(model.disclosure == nil || model.scopeApproved)
+                .padding(.horizontal, 10)
+            if let line = model.scopeNotice { notice(line) }
+        }
+    }
+
+    /// A labelled list in a card; empty lists are left out.
+    @ViewBuilder
+    private func pathList(_ label: String, _ items: [String]) -> some View {
+        if !items.isEmpty, items != [""] {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(label.localized)
+                    .font(.caption)
+                ForEach(items, id: \.self) { item in
+                    Text(verbatim: item)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .textSelection(.enabled)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 10)
+            .padding(.vertical, 7)
+            .glassCard(cornerRadius: 8)
+        }
+    }
+
+    // MARK: (C) Linked devices
+
+    @ViewBuilder
+    private func linkedSection() -> some View {
+        panel.infoSection(
+            DevicesCopy.linkedSection, summary: DevicesCopy.linkedSummary,
+            details: { panel.hint(DevicesCopy.removeMessage) }
+        ) {
+            if model.peers.isEmpty { panel.hint(DevicesCopy.noLinked) }
+            ForEach(model.peers, id: \.producerStatic) { peer in
+                // The name its owner gave it, on its own line and only as
+                // data: `panel.row` and `hint` look their text up as a
+                // localization key.
+                if let name = Self.nameLine(peer, learned: model.overlay.names) {
+                    Text(verbatim: name)
+                        .font(.caption.weight(.medium))
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                        .padding(.horizontal, 10)
+                }
+                panel.row(Self.address(peer)) {
+                    Text(DevicesCopy.state(peer.state).localized)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                    Button(DevicesCopy.remove.localized) { removeTarget = peer }
+                        .controlSize(.small)
+                }
+                // Third line: how this device is doing, from what the dashboard
+                // last learned; minute-level text, so it re-reads each 30 s.
+                TimelineView(.periodic(from: .now, by: Self.statusTick)) { context in
+                    if let status = model.overlay.settingsStatus(for: peer, now: context.date) {
+                        DeviceShortStatusView(status: status).padding(.horizontal, 10)
+                    }
+                }
+                panel.hint(Self.fingerprintLine(peer))
+                    .padding(.horizontal, 10)
+            }
+            caption(DevicesCopy.linkAnother)
+            linkControls()
+        }
+    }
+
+    @ViewBuilder
+    private func linkControls() -> some View {
+        switch model.pairing {
+        case .waiting(let claim):
+            Text(DevicesCopy.yourCode.localized(claim.sas))
+                .font(Layout.sasFont)
+                .textSelection(.enabled)
+                .padding(.horizontal, 10)
+            panel.hint(DevicesCopy.waitingApproval)
+            Button(DevicesCopy.cancel.localized) { model.cancelWait() }
+                .controlSize(.small)
+                .padding(.horizontal, 10)
+        case .confirming(let destination):
+            Text(DevicesCopy.linkDestination.localized)
+                .font(.caption)
+                .padding(.horizontal, 10)
+            // In full: a remote string, never a localization key, never cut.
+            Text(verbatim: Self.address(host: destination.host, port: destination.port))
+                .font(.caption.monospaced())
+                .textSelection(.enabled)
+                .fixedSize(horizontal: false, vertical: true)
+                .padding(.horizontal, 10)
+            panel.hint(DevicesCopy.linkDestinationHint)
+            HStack {
+                Button(DevicesCopy.cancel.localized) { model.cancelLink() }
+                Button(DevicesCopy.link.localized) { Task { await model.confirmLink() } }
+            }
+            .controlSize(.small)
+            .padding(.horizontal, 10)
+        case .previewing, .claiming:
+            ProgressView().controlSize(.small).padding(.horizontal, 10)
+        case .idle, .linked, .failed:
+            HStack {
+                // Masked: the invitation is a secret until it is claimed.
+                SecureField(DevicesCopy.pastePlaceholder.localized, text: $pasted)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.caption)
+                Button(DevicesCopy.link.localized) {
+                    let text = pasted
+                    pasted = ""
+                    Task { await model.link(pairUrl: text) }
+                }
+                .controlSize(.small)
+                .disabled(pasted.isEmpty)
+            }
+            .padding(.horizontal, 10)
+            if case .linked = model.pairing { panel.hint(DevicesCopy.linkedLine) }
+            if case .failed(let line) = model.pairing { notice(line) }
+        }
+    }
+
+    // MARK: Pieces
+
+    /// A sub-heading inside a section, the style `AccountsCopy.autoToggle`
+    /// uses inside its popover.
+    private func caption(_ key: String) -> some View {
+        Text(key.localized)
+            .font(.caption2.weight(.semibold))
+            .padding(.horizontal, 10)
+    }
+
+    /// A state notice: the orange caption the Accounts page uses for one.
+    private func notice(_ key: String) -> some View {
+        Text(key.localized)
+            .font(.caption2)
+            .foregroundStyle(.orange)
+            .fixedSize(horizontal: false, vertical: true)
+    }
+
+    /// The linked device's own name for itself, shown on its own line; nil
+    /// until it has sent one.
+    /// The newest name the dashboard learned wins over the peer record's
+    /// (`DeviceOverlayCopy.displayName`'s order); the address is not repeated
+    /// here, the row below shows it.
+    static func nameLine(_ peer: RemotePeer, learned: [String: String] = [:]) -> String? {
+        learned[peer.fingerprint] ?? peer.nodeLabel
+    }
+
+    /// Relative times are in minutes; 30 s keeps "just now" from lingering.
+    private static let statusTick: TimeInterval = 30
+
+    static func address(_ peer: RemotePeer) -> String {
+        address(host: peer.host, port: peer.port)
+    }
+
+    /// `host:port`; an IPv6 host in brackets.
+    static func address(host: String, port: Int) -> String {
+        host.contains(":") ? "[\(host)]:\(port)" : "\(host):\(port)"
+    }
+
+    /// Each variable once, in the order given: several clients can follow
+    /// the same variable (all of tokscale's own roots follow
+    /// `TOKSCALE_CONFIG_DIR`), and the notice listed it once per client.
+    static func variableNames(_ roots: [RemoteScopeDisclosure.EnvRoot]) -> String {
+        var seen = Set<String>()
+        return roots.map(\.variable).filter { seen.insert($0).inserted }.joined(separator: ", ")
+    }
+
+    static func flatten(_ paths: [String: [String]]) -> [String] {
+        paths.keys.sorted().flatMap { client in paths[client, default: []].map { "\(client): \($0)" } }
+    }
+
+    /// The text of a "can access this Mac" row (beside Revoke) and the last
+    /// line of a linked device: the fingerprint only. DR-3b: a grant lasts
+    /// 100 years and access ends by revoke or re-pairing, so no expiry date
+    /// is shown (`expiresAt` is still decoded).
+    static func grantLine(_ grant: RemoteGrant) -> String { grant.peerFingerprint }
+    static func fingerprintLine(_ peer: RemotePeer) -> String { peer.fingerprint }
+
+    static func remaining(until unixMs: Int64, now: Date) -> String {
+        let seconds = max(0, Int((TimeInterval(unixMs) / 1000 - now.timeIntervalSince1970).rounded(.up)))
+        return String(format: "%d:%02d", seconds / 60, seconds % 60)
+    }
+}

@@ -8,8 +8,9 @@
 //! revoke, listen configure) go through `control::Client` against the agent's
 //! own socket, with the control token read from the state store and held only
 //! in memory for that call. The only direct calls are
-//! `Runtime::enable_sharing` / `disable_sharing`, `Agent::approve_scope`, the
-//! receiver's `PairingClient` and `PeerStore`, and one `set_listen_config` that
+//! `Runtime::enable_sharing` / `disable_sharing` / `remove_peer`,
+//! `Agent::approve_scope`, the receiver's `PairingClient`, `PeerStore` and
+//! `security::parse_pair_url` (the destination preview), and one `set_listen_config` that
 //! writes the node label back with the host and port the listen command just
 //! stored (the frozen listen command carries no label).
 //!
@@ -45,10 +46,11 @@ use syrtis_agent::{
     runtime::{Options, PullError, RuntimeError},
     secure_fs::StorageError,
     security::{
-        clock_status, decode_fixed_hex, hex_encode, GrantState, MemoryLedger, SecurityError,
+        clock_status, decode_fixed_hex, hex_encode, parse_pair_url, GrantState, MemoryLedger,
+        SecurityError,
     },
     source::owner_inputs_sha256,
-    state_store::{Secret32, NODE_LABEL_MAX_BYTES},
+    state_store::{Secret32, StoredState, NODE_LABEL_MAX_BYTES},
 };
 
 pub(crate) type Reply = Result<Value, String>;
@@ -136,6 +138,16 @@ pub(crate) struct RemoteAgent {
     /// Test seam: the next monitor spawn fails as if the OS refused a thread.
     #[cfg(test)]
     fail_monitor_spawn: AtomicBool,
+    /// Test seam: runs inside `listen_configure` after the stored address is
+    /// read and before it is written back, the window the `configuring` lock
+    /// closes.
+    #[cfg(test)]
+    listen_pause: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    /// Test seam: runs after every `Runtime::pull` in [`Self::pull_peer`]
+    /// (counts the pulls; can revoke the grant between a code-2 refusal and
+    /// its Grant status).
+    #[cfg(test)]
+    pub(crate) after_pull: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 /// The process's agent, behind the `tb_remote_*` entry points.
@@ -218,19 +230,39 @@ impl RemoteAgent {
         // Unchanged inputs need no restart: answered under the read lock, so
         // a repeated start does not wait behind an in-flight pull. A running
         // agent always has its monitor (a start that cannot spawn one stops
-        // the agent it started).
-        {
+        // the agent it started). Inputs that cannot be built any more stop
+        // the running agent, as `tick` does: an error caused by the inputs
+        // leaves no agent running. An error from reading the status below is
+        // not about the inputs and leaves the agent as it was.
+        let inputs_failed = {
             let running = read(&self.running);
-            if let Some(current) = running.as_ref() {
-                let inputs = make()?;
-                if unchanged(current, &inputs) {
-                    *lock(&current.make) = make;
-                    return status_of(current);
-                }
+            match running.as_ref() {
+                Some(current) => match make() {
+                    Ok(inputs) if unchanged(current, &inputs) => {
+                        *lock(&current.make) = make;
+                        return status_of(current);
+                    }
+                    Ok(_) => None,
+                    Err(error) => Some(error),
+                },
+                None => None,
             }
+        };
+        if let Some(error) = inputs_failed {
+            // The old agent is dropped outside the write guard, as in `stop`.
+            let old = write(&self.running).take();
+            drop(old);
+            return Err(error);
         }
         let mut running = write(&self.running);
-        ensure(&mut running, make)?;
+        if let Err(error) = ensure(&mut running, make) {
+            // `make` failed (the agent is still there) or the new agent could
+            // not start (nothing is): either way none is left running.
+            let old = running.take();
+            drop(running);
+            drop(old);
+            return Err(error);
+        }
         let current = running.as_ref().ok_or("internal")?;
         let period = current.inputs.pricing_period;
         let status = status_of(current);
@@ -266,7 +298,13 @@ impl RemoteAgent {
             .spawn(move || loop {
                 thread::sleep(period);
                 match agent.upgrade() {
-                    Some(agent) => agent.tick(),
+                    // A panicking period must not end the monitor: the agent
+                    // would keep sharing under its old scope for good.
+                    Some(agent) => {
+                        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            agent.tick()
+                        }));
+                    }
                     None => break,
                 }
             });
@@ -340,6 +378,14 @@ impl RemoteAgent {
 
     /// The frozen `listenConfigure`, then the node label written with the
     /// host and port that command stored. Returns the status.
+    ///
+    /// The agent refuses a changed label that fails `valid_node_label` (after
+    /// its own NFC step, which this crate cannot repeat: `unicode-normalization`
+    /// is not a direct dependency). That refusal would come at the second step,
+    /// after the address had already moved, so a changed label is first
+    /// written alone, with the stored host and port: the agent's own check,
+    /// before anything else changes. If the address step then fails, the old
+    /// label is put back.
     pub(crate) fn listen_configure(&self, host: &str, port: u16, label: Option<String>) -> Reply {
         if label
             .as_ref()
@@ -352,13 +398,37 @@ impl RemoteAgent {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         self.with(|current| {
-            call(
+            let store = current.agent.runtime().store();
+            let before = store.state().map_err(storage_class)?.config;
+            let changed = label != before.node_label;
+            if changed {
+                store
+                    .set_listen_config(before.bind_host.clone(), before.bind_port, label.clone())
+                    .map_err(storage_class)?;
+            }
+            if let Err(error) = call(
                 current,
                 control::LISTEN_CONFIGURE,
                 json!({"bindHost": host, "bindPort": port}),
-            )?;
-            let store = current.agent.runtime().store();
+            ) {
+                if changed {
+                    // Best effort: the old label may itself predate the rule.
+                    let _ = store.set_listen_config(
+                        before.bind_host,
+                        before.bind_port,
+                        before.node_label,
+                    );
+                }
+                return Err(error);
+            }
             let config = store.state().map_err(storage_class)?.config;
+            #[cfg(test)]
+            {
+                let pause = lock(&self.listen_pause).clone();
+                if let Some(pause) = pause {
+                    pause();
+                }
+            }
             store
                 .set_listen_config(config.bind_host, config.bind_port, label)
                 .map_err(storage_class)?;
@@ -470,7 +540,20 @@ impl RemoteAgent {
                             "peerFingerprint": fingerprint(&grant.initiator_static),
                             "createdAt": grant.created_at_ms,
                             "expiresAt": grant.expires_at_ms,
+                            // A stored `Active` grant stops authorizing when
+                            // a scope approval moves the generation and
+                            // raises the deny floor (`security::authorize`);
+                            // the record itself is not rewritten. Listed as
+                            // `active` it would show a device that can no
+                            // longer read as one that can.
                             "state": match grant.state {
+                                GrantState::Active
+                                    if grant.auth_epoch <= state.reference.deny_floor
+                                        || grant.source_scope_generation
+                                            != state.reference.source_scope_generation =>
+                                {
+                                    "superseded"
+                                }
                                 GrantState::Active => "active",
                                 GrantState::Revoked => "revoked",
                                 GrantState::Expired => "expired",
@@ -498,13 +581,7 @@ impl RemoteAgent {
                 .state()
                 .map_err(storage_class)?;
             let identity = StaticKey::from_state(&state).map_err(storage_class)?;
-            let os_now = current
-                .inputs
-                .clock
-                .os_now_seconds()
-                .map_err(storage_class)?;
-            let now = clock_status(os_now, state.reference.last_accepted_wall_unix_seconds());
-            let now_ms = now.effective_now.checked_mul(1_000).ok_or("invalid")?;
+            let now_ms = effective_now_ms(current, &state)?;
             Ok((identity, now_ms, Arc::clone(&current.inputs.clock)))
         })?;
         let ledger = MemoryLedger::default();
@@ -527,6 +604,28 @@ impl RemoteAgent {
         });
         claims.open.insert(handle, claimed);
         Ok(reply)
+    }
+
+    /// Receiver: where a Pair URL would connect, `{host, port}`, so the
+    /// owner sees it before [`pair_claim`] connects. The same effective now
+    /// and the same frozen `parse_pair_url` as the claim; no connection, and
+    /// the URL and the offer (which holds the secret) are neither kept,
+    /// formatted nor logged.
+    pub(crate) fn pair_destination(&self, pair_url: &str) -> Reply {
+        let now_ms = self.with(|current| {
+            let state = current
+                .agent
+                .runtime()
+                .store()
+                .state()
+                .map_err(storage_class)?;
+            effective_now_ms(current, &state)
+        })?;
+        let offer = parse_pair_url(pair_url, now_ms).map_err(|error| match error {
+            SecurityError::Expired => "expired",
+            _ => "invalidOffer",
+        })?;
+        Ok(json!({"host": offer.host, "port": offer.port}))
     }
 
     /// Receiver: waits (blocking, up to the frozen poll window) for the
@@ -609,6 +708,8 @@ impl RemoteAgent {
                             "producerStatic": hex_encode(&peer.responder_static),
                             "fingerprint": fingerprint(&peer.responder_static),
                             "nodeLabel": peer.node_label,
+                            "host": peer.host,
+                            "port": peer.port,
                             "createdAt": peer.created_at_ms,
                             "expiresAt": peer.expires_at_ms,
                             "state": match peer.state {
@@ -623,15 +724,15 @@ impl RemoteAgent {
         })
     }
 
-    /// Receiver: forgets one producer (`producerStatic`, 64 lowercase hex).
+    /// Receiver: forgets one producer (`producerStatic`, 64 lowercase hex)
+    /// and deletes its receiver cache entries (`Runtime::remove_peer`).
     pub(crate) fn peer_remove(&self, producer_static: &str) -> Reply {
         let key = decode_fixed_hex::<32>(producer_static).map_err(|_| "invalid")?;
         self.with(|current| {
             current
                 .agent
                 .runtime()
-                .peers()
-                .remove(&key)
+                .remove_peer(&key)
                 .map(|()| Value::Null)
                 .map_err(storage_class)
         })
@@ -661,11 +762,18 @@ impl RemoteAgent {
 
     /// `Runtime::pull` of one producer, under the agent's read lock for the
     /// whole fetch: other calls go on beside it, and a restart (write lock)
-    /// waits until it ends, so it never writes into a newer agent. A fresh pull stamps [`last_success_at`]. A refusal
-    /// with error code 2 (`CheckGrantStatus`) asks Grant status once and
-    /// stores the answer (`revoked` / `expired`: `PeerStore::set_state`;
-    /// `active`: `PeerStore::update_grant`); the pull is not retried. `None`:
-    /// no agent runs.
+    /// waits until it ends, so it never writes into a newer agent. A fresh
+    /// pull stamps [`last_success_at`]. A refusal with error code 2
+    /// (`CheckGrantStatus`) asks Grant status once and stores the answer
+    /// ([`check_grant`]). Only when that answer was `active` and stored
+    /// (`PeerStore::update_grant` succeeded) is the pull retried, once, with
+    /// the refreshed record, under the same read lock; the retry's result is
+    /// returned, a second code 2 included, as is. A code-2 refusal takes no
+    /// token from the producer's per-grant limit (`spec/report-peer-v1.md`,
+    /// "Limits"), so the retry is not refused as `busy` for it. Since DR-3a
+    /// every approval that revokes renumbers the other devices' grants, so
+    /// without the retry each of them showed "stopped" until the next poll.
+    /// `None`: no agent runs.
     pub(crate) fn pull_peer(
         &self,
         producer: &[u8; 32],
@@ -673,15 +781,28 @@ impl RemoteAgent {
     ) -> Option<Result<Fetched, PullError>> {
         let running = read(&self.running);
         let current = running.as_ref()?;
-        let result = current.agent.runtime().pull(producer, query);
-        match &result {
-            Ok(_) => {
-                if let Ok(now) = current.inputs.clock.os_now_seconds() {
-                    lock(&self.last_success).insert(last_success_key(producer, query), now);
+        let runtime = current.agent.runtime();
+        let pull = || {
+            let result = runtime.pull(producer, query);
+            #[cfg(test)]
+            {
+                let hook = lock(&self.after_pull).clone();
+                if let Some(hook) = hook {
+                    hook();
                 }
             }
-            Err(PullError::Fetch(FetchError::CheckGrantStatus)) => check_grant(current, producer),
-            Err(_) => {}
+            result
+        };
+        let mut result = pull();
+        if matches!(result, Err(PullError::Fetch(FetchError::CheckGrantStatus)))
+            && check_grant(current, producer)
+        {
+            result = pull();
+        }
+        if result.is_ok() {
+            if let Ok(now) = current.inputs.clock.os_now_seconds() {
+                lock(&self.last_success).insert(last_success_key(producer, query), now);
+            }
         }
         Some(result)
     }
@@ -711,6 +832,14 @@ impl RemoteAgent {
             .map(|current| body(&current.agent))
     }
 
+    /// `Runtime::ever_answered`: the producer ever gave this receiver a body
+    /// (`false` too when no agent runs).
+    pub(crate) fn ever_answered(&self, producer: &[u8; 32]) -> bool {
+        read(&self.running)
+            .as_ref()
+            .is_some_and(|current| current.agent.runtime().ever_answered(producer))
+    }
+
     /// The Unix seconds of the last fresh [`pull_peer`] of this query from
     /// this producer in this process.
     pub(crate) fn last_success_at(&self, producer: &[u8; 32], query: &ReportQuery) -> Option<i64> {
@@ -734,22 +863,24 @@ fn last_success_key(producer: &[u8; 32], query: &ReportQuery) -> String {
 
 /// Deferred item (4): one Grant status request for the producer's record,
 /// built from that record (host, port, responder static), and the answer
-/// stored. Any failure changes nothing.
-fn check_grant(current: &Running, producer: &[u8; 32]) {
+/// stored. Any failure changes nothing. True only when the answer was
+/// `active` and `update_grant` stored it: the record now carries the
+/// grant's current `authEpoch`, so a pull is worth retrying.
+fn check_grant(current: &Running, producer: &[u8; 32]) -> bool {
     let runtime = current.agent.runtime();
     let Some(record) = runtime.peers().peers().ok().and_then(|peers| {
         peers
             .into_iter()
             .find(|peer| peer.responder_static == *producer)
     }) else {
-        return;
+        return false;
     };
     let Ok(identity) = runtime
         .store()
         .state()
         .and_then(|state| StaticKey::from_state(&state))
     else {
-        return;
+        return false;
     };
     let ledger = MemoryLedger::default();
     let client = PairingClient {
@@ -769,20 +900,28 @@ fn check_grant(current: &Running, producer: &[u8; 32]) {
         claimed_at: Duration::ZERO,
     };
     let Ok(answer) = client.grant_status(&claimed, record.grant_id) else {
-        return;
+        return false;
     };
     let peers = runtime.peers();
-    let _ = match answer.state {
-        GrantStatus::Revoked => peers.set_state(producer, &record.grant_id, PeerState::Revoked),
-        GrantStatus::Expired => peers.set_state(producer, &record.grant_id, PeerState::Expired),
-        GrantStatus::Active => peers.update_grant(
-            producer,
-            &record.grant_id,
-            answer.auth_epoch,
-            answer.source_scope_generation,
-            answer.expires_at_ms,
-        ),
-    };
+    match answer.state {
+        GrantStatus::Revoked => {
+            let _ = peers.set_state(producer, &record.grant_id, PeerState::Revoked);
+            false
+        }
+        GrantStatus::Expired => {
+            let _ = peers.set_state(producer, &record.grant_id, PeerState::Expired);
+            false
+        }
+        GrantStatus::Active => peers
+            .update_grant(
+                producer,
+                &record.grant_id,
+                answer.auth_epoch,
+                answer.source_scope_generation,
+                answer.expires_at_ms,
+            )
+            .is_ok(),
+    }
 }
 
 fn start_agent(inputs: &Inputs) -> Result<Agent, String> {
@@ -887,6 +1026,21 @@ fn env_roots() -> Vec<Value> {
                 .map(move |var| json!({"client": client.as_str(), "variable": var}))
         })
         .collect()
+}
+
+/// The receiver's effective now in milliseconds: the OS clock, never below
+/// the last accepted wall time in `state` (`clock_status`). Pair claim and
+/// the destination preview read it the same way.
+fn effective_now_ms(current: &Running, state: &StoredState) -> Result<i64, String> {
+    let os_now = current
+        .inputs
+        .clock
+        .os_now_seconds()
+        .map_err(storage_class)?;
+    let now = clock_status(os_now, state.reference.last_accepted_wall_unix_seconds());
+    now.effective_now
+        .checked_mul(1_000)
+        .ok_or_else(|| "invalid".into())
 }
 
 fn storage_class(error: StorageError) -> String {
@@ -1041,27 +1195,27 @@ pub(crate) fn app_make_inputs(home_override: Option<PathBuf>) -> MakeInputs {
 /// directories, `context.scanner_settings()`, and the pricing source.
 /// `home_override` `None` is the directory-service home and the frozen root;
 /// a test build refuses it (`homeRequired`), so no test opens the real root.
+///
+/// The config and data directories are `home/.config` and
+/// `home/.local/share` in both branches, from
+/// `syrtis_agent::cli::default_dirs` (the standalone agent's own function, so
+/// both assemblers compute the same owner inputs). They depend on the trusted
+/// or override home alone, never on `$HOME` or another variable. The engine
+/// takes the data dir as the XDG data root and `<config dir>/tokscale` as its
+/// config root; `Library/Application Support` there missed every client the
+/// local report finds under `.local/share` or `.config/tokscale` (DR-1e).
 pub(crate) fn inputs_from(
     home_override: Option<&Path>,
     sources: &Sources,
 ) -> Result<Inputs, String> {
-    let (home, state_suffix, config_dir, data_dir) = match home_override {
+    let (home, state_suffix) = match home_override {
         Some(home) => {
             prepare_override_home(home)?;
-            // The platform directories, moved below the override home.
-            let below = |dir: Option<PathBuf>| -> Result<PathBuf, String> {
-                dir.zip(dirs::home_dir())
-                    .and_then(|(dir, platform)| {
-                        dir.strip_prefix(&platform).ok().map(Path::to_path_buf)
-                    })
-                    .map(|relative| home.join(relative))
-                    .ok_or_else(|| "unsupported".into())
-            };
-            let (config, data) = (below(dirs::config_dir())?, below(dirs::data_dir())?);
-            (home.to_path_buf(), OVERRIDE_SUFFIX, config, data)
+            (home.to_path_buf(), OVERRIDE_SUFFIX)
         }
         None => product_roots()?,
     };
+    let (config_dir, data_dir) = syrtis_agent::cli::default_dirs(&home);
     Ok(Inputs {
         home,
         state_suffix,
@@ -1074,17 +1228,12 @@ pub(crate) fn inputs_from(
     })
 }
 
-type Roots = (PathBuf, &'static [&'static str], PathBuf, PathBuf);
+type Roots = (PathBuf, &'static [&'static str]);
 
 #[cfg(not(test))]
 fn product_roots() -> Result<Roots, String> {
     let home = syrtis_agent::secure_fs::trusted_home().map_err(storage_class)?;
-    Ok((
-        home,
-        syrtis_agent::secure_fs::STATE_SUFFIX,
-        dirs::config_dir().ok_or("unsupported")?,
-        dirs::data_dir().ok_or("unsupported")?,
-    ))
+    Ok((home, syrtis_agent::secure_fs::STATE_SUFFIX))
 }
 
 #[cfg(test)]
@@ -1461,6 +1610,17 @@ mod tests {
         );
         assert_eq!(epoch(&producer), same, "unchanged inputs must not restart");
 
+        // Approving the new scope moves the generation: the grant made under
+        // the old one can never read again, and the list says so instead of
+        // still calling it active.
+        assert_eq!(producer.grants().unwrap()[0]["state"], "active");
+        let digest = producer.scope_disclosure().unwrap()["ownerInputsSha256"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        producer.scope_approve(&digest).unwrap();
+        assert_eq!(producer.grants().unwrap()[0]["state"], "superseded");
+
         producer.revoke(grant["grantId"].as_str().unwrap()).unwrap();
         assert_eq!(producer.grants().unwrap()[0]["state"], "revoked");
         clock.advance(61);
@@ -1468,6 +1628,48 @@ mod tests {
             pull(&receiver, &producer_static),
             Err(PullError::Fetch(FetchError::Revoked))
         );
+    }
+
+    /// `SA-3c` acceptance (5): each `peers` row carries the record's `host`
+    /// and `port` (the Devices page shows `host:port`).
+    #[test]
+    fn peers_rows_carry_the_record_host_and_port() {
+        let clock = TestClock::new();
+        let home = TempHome::new();
+        let agent = Arc::new(RemoteAgent::default());
+        start(&agent, &home, &clock, ScannerSettings::default());
+        agent
+            .with(|current| {
+                let runtime = current.agent.runtime();
+                let identity = runtime
+                    .store()
+                    .state()
+                    .and_then(|state| state.identity_public())
+                    .map_err(storage_class)?;
+                runtime
+                    .peers()
+                    .upsert(PeerRecord {
+                        auth_epoch: 1,
+                        created_at_ms: 1,
+                        expires_at_ms: i64::MAX / 2,
+                        grant_id: [7; 16],
+                        host: "192.0.2.10".into(),
+                        initiator_static: identity,
+                        node_label: Some("desk".into()),
+                        pending_id: [7; 16],
+                        port: 48_123,
+                        responder_static: [9; 32],
+                        source_scope_generation: 1,
+                        state: PeerState::Active,
+                    })
+                    .map_err(storage_class)
+            })
+            .unwrap();
+        let peers = agent.peers().unwrap();
+        let row = &peers.as_array().unwrap()[0];
+        assert_eq!(row["host"], "192.0.2.10");
+        assert_eq!(row["port"], 48_123);
+        assert_eq!(row["nodeLabel"], "desk");
     }
 
     /// Acceptance (3c): the address goes through the frozen command; after a
@@ -1490,6 +1692,121 @@ mod tests {
             agent.listen_configure("not a host", new, None),
             Err("invalid".into())
         );
+    }
+
+    /// DR-2b2: a label the agent refuses (control or bidi character, blank,
+    /// invisible only) is `invalid` before the address moves: the stored host,
+    /// port and label, and the listener, stay as they were. A valid label
+    /// moves the address and is stored in NFC; a failing address step puts
+    /// the old label back.
+    #[test]
+    fn an_invalid_label_leaves_the_listen_address_and_label_unchanged() {
+        let clock = TestClock::new();
+        let home = TempHome::new();
+        let agent = Arc::new(RemoteAgent::default());
+        start(&agent, &home, &clock, ScannerSettings::default());
+        // `free_port` releases its listener, so two calls can return the same
+        // port; the checks below need two different ones.
+        let old = free_port();
+        let new = std::iter::repeat_with(free_port)
+            .find(|port| *port != old)
+            .expect("an endless iterator");
+        agent
+            .listen_configure("127.0.0.1", old, Some("Desk".into()))
+            .unwrap();
+        let stored = || {
+            let config = agent
+                .with_agent(|a| a.runtime().store().state().unwrap().config)
+                .unwrap();
+            (config.bind_host, config.bind_port, config.node_label)
+        };
+        let before = stored();
+        assert_eq!(before.1, old);
+        for bad in [
+            "Mac\u{202E}cod.exe",
+            "tab\there",
+            "line\u{2028}break",
+            "   ",
+            "\u{200B}",
+            "",
+        ] {
+            assert_eq!(
+                agent.listen_configure("127.0.0.1", new, Some(bad.into())),
+                Err("invalid".into()),
+                "{bad:?}"
+            );
+            assert_eq!(stored(), before, "{bad:?} changed the stored config");
+            assert!(listening(old), "{bad:?} moved the listener");
+            assert!(!listening(new), "{bad:?} moved the listener");
+        }
+        // Control: a valid label moves the address; NFD input is stored as NFC.
+        agent
+            .listen_configure("127.0.0.1", new, Some("Cafe\u{301}".into()))
+            .unwrap();
+        assert_eq!(stored().1, new);
+        assert_eq!(stored().2.as_deref(), Some("Caf\u{e9}"));
+        assert!(listening(new) && !listening(old));
+        // A refused address after a label change restores the old label.
+        assert_eq!(
+            agent.listen_configure("not a host", new, Some("Other".into())),
+            Err("invalid".into())
+        );
+        assert_eq!(stored().2.as_deref(), Some("Caf\u{e9}"));
+        // The label alone may be cleared.
+        agent.listen_configure("127.0.0.1", new, None).unwrap();
+        assert_eq!(stored().2, None);
+    }
+
+    /// SA-3d deferred item 2: two overlapping `listen_configure` calls. The
+    /// first is held between reading the stored address and writing it back;
+    /// the second must wait for the `configuring` lock, so the stored address
+    /// ends up the one the listener is bound to (the second call's).
+    #[test]
+    fn overlapping_listen_configure_calls_are_serialized() {
+        let clock = TestClock::new();
+        let home = TempHome::new();
+        let agent = Arc::new(RemoteAgent::default());
+        start(&agent, &home, &clock, ScannerSettings::default());
+        // `free_port` releases its listener, so two calls can return the same
+        // port; the assertions below need two different ones.
+        let first = free_port();
+        let second = std::iter::repeat_with(free_port)
+            .find(|port| *port != first)
+            .expect("an endless iterator");
+        let (paused, is_paused) = std::sync::mpsc::channel::<()>();
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let released = Mutex::new(released);
+        let once = AtomicBool::new(true);
+        *lock(&agent.listen_pause) = Some(Arc::new(move || {
+            if once.swap(false, Ordering::SeqCst) {
+                paused.send(()).unwrap();
+                let _ = lock(&released).recv_timeout(Duration::from_secs(30));
+            }
+        }));
+        let one = Arc::clone(&agent);
+        let a = thread::spawn(move || one.listen_configure("127.0.0.1", first, Some("a".into())));
+        is_paused.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert!(
+            agent.configuring.try_lock().is_err(),
+            "the first call does not hold the configuring lock inside the window"
+        );
+        let two = Arc::clone(&agent);
+        let b = thread::spawn(move || two.listen_configure("127.0.0.1", second, Some("b".into())));
+        thread::sleep(Duration::from_millis(400));
+        let early = b.is_finished();
+        release.send(()).unwrap();
+        a.join().unwrap().unwrap();
+        b.join().unwrap().unwrap();
+        assert!(!early, "the second call ran inside the first call's window");
+        let stored = agent
+            .with_agent(|a| a.runtime().store().state().unwrap().config)
+            .unwrap();
+        assert_eq!(
+            stored.bind_port, second,
+            "stored address is not the bound one"
+        );
+        assert!(listening(second));
+        assert!(!listening(first));
     }
 
     /// Acceptance (4): both pricing files are copied at start (same bytes,
@@ -1535,6 +1852,249 @@ mod tests {
             thread::sleep(Duration::from_millis(20));
         }
         assert_eq!(epoch(&agent), started);
+    }
+
+    /// A producer with an approved scope, sharing on and listening on
+    /// loopback, paired to `receiver` through offer, claim, approve and
+    /// poll. Returns the producer's static key.
+    fn pair_two(producer: &RemoteAgent, receiver: &RemoteAgent) -> [u8; 32] {
+        producer
+            .listen_configure("127.0.0.1", free_port(), None)
+            .unwrap();
+        let digest = producer.scope_disclosure().unwrap()["ownerInputsSha256"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        producer.scope_approve(&digest).unwrap();
+        producer.sharing_set(true).unwrap();
+        let offer = producer.offer_create(600).unwrap();
+        let claim = receiver
+            .pair_claim(offer["pairUrl"].as_str().unwrap())
+            .unwrap();
+        let pending = producer.pending_list().unwrap();
+        producer
+            .decide(true, pending[0]["pendingId"].as_str().unwrap(), 1)
+            .unwrap();
+        let paired = receiver
+            .pair_poll(claim["handle"].as_u64().unwrap())
+            .unwrap();
+        decode_fixed_hex::<32>(paired["producerStatic"].as_str().unwrap()).unwrap()
+    }
+
+    /// Receiver cache files (`rcache-*`) anywhere below `dir`.
+    fn receiver_cache_files(dir: &Path) -> usize {
+        fs::read_dir(dir)
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .map(|entry| {
+                        let path = entry.path();
+                        if path.is_dir() && !path.is_symlink() {
+                            receiver_cache_files(&path)
+                        } else {
+                            usize::from(entry.file_name().to_string_lossy().starts_with("rcache-"))
+                        }
+                    })
+                    .sum()
+            })
+            .unwrap_or(0)
+    }
+
+    /// `SA-3e` B2: Remove deletes the producer's receiver cache entries at
+    /// once (`Runtime::remove_peer`), not after their 30-day expiry. The
+    /// entry comes from a real pull, so the count before is not vacuous.
+    #[test]
+    fn peer_remove_deletes_the_receiver_cache() {
+        let clock = TestClock::new();
+        let (producer_home, receiver_home) = (TempHome::new(), TempHome::new());
+        let (producer, receiver) = (
+            Arc::new(RemoteAgent::default()),
+            Arc::new(RemoteAgent::default()),
+        );
+        start(
+            &producer,
+            &producer_home,
+            &clock,
+            ScannerSettings::default(),
+        );
+        start(
+            &receiver,
+            &receiver_home,
+            &clock,
+            ScannerSettings::default(),
+        );
+        let producer_static = pair_two(&producer, &receiver);
+        clock.advance(61);
+        assert_eq!(pull(&receiver, &producer_static), Ok(()));
+        assert!(
+            receiver_cache_files(&receiver_home.0) >= 1,
+            "control: the pull must have written a receiver cache entry"
+        );
+
+        receiver.peer_remove(&hex_encode(&producer_static)).unwrap();
+        assert_eq!(receiver_cache_files(&receiver_home.0), 0);
+        assert_eq!(receiver.peers().unwrap(), json!([]));
+    }
+
+    /// A canonical Pair URL to `127.0.0.1:port` that expires `ttl_ms` after
+    /// the clock's now, with a responder key that is not the receiver's.
+    fn loopback_pair_url(clock: &TestClock, port: u16, ttl_ms: i64) -> String {
+        let now_ms = clock.os_now_seconds().unwrap() * 1_000;
+        syrtis_agent::security::pair_url(&syrtis_agent::security::PairOffer {
+            expires_at: now_ms + ttl_ms,
+            host: "127.0.0.1".into(),
+            offer_id: hex_encode(&[3; 16]),
+            port,
+            responder_static: hex_encode(&[4; 32]),
+            secret: hex_encode(&[5; 32]),
+            version: syrtis_agent::security::PEER_PROTOCOL_VERSION,
+        })
+        .unwrap()
+    }
+
+    /// `SA-3e` B2: the preview answers the offer's own host and port, the
+    /// reply holds exactly `host` and `port` (no secret, no offer id), and
+    /// it makes no claim.
+    #[test]
+    fn pair_destination_is_the_offer_address_and_nothing_more() {
+        let clock = TestClock::new();
+        let (producer_home, receiver_home) = (TempHome::new(), TempHome::new());
+        let (producer, receiver) = (
+            Arc::new(RemoteAgent::default()),
+            Arc::new(RemoteAgent::default()),
+        );
+        start(
+            &producer,
+            &producer_home,
+            &clock,
+            ScannerSettings::default(),
+        );
+        let port = free_port();
+        producer.listen_configure("127.0.0.1", port, None).unwrap();
+        let digest = producer.scope_disclosure().unwrap()["ownerInputsSha256"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        producer.scope_approve(&digest).unwrap();
+        producer.sharing_set(true).unwrap();
+        let offer = producer.offer_create(600).unwrap();
+        let pair_url = offer["pairUrl"].as_str().unwrap();
+        let parsed = parse_pair_url(pair_url, clock.os_now_seconds().unwrap() * 1_000).unwrap();
+
+        assert_eq!(
+            receiver.pair_destination(pair_url),
+            Err("notRunning".into())
+        );
+        start(
+            &receiver,
+            &receiver_home,
+            &clock,
+            ScannerSettings::default(),
+        );
+        let reply = receiver.pair_destination(pair_url).unwrap();
+        assert_eq!(reply, json!({"host": "127.0.0.1", "port": port}));
+        let keys: Vec<&String> = reply.as_object().unwrap().keys().collect();
+        assert_eq!(keys, ["host", "port"]);
+        let text = reply.to_string();
+        assert!(
+            !text.contains(&parsed.secret),
+            "the secret must not be answered"
+        );
+        assert!(!text.contains(offer["offerId"].as_str().unwrap()));
+        assert!(!text.contains(&parsed.offer_id));
+        assert!(
+            lock(&receiver.claims).open.is_empty(),
+            "a preview claims nothing"
+        );
+        assert!(
+            producer
+                .pending_list()
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .is_empty(),
+            "the producer saw no claim"
+        );
+    }
+
+    /// `SA-3e` B2: expired, garbage and over-long URLs are their classes, and
+    /// none of them makes a claim.
+    #[test]
+    fn pair_destination_refusals_are_their_classes() {
+        let clock = TestClock::new();
+        let home = TempHome::new();
+        let receiver = Arc::new(RemoteAgent::default());
+        start(&receiver, &home, &clock, ScannerSettings::default());
+        let expired = loopback_pair_url(&clock, 47_000, 60_000);
+        assert!(receiver.pair_destination(&expired).is_ok(), "control");
+        clock.advance(120);
+        assert_eq!(receiver.pair_destination(&expired), Err("expired".into()));
+        assert_eq!(
+            receiver.pair_destination("not a pair url"),
+            Err("invalidOffer".into())
+        );
+        let tampered = loopback_pair_url(&clock, 47_000, 60_000).replacen("7b", "7B", 1);
+        assert_eq!(
+            receiver.pair_destination(&tampered),
+            Err("invalidOffer".into())
+        );
+        let long = format!(
+            "syrtis://pair?offer={}",
+            "0".repeat(syrtis_agent::security::PAIR_URL_RAW_MAX)
+        );
+        assert_eq!(receiver.pair_destination(&long), Err("invalidOffer".into()));
+        let claims = lock(&receiver.claims);
+        assert!(
+            claims.open.is_empty() && claims.next == 0,
+            "no claim was made"
+        );
+    }
+
+    /// `SA-3e` B2: a preview of a URL to a live `127.0.0.1` listener makes
+    /// no connection; control: `pair_claim` with the same URL connects.
+    #[test]
+    fn pair_destination_never_connects() {
+        let clock = TestClock::new();
+        let home = TempHome::new();
+        let receiver = Arc::new(RemoteAgent::default());
+        start(&receiver, &home, &clock, ScannerSettings::default());
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let pair_url = loopback_pair_url(&clock, port, 600_000);
+
+        receiver.pair_destination(&pair_url).unwrap();
+        // A completed connect waits in the backlog whether or not it was
+        // accepted, so a nonblocking accept sees any the preview made.
+        assert_eq!(
+            listener.accept().map(drop).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock,
+            "the preview must not connect"
+        );
+
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let done = Arc::new(AtomicBool::new(false));
+        let acceptor = {
+            let (accepted, done) = (Arc::clone(&accepted), Arc::clone(&done));
+            thread::spawn(move || {
+                while !done.load(Ordering::SeqCst) {
+                    match listener.accept() {
+                        // Dropped at once: the claim fails on its transport.
+                        Ok(_) => {
+                            accepted.fetch_add(1, Ordering::SeqCst);
+                        }
+                        Err(_) => thread::sleep(Duration::from_millis(5)),
+                    }
+                }
+            })
+        };
+        assert!(receiver.pair_claim(&pair_url).is_err());
+        done.store(true, Ordering::SeqCst);
+        acceptor.join().unwrap();
+        assert!(
+            accepted.load(Ordering::SeqCst) >= 1,
+            "control: the claim with the same URL connects"
+        );
     }
 
     /// A panic inside a `tb_remote_*` body is the fixed class, without its
@@ -1811,6 +2371,64 @@ mod tests {
             Err(PullError::Fetch(FetchError::Internal)),
             "the old grant must not read the scope the owner removed"
         );
+    }
+
+    /// A panic in one monitor period must not end the monitor: a later
+    /// input change is still noticed.
+    #[test]
+    fn the_monitor_survives_a_panicking_period() {
+        let clock = TestClock::new();
+        let home = TempHome::new();
+        let agent = Arc::new(RemoteAgent::default());
+        let settings = Arc::new(Mutex::new(ScannerSettings::default()));
+        let panic_next = Arc::new(AtomicBool::new(false));
+        let (path, time) = (home.0.clone(), Arc::clone(&clock));
+        let (shared, flag) = (Arc::clone(&settings), Arc::clone(&panic_next));
+        agent
+            .start(Arc::new(move || {
+                if flag.swap(false, Ordering::SeqCst) {
+                    panic!("injected inputs panic");
+                }
+                Ok(inputs(&path, &time, lock(&shared).clone()))
+            }))
+            .unwrap();
+        let before = epoch(&agent);
+        panic_next.store(true, Ordering::SeqCst);
+        let deadline = Instant::now() + PERIOD * 50;
+        while panic_next.load(Ordering::SeqCst) {
+            assert!(Instant::now() < deadline, "no period ran");
+            thread::sleep(PERIOD / 4);
+        }
+        assert_eq!(epoch(&agent), before);
+        // The owner changes a scan input after the panicked period.
+        *lock(&settings) = claude_root(&home);
+        let deadline = Instant::now() + PERIOD * 50;
+        while epoch(&agent) == before {
+            assert!(
+                Instant::now() < deadline,
+                "the monitor ended with the panic"
+            );
+            thread::sleep(PERIOD / 4);
+        }
+    }
+
+    /// An error caused by the inputs leaves no agent running, on the fast
+    /// path (running, `make` fails) as `tick` does.
+    #[test]
+    fn a_start_whose_inputs_fail_stops_the_running_agent() {
+        let clock = TestClock::new();
+        let home = TempHome::new();
+        let agent = Arc::new(RemoteAgent::default());
+        start(&agent, &home, &clock, ScannerSettings::default());
+        let port = free_port();
+        agent.listen_configure("127.0.0.1", port, None).unwrap();
+        assert!(listening(port));
+        assert_eq!(
+            agent.start(Arc::new(|| Err("invalid".into()))),
+            Err("invalid".into())
+        );
+        assert_eq!(agent.status(), Ok(json!({"running": false})));
+        assert!(!listening(port), "the stopped agent still accepts");
     }
 
     /// Review fix: a monitor that cannot be spawned leaves no agent running

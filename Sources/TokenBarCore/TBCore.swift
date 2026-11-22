@@ -739,6 +739,11 @@ public enum TBCore {
         try remoteNothing(grantId.withCString { tb_remote_revoke($0) })
     }
 
+    /// Where `remotePairClaim` would connect for this Pair URL; parses only.
+    public static func remotePairDestination(pairUrl: String) throws -> RemotePairDestination {
+        try unwrap(pairUrl.withCString { tb_remote_pair_destination($0) })
+    }
+
     public static func remotePairClaim(pairUrl: String) throws -> RemoteClaim {
         try unwrap(pairUrl.withCString { tb_remote_pair_claim($0) })
     }
@@ -759,7 +764,10 @@ public enum TBCore {
     // MARK: Device-aware pages (`tb_*_devices`, ctb.h). Every call blocks
     // (`refresh` up to one fetch deadline per selected producer): off the
     // main thread. The result is a `DeviceAwarePayload`, never the page's
-    // own type, so it cannot reach `SnapshotStore`. The timezone is always
+    // own type; `payload` is public, so nothing here stops a caller from
+    // handing it to `apply`, and the SA3D selftest guards that instead: the
+    // dashboard model never gives an overlay to anything that persists or
+    // feeds the tray. The timezone is always
     // this process's (`TimeZone.current`), the one the core computes the
     // local rows in: another zone would put remote hour slots and dates of
     // that zone beside local ones of this zone, and the core cannot check.
