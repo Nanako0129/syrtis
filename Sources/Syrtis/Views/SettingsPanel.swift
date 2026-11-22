@@ -103,6 +103,8 @@ struct SettingsPanel: View {
     /// its default in two views).
     @AppStorage(DiscordPresence.enabledKey) private var discordEnabled = false
     @AppStorage(DiscordPresence.wholeDollarsKey) private var discordWholeDollars = false
+    /// Default false, same as `DiscordPresence.includeDevices()`'s absent-key answer.
+    @AppStorage(DiscordPresence.includeDevicesKey) private var discordIncludeDevices = false
     /// Stored as the raw comma-separated string the payload layer parses, so
     /// the view and `DiscordPresence.components()` cannot drift into two
     /// different ideas of what is selected.
@@ -1014,6 +1016,8 @@ struct SettingsPanel: View {
             // work — so it is treated as switching the feature off for as long
             // as it stays empty.
             hint("Untick everything to show nothing.")
+            toggleRow("Include other devices selected in the dashboard", isOn: $discordIncludeDevices)
+            hint("Other devices' usage for today updates about every 5 minutes.")
             // Read here, not inside the options expression: `selection()` goes
             // to UserDefaults and registers no SwiftUI dependency, so the list
             // would keep a de-listed selection visible after the user picked
