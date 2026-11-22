@@ -880,28 +880,18 @@ fn local_quota_result(
         let windows = windows_from_quota_summary(&body, now);
         (!windows.is_empty()).then_some(windows)
     });
-    let status = status.and_then(|body| parse_user_status(&body, now));
-    match (summary_windows, status) {
-        (Some(windows), Ok(mut fetched)) => {
+    // A failed identity request fails the route, summary or not: the caller
+    // then falls through to the OAuth route, which names the account. A card
+    // built from the summary alone would carry no email or plan and no trusted
+    // scope, so it would record no history and replace a card that had both.
+    let mut fetched = status.and_then(|body| parse_user_status(&body, now))?;
+    match summary_windows {
+        Some(windows) => {
             fetched.windows = windows;
             Ok(fetched)
         }
-        // A summary without an identity is still a usable card; the account
-        // scope stays untrusted, which is how every non-authoritative route
-        // already behaves.
-        (Some(windows), Err(_)) => Ok(Fetched {
-            agy_login_marker: None,
-            bound_account_key: None,
-            source: "cli".to_string(),
-            identity: None,
-            account_scope: Err(AccountScopeError::NoTrustedEvidence),
-            history_scope: Err(AccountScopeError::NoTrustedEvidence),
-            cache_binding: None,
-            windows,
-        }),
-        (None, Ok(fetched)) if !fetched.windows.is_empty() => Ok(fetched),
-        (None, Ok(_)) => Err("local API returned no model quotas".to_string()),
-        (None, Err(error)) => Err(error),
+        None if !fetched.windows.is_empty() => Ok(fetched),
+        None => Err("local API returned no model quotas".to_string()),
     }
 }
 
@@ -4643,21 +4633,18 @@ mod tests {
     }
 
     #[test]
-    fn local_summary_survives_a_failed_identity_request() {
+    fn local_summary_without_an_identity_fails_the_route() {
         let now = DateTime::parse_from_rfc3339("2026-11-04T08:00:00Z")
             .unwrap()
             .with_timezone(&Utc);
-        let fetched = local_quota_result(
+        let error = local_quota_result(
             Ok(three_group_summary().to_string()),
             Err("status failed".to_string()),
             now,
         )
-        .unwrap();
+        .err();
 
-        assert_eq!(fetched.source, "cli");
-        assert!(fetched.identity.is_none());
-        assert!(fetched.account_scope.is_err());
-        assert_eq!(fetched.windows.len(), 5);
+        assert_eq!(error.as_deref(), Some("status failed"));
     }
 
     #[test]
