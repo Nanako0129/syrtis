@@ -2328,6 +2328,13 @@ enum SelfTest {
                 sourceClient: "codex", provider: "xai",
                 subscriptionClients: ["grok", "grok-bot"]) == .assigned("grok"),
             "xai reached from another client still spends grok, not grok-bot, when both are subscribed")
+        // A Factory plan is spent only through Droid. Mutation: drop "droid" from `ownRowsOnlySubscriptions` ->
+        // droid becomes the one eligible owner of the bound anthropic row and the suggestion is .assigned("droid").
+        expect(
+            UsageAttributionSettings.suggestionTarget(
+                sourceClient: "cline", provider: "anthropic",
+                subscriptionClients: ["claude", "droid"]) == .excluded,
+            "an anthropic row another client logged is not Factory plan spend")
         // The two policies contradict each other, so no provider may appear in
         // both — otherwise which one wins depends on the order of the branches.
         expect(
