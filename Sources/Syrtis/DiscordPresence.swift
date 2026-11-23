@@ -168,8 +168,9 @@ enum DiscordPresence {
         /// A held result survives this many failed calls in a row, then goes:
         /// one failure should not make the published figure dip to this Mac's
         /// alone, but a result nothing can renew stops counting this Mac's new
-        /// usage and has no entry for today after midnight. Calls come one per
-        /// tray poll (5 min closed, 60 s open), so this is at most 15 min.
+        /// usage and has no entry for today after midnight. Calls come at most
+        /// one per tray poll (5 min closed, 60 s open): about 15 min when each
+        /// returns promptly, longer when a tick is skipped behind a running call.
         static let maxFailuresHeld = 3
 
         struct State {
