@@ -12184,6 +12184,29 @@ enum SelfTest {
                 "D1 (4) graphDevices fails: the last merged result is kept; never succeeded: this "
                     + "Mac's graph; control: the same state with the fake working is the merged one")
 
+            // (4b) the held result goes after `maxFailuresHeld` failures in a
+            // row; a success in between starts the count again.
+            var st4b = st4
+            var heldUntil4b = 0
+            for i in 1..<M.maxFailuresHeld {
+                if d1Pay(d1Decide(st4b, at: d1T0.addingTimeInterval(401)).graph) == d1Pay(d1Merged) {
+                    heldUntil4b += 1
+                }
+                st4b = d1Run(d1Decide(st4b, at: d1T0.addingTimeInterval(400 + Double(i) * 400)), fake4)
+            }
+            let dropped4b = d1Decide(st4b, at: d1T0.addingTimeInterval(9000))
+            fake4.setFail(false)
+            var again4b = d1Run(d1Decide(st4, at: d1T0.addingTimeInterval(800)), fake4)
+            fake4.setFail(true)
+            again4b = d1Run(d1Decide(again4b, at: d1T0.addingTimeInterval(1200)), fake4)
+            expect(heldUntil4b == M.maxFailuresHeld - 1 && d1Pay(dropped4b.graph) == d1Pay(d1Local)
+                    && st4b.merged == nil && again4b.failures == 1
+                    && d1Pay(d1Decide(again4b, at: d1T0.addingTimeInterval(1201)).graph)
+                        == d1Pay(d1Merged),
+                "D1 (4b) \(M.maxFailuresHeld) failed calls in a row drop the held result and Discord is "
+                    + "built from this Mac's graph; a success in between starts the count again "
+                    + "(held through \(heldUntil4b) failures)")
+
             // (5) the peers change: a new generation, the old result is not used.
             let peerB = String(repeating: "b", count: 64)
             let before5 = d1Run(d1Decide(M.State(), at: d1T0), fake2)
