@@ -165,6 +165,13 @@ enum DiscordPresence {
         /// reason: a producer grants a burst of 2 requests per grant and refills
         /// one per 60 s.
         static let refreshSeconds: TimeInterval = 300
+        /// A held result survives this many failed calls in a row, then goes:
+        /// one failure should not make the published figure dip to this Mac's
+        /// alone, but a result nothing can renew stops counting this Mac's new
+        /// usage and has no entry for today after midnight. Calls come at most
+        /// one per tray poll (5 min closed, 60 s open): about 15 min when each
+        /// returns promptly, longer when a tick is skipped behind a running call.
+        static let maxFailuresHeld = 3
 
         struct State {
             /// The merged `UsagePayload` only. The per-device rows are dropped:
@@ -175,6 +182,8 @@ enum DiscordPresence {
             var generation: UInt64 = 0
             var lastRefresh: Date?
             var inFlight = false
+            /// Calls that failed in a row since `merged` was last stored.
+            var failures = 0
             // The inputs last seen, so any change bumps `generation`.
             var includeDevices = false
             var discordOn = false
@@ -271,13 +280,21 @@ enum DiscordPresence {
         }
 
         /// A call came back. A result from an older generation is dropped; a
-        /// failure keeps whatever was there.
+        /// failure keeps what was there until `maxFailuresHeld` in a row.
         static func arrived(_ state: State, call: Call, payload: UsagePayload?) -> State {
             var next = state
             next.inFlight = false
-            if let payload, call.generation == state.generation {
+            guard call.generation == state.generation else { return next }
+            if let payload {
                 next.merged = payload
                 next.mergedPeers = call.selection.peers
+                next.failures = 0
+            } else {
+                next.failures += 1
+                if next.failures >= maxFailuresHeld {
+                    next.merged = nil
+                    next.mergedPeers = []
+                }
             }
             return next
         }
