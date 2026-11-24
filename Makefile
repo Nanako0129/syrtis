@@ -118,12 +118,14 @@ selftest-bundled: rust
 # says "this version doesn't include the remote agent" when adding a machine.
 #   make remote-agent                                    download the release pinned in scripts/remote-agent.lock
 #   make remote-agent REMOTE_AGENT_REPO=<owner/repo> REMOTE_AGENT_TAG=<tag> REMOTE_AGENT_SHA256=<hex>
-#                                                        another release (the sha256 is required with them)
+#                                                        another release (all three together, or none)
 #   make remote-agent REMOTE_AGENT_BIN=path/to/agent     use that file (no release needed)
 # The lock (repo, tag, target, sha256) is committed and is the trust root: the
 # download must hash to its sha256. It is empty until the upstream agent
 # publishes a Linux release, so a run with an empty lock and neither override
-# stops with a message.
+# stops with a message. scripts/bundle.sh re-hashes what is staged and accepts it
+# only if it equals the lock, or the same overrides are given to that call
+# (`make bundle REMOTE_AGENT_BIN=...` prints a development-build warning).
 REMOTE_AGENT_REPO ?=
 REMOTE_AGENT_TAG ?=
 REMOTE_AGENT_SHA256 ?=

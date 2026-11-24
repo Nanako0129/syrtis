@@ -44,8 +44,45 @@ cp -R Sources/Syrtis/Resources/Localizations/*.lproj "$APP/Contents/Resources/"
 # checksum file is written last, so only a complete staging is copied). Before
 # signing: the seal covers it.
 REMOTE_AGENT_STAGE=".build/remote-agent/x86_64-unknown-linux-gnu"
+# The staged file is never trusted for what it says about itself: its sha256 is
+# recomputed here and must equal the lock's, or the override given in this same
+# call (REMOTE_AGENT_REPO, REMOTE_AGENT_TAG and REMOTE_AGENT_SHA256 together, or
+# REMOTE_AGENT_BIN=<file> for a development build, which is announced loudly).
+# Anything else left in .build/remote-agent/ fails the bundle.
+OVERRIDES=0
+for v in REMOTE_AGENT_REPO REMOTE_AGENT_TAG REMOTE_AGENT_SHA256; do
+  [ -z "${!v:-}" ] || OVERRIDES=$((OVERRIDES + 1))
+done
+if [ "$OVERRIDES" -ne 0 ] && [ "$OVERRIDES" -ne 3 ]; then
+  echo "error: REMOTE_AGENT_REPO, REMOTE_AGENT_TAG and REMOTE_AGENT_SHA256 must be set together (got $OVERRIDES of 3)." >&2
+  exit 1
+fi
 if [ -f "$REMOTE_AGENT_STAGE/syrtis-agent" ] && [ -f "$REMOTE_AGENT_STAGE/syrtis-agent.sha256" ]; then
-  echo "==> bundling the remote agent ($(cut -c1-12 "$REMOTE_AGENT_STAGE/syrtis-agent.sha256"))"
+  STAGED_SHA="$(shasum -a 256 "$REMOTE_AGENT_STAGE/syrtis-agent" | awk '{ print $1 }')"
+  LOCK_SHA="$(awk -F= '$1 == "sha256" { gsub(/[ \t\r]/, "", $2); print $2; exit }' scripts/remote-agent.lock 2>/dev/null || true)"
+  if [ -n "${REMOTE_AGENT_BIN:-}" ]; then
+    [ -f "$REMOTE_AGENT_BIN" ] && [ "$(shasum -a 256 "$REMOTE_AGENT_BIN" | awk '{ print $1 }')" = "$STAGED_SHA" ] || {
+      echo "error: the staged remote agent is not REMOTE_AGENT_BIN ($REMOTE_AGENT_BIN); re-run make remote-agent." >&2
+      exit 1
+    }
+    echo "WARNING: bundling a local development remote agent from REMOTE_AGENT_BIN; do not ship this app." >&2
+  elif [ "$OVERRIDES" -eq 3 ]; then
+    [ "$STAGED_SHA" = "$REMOTE_AGENT_SHA256" ] || {
+      echo "error: the staged remote agent ($STAGED_SHA) is not REMOTE_AGENT_SHA256 ($REMOTE_AGENT_SHA256)." >&2
+      exit 1
+    }
+  else
+    [ -n "$LOCK_SHA" ] && [ "$STAGED_SHA" = "$LOCK_SHA" ] || {
+      echo "error: the staged remote agent ($STAGED_SHA) does not match scripts/remote-agent.lock (${LOCK_SHA:-empty})." >&2
+      echo "  Remove .build/remote-agent/, or pass REMOTE_AGENT_REPO, REMOTE_AGENT_TAG and REMOTE_AGENT_SHA256 / REMOTE_AGENT_BIN to this call." >&2
+      exit 1
+    }
+  fi
+  [ "$(awk 'NR == 1 { print $1 }' "$REMOTE_AGENT_STAGE/syrtis-agent.sha256")" = "$STAGED_SHA" ] || {
+    echo "error: $REMOTE_AGENT_STAGE/syrtis-agent.sha256 does not match the staged binary." >&2
+    exit 1
+  }
+  echo "==> bundling the remote agent (${STAGED_SHA:0:12})"
   mkdir -p "$APP/Contents/Resources/remote-agent/x86_64-unknown-linux-gnu"
   cp "$REMOTE_AGENT_STAGE/syrtis-agent" "$REMOTE_AGENT_STAGE/syrtis-agent.sha256" \
     "$APP/Contents/Resources/remote-agent/x86_64-unknown-linux-gnu/"

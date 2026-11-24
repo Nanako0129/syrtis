@@ -11,9 +11,9 @@
 # release can replace that file too.
 #
 # Using another release (for example a fork): either edit the lock, or set
-# REMOTE_AGENT_REPO and REMOTE_AGENT_TAG together with REMOTE_AGENT_SHA256
-# (the sha256 of that release's asset; required whenever repo or tag is
-# overridden, since the lock's sha256 belongs to the lock's release).
+# REMOTE_AGENT_REPO, REMOTE_AGENT_TAG and REMOTE_AGENT_SHA256 together (the
+# sha256 of that release's asset; all three or none, since the lock's sha256
+# belongs to the lock's release).
 # REMOTE_AGENT_OUT changes the output directory.
 #
 # Writes <OUT>/syrtis-agent and <OUT>/syrtis-agent.sha256 (the checksum of that
@@ -49,11 +49,12 @@ else
   LOCK_TARGET="$(lock_value target)"
   REPO="${REMOTE_AGENT_REPO:-$(lock_value repo)}"
   TAG="${REMOTE_AGENT_TAG:-$(lock_value tag)}"
-  if [ -n "${REMOTE_AGENT_REPO:-}${REMOTE_AGENT_TAG:-}" ]; then
-    PIN="${REMOTE_AGENT_SHA256:-}"
-    [ -n "$PIN" ] || fail "REMOTE_AGENT_REPO/REMOTE_AGENT_TAG override the lock, so REMOTE_AGENT_SHA256 (the sha256 of $ASSET in that release) is required"
+  if [ -n "${REMOTE_AGENT_REPO:-}${REMOTE_AGENT_TAG:-}${REMOTE_AGENT_SHA256:-}" ]; then
+    [ -n "${REMOTE_AGENT_REPO:-}" ] && [ -n "${REMOTE_AGENT_TAG:-}" ] && [ -n "${REMOTE_AGENT_SHA256:-}" ] \
+      || fail "REMOTE_AGENT_REPO, REMOTE_AGENT_TAG and REMOTE_AGENT_SHA256 (the sha256 of $ASSET in that release) must be set together"
+    PIN="$REMOTE_AGENT_SHA256"
   else
-    PIN="${REMOTE_AGENT_SHA256:-$(lock_value sha256)}"
+    PIN="$(lock_value sha256)"
     [ -z "$LOCK_TARGET" ] || [ "$LOCK_TARGET" = "$TRIPLE" ] || fail "$LOCK has target '$LOCK_TARGET', expected $TRIPLE"
   fi
   if [ -z "$TAG" ] || [ -z "$PIN" ]; then
