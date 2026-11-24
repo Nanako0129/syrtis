@@ -942,6 +942,7 @@
 "Only Linux x86_64 machines are supported." = "只支援 Linux x86_64 機器。";
 "The agent didn't match its pinned checksum. Nothing was installed." = "agent 與釘選的檢查碼不符，沒有安裝任何東西。";
 "The agent isn't installed on the machine." = "那台機器上沒有安裝 agent。";
+"The agent can't run on that machine. It needs Linux x86_64 with glibc 2.35 or newer. %@" = "agent 無法在那台機器上執行，需要 Linux x86_64 且 glibc 2.35 以上。%@";
 "The agent command failed (%lld). The machine's folder permissions or state directory may have failed a check. %@" = "agent 指令失敗（%lld）。可能是那台機器的目錄權限或狀態目錄檢查沒通過。%@";
 "These folders on the machine can be written by group or others, so the agent can't be installed: %@. Nothing was uploaded or changed. Run “%@” in a terminal, then try again." = "那台機器上這些目錄允許 group 或其他人寫入，agent 無法安裝：%@。沒有上傳或改動任何東西。請在終端機執行「%@」，再試一次。";
 "Another machine operation is running." = "另一個機器操作正在進行。";

@@ -235,6 +235,17 @@ enum SSHRemoteSelfTest {
         }
         fake.seed(running: true)
         expect(value(blockingSync { try ctl.status() })?.sharingEnabled == false, "SSH ctl: a clean status parses")
+
+        // Baseline: any ctl answer other than 4 (not running) or 127 (missing) means installed, so an
+        // older agent without `ctl` (exit 2) is replaced by deploy instead of blocking it.
+        fake.setMode("old2")
+        expect(value(blockingSync { try ctl.probeAgent() }) == SSHAgentBaseline(installed: true, running: true),
+               "SSH ctl: an agent answering exit 2 counts as installed")
+        fake.setMode(nil)
+        fake.seed(running: false)
+        expect(value(blockingSync { try ctl.probeAgent() }) == SSHAgentBaseline(installed: true, running: false),
+               "SSH ctl: exit 4 is installed and not running")
+        fake.seed(running: true)
     }
 
     static func blockingSync<T>(_ op: () throws -> T) -> Result<T, Error> { Result { try op() }}
@@ -294,6 +305,19 @@ enum SSHRemoteSelfTest {
             let truncated = try? fake.runner.run(target, command, stdin: .data(Data("partial".utf8)), timeout: 30)
             expect(truncated?.end == .exited(72) && leftovers().isEmpty,
                    "SSH deploy: a truncated upload does not match and is removed")
+        }
+
+        // A binary the remote cannot execute (loader error, bad interpreter) is its own error, with the
+        // first stderr line passed on and nothing left behind.
+        let broken = fake.dir.appendingPathComponent("broken-agent")
+        try? Data("#!/nonexistent/loader\n".utf8).write(to: broken)
+        if let brokenPin = try? SSHAgentPin.sha256(of: broken) {
+            if case .agentCannotRun(let detail)? = errorOf(blockingSync { try ctl.deploy(binaryFor: { _ in broken }, pin: brokenPin) }) {
+                expect(detail.count <= 200 && leftovers().isEmpty,
+                       "SSH deploy: a binary that cannot execute is reported as such and cleaned up")
+            } else {
+                expect(false, "SSH deploy: a binary that cannot execute is reported as such and cleaned up")
+            }
         }
 
         // Fresh install, then an upgrade over a running agent: shutdown first, install, start, answer.
@@ -826,7 +850,7 @@ enum SSHRemoteSelfTest {
         // The ssh that ships with macOS must accept every one of them.
         guard FileManager.default.isExecutableFile(atPath: "/usr/bin/ssh") else { return }
         for (name, args) in [("command", oneShot), ("tunnel", tunnel)] {
-            let probe = ["-G"] + args.filter { $0 != command.shell }
+            let probe = ["-G", "-F", "/dev/null"] + args.filter { $0 != command.shell }
             let result = try? SSHRunner.execute(
                 path: "/usr/bin/ssh", arguments: probe, environment: SSHRunner().environment(), stdin: .none,
                 timeout: 10, maxStdout: 64 * 1024, cancel: nil)

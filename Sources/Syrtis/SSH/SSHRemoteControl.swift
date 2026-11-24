@@ -91,6 +91,10 @@ struct SSHCtl: SSHRemoteControl {
             return SSHAgentBaseline(installed: true, running: false)
         } catch SSHRemoteError.agentMissing {
             return .missing
+        } catch SSHRemoteError.ctl {
+            // Any other answer (an older agent without `ctl` exits 2) means it is
+            // installed; deploying replaces it.
+            return SSHAgentBaseline(installed: true, running: true)
         }
     }
 
@@ -181,6 +185,8 @@ struct SSHCtl: SSHRemoteControl {
             }
         } catch SSHRemoteError.ctl(code: 72, _) {
             throw SSHRemoteError.integrity
+        } catch SSHRemoteError.ctl(code: 73, let detail) {
+            throw SSHRemoteError.agentCannotRun(detail)
         }
         _ = try waitForAgent()
     }

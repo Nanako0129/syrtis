@@ -55,6 +55,7 @@ enum SSHMachinesCopy {
     static let errPlatform = "Only Linux x86_64 machines are supported."
     static let errIntegrity = "The agent didn't match its pinned checksum. Nothing was installed."
     static let errAgentMissing = "The agent isn't installed on the machine."
+    static let errCannotRun = "The agent can't run on that machine. It needs Linux x86_64 with glibc 2.35 or newer. %@"
     static let errCommand = "The agent command failed (%lld). The machine's folder permissions or state directory may have failed a check. %@"
     static let errUnsafeDirs = "These folders on the machine can be written by group or others, so the agent can't be installed: %@. Nothing was uploaded or changed. Run “%@” in a terminal, then try again."
     static let errBusy = "Another machine operation is running."
@@ -86,7 +87,7 @@ enum SSHMachinesCopy {
         connecting, retrying, stopped, portBusy,
         needsReapproval, reapprove, hostKey, removeTitle, removeMessage, purge,
         identityKept, errInvalid, errLaunch, errUnreachable, errUnreachableBare, errTimeout, errOutput, errMalformed,
-        errPlatform, errIntegrity, errAgentMissing, errCommand, errBusy, errNoPort,
+        errPlatform, errIntegrity, errAgentMissing, errCannotRun, errCommand, errBusy, errNoPort,
         errDeclined, errNotLoopback, errTunnel, errTunnelBare, errPairing, errIdentity,
         errCancelled, errOther, errUnsafeDirs, portInUse,
         errTruncated, agentInstalled, agentReplaced, agentStarted, agentUnchanged, scopeTruncated,

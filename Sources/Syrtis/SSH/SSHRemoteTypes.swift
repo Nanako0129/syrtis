@@ -39,6 +39,8 @@ enum SSHRemoteError: Error, Equatable, Sendable {
     case integrity
     /// The remote has no agent binary where `install` puts it.
     case agentMissing
+    /// The uploaded agent cannot execute on the remote (wrong libc or kernel).
+    case agentCannotRun(String)
     /// `ctl` or the deploy script exited with `code` (spec/cli-v1.md).
     case ctl(code: Int32, detail: String)
     /// Existing directories the agent refuses (group or other writable), as `~`-relative paths.
@@ -288,8 +290,9 @@ struct SSHRemoteCommand: Equatable, Sendable {
 
     /// Upload from stdin, hash, install, start, clean up. `pin` is 64 lowercase
     /// hex (checked here). The temp directory is 0700 under `$HOME` and never
-    /// reported back. Exit 70 mktemp, 71 upload, 72 hash mismatch, else `ctl
-    /// install`'s status; stdout is `ctl install`'s frame.
+    /// reported back. Exit 70 mktemp, 71 upload, 72 hash mismatch, 73 the binary
+    /// cannot run here (`ctl install` exited 126 or 127, e.g. a loader error; the
+    /// first line of its stderr is passed on), else `ctl install`'s status; stdout is `ctl install`'s frame.
     static func deploy(pin: String) throws -> SSHRemoteCommand {
         guard SSHInput.isDigest(pin) else { throw SSHRemoteError.invalidInput("pin") }
         let script = [
@@ -302,8 +305,9 @@ struct SSHRemoteCommand: Equatable, Sendable {
             "chmod 700 \"$T/a\"",
             "\"$T/a\" ctl shutdown >/dev/null 2>&1",
             "i=0",
-            "while [ $i -lt 20 ]; do OUT=$(\"$T/a\" ctl install 2>/dev/null); rc=$?; "
+            "while [ $i -lt 20 ]; do OUT=$(\"$T/a\" ctl install 2>\"$T/e\"); rc=$?; "
                 + "[ $rc -eq 9 ] || break; i=$((i+1)); sleep 1; done",
+            "case $rc in 126|127) head -n 1 \"$T/e\" >&2; exit 73;; esac",
             "[ $rc -eq 0 ] || exit $rc",
             startFragment,
             "printf \"%s\\n\" \"$OUT\"",

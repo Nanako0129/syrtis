@@ -159,6 +159,7 @@ final class SSHFake: @unchecked Sendable {
           hang) exec sleep 60;;
           hostkey) echo "Host key verification failed." >&2; exit 255;;
           leak) echo "boom syrtis://secret/path?s=1 end" >&2; exit 255;;
+          old2) echo "syrtis-agent: unknown argument: ctl" >&2; exit 2;;
           leak5) echo "syrtis-agent ctl: refused syrtis://secret/path?s=1" >&2; exit 5;;
         esac
         if [ "$MODE" = approve-hang ]; then

@@ -285,6 +285,7 @@ final class SSHMachinesModel: ObservableObject {
         case .agentPinMissing: return C.noAgent.localized
         case .integrity: return C.errIntegrity.localized
         case .agentMissing: return C.errAgentMissing.localized
+        case .agentCannotRun(let detail): return C.errCannotRun.localized(detail)
         case .ctl(let code, let detail): return C.errCommand.localized(Int(code), detail)
         case .unsafeRemoteDirs(let dirs):
             let fix = "\(command ?? "ssh") 'chmod go-w \(dirs.joined(separator: " "))'"
