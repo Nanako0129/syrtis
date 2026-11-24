@@ -84,7 +84,7 @@ sequenceDiagram
 | 掃描範圍 | 使用者在 UI 確認 disclosure 後才送 `scope approve --digest`，digest 原樣帶回；disclosure 預設展開，以 `Text(verbatim:)` 顯示。超過 64 行、name 超過 64 字或 value 超過 512 字時截斷並明示「已截斷」；digest 涵蓋整份 scope，看不全就不能核准，核准鍵停用並說明原因，協調器在 confirm 回 yes 後仍再擋一次。核准鍵不設 `.defaultAction`（不能靠 Return 帶過）。若遠端有其他 consumer 的 grant，提示 approve 會使它們 superseded |
 | 取消或失敗 | 在同一個流程裡盡力撤銷本次做過的事，做不到就顯示手動指令，見下方「同流程回復」 |
 | 配對核准 | offer TTL 120 秒。`ctl pending approve --expect-sas` 先列 pending，只有恰好一筆 `sasCode` 相符時，才用該筆 `pendingId` 與 generation 送 APPROVE；零筆、多筆或不符就不 approve、也不 reject 其他筆，並 cancel 本次 offer、以非零狀態結束 |
-| 重新核准 | grant 變 `superseded` 時機器列顯示「需要重新核准」；確認後重跑 disclosure 與配對，沿用同一個 lport。新的 `responderStatic` 與已存的 `producerStatic` 不同時明示給使用者，不靜默取代 |
+| 重新核准 | grant 變 `superseded` 時機器列顯示「需要重新核准」；確認後重跑 disclosure 與配對，沿用同一個 lport。新的 `responderStatic` 與已存的 `producerStatic` 不同時明示給使用者，不靜默取代；身分在 claim 後才知道，所以重新核准時 `scope approve` 排在身分確認之後、`pending approve` 之前 |
 | 移除 | 經 `ctl grant revoke` 只撤銷本機這個 receiver 的 grant；`activeGrantCount` 歸零才 `sharing off`。之後忘記 peer、停轉發；可選擇 `shutdown` 加 `ctl uninstall --purge` 一併清掉遠端 state，但只在撤銷自己的 grant 後重讀 `status`、`activeGrantCount` 為 0 時才做；還有其他 active grant 就不 purge，也不關 sharing，並提示使用者還有 N 台裝置在用。SSH 連不上時，機器照樣從本機移除，並顯示要手動執行的 `ctl` 指令（不存檔、不重試） |
 
 ### 同流程回復
@@ -101,7 +101,7 @@ sequenceDiagram
 
 - 回復失敗（連不上、逾時、agent 拒絕）時，錯誤連同要手動執行的指令一起顯示。第一個因連線失敗而停下的步驟之後，其餘步驟不再嘗試，直接列成指令，免得每步各等一次連線逾時。offer 取消不了就不列，它的 TTL 120 秒會自己到期。
 - `approvePending` 的回覆遺失（逾時、取消、輸出不完整）時，Mac 端拿不到 `pendingId`，無法推導出 grantId。回復時基線分享是關閉的，就用 `sharing off` 一併結束孤兒 grant；基線分享已開（有其他 consumer）時無法安全結束，讀 `status`，active grant 數沒有超過預期（基線已核准範圍才算既有 grant，否則為 0）就視為沒核准，超過就顯示 `ctl status` 與 `ctl sharing off` 指令由使用者判斷。agent 以明確錯誤碼拒絕（例如 SAS 不符）代表沒核准。
-- 移除時同樣：撤銷自己的 grant、必要時 `sharing off` 與 purge；連不上就顯示 `ctl grant revoke`（與 purge 時的 `shutdown`、`uninstall --purge`）指令，機器照樣從本機移除。
+- 移除時同樣：撤銷自己的 grant、必要時 `sharing off` 與 purge；連不上就顯示 `ctl grant revoke`；purge 時接著列 `ctl status`，`shutdown`、`uninstall --purge` 附條件說明，只在 `activeGrantCount` 為 0 時才執行，機器照樣從本機移除。
 - 手動指令的格式是貼到終端機就能執行：`ssh [-p port] -- dest '<sh -c …>'`，內含的單引號以 `'\''` 跳脫，selftest 用 `/bin/sh` 解析並斷言 ssh 收到的最後一個參數與程式自己傳的相同。
 
 ### 威脅模型：Syrtis 代使用者經 SSH 核准配對
@@ -130,7 +130,7 @@ sequenceDiagram
 ### SSH 選項
 
 - 所有命令：`-T -o BatchMode=yes -o StrictHostKeyChecking=yes -o ForwardAgent=no -o ForwardX11=no -o PermitLocalCommand=no -o ControlMaster=no -o ControlPath=none -o ConnectTimeout=10 -o NoHostAuthenticationForLocalhost=no -o ForkAfterAuthentication=no -o RemoteCommand=none`（後三項擋住使用者 config 改變 host key 檢查、讓 ssh 在背景化、或在命令列命令之外再塞 `RemoteCommand`）。macOS 內建的 OpenSSH 10.5p1 以 `ssh -G -o …` 確認支援全部選項，selftest 也用內建 ssh 的 `-G` 檢查。
-- 一次性命令另加 `-o ClearAllForwardings=yes -o SessionType=default`，並設總逾時；stdout 邊讀邊檢查長度上限，超過就終止 ssh。
+- 一次性命令另加 `-o ClearAllForwardings=yes -o SessionType=default -o StdinNull=no`（後者讓部署上傳不被 config 的 `StdinNull yes` 截斷；轉發不加），並設總逾時；stdout 邊讀邊檢查長度上限，超過就終止 ssh。
 - 轉發：`-N -o SessionType=none -L 127.0.0.1:lport:127.0.0.1:rport -o ExitOnForwardFailure=yes -o ServerAliveInterval=30`。`ClearAllForwardings` 會清掉命令列的 `-L`，所以轉發不加，會繼承使用者 config 裡自己的 Forward 設定，視為使用者意圖。
 - host key 未知時會失敗，UI 顯示「請先在終端機執行 `ssh <target>` 一次確認 host key」，不自動接受。
 
@@ -171,6 +171,12 @@ sequenceDiagram
 
 - 遠端機器的聚合用量（model、token、小時、費用）會進到這台 Mac 的 receiver cache；機器若受組織管理，是否允許由使用者自行判斷，Syrtis 不替使用者決定。
 - 假設遠端主機的 sshd 允許 `-L` 轉發。
+
+已知限制：
+
+- `approvePending` 的回覆遺失，又剛好遇到他人撤銷基線 grant 時，active grant 數回到預期，回復判斷沒有孤兒，可能留下一個沒有名字的 grant；數量比較無法分辨身分，需要 agent 提供 grant 身分才能根治。
+- alias 自帶的 `LocalForward`、`RemoteForward` 會隨 tunnel 一起開，既有 port 被占用時 `ExitOnForwardFailure` 會讓 tunnel 失敗。建議為 Syrtis 另設不含 forward 的 alias。
+- 跨版本升級後，舊版留下的 tunnel process 無法被新版 reap（PID 記錄不含啟動參數，選項改變後比對不上），要結束 app 或重新登入才會清掉。
 
 ### Security review（2026-11-19）
 

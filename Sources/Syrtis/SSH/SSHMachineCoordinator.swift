@@ -379,10 +379,14 @@ final class SSHMachineCoordinator: @unchecked Sendable {
             }
             return SSHRemoveResult(manualCommands: [], error: nil, purgeSkippedGrants: skipped)
         } catch {
-            var owed: [SSHCtlCommand] = grantId.map { [.grantRevoke(grantId: $0)] } ?? []
-            if purge { owed += [.shutdown, .uninstall(purge: true)] }
+            // Purge ends other devices' access too: it follows only a status that shows no grants.
+            var lines = SSHManualCommands.lines((grantId.map { [.grantRevoke(grantId: $0)] } ?? []) + (purge ? [.status] : []), on: target)
+            if purge {
+                lines.append("# only if activeGrantCount is 0:")
+                lines += SSHManualCommands.lines([.shutdown, .uninstall(purge: true)], on: target)
+            }
             return SSHRemoveResult(
-                manualCommands: SSHManualCommands.lines(owed, on: target),
+                manualCommands: lines,
                 error: (error as? SSHRemoteError) ?? .unreachable(""))
         }
     }
@@ -426,7 +430,9 @@ final class SSHMachineCoordinator: @unchecked Sendable {
         var pairedKey: String?
         let local = deps.local
         do {
-            if !baseline.scopeApproved {
+            // A re-approval confirms a changed identity first: approving a scope ends other devices' grants.
+            let scopeLater = expectedFingerprint != nil
+            if !baseline.scopeApproved, !scopeLater {
                 try await io { try remote.approveScope(digest: disclosure.digest) }
             }
             if !baseline.sharingEnabled {
@@ -496,6 +502,9 @@ final class SSHMachineCoordinator: @unchecked Sendable {
                 else { throw SSHRemoteError.identityChanged }
             }
             try check(cancel)
+            if !baseline.scopeApproved, scopeLater {
+                try await io { try remote.approveScope(digest: disclosure.digest) }
+            }
             let sas = claim.sas
             let pendingId: String
             do {
@@ -513,6 +522,7 @@ final class SSHMachineCoordinator: @unchecked Sendable {
             let handle = claim.handle
             let paired = try await io { try local.poll(handle: handle) }
             pairedKey = paired.producerStatic
+            try check(cancel)
             let result = try commit(
                 Paired(
                     producerStatic: paired.producerStatic, fingerprint: paired.fingerprint,

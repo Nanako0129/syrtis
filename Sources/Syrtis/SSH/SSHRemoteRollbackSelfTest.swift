@@ -104,6 +104,18 @@ extension SSHRemoteSelfTest {
                 "SSH rollback: when the machine is lost, the error carries the sharing off, shutdown and uninstall commands")
         }
 
+        // Cancelled while the poll waits: nothing is saved, and the grant and the peer are undone.
+        if let rig = Rig() {
+            defer { rig.cleanup() }
+            rig.fake.seed(running: true, sharing: false, scope: false)
+            let cancel = SSHCancellation()
+            rig.local.onPoll = { cancel.cancel() }
+            let result = add(rig, cancel: cancel)
+            expect(errorOf(result) == .cancelled && rig.store.all().isEmpty && rig.fake.lines("grants").isEmpty
+                && rig.local.removed.contains(rig.local.producerStatic),
+                "SSH rollback: a cancel during the poll is not committed; the grant is revoked and the peer removed")
+        }
+
         // The approval's answer is lost. Sharing was off: the rollback's sharing off ends the orphan. Sharing was on: it is shown for the owner.
         for sharing in [false, true] {
             guard let rig = Rig(callTimeout: 3) else { continue }

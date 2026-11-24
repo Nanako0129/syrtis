@@ -343,6 +343,21 @@ enum SSHRemoteSelfTest {
         expect(store.all().first?.label == "box", "SSH machines: a saved label is cleaned of bidi controls")
         expect((try? store.add(make("a.example", lport: 47102))) == nil, "SSH machines: the same user and host is not added twice")
         expect((try? store.add(make("b.example", lport: 47101))) == nil, "SSH machines: a local port is held by one machine")
+        // One record that does not decode is skipped, and a store that is not a list is never overwritten.
+        let lossySuite = "com.tokenbar.selftest.ssh-machines-lossy"
+        if let defaults = UserDefaults(suiteName: lossySuite), let kept = try? JSONEncoder().encode(good),
+           let keptText = String(data: kept, encoding: .utf8) {
+            defer { defaults.removePersistentDomain(forName: lossySuite) }
+            let store = SSHMachines(defaults: defaults)
+            defaults.set(Data("[\(keptText),{\"id\":\"x\",\"localPort\":\"47101\"}]".utf8), forKey: SSHMachines.machinesKey)
+            expect(store.all().map(\.id) == [good.id] && (try? store.add(make("c.example", lport: 47103))) != nil
+                && store.all().count == 2, "SSH machines: a record that fails to decode is skipped and the others are kept")
+            let broken = Data("{".utf8)
+            defaults.set(broken, forKey: SSHMachines.machinesKey)
+            expect((try? store.add(make("d.example", lport: 47104))) == nil && store.all().isEmpty
+                && defaults.data(forKey: SSHMachines.machinesKey) == broken,
+                "SSH machines: an unreadable store refuses a write and is left as it is")
+        }
         // Records edited behind the app's back are dropped on load.
         var raw = store.all()
         raw.append(make("-oProxyCommand=x", lport: 47103))
@@ -547,6 +562,21 @@ enum SSHRemoteSelfTest {
                 && offline?.manualCommands.first?.contains("grant revoke --grant-id \(third?.grantId ?? "?")") == true
                 && rig.fake.lines("grants").count == 2,
                 "SSH remove: an unreachable remote still removes the machine here and returns the revoke command to run by hand")
+
+            // With purge, the destructive commands come after a status and a condition on it.
+            rig.fake.setDown(false)
+            let fourth = value(blocking { [coordinator = rig.coordinator] in
+                try await coordinator.add(user: "me", host: "box4.example", label: nil, confirm: { _ in true })
+            })
+            rig.fake.setDown(true)
+            let purged = fourth.flatMap { m in
+                value(blocking { [coordinator = rig.coordinator] in try await coordinator.remove(id: m.id, purge: true) })
+            }
+            let owed = purged?.manualCommands ?? []
+            func at(_ text: String) -> Int { owed.firstIndex { $0.contains(text) } ?? -1 }
+            expect(at("ctl status") > at("grant revoke") && at("activeGrantCount is 0") > at("ctl status")
+                && at("ctl shutdown") > at("activeGrantCount is 0") && at("--purge") > at("ctl shutdown") && at("grant revoke") >= 0,
+                "SSH remove: when the remote is unreachable, purge commands follow a status and a condition on it")
         }
 
         // Re-approval.
@@ -567,14 +597,16 @@ enum SSHRemoteSelfTest {
 
             // A changed producer key: declined rolls back and keeps the record; accepted is reported.
             rig.fake.put("grants", "")
+            rig.fake.put("scope", "0")
             rig.local.fingerprint = "fedcba9876543210"
             rig.local.producerStatic = String(repeating: "cd", count: 32)
             let declined = blocking { [coordinator = rig.coordinator] in
                 try await coordinator.reapprove(id: machine.id, confirm: { _ in true }, confirmIdentityChange: { _, _ in false })
             }
-            expect(errorOf(declined) == .identityChanged && rig.fake.lines("grants").isEmpty && rig.fake.lines("offers").isEmpty
+            expect(errorOf(declined) == .identityChanged && rig.fake.read("scope") == "0"
+                && rig.fake.lines("grants").isEmpty && rig.fake.lines("offers").isEmpty
                 && rig.store.all().first?.fingerprint == again?.machine.fingerprint,
-                "SSH reapprove: a changed responderStatic that is not accepted approves nothing and keeps the record")
+                "SSH reapprove: a changed responderStatic that is not accepted approves neither the scope nor a grant and keeps the record")
             rig.fake.put("pending", "") // the declined attempt's pending record is not this one
             let accepted = value(blocking { [coordinator = rig.coordinator] in
                 try await coordinator.reapprove(id: machine.id, confirm: { _ in true }, confirmIdentityChange: { _, _ in true })
@@ -741,12 +773,13 @@ enum SSHRemoteSelfTest {
         let exactLines = decode((0..<SSHDisclosure.maxLines).map { ("n\($0)", "v") })
         let longValue = decode([("Home", String(repeating: "x", count: SSHDisclosure.maxValue + 1))])
         let exactValue = decode([("Home", String(repeating: "x", count: SSHDisclosure.maxValue))])
+        let tabbed = decode([("Home", "/a\\tb")])
         let longName = decode([(String(repeating: "n", count: SSHDisclosure.maxName + 1), "v")])
         expect(ok?.truncated == false && exactLines?.truncated == false && exactValue?.truncated == false
             && manyLines?.truncated == true && manyLines?.lines.count == SSHDisclosure.maxLines
             && longValue?.truncated == true && longValue?.lines.first?.value.count == SSHDisclosure.maxValue
-            && longName?.truncated == true,
-            "SSH disclosure: more than 64 lines, a name over 64 or a value over 512 characters carries the truncated flag; the limits themselves do not")
+            && longName?.truncated == true && tabbed?.truncated == true,
+            "SSH disclosure: more than 64 lines, a name over 64 or a value over 512 characters, or text changed by cleaning, carries the truncated flag; the limits themselves do not")
 
         if let rig = Rig() {
             defer { rig.cleanup() }
@@ -786,7 +819,8 @@ enum SSHRemoteSelfTest {
             && hasOption(tunnel, "SessionType=none") && !hasOption(tunnel, "SessionType=default")
             && Array(oneShot.prefix(SSHRunner.fixedOptions.count)) == SSHRunner.fixedOptions
             && Array(tunnel.prefix(SSHRunner.fixedOptions.count)) == SSHRunner.fixedOptions
-            && tunnel.contains("-N") && !hasOption(tunnel, "ClearAllForwardings=yes"),
+            && tunnel.contains("-N") && !hasOption(tunnel, "ClearAllForwardings=yes")
+            && hasOption(oneShot, "StdinNull=no") && !hasOption(tunnel, "StdinNull=no"),
             "SSH options: every call pins NoHostAuthenticationForLocalhost, ForkAfterAuthentication and RemoteCommand; a tunnel has SessionType=none, a command SessionType=default")
 
         // The ssh that ships with macOS must accept every one of them.

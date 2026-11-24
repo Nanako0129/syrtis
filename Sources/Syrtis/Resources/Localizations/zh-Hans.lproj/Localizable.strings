@@ -952,10 +952,10 @@
 "Pairing failed (%@)." = "配对失败（%@）。";
 "The machine's identity changed and wasn't accepted." = "机器的身份有变，且未被接受。";
 "Cancelled." = "已取消。";
-"The scan scope is too long to review in full, so it wasn't approved." = "扫描范围太长，无法完整查看，所以没有批准。";
+"The scan scope can't be shown in full, so it wasn't approved." = "扫描范围无法完整显示，所以没有批准。";
 "The agent was installed just now. Cancel uninstalls it again." = "agent 是刚才安装的。取消会再把它卸载。";
 "An agent was already installed there, so it was stopped, replaced and restarted. Cancel restarts it; the old build is not restored." = "那边原本已有 agent，已停止、替换并重新启动。取消只会让它重新启动，不会还原旧版本。";
 "The agent there wasn't running, so it was started. Cancel stops it again." = "那边的 agent 原本没在运行，已启动。取消会再把它停止。";
 "The agent there is already running and was left as it is." = "那边的 agent 已在运行，保持原状。";
-"This list was cut off (over 64 lines or 512 characters). The approval covers all of it, so it can't be approved until it can be shown in full." = "这份清单被截断了（超过 64 行或 512 字）。批准涵盖全部内容，所以无法完整显示时不能批准。";
+"This list was cut off or changed for display (over 64 lines or 512 characters, or it had control characters). The approval covers all of it, so it can't be approved until it can be shown in full." = "这份清单被截断或改动过（超过 64 行或 512 字，或含有控制字符）。批准涵盖全部内容，所以无法完整显示时不能批准。";
 "Other devices (%lld) still use the agent there, so it was left installed." = "还有其他设备（%lld）在使用那边的 agent，所以保留未卸载。";

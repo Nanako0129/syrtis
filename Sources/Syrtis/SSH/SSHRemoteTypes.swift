@@ -537,7 +537,7 @@ struct SSHDisclosure: Equatable, Sendable {
         func bound(_ text: String, _ limit: Int) -> String {
             let clean = String(String.UnicodeScalarView(
                 text.unicodeScalars.filter { !CharacterSet.controlCharacters.contains($0) }))
-            if clean.count > limit { cut = true }
+            if clean.count > limit || clean != text { cut = true }
             return String(clean.prefix(limit))
         }
         let lines = wire.lines.prefix(Self.maxLines).map {

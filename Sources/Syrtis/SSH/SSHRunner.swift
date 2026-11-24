@@ -60,8 +60,11 @@ struct SSHRunner: Sendable {
         "-o", "RemoteCommand=none",
     ]
     /// One-shot commands only: a `-L` on the tunnel would be cleared by this.
-    /// `SessionType=default` runs our command even if the config asks for none.
-    static let oneShotOptions: [String] = ["-o", "ClearAllForwardings=yes", "-o", "SessionType=default"]
+    /// `SessionType=default` runs our command even if the config asks for none;
+    /// `StdinNull=no` keeps the deploy upload connected to stdin.
+    static let oneShotOptions: [String] = [
+        "-o", "ClearAllForwardings=yes", "-o", "SessionType=default", "-o", "StdinNull=no",
+    ]
     static let tunnelOptions: [String] = [
         "-N",
         "-o", "SessionType=none",

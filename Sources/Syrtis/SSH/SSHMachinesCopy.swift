@@ -66,14 +66,14 @@ enum SSHMachinesCopy {
     static let errPairing = "Pairing failed (%@)."
     static let errIdentity = "The machine's identity changed and wasn't accepted."
     static let errCancelled = "Cancelled."
-    static let errTruncated = "The scan scope is too long to review in full, so it wasn't approved."
+    static let errTruncated = "The scan scope can't be shown in full, so it wasn't approved."
     static let errOther = "Something went wrong. Try again."
 
     static let agentInstalled = "The agent was installed just now. Cancel uninstalls it again."
     static let agentReplaced = "An agent was already installed there, so it was stopped, replaced and restarted. Cancel restarts it; the old build is not restored."
     static let agentStarted = "The agent there wasn't running, so it was started. Cancel stops it again."
     static let agentUnchanged = "The agent there is already running and was left as it is."
-    static let scopeTruncated = "This list was cut off (over 64 lines or 512 characters). The approval covers all of it, so it can't be approved until it can be shown in full."
+    static let scopeTruncated = "This list was cut off or changed for display (over 64 lines or 512 characters, or it had control characters). The approval covers all of it, so it can't be approved until it can be shown in full."
     static let manualNotice = "Syrtis couldn't finish this on the machine. To finish it yourself, run:\n%@"
     static let purgeSkipped = "Other devices (%lld) still use the agent there, so it was left installed."
 

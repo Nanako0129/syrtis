@@ -17,7 +17,7 @@ final class SSHMachines: @unchecked Sendable {
     func all() -> [SSHMachine] {
         lock.lock()
         defer { lock.unlock() }
-        return loadMachines()
+        return (try? loadMachines()) ?? []
     }
 
     func machine(id: UUID) -> SSHMachine? { all().first { $0.id == id } }
@@ -28,7 +28,7 @@ final class SSHMachines: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         guard let clean = machine.validated() else { throw SSHRemoteError.invalidInput("machine") }
-        var list = loadMachines()
+        var list = try loadMachines()
         guard !list.contains(where: {
             $0.id == clean.id
                 || ($0.user == clean.user && $0.host == clean.host && $0.sshPort == clean.sshPort)
@@ -44,7 +44,7 @@ final class SSHMachines: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         guard let clean = machine.validated() else { throw SSHRemoteError.invalidInput("machine") }
-        var list = loadMachines()
+        var list = try loadMachines()
         guard let index = list.firstIndex(where: { $0.id == clean.id }) else {
             throw SSHRemoteError.invalidInput("machine")
         }
@@ -55,15 +55,23 @@ final class SSHMachines: @unchecked Sendable {
     func remove(id: UUID) {
         lock.lock()
         defer { lock.unlock() }
-        saveMachines(loadMachines().filter { $0.id != id })
+        if let list = try? loadMachines() { saveMachines(list.filter { $0.id != id }) }
     }
 
-    private func loadMachines() -> [SSHMachine] {
-        guard let data = defaults.data(forKey: Self.machinesKey),
-              let raw = try? JSONDecoder().decode([SSHMachine].self, from: data)
-        else { return [] }
+    /// A record that does not decode is skipped. A store that is not a list at
+    /// all throws, so a write never replaces it with an empty one.
+    private func loadMachines() throws -> [SSHMachine] {
+        guard let data = defaults.data(forKey: Self.machinesKey) else { return [] }
+        guard let raw = try? JSONDecoder().decode([Lossy].self, from: data) else {
+            throw SSHRemoteError.invalidInput("saved machines")
+        }
         var seen: Set<Int> = []
-        return raw.compactMap { $0.validated() }.filter { seen.insert($0.localPort).inserted }
+        return raw.compactMap { $0.machine?.validated() }.filter { seen.insert($0.localPort).inserted }
+    }
+
+    private struct Lossy: Decodable {
+        let machine: SSHMachine?
+        init(from decoder: Decoder) { machine = try? SSHMachine(from: decoder) }
     }
 
     private func saveMachines(_ list: [SSHMachine]) {
