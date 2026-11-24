@@ -57,12 +57,8 @@ struct SSHCtl: SSHRemoteControl {
         case .cancelled: throw SSHRemoteError.cancelled
         case .exited(0): return result.stdout
         case .exited(255):
+            if SSHInput.saysHostKeyRejected(result.stderr) { throw SSHRemoteError.hostKeyRejected }
             let line = SSHInput.firstLine(result.stderr)
-            let lowered = line.lowercased()
-            if lowered.contains("host key verification failed")
-                || lowered.contains("remote host identification has changed") {
-                throw SSHRemoteError.hostKeyRejected
-            }
             sshLog.error("ssh failed: \(line, privacy: .private)")
             throw SSHRemoteError.unreachable(line)
         case .exited(127): throw SSHRemoteError.agentMissing

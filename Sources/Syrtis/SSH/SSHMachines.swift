@@ -95,17 +95,26 @@ final class SSHMachines: @unchecked Sendable {
 }
 
 enum SSHPorts {
-    /// A real `bind` on 127.0.0.1:port, closed again. False when the port is
-    /// held (by anything, including a running forward of ours).
+    /// Real `bind`s on 127.0.0.1:port and on 0.0.0.0:port, closed again, both
+    /// with `SO_REUSEADDR` so a port left only in TIME_WAIT counts as free.
+    /// False when either is held (by anything, including a running forward of
+    /// ours): on XNU `SO_REUSEADDR` lets 127.0.0.1 bind beside a `*:port`
+    /// listener, which the wildcard bind catches.
     static func canBindLoopback(_ port: Int) -> Bool {
+        canBind(port, host: "127.0.0.1") && canBind(port, host: "0.0.0.0")
+    }
+
+    private static func canBind(_ port: Int, host: String) -> Bool {
         let fd = socket(AF_INET, SOCK_STREAM, 0)
         guard fd >= 0 else { return false }
         defer { close(fd) }
+        var one: Int32 = 1
+        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, socklen_t(MemoryLayout<Int32>.size))
         var address = sockaddr_in()
         address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
         address.sin_family = sa_family_t(AF_INET)
         address.sin_port = in_port_t(UInt16(truncatingIfNeeded: port)).bigEndian
-        address.sin_addr = in_addr(s_addr: inet_addr("127.0.0.1"))
+        address.sin_addr = in_addr(s_addr: inet_addr(host))
         let result = withUnsafePointer(to: &address) {
             $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
                 bind(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size))

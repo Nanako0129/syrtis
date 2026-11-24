@@ -7,8 +7,10 @@ import TokenBarCore
 extension SSHRemoteSelfTest {
     private static let host = "box.example"
 
-    private static func add(_ rig: Rig, confirm: @escaping SSHConsent = { _ in true }, cancel: SSHCancellation = SSHCancellation())
-        -> Result<SSHMachine, Error> {
+    private static func add(
+        _ rig: Rig, confirm: @escaping SSHConsent = { _ in true }, cancel: SSHCancellation = SSHCancellation(),
+        host: String = Self.host
+    ) -> Result<SSHMachine, Error> {
         blocking { [coordinator = rig.coordinator] in
             try await coordinator.add(user: "me", host: host, label: nil, confirm: confirm, cancel: cancel)
         }
@@ -41,6 +43,18 @@ extension SSHRemoteSelfTest {
         expect(alone?.purgeSkippedGrants == nil && rig.fake.lines("log").contains("uninstall --purge")
             && rig.fake.lines("log").contains("shutdown"),
             "SSH purge: once our own grant is revoked and none is left the agent is shut down and uninstalled with --purge")
+
+        // The purge itself exits 7: its error and detail are kept, and rerunning it is the one command left.
+        rig.fake.seed(running: true, sharing: true, scope: true, host: "127.0.0.1", port: 47777)
+        rig.fake.setMode("purge-7")
+        let leftover = purge(at: "box3.example")
+        rig.fake.setMode(nil)
+        let detail = "syrtis-agent ctl: uninstall left objects for a manual repair: state"
+        let rerun = (try? SSHTarget(user: "me", host: "box3.example")).map { SSHManualCommands.lines([.uninstall(purge: true)], on: $0) }
+        expect(leftover?.error == .ctl(code: 7, detail: detail) && leftover?.manualCommands == rerun && rerun?.count == 1
+            && !rig.store.all().contains { $0.host == "box3.example" }
+            && leftover.flatMap(SSHMachinesModel.removeNotice)?.contains(detail) == true,
+            "SSH purge: an uninstall that exits 7 keeps its detail, lists only the purge to rerun, removes the machine here, and the notice shows the detail")
     }
 
     // MARK: Undo in the same flow
@@ -133,6 +147,67 @@ extension SSHRemoteSelfTest {
                 ? (text.contains("ctl status") && text.contains("sharing off") && rig.fake.lines("grants").count == 2)
                 : (incomplete(result) == nil && errorOf(result) == .timedOut && rig.fake.lines("grants").isEmpty),
                 "SSH rollback: a lost approval with sharing \(sharing ? "on is handed to the owner as commands" : "off is ended by sharing off")")
+        }
+
+        // The approval exits 6 (no valid reply) after the grant was added: it may have gone through.
+        if let rig = Rig() {
+            defer { rig.cleanup() }
+            rig.fake.seed(running: true, sharing: true, scope: true, host: "127.0.0.1", port: 47777, grants: [other])
+            rig.fake.setMode("approve-6")
+            let result = add(rig)
+            rig.fake.setMode(nil)
+            let text = (incomplete(result)?.commands ?? []).joined(separator: "\n")
+            var cause6 = false
+            if case .ctl(6, _)? = incomplete(result)?.cause as? SSHRemoteError { cause6 = true }
+            expect(cause6 && text.contains("ctl status") && text.contains("sharing off") && rig.fake.lines("grants").count == 2,
+                "SSH rollback: an approval answered with exit 6 may have gone through, so status and sharing off are handed to the owner")
+        }
+
+        // `sharing on` refused (someone turned it on after the baseline): not ours, so it is not turned off.
+        if let rig = Rig() {
+            defer { rig.cleanup() }
+            rig.fake.seed(running: true, sharing: false, scope: true)
+            let result = add(rig, confirm: { [fake = rig.fake] _ in
+                fake.put("sharing", "on")
+                return true
+            })
+            var refused = false
+            if case .ctl(5, _)? = errorOf(result) { refused = true }
+            expect(refused && !rig.fake.lines("log").contains("sharing-off") && rig.fake.read("sharing") == "on",
+                "SSH rollback: a refused sharing on leaves sharing as someone else set it")
+        }
+
+        // `sharing on` applied but its answer lost: the rollback turns it off.
+        if let rig = Rig(callTimeout: 3) {
+            defer { rig.cleanup() }
+            rig.fake.seed(running: true, sharing: false, scope: true)
+            rig.fake.setMode("sharing-hang")
+            let result = add(rig)
+            rig.fake.setMode(nil)
+            expect(errorOf(result) == .timedOut && rig.fake.lines("log").contains("sharing-off") && rig.fake.read("sharing") == "off",
+                "SSH rollback: a sharing on whose answer is lost is turned off again")
+        }
+
+        // A re-approval that fails after a claim retry moved the forward: the saved forward comes back.
+        if let rig = Rig() {
+            defer { rig.cleanup() }
+            rig.fake.seed(running: true, sharing: true, scope: true)
+            if let original = value(add(rig)) {
+                rig.fake.put("host", "") // no listener: the saved port is listened on first
+                rig.fake.put("grants", "")
+                rig.local.failClaims = 1
+                rig.local.pendingSas = "0000-1111"
+                let result = blocking { [coordinator = rig.coordinator] in
+                    try await coordinator.reapprove(id: original.id, confirm: { _ in true }, confirmIdentityChange: { _, _ in true })
+                }
+                let moved = rig.tunnels.started.contains { $0.id == original.id && $0.remotePort != original.remotePort }
+                let kept = moved && rig.tunnels.started.last == original && !rig.tunnels.stopped.contains(original.id)
+                    && rig.store.all() == [original] && errorOf(result) != nil
+                // A failed add still stops its forward.
+                _ = add(rig, confirm: { _ in true }, host: "box2.example")
+                expect(kept && rig.tunnels.stopped.count == 1 && rig.tunnels.stopped.last == rig.tunnels.started.last?.id,
+                    "SSH rollback: a failed re-approval restarts the saved forward (its remote port); a failed add stops its own")
+            } else { expect(false, "SSH rollback: re-approve setup") }
         }
     }
 

@@ -93,9 +93,9 @@ struct SSHReapproveResult: Sendable {
 }
 
 struct SSHRemoveResult: Sendable {
-    /// Steps on the machine that did not run (it could not be reached, or the
-    /// agent refused), as lines to paste into a terminal. The machine is gone
-    /// from this Mac either way.
+    /// Steps on the machine that did not run (it could not be reached, the
+    /// agent refused, or a purge left something), as lines to paste into a
+    /// terminal. The machine is gone from this Mac either way.
     let manualCommands: [String]
     let error: SSHRemoteError?
     /// A purge was asked for but this many other devices still hold a grant
@@ -167,10 +167,13 @@ final class SSHMachineCoordinator: @unchecked Sendable {
         /// An approval may have gone through without its id reaching this Mac.
         var grantUnknown = false
         var tunnelTouched = false
+        /// The saved record before a re-approval (nil for an add): its forward is what a rollback restores.
+        let original: SSHMachine?
 
-        init(target: SSHTarget, machineId: UUID) {
+        init(target: SSHTarget, machineId: UUID, original: SSHMachine? = nil) {
             self.target = target
             self.machineId = machineId
+            self.original = original
         }
     }
 
@@ -267,7 +270,7 @@ final class SSHMachineCoordinator: @unchecked Sendable {
         guard let original = deps.store.machine(id: id) else { throw SSHRemoteError.invalidInput("machine") }
         let target = try original.target()
         let remote = deps.makeRemote(target, cancel)
-        let flow = Flow(target: target, machineId: id)
+        let flow = Flow(target: target, machineId: id, original: original)
         do {
             return try await reapproveSteps(
                 flow: flow, remote: remote, original: original, target: target,
@@ -368,7 +371,9 @@ final class SSHMachineCoordinator: @unchecked Sendable {
                 if purge {
                     if status.activeGrantCount == 0 {
                         try? remote.shutdown()
-                        try remote.uninstall(purge: true)
+                        do { try remote.uninstall(purge: true) } catch SSHRemoteError.ctl(code: 7, let detail) {
+                            throw PurgeLeftover(detail: detail)
+                        }
                         startedHere = false
                     } else {
                         skipped = status.activeGrantCount
@@ -378,6 +383,11 @@ final class SSHMachineCoordinator: @unchecked Sendable {
                 return skipped
             }
             return SSHRemoveResult(manualCommands: [], error: nil, purgeSkippedGrants: skipped)
+        } catch let leftover as PurgeLeftover {
+            // The agent is stopped and its grants are gone: rerunning the purge is all that is left.
+            return SSHRemoveResult(
+                manualCommands: SSHManualCommands.lines([.uninstall(purge: true)], on: target),
+                error: .ctl(code: 7, detail: leftover.detail))
         } catch {
             // Purge ends other devices' access too: it follows only a status that shows no grants.
             var lines = SSHManualCommands.lines((grantId.map { [.grantRevoke(grantId: $0)] } ?? []) + (purge ? [.status] : []), on: target)
@@ -390,6 +400,9 @@ final class SSHMachineCoordinator: @unchecked Sendable {
                 error: (error as? SSHRemoteError) ?? .unreachable(""))
         }
     }
+
+    /// `uninstall --purge` exited 7: it left something, or a safety check stopped it.
+    private struct PurgeLeftover: Error { let detail: String }
 
     // MARK: Pairing
 
@@ -406,12 +419,14 @@ final class SSHMachineCoordinator: @unchecked Sendable {
 
     private struct Outcome: Sendable { let machine: SSHMachine }
 
-    /// After `approvePending` failed: the agent may have approved before the
-    /// answer was lost. An answer from the agent (`ctl` exit) means it did not.
-    private static func mayHaveApproved(_ error: Error) -> Bool {
+    /// After a changing call (`pending approve`, `sharing on`) failed: the agent
+    /// may have applied it before the answer was lost. `ctl` 6 (no valid reply)
+    /// and 7 (may have taken effect) say so too; any other `ctl` exit is a refusal.
+    private static func mayHaveApplied(_ error: Error) -> Bool {
         guard let error = error as? SSHRemoteError else { return true }
         switch error {
         case .timedOut, .cancelled, .outputLimit, .malformedOutput, .unreachable: return true
+        case .ctl(code: 6, _), .ctl(code: 7, _): return true
         default: return false
         }
     }
@@ -436,8 +451,14 @@ final class SSHMachineCoordinator: @unchecked Sendable {
                 try await io { try remote.approveScope(digest: disclosure.digest) }
             }
             if !baseline.sharingEnabled {
-                flow.sharingOn = true
-                try await io { try remote.setSharing(true) }
+                do {
+                    try await io { try remote.setSharing(true) }
+                    flow.sharingOn = true
+                } catch {
+                    // A refusal changed nothing; sharing that someone else turned on is not ours to turn off.
+                    if Self.mayHaveApplied(error) { flow.sharingOn = true }
+                    throw error
+                }
             }
             try check(cancel)
 
@@ -511,7 +532,7 @@ final class SSHMachineCoordinator: @unchecked Sendable {
                 pendingId = try await io { try remote.approvePending(sas: sas) }
             } catch {
                 // The id comes only with the answer; without it the grant cannot be named.
-                if Self.mayHaveApproved(error) { flow.grantUnknown = true }
+                if Self.mayHaveApplied(error) { flow.grantUnknown = true }
                 throw error
             }
             guard let grantId = SSHGrantId.derive(pendingId: pendingId) else {
@@ -557,7 +578,11 @@ final class SSHMachineCoordinator: @unchecked Sendable {
     /// wrapped with the commands to run by hand, and after a lost connection the
     /// remaining steps are listed without trying them.
     private func rollback(_ flow: Flow, after error: Error) async -> Error {
-        if flow.tunnelTouched { deps.tunnels.stop(id: flow.machineId) }
+        if flow.tunnelTouched {
+            // A re-approval may have moved the forward to another remote port: the saved one comes back.
+            if let original = flow.original, original.enabled { deps.tunnels.start(original) }
+            else { deps.tunnels.stop(id: flow.machineId) }
+        }
         let remote = deps.makeRemote(flow.target, nil)
         let sharingWasOff = flow.baseline.map { !$0.sharingEnabled } ?? false
         var owed: [SSHCtlCommand] = []

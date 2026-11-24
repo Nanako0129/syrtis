@@ -46,6 +46,7 @@ enum SSHRemoteSelfTest {
         runner(fake, expect)
         deploy(fake, expect)
         machines(expect)
+        portProbeChecks(expect)
         flows(expect)
         purgeChecks(expect)
         rollbackFlows(expect)
@@ -284,6 +285,19 @@ enum SSHRemoteSelfTest {
         expect(errorOf(blockingSync { try ctl.deploy(binaryFor: { _ in url }, pin: wrongPin) }) == .integrity
             && fake.invocations.count == mark + 2 && fake.read("log").isEmpty,
             "SSH deploy: a binary that does not match the pin is not uploaded")
+
+        // A binary the loader refuses with exit 1 (not a `ctl` status) is the same error as 126 and 127, with its line.
+        let stale = fake.dir.appendingPathComponent("agent-old-glibc")
+        try? "#!/bin/sh\necho \"a: version GLIBC_2.35 not found\" >&2\nexit 1\n".write(to: stale, atomically: true, encoding: .utf8)
+        try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: stale.path)
+        fake.seed(running: false)
+        if let stalePin = try? SSHAgentPin.sha256(of: stale) {
+            expect(errorOf(blockingSync { try ctl.deploy(binaryFor: { _ in stale }, pin: stalePin) })
+                == .agentCannotRun("a: version GLIBC_2.35 not found") && fake.read("running").isEmpty,
+                "SSH deploy: a binary that cannot run on the machine is reported as that, with the line it printed, and nothing is started")
+        } else {
+            expect(false, "SSH deploy: the stale-glibc fixture has a sha256")
+        }
 
         // uname answers: ../x, other arch.
         let remoteUname = { (answer: String) -> Result<String, Error> in
@@ -704,8 +718,81 @@ enum SSHRemoteSelfTest {
         expect(later == .up, "SSH tunnel: once the port is free the same port comes up")
         supervisor.stop(id: busy.id)
 
+        // A rejected host key: OpenSSH says why first, "verification failed" last; the row still names it.
+        fake.setMode("tunnel-hostkey")
+        let keyed = SSHMachine(
+            id: UUID(), label: "k", user: "me", host: "box.example", sshPort: 22, remotePort: 47500,
+            localPort: lport, producerStatic: nil, fingerprint: nil, grantId: nil, enabled: true)
+        supervisor.start(keyed)
+        var keyState = supervisor.status(id: keyed.id)
+        for _ in 0..<100 {
+            if case .backoff = keyState { break }
+            Thread.sleep(forTimeInterval: 0.05)
+            keyState = supervisor.status(id: keyed.id)
+        }
+        supervisor.stop(id: keyed.id)
+        fake.setMode(nil)
+        var backedOff = false
+        if case .backoff = keyState { backedOff = true }
+        let keyRow = SSHMachinesModel.Row(machine: keyed, tunnel: keyState, needsReapproval: false)
+        expect(backedOff && SSHMachinesModel.hostKeyCommand(keyRow) != nil,
+               "SSH tunnel: a host key failure after another stderr line is still shown as a host key problem (\(keyState))")
+
         // Stale processes: only the same uid with the exact argv are ended.
         reapChecks(fake, expect)
+    }
+
+    // MARK: Port probe
+
+    /// `canBindLoopback`: TIME_WAIT alone is free; a listener on loopback or on the wildcard is not.
+    private static func portProbeChecks(_ expect: Expect) {
+        /// A socket bound to host:port (0: any), listening when asked; -1 when the bind fails.
+        func bound(_ host: String, _ port: Int, listening: Bool) -> (fd: Int32, port: Int) {
+            let fd = socket(AF_INET, SOCK_STREAM, 0)
+            var address = sockaddr_in()
+            address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+            address.sin_family = sa_family_t(AF_INET)
+            address.sin_port = in_port_t(UInt16(port)).bigEndian
+            address.sin_addr = in_addr(s_addr: inet_addr(host))
+            var size = socklen_t(MemoryLayout<sockaddr_in>.size)
+            let ok = withUnsafeMutablePointer(to: &address) {
+                $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                    bind(fd, $0, size) == 0 && (!listening || listen(fd, 1) == 0) && getsockname(fd, $0, &size) == 0
+                }
+            }
+            if !ok { close(fd); return (-1, port) }
+            return (fd, Int(UInt16(bigEndian: address.sin_port)))
+        }
+        let wildcard = bound("0.0.0.0", 0, listening: true)
+        let loopback = bound("127.0.0.1", 0, listening: true)
+        let wildcardHeld = wildcard.fd >= 0 && !SSHPorts.canBindLoopback(wildcard.port)
+        let loopbackHeld = loopback.fd >= 0 && !SSHPorts.canBindLoopback(loopback.port)
+        close(wildcard.fd)
+        close(loopback.fd)
+
+        // TIME_WAIT on the listener's port: the accepted side closes first, then the client, then the listener.
+        let server = bound("127.0.0.1", 0, listening: true)
+        let client = socket(AF_INET, SOCK_STREAM, 0)
+        var target = sockaddr_in()
+        target.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        target.sin_family = sa_family_t(AF_INET)
+        target.sin_port = in_port_t(UInt16(server.port)).bigEndian
+        target.sin_addr = in_addr(s_addr: inet_addr("127.0.0.1"))
+        let connected = withUnsafePointer(to: &target) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { connect(client, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) }
+        } == 0
+        let accepted = accept(server.fd, nil, nil)
+        close(accepted)
+        Thread.sleep(forTimeInterval: 0.1)
+        close(client)
+        close(server.fd)
+        Thread.sleep(forTimeInterval: 0.1)
+        // Control: without SO_REUSEADDR the port does not bind, so TIME_WAIT is really there.
+        let plain = bound("127.0.0.1", server.port, listening: false)
+        if plain.fd >= 0 { close(plain.fd) }
+        let timeWaitFree = SSHPorts.canBindLoopback(server.port)
+        expect(wildcardHeld && loopbackHeld && connected && accepted >= 0 && plain.fd < 0 && timeWaitFree,
+               "SSH ports: a port only in TIME_WAIT binds; a listener on 127.0.0.1 or on 0.0.0.0 holds it (wildcard \(wildcardHeld), loopback \(loopbackHeld), time-wait control \(plain.fd < 0), free \(timeWaitFree))")
     }
 
     private final class HeldPort: @unchecked Sendable {

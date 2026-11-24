@@ -301,7 +301,10 @@ final class SSHTunnelSupervisor: SSHTunnelControlling, @unchecked Sendable {
             try? FileManager.default.removeItem(at: pidFile(machine.id))
             if entry.isStopping { break }
             if let upSince, Date().timeIntervalSince(upSince) >= options.stableAfter { attempt = 0 }
-            let line = SSHInput.firstLine(tail.data)
+            // The host key line, when there is one, so the row can name the cause.
+            let line = String(decoding: tail.data, as: UTF8.self).split(whereSeparator: \.isNewline)
+                .first { SSHInput.saysHostKeyRejected(String($0)) }
+                .map { SSHInput.redacted(String($0)) } ?? SSHInput.firstLine(tail.data)
             if line.lowercased().contains("address already in use") {
                 set(entry, .portInUse(machine.localPort))
             } else {

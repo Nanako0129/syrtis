@@ -161,6 +161,18 @@ enum SSHInput {
         let line = text.split(whereSeparator: \.isNewline).first.map(String.init) ?? ""
         return redacted(line)
     }
+
+    /// True when ssh's stderr, any line of it, says the host key was rejected
+    /// (OpenSSH prints why on the line before "verification failed").
+    static func saysHostKeyRejected(_ text: String) -> Bool {
+        let lowered = text.lowercased()
+        return lowered.contains("host key verification failed")
+            || lowered.contains("remote host identification has changed")
+    }
+
+    static func saysHostKeyRejected(_ data: Data) -> Bool {
+        saysHostKeyRejected(String(decoding: data, as: UTF8.self))
+    }
 }
 
 // MARK: Machine and target
@@ -291,7 +303,8 @@ struct SSHRemoteCommand: Equatable, Sendable {
     /// Upload from stdin, hash, install, start, clean up. `pin` is 64 lowercase
     /// hex (checked here). The temp directory is 0700 under `$HOME` and never
     /// reported back. Exit 70 mktemp, 71 upload, 72 hash mismatch, 73 the binary
-    /// cannot run here (`ctl install` exited 126 or 127, e.g. a loader error; the
+    /// cannot run here (`ctl install` exited 1, 126 or 127, none of them a `ctl`
+    /// status, e.g. a loader error; the
     /// first line of its stderr is passed on), else `ctl install`'s status; stdout is `ctl install`'s frame.
     static func deploy(pin: String) throws -> SSHRemoteCommand {
         guard SSHInput.isDigest(pin) else { throw SSHRemoteError.invalidInput("pin") }
@@ -307,8 +320,8 @@ struct SSHRemoteCommand: Equatable, Sendable {
             "i=0",
             "while [ $i -lt 20 ]; do OUT=$(\"$T/a\" ctl install 2>\"$T/e\"); rc=$?; "
                 + "[ $rc -eq 9 ] || break; i=$((i+1)); sleep 1; done",
-            "case $rc in 126|127) head -n 1 \"$T/e\" >&2; exit 73;; esac",
-            "[ $rc -eq 0 ] || exit $rc",
+            "case $rc in 1|126|127) head -n 1 \"$T/e\" >&2; exit 73;; esac",
+            "[ $rc -eq 0 ] || { head -n 1 \"$T/e\" >&2; exit $rc; }",
             startFragment,
             "printf \"%s\\n\" \"$OUT\"",
         ].joined(separator: "; ")

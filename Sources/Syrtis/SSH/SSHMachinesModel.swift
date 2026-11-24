@@ -168,12 +168,7 @@ final class SSHMachinesModel: ObservableObject {
         Task {
             defer { working = false }
             do {
-                let result = try await runtime.coordinator.remove(id: id, purge: purge)
-                if !result.manualCommands.isEmpty {
-                    notice = SSHMachinesCopy.manualNotice.localized(result.manualCommands.joined(separator: "\n"))
-                } else if let others = result.purgeSkippedGrants {
-                    notice = SSHMachinesCopy.purgeSkipped.localized(others)
-                }
+                notice = Self.removeNotice(try await runtime.coordinator.remove(id: id, purge: purge))
             } catch {
                 notice = Self.message(for: error, command: nil)
             }
@@ -264,8 +259,20 @@ final class SSHMachinesModel: ObservableObject {
         return "ssh -p \(port) \(destination)"
     }
 
+    /// What a finished remove shows: its error (with the agent's detail), then
+    /// the commands left to run by hand; or the skipped purge; or nothing.
+    nonisolated static func removeNotice(_ result: SSHRemoveResult) -> String? {
+        let error = result.error.map { message(for: $0, command: nil) }
+        if !result.manualCommands.isEmpty {
+            let manual = SSHMachinesCopy.manualNotice.localized(result.manualCommands.joined(separator: "\n"))
+            return error.map { $0 + "\n" + manual } ?? manual
+        }
+        if let error { return error }
+        return result.purgeSkippedGrants.map { SSHMachinesCopy.purgeSkipped.localized($0) }
+    }
+
     /// Fixed copy; remote text (stderr first line, a ctl detail) only as an argument.
-    static func message(for error: Error, command: String?) -> String {
+    nonisolated static func message(for error: Error, command: String?) -> String {
         typealias C = SSHMachinesCopy
         if let incomplete = error as? SSHRollbackIncomplete {
             return message(for: incomplete.cause, command: command) + "\n"
@@ -316,10 +323,7 @@ final class SSHMachinesModel: ObservableObject {
 
     /// The last ssh line of a backoff, when it says the host key is the cause.
     nonisolated static func hostKeyCommand(_ row: Row) -> String? {
-        guard case .backoff(_, _, let reason) = row.tunnel else { return nil }
-        let line = reason.lowercased()
-        guard line.contains("host key verification failed") || line.contains("identification has changed")
-        else { return nil }
+        guard case .backoff(_, _, let reason) = row.tunnel, SSHInput.saysHostKeyRejected(reason) else { return nil }
         return sshCommand(user: row.machine.user, host: row.machine.host, port: row.machine.sshPort)
     }
 

@@ -140,6 +140,7 @@ final class SSHFake: @unchecked Sendable {
         n=$(cat "$D/count" 2>/dev/null || echo 0); n=$((n+1)); echo $n > "$D/count"
         for a in "$@"; do printf '%s\n' "$a"; done > "$D/argv.$n"
         MODE=$(cat "$D/mode" 2>/dev/null)
+        HOSTKEY="No ED25519 host key is known for box.example and you have requested strict checking."
         tunnel=0; fwd=""
         prev=""
         for a in "$@"; do
@@ -149,6 +150,7 @@ final class SSHFake: @unchecked Sendable {
         done
         if [ $tunnel = 1 ]; then
           [ "$MODE" = "tunnel-fail" ] && { echo "ssh: connect to host h port 22: Connection refused" >&2; exit 255; }
+          [ "$MODE" = "tunnel-hostkey" ] && { printf '%s\n' "$HOSTKEY" "Host key verification failed." >&2; exit 255; }
           LP=${fwd#127.0.0.1:}; LP=${LP%%:*}
           exec nc -l 127.0.0.1 "$LP"
         fi
@@ -157,17 +159,20 @@ final class SSHFake: @unchecked Sendable {
           noisy) echo "Welcome to the fake rc";;
           flood) exec yes "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";;
           hang) exec sleep 60;;
-          hostkey) echo "Host key verification failed." >&2; exit 255;;
+          hostkey) printf '%s\n' "$HOSTKEY" "Host key verification failed." >&2; exit 255;;
           leak) echo "boom syrtis://secret/path?s=1 end" >&2; exit 255;;
           old2) echo "syrtis-agent: unknown argument: ctl" >&2; exit 2;;
           leak5) echo "syrtis-agent ctl: refused syrtis://secret/path?s=1" >&2; exit 5;;
         esac
-        if [ "$MODE" = approve-hang ]; then
-          case "$LAST" in *"pending approve"*)
+        # The command takes effect, then its answer is lost (hang) or comes back as exit 6.
+        case "$MODE:$LAST" in
+          approve-hang:*"pending approve"*|sharing-hang:*"sharing on"*|approve-6:*"pending approve"*)
             env HOME="\#(home)" PATH="\#(bin):/usr/bin:/bin:/usr/sbin:/sbin"\#(extraEnv) /bin/sh -c "$LAST" >/dev/null 2>&1
+            [ "$MODE" = approve-6 ] && { echo "syrtis-agent ctl: no valid reply came back; the command may have taken effect; run status" >&2; exit 6; }
             exec sleep 60;;
-          esac
-        fi
+          purge-7:*"uninstall --purge"*)
+            echo "syrtis-agent ctl: uninstall left objects for a manual repair: state" >&2; exit 7;;
+        esac
         exec env HOME="\#(home)" PATH="\#(bin):/usr/bin:/bin:/usr/sbin:/sbin"\#(extraEnv) /bin/sh -c "$LAST"
         """#
     }
