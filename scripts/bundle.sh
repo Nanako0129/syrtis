@@ -40,6 +40,16 @@ cp -R .build/release/Syrtis_Syrtis.bundle "$APP/Contents/Resources/"
 # stages the same .lproj directories from the SwiftPM resource bundle before
 # SwiftUI creates any views.
 cp -R Sources/Syrtis/Resources/Localizations/*.lproj "$APP/Contents/Resources/"
+# The Linux agent for SSH machines, when `make remote-agent` staged one (its
+# checksum file is written last, so only a complete staging is copied). Before
+# signing: the seal covers it.
+REMOTE_AGENT_STAGE=".build/remote-agent/x86_64-unknown-linux-gnu"
+if [ -f "$REMOTE_AGENT_STAGE/syrtis-agent" ] && [ -f "$REMOTE_AGENT_STAGE/syrtis-agent.sha256" ]; then
+  echo "==> bundling the remote agent ($(cut -c1-12 "$REMOTE_AGENT_STAGE/syrtis-agent.sha256"))"
+  mkdir -p "$APP/Contents/Resources/remote-agent/x86_64-unknown-linux-gnu"
+  cp "$REMOTE_AGENT_STAGE/syrtis-agent" "$REMOTE_AGENT_STAGE/syrtis-agent.sha256" \
+    "$APP/Contents/Resources/remote-agent/x86_64-unknown-linux-gnu/"
+fi
 # Brand icon, shared with the Tauri app.
 if [ -f assets/icon.icns ]; then
   cp assets/icon.icns "$APP/Contents/Resources/icon.icns"
