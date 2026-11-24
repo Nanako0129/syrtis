@@ -23115,6 +23115,86 @@ enum SelfTest {
                    "SA3B the devices rows decode with their state, label and unknown last success")
         }
 
+        // SSH machines section (plan P3): copy, row state and messages. No ssh runs.
+        do {
+            var sshMissing: [String] = []
+            for key in SSHMachinesCopy.all {
+                for locale in ["zh-Hant", "zh-Hans"] {
+                    let value = AppLanguage.localizedString(key, locale: locale, bundle: .tokenBarResources)
+                    if value == nil || (value == key && !["Remove %@?", "Something went wrong. Try again."].contains(key)) {
+                        sshMissing.append("\(locale): \(key.prefix(24))")
+                    }
+                }
+            }
+            expect(sshMissing.isEmpty, "SSH3 every SSH machines copy key resolves to a translation: \(sshMissing)")
+
+            let tmp = FileManager.default.temporaryDirectory.appendingPathComponent("syrtis-ssh-ui-\(UUID().uuidString)")
+            let suite = "syrtis.ssh.ui.\(UUID().uuidString)"
+            let defaults = UserDefaults(suiteName: suite)!
+            defer {
+                try? FileManager.default.removeItem(at: tmp)
+                defaults.removePersistentDomain(forName: suite)
+            }
+            let store = SSHMachines(defaults: defaults)
+            let key = String(repeating: "cd", count: 32)
+            let machine = SSHMachine(
+                id: UUID(), label: "box", user: "me", host: "box.example", sshPort: 2222, remotePort: 47500,
+                localPort: 47501, producerStatic: key, fingerprint: String(repeating: "ab", count: 8),
+                grantId: String(repeating: "01", count: 16), enabled: true)
+            try? store.add(machine)
+            let runtime = SSHRemoteRuntime(store: store, resources: tmp, stateDirectory: tmp)
+            func peerList(_ state: String) -> [RemotePeer] {
+                let json = #"[{"producerStatic":"\#(key)","fingerprint":"abababababababab","nodeLabel":null,"host":"127.0.0.1","port":47501,"createdAt":1,"expiresAt":2,"state":"\#(state)"}]"#
+                return (try? JSONDecoder().decode([RemotePeer].self, from: Data(json.utf8))) ?? []
+            }
+            final class Box: @unchecked Sendable { var peers: [RemotePeer]? }
+            let box = Box()
+            let model = awaitMainActorValue {
+                SSHMachinesModel(runtime: runtime, peersProvider: {
+                    guard let peers = box.peers else { throw SSHRemoteError.cancelled }
+                    return peers
+                }, hasAgent: { false }, notifications: NotificationCenter())
+            }
+            func needs() -> [Bool]? {
+                awaitMainActorValue { await model?.refresh(); return model?.rows.map(\.needsReapproval) ?? [] }
+            }
+            box.peers = nil
+            expect(needs() == [false], "SSH3 an unreadable peer list does not mark a machine as needing re-approval")
+            box.peers = []
+            expect(needs() == [true], "SSH3 a machine whose peer is gone needs re-approval")
+            box.peers = peerList("revoked")
+            expect(needs() == [true], "SSH3 a revoked peer needs re-approval")
+            box.peers = peerList("active")
+            expect(needs() == [false], "SSH3 an active peer needs nothing")
+            let noAgent = awaitMainActorValue { () -> String? in
+                model?.add(user: "me", host: "h", portText: "22", label: "")
+                return model?.notice
+            }
+            expect(noAgent == SSHMachinesCopy.noAgent && awaitMainActorValue { model?.working == false } == true,
+                   "SSH3 a build without the agent refuses to add, before any ssh call")
+            let incomplete = SSHMachinesModel.message(
+                for: SSHRollbackIncomplete(cause: SSHRemoteError.declined, commands: ["ssh -- me@box 'sh -c x'"]), command: nil)
+            expect(incomplete.contains(SSHMachinesCopy.errDeclined.localized) && incomplete.contains("ssh -- me@box 'sh -c x'"),
+                   "SSH3 a flow whose undo did not finish shows its error and the commands to run by hand")
+            let row = SSHMachinesModel.Row(
+                machine: machine, tunnel: .backoff(attempt: 1, retryIn: 4, reason: "Host key verification failed."),
+                needsReapproval: false)
+            expect(SSHMachinesModel.hostKeyCommand(row) == "ssh -p 2222 me@box.example"
+                && SSHMachinesModel.message(for: SSHRemoteError.hostKeyRejected, command: "ssh me@h").contains("ssh me@h")
+                && SSHMachinesModel.statusLine(row) == SSHMachinesCopy.retrying.localized(4),
+                "SSH3 a host key failure names the ssh command to run once; a backoff shows its retry time")
+            let unsafeText = SSHMachinesModel.message(
+                for: SSHRemoteError.unsafeRemoteDirs(["~/.local", "~/.config"]), command: "ssh -p 2222 me@box.example")
+            expect(unsafeText.contains("~/.local, ~/.config")
+                && unsafeText.contains("ssh -p 2222 me@box.example 'chmod go-w ~/.local ~/.config'")
+                && !unsafeText.contains("~/.local/bin"),
+                "SSH3 unsafe remote folders are listed with a copyable chmod command for only those paths")
+            expect(SSHMachinesModel.message(for: SSHRemoteError.portInUse(47501), command: nil)
+                    == SSHMachinesCopy.portBusy.localized(47501)
+                && SSHMachinesModel.hostKeyCommand(.init(machine: machine, tunnel: .up, needsReapproval: false)) == nil,
+                "SSH3 port-in-use has its fixed line; a running forward has no host key hint")
+        }
+
         // SA-3c: the Devices page's model, driven by a fake client and a fake
         // pasteboard (never the agent, never NSPasteboard.general).
         do {
@@ -25389,6 +25469,8 @@ enum SelfTest {
             DeviceOverlayState.retryDelaySeconds = 65
             DeviceOverlayState.freshWindowSeconds = 60
         }
+
+        SSHRemoteSelfTest.run { ok, label in expect(ok, label) }
 
         accountsDefaults.restore()
 
