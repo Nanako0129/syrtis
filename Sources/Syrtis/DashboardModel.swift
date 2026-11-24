@@ -3014,6 +3014,8 @@ extension DeviceOverlayResult {
     /// when the list could not be read: the menu hides and only this Mac's own
     /// path runs.
     private(set) var selectablePeers: [RemotePeer] = []
+    /// Every peer the last successful list held, to match SSH machines' keys.
+    @ObservationIgnored private var allPeers: [RemotePeer] = []
     private(set) var graph: DeviceOverlaySlot<UsagePayload>?
     private(set) var models: DeviceOverlaySlot<ModelReport>?
     private(set) var hourly: DeviceOverlaySlot<HourlyReport>?
@@ -3286,7 +3288,9 @@ extension DeviceOverlayResult {
         case .success(let list):
             selectablePeers = list.filter { $0.state == "active" }
             let listed = Set(list.map(\.fingerprint))
+            allPeers = list
             learnedNames = learnedNames.filter { listed.contains($0.key) }
+            applySSHNames()
             let known = Set(selectablePeers.map(\.producerStatic))
             var kept = stored.peers.filter(known.contains)
             // Checked devices that are no longer active: forgotten as "seen",
@@ -3327,6 +3331,7 @@ extension DeviceOverlayResult {
             }
         case .failure:
             selectablePeers = []
+            allPeers = []
         }
         if !includesRemote { clearOverlays() }
         republishIfActive()
@@ -3623,6 +3628,14 @@ extension DeviceOverlayResult {
                 learnedNames[row.id] = nil
             }
         }
+        applySSHNames()
+    }
+
+    /// An SSH machine's peer is named by the machine's label, never by its
+    /// tunnel address.
+    private func applySSHNames() {
+        let overlaid = SSHPeerNames.overlaid(learnedNames, machines: SSHMachines().all(), peers: allPeers)
+        if overlaid != learnedNames { learnedNames = overlaid }
     }
 
     /// The one place a linked device's name is chosen: the newest name a page

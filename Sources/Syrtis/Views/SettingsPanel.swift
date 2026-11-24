@@ -1820,12 +1820,24 @@ struct SettingsPanel: View {
         @ViewBuilder details: () -> some View,
         @ViewBuilder content: () -> some View
     ) -> some View {
+        infoSection(label, summary: summary, details: details, accessory: { EmptyView() }, content: content)
+    }
+
+    /// `accessory` sits at the right end of the header line (an "Add" button).
+    func infoSection(
+        _ label: String, summary: String,
+        @ViewBuilder details: () -> some View,
+        @ViewBuilder accessory: () -> some View,
+        @ViewBuilder content: () -> some View
+    ) -> some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 4) {
                 Text(label.localized.uppercased())
                     .font(.caption2.weight(.semibold))
                     .foregroundStyle(.tertiary)
                 SettingsInfoButton(section: label.localized, details: details())
+                Spacer()
+                accessory()
             }
             hint(summary)
             content()

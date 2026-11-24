@@ -82,6 +82,8 @@ enum RemoteAgentLaunch {
         Task.detached(priority: .utility) {
             do {
                 try start(home: homeOverride())
+                // The SSH machines' tunnels start once the agent is up.
+                SSHRemoteRuntime.shared.agentStarted()
             } catch {
                 logStartFailure(error)
             }
