@@ -401,6 +401,10 @@ char *tb_remote_revoke(const char *grant_id);
 // Receiver. {host, port}: where tb_remote_pair_claim would connect for this
 // Pair URL. Parses only (no connection, nothing kept); invalidOffer or expired.
 char *tb_remote_pair_destination(const char *pair_url);
+// Receiver. {pairUrl}: the Pair URL with host forced to 127.0.0.1 and port set
+// to local_port (1024..=65535, else invalid), re-encoded by the agent. Parses
+// only; invalidOffer, expired, invalid, notRunning.
+char *tb_remote_pair_url_rehost(const char *pair_url, int64_t local_port);
 // Receiver. {handle, sas, expiresAt, producerFingerprint}.
 char *tb_remote_pair_claim(const char *pair_url);
 // Blocks up to 960 s. {producerStatic, fingerprint, expiresAt}. identityChanged:

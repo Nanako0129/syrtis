@@ -46,8 +46,8 @@ use syrtis_agent::{
     runtime::{Options, PullError, RuntimeError},
     secure_fs::StorageError,
     security::{
-        clock_status, decode_fixed_hex, hex_encode, parse_pair_url, GrantState, MemoryLedger,
-        SecurityError,
+        clock_status, decode_fixed_hex, hex_encode, pair_url, parse_pair_url, GrantState,
+        MemoryLedger, SecurityError,
     },
     source::owner_inputs_sha256,
     state_store::{Secret32, StoredState, NODE_LABEL_MAX_BYTES},
@@ -626,6 +626,36 @@ impl RemoteAgent {
             _ => "invalidOffer",
         })?;
         Ok(json!({"host": offer.host, "port": offer.port}))
+    }
+
+    /// Receiver: the same Pair URL with its host forced to `127.0.0.1` and its
+    /// port set to `local_port` (1024..=65535), `{pairUrl}`. Parsed with the
+    /// claim's effective now and re-encoded by the agent's own `pair_url`, so
+    /// the result passes `parse_pair_url`'s verbatim re-encode check; every
+    /// other field is carried over unchanged. No connection; the URL and the
+    /// offer (which holds the secret) are neither kept, formatted nor logged.
+    pub(crate) fn pair_url_rehost(&self, pair_url_text: &str, local_port: i64) -> Reply {
+        let port = u16::try_from(local_port)
+            .ok()
+            .filter(|port| *port >= 1024)
+            .ok_or("invalid")?;
+        let now_ms = self.with(|current| {
+            let state = current
+                .agent
+                .runtime()
+                .store()
+                .state()
+                .map_err(storage_class)?;
+            effective_now_ms(current, &state)
+        })?;
+        let mut offer = parse_pair_url(pair_url_text, now_ms).map_err(|error| match error {
+            SecurityError::Expired => "expired",
+            _ => "invalidOffer",
+        })?;
+        offer.host = "127.0.0.1".into();
+        offer.port = port;
+        let rewritten = pair_url(&offer).map_err(|_| "invalidOffer")?;
+        Ok(json!({"pairUrl": rewritten}))
     }
 
     /// Receiver: waits (blocking, up to the frozen poll window) for the
@@ -1950,6 +1980,78 @@ mod tests {
             version: syrtis_agent::security::PEER_PROTOCOL_VERSION,
         })
         .unwrap()
+    }
+
+    fn pair_url_with(host: &str, clock: &TestClock) -> String {
+        let now_ms = clock.os_now_seconds().unwrap() * 1_000;
+        syrtis_agent::security::pair_url(&syrtis_agent::security::PairOffer {
+            expires_at: now_ms + 60_000,
+            host: host.into(),
+            offer_id: hex_encode(&[3; 16]),
+            port: 40_000,
+            responder_static: hex_encode(&[4; 32]),
+            secret: hex_encode(&[5; 32]),
+            version: syrtis_agent::security::PEER_PROTOCOL_VERSION,
+        })
+        .unwrap()
+    }
+
+    /// P1: the rewrite is accepted by `parse_pair_url`, keeps every other
+    /// field, and forces the host whatever the URL carried.
+    #[test]
+    fn pair_url_rehost_forces_loopback_and_keeps_the_other_fields() {
+        let clock = TestClock::new();
+        let home = TempHome::new();
+        let receiver = Arc::new(RemoteAgent::default());
+        start(&receiver, &home, &clock, ScannerSettings::default());
+        let now_ms = clock.os_now_seconds().unwrap() * 1_000;
+        for host in [
+            "192.0.2.7",
+            "workstation.example",
+            "2001:db8::1",
+            "127.0.0.1",
+        ] {
+            let original = pair_url_with(host, &clock);
+            let reply = receiver.pair_url_rehost(&original, 51_234).unwrap();
+            let url = reply["pairUrl"].as_str().unwrap();
+            let before = syrtis_agent::security::parse_pair_url(&original, now_ms).unwrap();
+            let after = syrtis_agent::security::parse_pair_url(url, now_ms).unwrap();
+            assert_eq!((after.host.as_str(), after.port), ("127.0.0.1", 51_234));
+            assert_eq!(after.responder_static, before.responder_static);
+            assert_eq!(after.secret, before.secret);
+            assert_eq!(after.offer_id, before.offer_id);
+            assert_eq!(after.expires_at, before.expires_at);
+            assert_eq!(after.version, before.version);
+            assert_eq!(reply.as_object().unwrap().len(), 1);
+        }
+    }
+
+    #[test]
+    fn pair_url_rehost_refusals_are_classes_without_the_url() {
+        let clock = TestClock::new();
+        let home = TempHome::new();
+        let receiver = Arc::new(RemoteAgent::default());
+        start(&receiver, &home, &clock, ScannerSettings::default());
+        let url = pair_url_with("192.0.2.7", &clock);
+        assert!(receiver.pair_url_rehost(&url, 1024).is_ok());
+        assert!(receiver.pair_url_rehost(&url, 65_535).is_ok());
+        for port in [-1, 0, 1023, 65_536, i64::MAX] {
+            assert_eq!(receiver.pair_url_rehost(&url, port), Err("invalid".into()));
+        }
+        let secret = hex_encode(&[5; 32]);
+        let mut tampered = url.clone();
+        tampered.pop();
+        tampered.push('0');
+        for bad in ["not a pair url".to_string(), tampered, "x".repeat(20_000)] {
+            let error = receiver.pair_url_rehost(&bad, 40_000).unwrap_err();
+            assert_eq!(error, "invalidOffer");
+            assert!(!error.contains(&secret) && !error.contains(&url));
+        }
+        clock.advance(120);
+        assert_eq!(
+            receiver.pair_url_rehost(&url, 40_000),
+            Err("expired".into())
+        );
     }
 
     /// `SA-3e` B2: the preview answers the offer's own host and port, the
