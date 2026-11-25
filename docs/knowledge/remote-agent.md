@@ -132,7 +132,7 @@ flowchart LR
 
 ## Settings 的 Devices 頁
 
-Settings sidebar 在 Accounts 與 General 之間的 Devices 頁（`DevicesSettingsView`）。頁面只呼叫 `TBCore.remote*`（經 `DevicesModel.swift` 的 `DevicesRemoteClient`），顯示回傳內容，並把固定的錯誤類別對應到 `DevicesCopy` 的文案；授權、摘要、配對與 grant 的判定都在 agent。`DevicesModel.shared` 是行程層級的單例（`SettingsPanel` 切頁會重建頁面），呼叫在背景 task 上進行；頁面顯示時每 2 秒輪詢刷新；頁面消失時取消的是這個輪詢 task，它進行中的那次刷新在每次呼叫之後檢查取消、不再呼叫也不寫入。由按鈕動作或配對等待結束觸發的單次刷新不屬於輪詢 task，頁面消失時不會被取消，會跑完並更新狀態；`tb_remote_pair_poll` 在自己的 `Thread` 上等待。
+Settings sidebar 在 Accounts 與 General 之間的 Devices 頁（`DevicesSettingsView`）。頁面對本機 agent 既有的控制項只呼叫 `TBCore.remote*`（經 `DevicesModel.swift` 的 `DevicesRemoteClient`），顯示回傳內容，並把固定的錯誤類別對應到 `DevicesCopy` 的文案；授權、摘要、配對與 grant 的判定都在 agent。SSH machines 不經這條路徑：新增機器透過 `SSHMachineCoordinator.add` 走 ssh 部署，配對時呼叫 `TBCore.remotePairUrlRehost`、`TBCore.remotePairClaim`、`TBCore.remotePairPoll`，移除時呼叫 `TBCore.remotePeerRemove`。`DevicesModel.shared` 是行程層級的單例（`SettingsPanel` 切頁會重建頁面），呼叫在背景 task 上進行；頁面顯示時每 2 秒輪詢刷新；頁面消失時取消的是這個輪詢 task，它進行中的那次刷新在每次呼叫之後檢查取消、不再呼叫也不寫入。由按鈕動作或配對等待結束觸發的單次刷新不屬於輪詢 task，頁面消失時不會被取消，會跑完並更新狀態；`tb_remote_pair_poll` 在自己的 `Thread` 上等待。
 
 | 區塊 | 內容與規則 |
 |---|---|
