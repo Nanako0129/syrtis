@@ -48,7 +48,7 @@ REMOTE_AGENT_STAGE=".build/remote-agent/x86_64-unknown-linux-gnu"
 # recomputed here and must equal the lock's, or the override given in this same
 # call (REMOTE_AGENT_REPO, REMOTE_AGENT_TAG and REMOTE_AGENT_SHA256 together, or
 # REMOTE_AGENT_BIN=<file> for a development build, which is announced loudly).
-# Anything else left in .build/remote-agent/ fails the bundle.
+# Only the agent and its checksum file are copied; nothing else in .build/remote-agent/ is read.
 OVERRIDES=0
 for v in REMOTE_AGENT_REPO REMOTE_AGENT_TAG REMOTE_AGENT_SHA256; do
   [ -z "${!v:-}" ] || OVERRIDES=$((OVERRIDES + 1))
