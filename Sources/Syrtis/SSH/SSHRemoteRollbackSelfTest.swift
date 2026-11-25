@@ -176,6 +176,23 @@ extension SSHRemoteSelfTest {
                 "SSH rollback: sharing stays on while another consumer holds a grant, and sharing off is handed to the owner")
         }
 
+        // An agent that was off, another consumer granted after our `sharing on`: the rollback does not stop the agent under it.
+        if let rig = Rig() {
+            defer { rig.cleanup() }
+            rig.fake.seed(running: false, sharing: false, scope: true)
+            let cancel = SSHCancellation()
+            rig.local.onClaim = { [fake = rig.fake] in
+                fake.put("grants", Self.other + "\n")
+                cancel.cancel()
+            }
+            let result = add(rig, cancel: cancel)
+            let text = (incomplete(result)?.commands ?? []).joined(separator: "\n")
+            expect((incomplete(result)?.cause as? SSHRemoteError) == .cancelled && text.contains("ctl shutdown")
+                && !rig.fake.lines("log").contains("shutdown") && rig.fake.read("running") == "1"
+                && rig.fake.read("sharing") == "on" && rig.fake.lines("grants") == [Self.other],
+                "SSH rollback: an agent that was off is not stopped while another consumer holds a grant, and the stop is handed to the owner")
+        }
+
         // The approval's answer is lost. Sharing was off: the rollback's sharing off ends the orphan. Sharing was on: it is shown for the owner.
         for sharing in [false, true] {
             guard let rig = Rig(callTimeout: 3) else { continue }

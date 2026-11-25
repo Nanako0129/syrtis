@@ -583,7 +583,8 @@ final class SSHMachineCoordinator: @unchecked Sendable {
     /// Puts the remote back as the flow found it, touching only what this flow
     /// did: cancel its offer, revoke its own grant, `sharing off` only if the
     /// baseline had sharing off and no other grant is held, and the agent (uninstall a new one, stop one
-    /// that was off, start a replaced one again). `ctl` cannot clear a listen
+    /// that was off, start a replaced one again; a stop waits for the same
+    /// grant check as `sharing off`). `ctl` cannot clear a listen
     /// address, so a loopback listener chosen here stays configured (sharing off
     /// stops it). A step that fails is not retried: the flow's error comes back
     /// wrapped with the commands to run by hand, and after a lost connection the
@@ -596,6 +597,7 @@ final class SSHMachineCoordinator: @unchecked Sendable {
         }
         let remote = deps.makeRemote(flow.target, nil)
         let sharingWasOff = flow.baseline.map { !$0.sharingEnabled } ?? false
+        let allowed = flow.grantUnknown ? Int.max : (flow.baseline.map { $0.scopeApproved ? $0.activeGrantCount : 0 } ?? 0)
         var owed: [SSHCtlCommand] = []
         var unreachable = false
         /// Runs one undo step (true: nothing is left); a step that fails is owed by hand.
@@ -617,7 +619,6 @@ final class SSHMachineCoordinator: @unchecked Sendable {
         if flow.sharingOn, sharingWasOff {
             // `sharing off` ends every grant. A grant beyond what the baseline had is another consumer's, so
             // it is left to the owner; with an unnamed grant of ours possible the count cannot tell whose.
-            let allowed = flow.grantUnknown ? Int.max : (flow.baseline.map { $0.scopeApproved ? $0.activeGrantCount : 0 } ?? 0)
             await step([.status, .sharing(false)]) {
                 let status = try remote.status()
                 guard status.sharingEnabled else { return true }
@@ -634,7 +635,7 @@ final class SSHMachineCoordinator: @unchecked Sendable {
         }
         if flow.agent.touched {
             let agent = flow.agent
-            await step(Self.agentOwed(agent.before)) { try Self.restoreAgent(remote, agent); return true }
+            await step(Self.agentOwed(agent.before)) { try Self.restoreAgent(remote, agent, allowed: allowed) }
         }
         guard !owed.isEmpty else { return error }
         return SSHRollbackIncomplete(cause: error, commands: SSHManualCommands.lines(owed, on: flow.target))
@@ -655,20 +656,28 @@ final class SSHMachineCoordinator: @unchecked Sendable {
 
     /// An agent this flow installed goes (no purge) unless another device
     /// holds a grant there; one that was off is stopped again; one that was
-    /// running is made sure to run (the deploy stopped it).
-    private static func restoreAgent(_ remote: any SSHRemoteControl, _ setup: SSHAgentSetup) throws {
+    /// running is made sure to run (the deploy stopped it). A stop ends every
+    /// grant, so with more than `allowed` held (another consumer's) the agent
+    /// is left running and false comes back: the stop is owed by hand.
+    private static func restoreAgent(_ remote: any SSHRemoteControl, _ setup: SSHAgentSetup, allowed: Int) throws -> Bool {
         if !setup.before.installed {
             let count: Int
             do { count = try remote.status().activeGrantCount } catch SSHRemoteError.ctl(code: 4, _) {
                 count = 0
-            } catch SSHRemoteError.agentMissing { return }
-            guard count == 0 else { return }
+            } catch SSHRemoteError.agentMissing { return true }
+            guard count == 0 else { return true }
             try? remote.shutdown()
             try remote.uninstall(purge: false)
         } else if !setup.before.running {
+            let count: Int
+            do { count = try remote.status().activeGrantCount } catch SSHRemoteError.ctl(code: 4, _) {
+                count = 0
+            } catch SSHRemoteError.agentMissing { return true }
+            guard count <= allowed else { return false }
             try stop(remote)
         } else {
             _ = try remote.ensureRunning()
         }
+        return true
     }
 }
