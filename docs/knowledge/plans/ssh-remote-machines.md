@@ -175,6 +175,7 @@ sequenceDiagram
 已知限制：
 
 - `approvePending` 的回覆遺失，又剛好遇到他人撤銷基線 grant 時，active grant 數回到預期，回復判斷沒有孤兒，可能留下一個沒有名字的 grant；數量比較無法分辨身分，需要 agent 提供 grant 身分才能根治。
+- 移除機器時，若這次呼叫把原本停著的 agent 啟動了，而 `grant revoke` 或 `status` 又失敗，agent 會留在執行中，機器仍會從本機移除；手動指令只在勾選 purge 時才列出 `shutdown`。它原本就是停著的，留下的是一個閒置行程；失敗時 grant 數未知，自動停止可能誤停仍有 grant 的 agent，所以不處理，需要時手動執行 `ctl shutdown`。
 - alias 自帶的 `LocalForward`、`RemoteForward` 會隨 tunnel 一起開，既有 port 被占用時 `ExitOnForwardFailure` 會讓 tunnel 失敗。建議為 Syrtis 另設不含 forward 的 alias。
 - 跨版本升級後，舊版留下的 tunnel process 無法被新版 reap（PID 記錄不含啟動參數，選項改變後比對不上），結束 app 不會停掉它：`stopAll()` 只停這次執行啟動的 tunnel，`reapStale()` 對比對不上的 process 只刪 PID 記錄、不結束它，它可能一直占著本機 port，使該機器新的 tunnel 回報 `portInUse`。需要手動找出對應的 `ssh -N -L` process 並結束，再重試。
 
