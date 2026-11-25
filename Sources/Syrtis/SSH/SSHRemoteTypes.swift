@@ -352,7 +352,13 @@ enum SSHCtlCommand: Equatable, Sendable {
         switch self {
         case .status: args = "status"
         case .install: args = "install"
-        case .uninstall(let purge): args = purge ? "uninstall --purge" : "uninstall"
+        case .uninstall(let purge):
+            // The start enables the user unit, which leaves a `default.target.wants` link; `ctl uninstall`
+            // removes only the unit file, so once it succeeded the link is dropped here. `disable` works by
+            // name with the unit file gone (measured on Ubuntu 22.04). The status and the frame are `ctl`'s.
+            let uninstall = "\(SSHRemoteCommand.binary) ctl " + (purge ? "uninstall --purge" : "uninstall")
+            return try SSHRemoteCommand(script: uninstall + "; rc=$?; [ $rc -ne 0 ] || { command -v systemctl >/dev/null 2>&1 "
+                + "&& systemctl --user disable syrtis-agent.service >/dev/null 2>&1; }; exit $rc")
         case .scopeDisclosure: args = "scope disclosure"
         case .scopeApprove(let digest):
             try need(SSHInput.isDigest(digest), "digest")

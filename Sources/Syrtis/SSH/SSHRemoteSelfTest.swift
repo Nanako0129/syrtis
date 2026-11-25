@@ -617,6 +617,26 @@ enum SSHRemoteSelfTest {
                 "SSH remove: when the remote is unreachable, purge commands follow a status and a condition on it")
         }
 
+        // A purge drops the autostart link the start made: `systemctl --user disable` runs after a successful uninstall.
+        if let rig = Rig() {
+            defer { rig.cleanup() }
+            let record = rig.fake.dir.appendingPathComponent("systemctl.log")
+            let tool = rig.fake.bin.appendingPathComponent("systemctl")
+            // The stand-in records its arguments and, for `enable --now`, starts the fake agent as the real unit would.
+            try? "#!/bin/sh\necho \"$*\" >> \"\(record.path)\"\ncase \"$*\" in *\"enable --now\"*) \"$HOME/.local/bin/syrtis-agent\" run;; esac\n".write(to: tool, atomically: true, encoding: .utf8)
+            try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: tool.path)
+            let added = value(blocking { [coordinator = rig.coordinator] in
+                try await coordinator.add(user: "me", host: "box5.example", label: nil, confirm: { _ in true })
+            })
+            let removed = added.flatMap { m in
+                value(blocking { [coordinator = rig.coordinator] in try await coordinator.remove(id: m.id, purge: true) })
+            }
+            let calls = ((try? String(contentsOf: record, encoding: .utf8)) ?? "").split(separator: "\n").map(String.init)
+            expect(removed?.error == nil && removed?.manualCommands.isEmpty == true
+                && calls.last == "--user disable syrtis-agent.service" && calls.contains { $0.contains("enable --now") },
+                "SSH remove: a purge disables the user unit the start enabled (\(calls.suffix(2)))")
+        }
+
         // Re-approval.
         if let rig = Rig() {
             defer { rig.cleanup() }
