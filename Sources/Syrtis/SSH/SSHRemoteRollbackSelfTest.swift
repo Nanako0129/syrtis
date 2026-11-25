@@ -159,6 +159,23 @@ extension SSHRemoteSelfTest {
                 "SSH rollback: a cancelled re-approval with \(changed ? "a changed" : "the same") producer keeps the original peer and forward\(changed ? " and removes the replacement" : "")")
         }
 
+        // Another consumer was granted after our `sharing on`: the rollback leaves sharing on and hands the owner the commands.
+        if let rig = Rig() {
+            defer { rig.cleanup() }
+            rig.fake.seed(running: true, sharing: false, scope: true)
+            let cancel = SSHCancellation()
+            rig.local.onClaim = { [fake = rig.fake] in
+                fake.put("grants", Self.other + "\n")
+                cancel.cancel()
+            }
+            let result = add(rig, cancel: cancel)
+            let text = (incomplete(result)?.commands ?? []).joined(separator: "\n")
+            expect((incomplete(result)?.cause as? SSHRemoteError) == .cancelled && text.contains("ctl status")
+                && text.contains("sharing off") && !rig.fake.lines("log").contains("sharing-off")
+                && rig.fake.read("sharing") == "on" && rig.fake.lines("grants") == [Self.other],
+                "SSH rollback: sharing stays on while another consumer holds a grant, and sharing off is handed to the owner")
+        }
+
         // The approval's answer is lost. Sharing was off: the rollback's sharing off ends the orphan. Sharing was on: it is shown for the owner.
         for sharing in [false, true] {
             guard let rig = Rig(callTimeout: 3) else { continue }

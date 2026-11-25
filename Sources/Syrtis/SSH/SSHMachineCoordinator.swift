@@ -573,7 +573,7 @@ final class SSHMachineCoordinator: @unchecked Sendable {
 
     /// Puts the remote back as the flow found it, touching only what this flow
     /// did: cancel its offer, revoke its own grant, `sharing off` only if the
-    /// baseline had sharing off, and the agent (uninstall a new one, stop one
+    /// baseline had sharing off and no other grant is held, and the agent (uninstall a new one, stop one
     /// that was off, start a replaced one again). `ctl` cannot clear a listen
     /// address, so a loopback listener chosen here stays configured (sharing off
     /// stops it). A step that fails is not retried: the flow's error comes back
@@ -606,8 +606,14 @@ final class SSHMachineCoordinator: @unchecked Sendable {
             await step([.grantRevoke(grantId: grant)]) { try remote.revokeGrant(id: grant); return true }
         }
         if flow.sharingOn, sharingWasOff {
-            await step([.sharing(false)]) {
-                if try remote.status().sharingEnabled { try remote.setSharing(false) }
+            // `sharing off` ends every grant. A grant beyond what the baseline had is another consumer's, so
+            // it is left to the owner; with an unnamed grant of ours possible the count cannot tell whose.
+            let allowed = flow.grantUnknown ? Int.max : (flow.baseline.map { $0.scopeApproved ? $0.activeGrantCount : 0 } ?? 0)
+            await step([.status, .sharing(false)]) {
+                let status = try remote.status()
+                guard status.sharingEnabled else { return true }
+                guard status.activeGrantCount <= allowed else { return false }
+                try remote.setSharing(false)
                 return true
             }
         } else if flow.grantUnknown, let baseline = flow.baseline {
