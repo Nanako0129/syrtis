@@ -125,6 +125,9 @@ final class SSHMachineCoordinator: @unchecked Sendable {
     private let deps: Dependencies
     private let gate = NSLock()
     private var running = false
+    /// Held by a save (`commit`) and by the abandoned claim's check-and-remove,
+    /// so the saved keys it checks cannot change before the peer is removed.
+    private let saveGate = NSLock()
 
     init(_ dependencies: Dependencies) { deps = dependencies }
 
@@ -544,14 +547,16 @@ final class SSHMachineCoordinator: @unchecked Sendable {
             let paired = try await io { try local.poll(handle: handle) }
             pairedKey = paired.producerStatic
             try check(cancel)
-            let result = try commit(
-                Paired(
-                    producerStatic: paired.producerStatic, fingerprint: paired.fingerprint,
-                    grantId: grantId, remotePort: machine.remotePort))
+            let result = try saveGate.withLock {
+                try commit(
+                    Paired(
+                        producerStatic: paired.producerStatic, fingerprint: paired.fingerprint,
+                        grantId: grantId, remotePort: machine.remotePort))
+            }
             return Outcome(machine: result)
         } catch {
             let saved = Set(deps.store.all().compactMap(\.producerStatic))
-            if let handle = claimHandle, pairedKey == nil { abandon(handle, keeping: saved) }
+            if let handle = claimHandle, pairedKey == nil { abandon(handle) }
             if let key = pairedKey, !saved.contains(key) { _ = try? await io { try local.peerRemove(producerStatic: key) } }
             throw error
         }
@@ -559,12 +564,16 @@ final class SSHMachineCoordinator: @unchecked Sendable {
 
     /// A claim that is no longer wanted: its poll runs on to the end; if it then
     /// succeeds the peer is removed at once (as `DevicesModel.cancelWait`),
-    /// unless a saved machine holds it.
-    private func abandon(_ handle: Int64, keeping saved: Set<String>) {
-        let local = deps.local
-        DispatchQueue.global(qos: .utility).async {
-            if let paired = try? local.poll(handle: handle), !saved.contains(paired.producerStatic) {
-                try? local.peerRemove(producerStatic: paired.producerStatic)
+    /// unless a saved machine holds it. The saved machines are read again when
+    /// the poll ends, under `saveGate`, so a save that landed meanwhile counts.
+    private func abandon(_ handle: Int64) {
+        let local = deps.local, store = deps.store
+        DispatchQueue.global(qos: .utility).async { [saveGate] in
+            guard let paired = try? local.poll(handle: handle) else { return }
+            saveGate.withLock {
+                if !store.all().contains(where: { $0.producerStatic == paired.producerStatic }) {
+                    try? local.peerRemove(producerStatic: paired.producerStatic)
+                }
             }
         }
     }
