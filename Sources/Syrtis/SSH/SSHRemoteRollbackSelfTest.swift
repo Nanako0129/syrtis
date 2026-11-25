@@ -130,6 +130,35 @@ extension SSHRemoteSelfTest {
                 "SSH rollback: a cancel during the poll is not committed; the grant is revoked and the peer removed")
         }
 
+        // A re-approval cancelled during the poll: a replacement peer is removed, the original peer and forward stay.
+        for changed in [true, false] {
+            guard let rig = Rig() else { continue }
+            defer { rig.cleanup() }
+            rig.fake.seed(running: true, sharing: true, scope: true)
+            guard let original = value(add(rig)), let originalKey = original.producerStatic else {
+                expect(false, "SSH rollback: re-approve cancel setup")
+                continue
+            }
+            rig.fake.put("grants", "")
+            rig.local.removeAllRemoved()
+            let replacement = String(repeating: "cd", count: 32)
+            if changed {
+                rig.local.producerStatic = replacement
+                rig.local.fingerprint = "fedcba9876543210"
+            }
+            let cancel = SSHCancellation()
+            rig.local.onPoll = { cancel.cancel() }
+            let result = blocking { [coordinator = rig.coordinator] in
+                try await coordinator.reapprove(
+                    id: original.id, confirm: { _ in true }, confirmIdentityChange: { _, _ in true }, cancel: cancel)
+            }
+            let removed = rig.local.removed
+            expect(errorOf(result) == .cancelled && rig.store.all() == [original] && rig.fake.lines("grants").isEmpty
+                && removed.contains(replacement) == changed && !removed.contains(originalKey)
+                && rig.tunnels.started.last == original && !rig.tunnels.stopped.contains(original.id),
+                "SSH rollback: a cancelled re-approval with \(changed ? "a changed" : "the same") producer keeps the original peer and forward\(changed ? " and removes the replacement" : "")")
+        }
+
         // The approval's answer is lost. Sharing was off: the rollback's sharing off ends the orphan. Sharing was on: it is shown for the owner.
         for sharing in [false, true] {
             guard let rig = Rig(callTimeout: 3) else { continue }

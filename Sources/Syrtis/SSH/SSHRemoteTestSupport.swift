@@ -316,6 +316,12 @@ final class SSHFakeLocal: SSHLocalPairing, @unchecked Sendable {
         lock.unlock()
     }
 
+    func removeAllRemoved() {
+        lock.lock()
+        removed = []
+        lock.unlock()
+    }
+
     func agentListenPort() -> Int? { nil }
 }
 

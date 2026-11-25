@@ -240,8 +240,7 @@ final class SSHMachineCoordinator: @unchecked Sendable {
         let store = deps.store
         let outcome = try await pair(
             flow: flow, remote: remote, baseline: baseline, disclosure: disclosure,
-            machine: draft, expectedFingerprint: nil, confirmIdentity: nil, cancel: cancel,
-            removePeerOnFailure: true
+            machine: draft, expectedFingerprint: nil, confirmIdentity: nil, cancel: cancel
         ) { paired in
             var machine = draft
             machine.remotePort = paired.remotePort
@@ -307,7 +306,7 @@ final class SSHMachineCoordinator: @unchecked Sendable {
         let outcome = try await pair(
             flow: flow, remote: remote, baseline: baseline, disclosure: disclosure,
             machine: original, expectedFingerprint: original.fingerprint,
-            confirmIdentity: confirmIdentityChange, cancel: cancel, removePeerOnFailure: false
+            confirmIdentity: confirmIdentityChange, cancel: cancel
         ) { paired in
             var machine = original
             machine.remotePort = paired.remotePort
@@ -432,13 +431,14 @@ final class SSHMachineCoordinator: @unchecked Sendable {
     }
 
     /// Approve, share, listen, offer, tunnel, claim, approve the SAS, poll,
-    /// then `commit`. A failure ends the local claim and peer here and leaves
-    /// the remote to `rollback`.
+    /// then `commit`. A failure ends the local claim and the peer it added (never
+    /// one a saved machine holds, so a re-approval keeps its original) here and
+    /// leaves the remote to `rollback`.
     private func pair(
         flow: Flow, remote: any SSHRemoteControl, baseline: SSHRemoteStatus,
         disclosure: SSHDisclosure, machine start: SSHMachine, expectedFingerprint: String?,
         confirmIdentity: SSHIdentityConfirm?, cancel: SSHCancellation,
-        removePeerOnFailure: Bool, commit: @escaping @Sendable (Paired) throws -> SSHMachine
+        commit: @escaping @Sendable (Paired) throws -> SSHMachine
     ) async throws -> Outcome {
         var machine = start
         var claimHandle: Int64?
@@ -550,18 +550,20 @@ final class SSHMachineCoordinator: @unchecked Sendable {
                     grantId: grantId, remotePort: machine.remotePort))
             return Outcome(machine: result)
         } catch {
-            if let handle = claimHandle, pairedKey == nil { abandon(handle) }
-            if removePeerOnFailure, let key = pairedKey { _ = try? await io { try local.peerRemove(producerStatic: key) } }
+            let saved = Set(deps.store.all().compactMap(\.producerStatic))
+            if let handle = claimHandle, pairedKey == nil { abandon(handle, keeping: saved) }
+            if let key = pairedKey, !saved.contains(key) { _ = try? await io { try local.peerRemove(producerStatic: key) } }
             throw error
         }
     }
 
     /// A claim that is no longer wanted: its poll runs on to the end; if it then
-    /// succeeds the peer is removed at once (as `DevicesModel.cancelWait`).
-    private func abandon(_ handle: Int64) {
+    /// succeeds the peer is removed at once (as `DevicesModel.cancelWait`),
+    /// unless a saved machine holds it.
+    private func abandon(_ handle: Int64, keeping saved: Set<String>) {
         let local = deps.local
         DispatchQueue.global(qos: .utility).async {
-            if let paired = try? local.poll(handle: handle) {
+            if let paired = try? local.poll(handle: handle), !saved.contains(paired.producerStatic) {
                 try? local.peerRemove(producerStatic: paired.producerStatic)
             }
         }
