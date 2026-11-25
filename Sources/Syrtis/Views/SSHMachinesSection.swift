@@ -233,21 +233,12 @@ struct SSHMachinesSection: View {
             }
             if !request.canApprove { noticeText(C.scopeTruncated.localized) }
             DisclosureGroup(C.scopeHeader.localized, isExpanded: $scopeOpen) {
-                ScrollView {
-                    VStack(alignment: .leading, spacing: 4) {
-                        ForEach(Array(request.disclosure.lines.enumerated()), id: \.offset) { _, line in
-                            VStack(alignment: .leading, spacing: 0) {
-                                Text(verbatim: line.name).font(.caption2.weight(.semibold))
-                                Text(verbatim: line.value)
-                                    .font(.caption2)
-                                    .foregroundStyle(.secondary)
-                                    .textSelection(.enabled)
-                            }
-                        }
-                    }
-                    .frame(maxWidth: .infinity, alignment: .leading)
+                // A short list takes its own height; only a long one scrolls, capped at the limit.
+                ViewThatFits(in: .vertical) {
+                    scopeLines(request)
+                    ScrollView { scopeLines(request) }
                 }
-                .frame(height: Layout.disclosureHeight)
+                .frame(maxHeight: Layout.disclosureHeight)
                 .padding(.top, 4)
             }
             .font(.caption)
@@ -261,6 +252,21 @@ struct SSHMachinesSection: View {
                     .disabled(!request.canApprove)
             }
         }
+    }
+
+    private func scopeLines(_ request: SSHConsentRequest) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            ForEach(Array(request.disclosure.lines.enumerated()), id: \.offset) { _, line in
+                VStack(alignment: .leading, spacing: 0) {
+                    Text(verbatim: line.name).font(.caption2.weight(.semibold))
+                    Text(verbatim: line.value)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .textSelection(.enabled)
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     private func agentText(_ change: SSHAgentSetup.Change) -> String {
