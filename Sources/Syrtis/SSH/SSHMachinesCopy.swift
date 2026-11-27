@@ -3,7 +3,7 @@
 enum SSHMachinesCopy {
     static let section = "SSH machines"
     static let summary = "Read usage from Linux machines you can reach over SSH."
-    static let details = "Syrtis installs its usage agent on the machine over your ssh, keeps an ssh tunnel to it, and pairs through the tunnel. It uses your ssh config and ssh-agent, and never accepts an unknown host key. The machine's usage then appears in the device menu like any linked device."
+    static let details = "Syrtis installs its usage agent on the machine over your ssh, keeps an ssh tunnel to it, and pairs through the tunnel. It uses your ssh config and ssh-agent, and never accepts an unknown host key. It also copies Syrtis's price table to the machine so its costs can be calculated. The machine's usage then appears in the device menu like any linked device."
     static let noAgent = "This version doesn't include the remote agent."
     static let noMachines = "No SSH machines."
     static let addHeader = "Add a machine"

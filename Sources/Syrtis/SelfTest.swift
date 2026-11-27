@@ -23015,6 +23015,7 @@ enum SelfTest {
             let fixture = "/tmp/sa3a-selftest-\(getpid())"
             let sentinel = fixture + "/sentinel/opencode.db"
             let home = RemoteAgentLaunch.homeOverride(bundleIdentifier: "selftest-\(getpid())")
+            let pricingFixture = Data(#"{"timestamp":\#(Int(Date().timeIntervalSince1970) - 60),"data":{"sa3a-model":{"input_cost_per_token":1e-6}}}"#.utf8)
             var child: [String: Any]?
             let manager = FileManager.default
             // The root is created exclusively and 0700 before anything is
@@ -23037,6 +23038,12 @@ enum SelfTest {
                 let settings = try? JSONSerialization.data(
                     withJSONObject: ["scanner": ["opencodeDbPaths": [sentinel]]])
                 manager.createFile(atPath: fixture + "/config/settings.json", contents: settings)
+                // A price file in the engine's cache (`TOKSCALE_CONFIG_DIR/cache`): the agent's start
+                // copies it into its pricing directory, which the SSH price push reads.
+                try? manager.createDirectory(
+                    atPath: fixture + "/config/cache", withIntermediateDirectories: false,
+                    attributes: [.posixPermissions: 0o700])
+                manager.createFile(atPath: fixture + "/config/cache/pricing-litellm.json", contents: pricingFixture)
                 let process = Process()
                 process.executableURL = executable
                 process.arguments = ["--selftest", "-AppleLanguages", "(en)"]
@@ -23068,6 +23075,10 @@ enum SelfTest {
                            [fixture, home ?? fixture].contains { path.hasPrefix($0 + "/") || path == $0 }
                        }) == true,
                    "SA3A no disclosed path lies outside the fixture root or the agent home")
+            expect(child?["pricingSha256"] as? String == SSHPricingPush.sha256(pricingFixture),
+                   "SSH price table: the local source directory is where the running agent copies the engine's price file (same bytes)")
+            expect(SSHPricingPush.localDirectory(home: nil).path == realRoot + "/pricing",
+                   "SSH price table: the shipping source is the real agent root's pricing directory")
             if let home { try? FileManager.default.removeItem(atPath: home) }
             if fixtureCreated { try? FileManager.default.removeItem(atPath: fixture) }
             expect(realRootStamp() == realBefore,
@@ -25489,6 +25500,8 @@ enum SelfTest {
     @MainActor static func runRemoteAgentChild(home: String) -> Never {
         let status = try? RemoteAgentLaunch.start(home: home)
         let disclosure = try? TBCore.remoteScopeDisclosure()
+        let pricing = SSHPricingPush.readSource(
+            SSHPricingPush.localDirectory(home: home).appendingPathComponent(SSHPricingFile.litellm.rawValue))
         // SA-3b: the device-aware pages with this Mac and a device that was
         // never paired (cached: no connection). The snapshot directory is the
         // user's own Caches directory (Foundation does not follow `HOME`), so
@@ -25543,6 +25556,7 @@ enum SelfTest {
             "sa3bLocalOnly": localOnly?.devices.map(\.state) as Any,
             "sa3bLocalOnlyDuplicate": localOnly?.duplicateWarning as Any,
             "sa3bSnapshotSame": snapshotSame,
+            "pricingSha256": pricing.map(SSHPricingPush.sha256) as Any,
         ]
         let data = (try? JSONSerialization.data(withJSONObject: line)) ?? Data("{}".utf8)
         print(String(decoding: data, as: UTF8.self))

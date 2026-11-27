@@ -4,8 +4,8 @@ id: kb-remote-agent
 kind: canonical
 scope: repository
 read_when: changing the embedded remote-usage agent, its tb_remote_* C ABI, its start and stop wiring, or the agent dependency pin
-last_verified: 2026-11-24
-sources: ["crates/tb_core_ffi/src/remote_agent.rs", "crates/tb_core_ffi/src/remote_pages.rs", "crates/tb_core_ffi/src/usage_graph.rs", "crates/tb_core_ffi/src/model_report.rs", "crates/tb_core_ffi/src/hourly_report.rs", "crates/tb_core_ffi/src/agents_report.rs", "crates/tb_core_ffi/src/lib.rs", "crates/tb_core_ffi/Cargo.toml", "Cargo.toml", "Cargo.lock", "Sources/CTB/include/ctb.h", "Sources/TokenBarCore/TBCore.swift", "Sources/TokenBarCore/RemoteAgent.swift", "Sources/Syrtis/RemoteAgentLaunch.swift", "Sources/Syrtis/DevicesModel.swift", "Sources/Syrtis/DashboardModel.swift", "Sources/Syrtis/UsageDataSource.swift", "Sources/Syrtis/PopoverView.swift", "Sources/Syrtis/Views/DeviceSelectionMenu.swift", "Sources/Syrtis/Views/DeviceTotalsCard.swift", "Sources/Syrtis/Views/OverviewView.swift", "Sources/Syrtis/Views/StatsView.swift", "Sources/Syrtis/Views/DevicesSettingsView.swift", "Sources/Syrtis/Views/SettingsPanel.swift", "Sources/Syrtis/AppDelegate.swift", "Sources/Syrtis/ClaudeExtraRoots.swift", "Sources/Syrtis/CursorSync.swift", "Sources/Syrtis/SelfTest.swift", "scripts/check_agent_engine_pin.py", ".github/workflows/ci.yml", "public Syrtis-Agent 36ce38283d4972d30e2696e5725cf78a9fef59ad"]
+last_verified: 2026-11-27
+sources: ["crates/tb_core_ffi/src/remote_agent.rs", "crates/tb_core_ffi/src/remote_pages.rs", "crates/tb_core_ffi/src/usage_graph.rs", "crates/tb_core_ffi/src/model_report.rs", "crates/tb_core_ffi/src/hourly_report.rs", "crates/tb_core_ffi/src/agents_report.rs", "crates/tb_core_ffi/src/lib.rs", "crates/tb_core_ffi/Cargo.toml", "Cargo.toml", "Cargo.lock", "Sources/CTB/include/ctb.h", "Sources/TokenBarCore/TBCore.swift", "Sources/TokenBarCore/RemoteAgent.swift", "Sources/Syrtis/RemoteAgentLaunch.swift", "Sources/Syrtis/DevicesModel.swift", "Sources/Syrtis/DashboardModel.swift", "Sources/Syrtis/UsageDataSource.swift", "Sources/Syrtis/PopoverView.swift", "Sources/Syrtis/Views/DeviceSelectionMenu.swift", "Sources/Syrtis/Views/DeviceTotalsCard.swift", "Sources/Syrtis/Views/OverviewView.swift", "Sources/Syrtis/Views/StatsView.swift", "Sources/Syrtis/Views/DevicesSettingsView.swift", "Sources/Syrtis/Views/SettingsPanel.swift", "Sources/Syrtis/AppDelegate.swift", "Sources/Syrtis/ClaudeExtraRoots.swift", "Sources/Syrtis/CursorSync.swift", "Sources/Syrtis/SelfTest.swift", "Sources/Syrtis/SSH/SSHPricing.swift", "Sources/Syrtis/SSH/SSHRemoteTypes.swift", "Sources/Syrtis/SSH/SSHRemoteSelfTest.swift", "scripts/check_agent_engine_pin.py", ".github/workflows/ci.yml", "public Syrtis-Agent 36ce38283d4972d30e2696e5725cf78a9fef59ad"]
 ---
 
 # Embedded remote-usage agent
@@ -187,6 +187,18 @@ Popover 的 Overview、Graph（Stats、Daily、Monthly）、Models、Hourly、Ag
 
 > **已知限制**：引擎的 remote pricing snapshot 依 dataset 內的 `timestamp`（不是檔案 mtime）判斷新舊。engine PR [#90](https://github.com/Nanako0129/tokscale-core/pull/90) 之前，`timestamp` 超過 3,600 秒的 dataset 會被拒收，不自帶 cost 的 client（例如 Claude Code）分享出去的 cost 在每小時有一段時間為 0；現在可解析且 `timestamp` 不在未來的 dataset 不論多舊都用來計價（仍回報 `Stale`），所以這一項不再發生。仍然成立：分享端沒有價格表（檔案不存在）、檔案無法解析、或 `timestamp` 在未來（時鐘偏差）時，不自帶 cost 的 client 分享出去的 cost 仍為 0；這三種現在**都有**提示：引擎的診斷是 `Missing`（檔案不存在）或 `Corrupt`（無法解析，**或 `timestamp` 在未來**，見 `vendor/tokscale-core/src/pricing/mod.rs` 的 `decode_dataset`），agent 把 `Missing`／`Corrupt` 送成 `costIncomplete: true`（`source.rs` 的 `cost_incomplete`），狀態列對該裝置顯示「費用可能不完整」那句（DR-2b）；兩個價格檔中只要一個缺或壞就算。**仍然沒有提示**的：`Stale`（價格表可解析但超過 3,600 秒，仍用來計價，費用可能落後最新價格，`costIncomplete` 為 false），以及價格表載入成功但沒有某個模型的價格（診斷沒有這一種，該模型的 cost 為 0；從 `pricing/mod.rs` 讀出，沒有實測）。
 
+### SSH 機器的價格表
+
+獨立執行的 `syrtis-agent`（SSH 機器上那一個）自己不抓價格表，`pricing/` 是空的，不自帶 cost 的 client 在那台的 cost 都是 0、狀態列顯示「費用可能不完整」。App 因此把本機 agent 的兩個價格檔複製過去（`Sources/Syrtis/SSH/SSHPricing.swift` 的 `SSHPricingPush`，只有 Swift，不經 C ABI）：
+
+- **來源**：本機 agent 的 pricing 目錄，也就是上面 `sync_pricing` 寫入的那份。路徑由 `SSHPricingPush.localDirectory` 以 `RemoteAgentLaunch` 傳給 `tb_remote_start` 的同一個 root 組出：override home 是 `<home>/a/pricing`（`OVERRIDE_SUFFIX`），出貨 root 是 directory-service home（getpwuid）下的 `Library/Application Support/com.nyanako.syrtis.agent/pricing`。每個檔以 `O_NOFOLLOW` 開一次、`fstat` 同一個 descriptor（regular file、最多 32 MiB），讀進記憶體，只有解析成 JSON object、`timestamp` 是非負整數、`data` 是 object（引擎要的 envelope）才送；雜湊與送出的都是這份讀進來的位元組。
+- **遠端命令**（`SSHRemoteCommand.pricingHashes`、`pricingUpload`，固定 `sh -c` script；插入的只有 `SSHPricingFile` 的兩個固定檔名之一與通過 `SSHInput.isDigest` 的 sha256）：先查 `$HOME/.local/state/syrtis-agent/pricing` 存在、不是 link、屬於遠端使用者，否則 exit 74；`pricing/<name>` 是目錄或指向目錄的 link 時 exit 75（`mv` 會寫進那個目錄）。唯讀的那一支印出現有檔案的 `<sha256>  <name>`；上傳那一支在同一目錄 `mktemp`（70）、`cat` 收 stdin（71）、核對 sha256（72）、`mv -f` 原子替換，trap 在結束時刪掉暫存檔。不建立目錄：agent 從沒跑過的機器沒有 `pricing/`，就是 74、跳過。
+- **何時**：add 或重新核准完成後一次（`force`，略過下面的一小時限制一次）、tunnel 每次變成 Connected（`SSHTunnelSupervisor.onStatusChange` 的 `.up`）、以及之後每小時一次（只對 tunnel 是 `.up` 的機器）。每台同時只跑一個；不佔 coordinator 的獨佔狀態。被移除的機器（`SSHMachineCoordinator.remove` 呼叫 `forget`）不再開始，進行中的取消。
+- **不重送**：遠端雜湊等於本機的檔不送；雜湊輸出只接受每行恰為 `<64 hex>  <固定檔名>`，其他一律當「不知道」。每台每個檔記住最後一次送出的本機 sha256 與時間（不論成功失敗），一小時內同樣的位元組不再送，所以上傳一直失敗時不會跟著 tunnel 的重連頻率重送。上傳的 timeout 與 deploy 相同（300 秒）。
+- **失敗**：只寫 private log，不顯示錯誤、不改機器狀態；下一次觸發重試。唯一的訊號仍是既有的 `costIncomplete` 那句。
+
+已知限制：兩台 Mac 連到同一台機器時後寫的贏，可能是較舊的那份表；遠端時鐘比 Mac 慢、`timestamp` 落在遠端的未來時，那份表在遠端是 `Corrupt`（見上）。連到同一個遠端 agent 的其他裝置看到的 cost 也用這台 Mac 的表計價。移除機器時 `ctl uninstall --purge` 本來就留下 `pricing/`。實機（188）尚未驗證。
+
 ## 單一引擎與依賴 pin
 
 `tb_core_ffi` 以 exact rev 依賴 `syrtis-agent`；workspace 的 `[patch."https://github.com/Nanako0129/tokscale-core"]` 把 agent 的引擎指向 `vendor/tokscale-core`，所以 binary 裡只有一份引擎。`scripts/check_agent_engine_pin.py`（CI 的「Agent engine pin」一步，先跑 `--self-test`）檢查三件事：
@@ -252,6 +264,8 @@ Popover 的 Overview、Graph（Stats、Daily、Monthly）、Models、Hourly、Ag
 | 目的地預覽：回 offer 的 host／port、key 恰為 `host`／`port`、不含 secret 與 `offerId`、沒在跑時 `notRunning`、不產生 claim；過期、亂碼、canonical 不符、超長各回對應類別；對 `127.0.0.1` listener 預覽 0 個連線，control：同一 URL 的 `pair_claim` 至少 1 個 | `remote_agent::tests::pair_destination_is_the_offer_address_and_nothing_more`、`pair_destination_refusals_are_their_classes`、`pair_destination_never_connects` |
 | `peer_remove` 刪掉 receiver cache：一次真的 pull 之後 `rcache-*` ≥ 1，移除後 0 | `remote_agent::tests::peer_remove_deletes_the_receiver_cache` |
 | Devices 頁：sidebar 位置、三語文案、狀態機（未啟動→重試、未核准→開關不可用、核准後可開、錯誤類別對應）、Pair URL 不在 description／UserDefaults 且到期與頁面消失時清除並取消、Link 先預覽目的地（0 次 claim）、Cancel 與預覽失敗不 claim 且不留文字、確認 claim 預覽的那一份文字且連按兩次只 claim 一次、預覽完成前離開頁面回到 idle、離開頁面後完成的等待、取消後成功即移除、列綁定、核准綁定、監聽選單（全部以假 client 與假 pasteboard 驅動） | SelfTest 的 `SA3C` 案例 |
+| SSH 機器的價格表：tunnel 接上後兩個檔以本機位元組到達、沒有留下暫存檔；檔案不變時再觸發只跑雜湊、不送 body；`pricing/<name>` 是目錄或指向目錄的 link 時雜湊與上傳都 exit 75、什麼都沒落進去；本機來源是 link、超過 32 MiB 或不是 envelope 時不讀不送；上傳一直 72 時五次重連只送一次 body，機器仍是 Connected、紀錄不變；遠端沒有 `pricing/`（74）時 0 個 body、不建立目錄；移除後不再開始；add 完成後兩個檔到達；builder 只收兩個固定檔名與 64 hex。拿掉上傳呼叫或 tunnel 觀察者的變異讓「到達」那項失敗（全部以假 ssh 驅動） | `--selftest-ssh` 的 `SSH price table` 案例 |
+| SSH 價格表的來源路徑：fixture 子行程裡 agent 啟動後，`SSHPricingPush.localDirectory(home:)` 下讀到的檔與 fixture 引擎 cache 的價格檔位元組相同；出貨路徑是真正 agent root 下的 `pricing` | SelfTest 的 `SA3A` 案例（`SSH price table` 兩項） |
 | pin 與 lock 閉包 | `python3 scripts/check_agent_engine_pin.py --self-test` 與不帶參數的執行 |
 
 經過 App 自己的來源（`Sources::app`、`LocalSourceContext`）的測試都在清空環境的子行程裡跑：`HOME` 與 `TOKSCALE_CONFIG_DIR` 指向測試建立的 temp root，所以 OpenCode `settings.json`、`OPENCODE_DB`、Cursor 與 extra-root registry、pricing cache 都是 fixture。直接建立 `Inputs` 的測試不經過那些來源。selftest 的 start 案例以同樣方式啟動自己的子行程。

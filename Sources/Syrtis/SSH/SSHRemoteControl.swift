@@ -187,6 +187,31 @@ struct SSHCtl: SSHRemoteControl {
         _ = try waitForAgent()
     }
 
+    // MARK: Price table
+
+    /// The remote sha256 of each price file that exists. nil when the output is anything but
+    /// lines of exactly `<64 hex>  <fixed name>` (unknown: compare nothing). Exit 74 and 75 come
+    /// back as `.ctl` like any other exit.
+    func pricingHashes() throws -> [SSHPricingFile: String]? {
+        let out = try stdout(of: SSHRemoteCommand.pricingHashes, maxStdout: 512)
+        var hashes: [SSHPricingFile: String] = [:]
+        for line in String(decoding: out, as: UTF8.self).split(separator: "\n", omittingEmptySubsequences: false).dropLast() {
+            let parts = line.split(separator: " ", omittingEmptySubsequences: false)
+            guard parts.count == 3, parts[1].isEmpty, SSHInput.isDigest(String(parts[0])),
+                  let file = SSHPricingFile(rawValue: String(parts[2])), hashes[file] == nil
+            else { return nil }
+            hashes[file] = String(parts[0])
+        }
+        guard out.isEmpty || out.last == 0x0A else { return nil }
+        return hashes
+    }
+
+    /// Sends `data` as `file`; the remote checks it against `digest` before the rename.
+    func uploadPricing(_ file: SSHPricingFile, data: Data, digest: String) throws {
+        _ = try stdout(of: SSHRemoteCommand.pricingUpload(file, digest: digest), stdin: .data(data),
+                       timeout: deployTimeout, maxStdout: 256)
+    }
+
     func ensureRunning() throws -> SSHRemoteStatus {
         do {
             return try status()

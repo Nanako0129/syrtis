@@ -54,6 +54,7 @@ enum SSHRemoteSelfTest {
         disclosureChecks(expect)
         sshOptionChecks(fake, expect)
         supervisor(expect)
+        pricingChecks(expect)
     }
 
     // MARK: ssh target
@@ -454,7 +455,7 @@ enum SSHRemoteSelfTest {
         let suite: String
         let coordinator: SSHMachineCoordinator
 
-        init?(callTimeout: TimeInterval? = nil) {
+        init?(callTimeout: TimeInterval? = nil, pricingSource: URL? = nil) {
             guard let fake = try? SSHFake() else { return nil }
             self.fake = fake
             local = SSHFakeLocal(fake: fake)
@@ -474,6 +475,7 @@ enum SSHRemoteSelfTest {
                 binaryFor: { _ in agent })
             deps.pin = fake.agentSHA256
             deps.randomRemotePort = { Int.random(in: 47500...47599) }
+            if let pricingSource { deps.pricing = SSHPricingPush(runner: runner, store: store, source: pricingSource) }
             coordinator = SSHMachineCoordinator(deps)
         }
 
@@ -963,5 +965,209 @@ enum SSHRemoteSelfTest {
                 timeout: 10, maxStdout: 64 * 1024, cancel: nil)
             expect(result?.end == .exited(0), "SSH options: /usr/bin/ssh -G accepts the \(name) options")
         }
+    }
+}
+
+// MARK: Price table
+
+extension SSHRemoteSelfTest {
+    /// Waits up to `seconds` for `condition`.
+    private static func eventually(_ seconds: TimeInterval, _ condition: () -> Bool) -> Bool {
+        let deadline = Date().addingTimeInterval(seconds)
+        while Date() < deadline {
+            if condition() { return true }
+            Thread.sleep(forTimeInterval: 0.05)
+        }
+        return condition()
+    }
+
+    static func pricingChecks(_ expect: Expect) {
+        let fm = FileManager.default
+        guard let fake = try? SSHFake() else { return expect(false, "SSH price table: setup") }
+        defer { fake.cleanup() }
+        let suite = "com.tokenbar.selftest.ssh-pricing-\(UUID().uuidString)"
+        guard let defaults = UserDefaults(suiteName: suite) else { return expect(false, "SSH price table: setup") }
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let store = SSHMachines(defaults: defaults)
+
+        // The builder: two fixed names, a 64-hex digest, one line without single quotes.
+        let digest = String(repeating: "a", count: 64)
+        let upload = try? SSHRemoteCommand.pricingUpload(.litellm, digest: digest).shell
+        expect(SSHPricingFile(rawValue: "../x") == nil && SSHPricingFile.allCases.count == 2
+            && (try? SSHRemoteCommand.pricingUpload(.litellm, digest: "abc")) == nil
+            && (try? SSHRemoteCommand.pricingUpload(.openrouter, digest: String(repeating: "A", count: 64))) == nil
+            && (try? SSHRemoteCommand.pricingUpload(.openrouter, digest: "$(id)" + String(repeating: "a", count: 59))) == nil
+            && upload?.contains("\n") == false && upload?.dropFirst(7).dropLast(1).contains("'") == false
+            && SSHRemoteCommand.pricingHashes.shell.dropFirst(7).dropLast(1).contains("'") == false,
+            "SSH price table: the builder takes only the two fixed names and a 64-hex digest; both scripts are one line without single quotes")
+
+        // Local sources: two envelopes, plus a link, an oversized file and a non-envelope.
+        let source = fake.dir.appendingPathComponent("src")
+        let bad = fake.dir.appendingPathComponent("bad")
+        for url in [source, bad] { try? fm.createDirectory(at: url, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700]) }
+        let bytes: [SSHPricingFile: Data] = [
+            .litellm: Data(#"{"timestamp":1700000000,"data":{"m":{"input_cost_per_token":1e-6}}}"#.utf8),
+            .openrouter: Data(#"{"timestamp":1700000001,"data":{"o":{"input_cost_per_token":2e-6}}}"#.utf8),
+        ]
+        for (file, data) in bytes { try? data.write(to: source.appendingPathComponent(file.rawValue)) }
+        try? fm.createSymbolicLink(at: bad.appendingPathComponent(SSHPricingFile.litellm.rawValue),
+                                   withDestinationURL: source.appendingPathComponent(SSHPricingFile.litellm.rawValue))
+        let big = bad.appendingPathComponent(SSHPricingFile.openrouter.rawValue)
+        fm.createFile(atPath: big.path, contents: bytes[.openrouter])
+        if let handle = try? FileHandle(forWritingTo: big) {
+            try? handle.truncate(atOffset: UInt64(SSHPricingPush.maxBytes + 1))
+            try? handle.close()
+        }
+        let notEnvelope = fake.dir.appendingPathComponent("plain.json")
+        try? Data(#"{"timestamp":-1,"data":{}}"#.utf8).write(to: notEnvelope)
+        let boolStamp = fake.dir.appendingPathComponent("bool.json")
+        try? Data(#"{"timestamp":true,"data":{}}"#.utf8).write(to: boolStamp)
+        expect(SSHPricingPush.readSource(source.appendingPathComponent(SSHPricingFile.litellm.rawValue)) == bytes[.litellm]
+            && SSHPricingPush.readSource(bad.appendingPathComponent(SSHPricingFile.litellm.rawValue)) == nil
+            && SSHPricingPush.readSource(big) == nil && SSHPricingPush.readSource(notEnvelope) == nil
+            && SSHPricingPush.readSource(boolStamp) == nil
+            && !SSHPricingPush.isEnvelope(Data(#"{"timestamp":1.5,"data":{}}"#.utf8))
+            && !SSHPricingPush.isEnvelope(Data(#"{"timestamp":1,"data":[]}"#.utf8))
+            && !SSHPricingPush.isEnvelope(Data(#"[1]"#.utf8)),
+            "SSH price table: only a regular file (no link), at most 32 MiB, with an unsigned integer timestamp and an object data is read")
+
+        let remoteDir = fake.home.appendingPathComponent(".local/state/syrtis-agent/pricing")
+        func makeRemoteDir() {
+            try? fm.createDirectory(at: remoteDir, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        }
+        func remote(_ file: SSHPricingFile) -> Data? { try? Data(contentsOf: remoteDir.appendingPathComponent(file.rawValue)) }
+        /// ssh calls since `mark` that carried a body (only the price upload script reads stdin here).
+        func bodies(since mark: Int) -> Int {
+            fake.invocations.dropFirst(mark).filter { $0.last?.contains("/.up.XXXXXX") == true }.count
+        }
+        makeRemoteDir()
+        let lport = (try? store.allocateLocalPort()) ?? 47160
+        let machine = SSHMachine(
+            id: UUID(), label: "p", user: "me", host: "box.example", sshPort: nil, remotePort: 47500,
+            localPort: lport, producerStatic: nil, fingerprint: nil, grantId: nil, enabled: true)
+        try? store.add(machine)
+        fake.seed(running: true)
+
+        // (a) A tunnel that comes up copies both files with the local bytes.
+        var options = SSHTunnelSupervisor.Options(runner: fake.runner, stateDirectory: fake.dir.appendingPathComponent("pt"))
+        options.backoff = [0.1, 0.2]
+        options.pollInterval = 0.05
+        let supervisor = SSHTunnelSupervisor(options: options)
+        defer { supervisor.stopAll() }
+        let push = SSHPricingPush(runner: fake.runner, store: store, source: source)
+        push.observe(supervisor)
+        supervisor.start(machine)
+        let arrived = eventually(15) { remote(.litellm) == bytes[.litellm] && remote(.openrouter) == bytes[.openrouter] }
+        let leftovers = { ((try? fm.contentsOfDirectory(atPath: remoteDir.path)) ?? []).filter { $0.hasPrefix(".up.") } }
+        expect(arrived && leftovers().isEmpty,
+               "SSH price table: after the tunnel connects both files arrive with the local bytes, no temp file left")
+        _ = eventually(5) { supervisor.status(id: machine.id) == .up }
+
+        // (b) Unchanged: even a forced trigger sends no body (the remote hashes match).
+        var mark = fake.invocations.count
+        let sentAgain = push.push(machine.id, force: true)
+        expect(sentAgain == 0 && bodies(since: mark) == 0 && fake.invocations.count == mark + 1,
+               "SSH price table: a second trigger with unchanged files sends no body, only the hash check")
+
+        // `pricing/<name>` is a directory, or a link to one: nothing lands in or through it; a skip.
+        let outside = fake.dir.appendingPathComponent("outside")
+        try? fm.createDirectory(at: outside, withIntermediateDirectories: true)
+        let named = remoteDir.appendingPathComponent(SSHPricingFile.litellm.rawValue)
+        let target = try? machine.target()
+        for asLink in [false, true] {
+            try? fm.removeItem(at: named)
+            if asLink { try? fm.createSymbolicLink(at: named, withDestinationURL: outside) }
+            else { try? fm.createDirectory(at: named, withIntermediateDirectories: false) }
+            mark = fake.invocations.count
+            let sent = push.push(machine.id, force: true)
+            let direct = target.flatMap { target in
+                (try? SSHRemoteCommand.pricingUpload(.litellm, digest: SSHPricingPush.sha256(bytes[.litellm]!)))
+                    .flatMap { try? fake.runner.run(target, $0, stdin: .data(bytes[.litellm]!), timeout: 30) }
+            }
+            let inside = (try? fm.contentsOfDirectory(atPath: (asLink ? outside : named).path)) ?? ["?"]
+            expect(sent == 0 && bodies(since: mark) == 1 && direct?.end == .exited(SSHPricingExit.nameIsDirectory)
+                && inside.isEmpty && leftovers().isEmpty,
+                "SSH price table: pricing/<name> as \(asLink ? "a link to a directory" : "a directory") is a skip (75) for the hash check and the upload, and nothing lands \(asLink ? "outside" : "inside it")")
+        }
+        try? fm.removeItem(at: named)
+
+        // Local sources that are a link, oversized or not the envelope are not sent.
+        let refused = SSHPricingPush(runner: fake.runner, store: store, source: bad)
+        mark = fake.invocations.count
+        expect(refused.push(machine.id, force: true) == 0 && fake.invocations.count == mark,
+               "SSH price table: a source that is a link or over 32 MiB is not read and no ssh call is made")
+        try? fm.removeItem(at: big)
+        try? Data(#"{"timestamp":"1","data":{}}"#.utf8).write(to: big)
+        mark = fake.invocations.count
+        expect(refused.push(machine.id, force: true) == 0 && fake.invocations.count == mark,
+               "SSH price table: a source that is not the JSON envelope is not sent")
+
+        // Five reconnects with a failing upload (72: the remote hash never matches) send one body.
+        let single = fake.dir.appendingPathComponent("single")
+        try? fm.createDirectory(at: single, withIntermediateDirectories: true)
+        try? Data(#"{"timestamp":1700000002,"data":{}}"#.utf8).write(to: single.appendingPathComponent(SSHPricingFile.litellm.rawValue))
+        let wrongHash = fake.bin.appendingPathComponent("sha256sum")
+        try? "#!/bin/sh\necho \"\(String(repeating: "0", count: 64))  $1\"\n".write(to: wrongHash, atomically: true, encoding: .utf8)
+        try? fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: wrongHash.path)
+        let before72 = remote(.litellm)
+        let failing = SSHPricingPush(runner: fake.runner, store: store, source: single)
+        failing.observe(supervisor)
+        mark = fake.invocations.count
+        var reconnects = 0
+        let state = fake.dir.appendingPathComponent("pt")
+        for _ in 0..<5 {
+            guard let pid = readPid(state, machine.id) else { break }
+            kill(pid, SIGKILL)
+            if eventually(10, { readPid(state, machine.id).map { $0 != pid } == true && supervisor.status(id: machine.id) == .up }) {
+                reconnects += 1
+            }
+        }
+        _ = eventually(3) { bodies(since: mark) >= 1 }
+        Thread.sleep(forTimeInterval: 0.5)
+        expect(reconnects == 5 && bodies(since: mark) == 1 && remote(.litellm) == before72 && leftovers().isEmpty,
+               "SSH price table: five reconnects with an upload that fails (72) send one body within the hour (\(reconnects) reconnects, \(bodies(since: mark)) bodies)")
+        let direct72 = target.flatMap { target in
+            (try? SSHRemoteCommand.pricingUpload(.litellm, digest: SSHPricingPush.sha256(bytes[.litellm]!)))
+                .flatMap { try? fake.runner.run(target, $0, stdin: .data(bytes[.litellm]!), timeout: 30) }
+        }
+        expect(direct72?.end == .exited(SSHPricingExit.mismatch) && supervisor.status(id: machine.id) == .up
+            && store.machine(id: machine.id) == machine,
+               "SSH price table: a failed upload (72) leaves the machine Connected and its record unchanged")
+        try? fm.removeItem(at: wrongHash)
+
+        // (c) No `pricing/` on the remote (74): zero body bytes, nothing created, still Connected.
+        try? fm.removeItem(at: remoteDir)
+        mark = fake.invocations.count
+        let fresh = SSHPricingPush(runner: fake.runner, store: store, source: source)
+        let hash74 = target.flatMap { try? fake.runner.run($0, SSHRemoteCommand.pricingHashes, timeout: 30) }
+        expect(hash74?.end == .exited(SSHPricingExit.noDirectory)
+            && fresh.push(machine.id, force: true) == 0 && bodies(since: mark) == 0
+            && !fm.fileExists(atPath: remoteDir.path) && supervisor.status(id: machine.id) == .up
+            && store.machine(id: machine.id) == machine,
+            "SSH price table: a remote without pricing/ (74) gets zero body bytes and no directory, and the machine stays Connected")
+        makeRemoteDir()
+
+        // A removed machine: no push starts for it.
+        mark = fake.invocations.count
+        fresh.forget(machine.id)
+        expect(fresh.push(machine.id, force: true) == 0 && fake.invocations.count == mark,
+               "SSH price table: no push starts for a machine that was removed")
+        supervisor.stop(id: machine.id)
+
+        // The coordinator: a completed add copies the files.
+        if let rig = Rig(pricingSource: source) {
+            defer { rig.cleanup() }
+            rig.fake.seed(running: false)
+            let dir = rig.fake.home.appendingPathComponent(".local/state/syrtis-agent/pricing")
+            try? fm.createDirectory(at: dir, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+            let added = value(blocking { [coordinator = rig.coordinator] in
+                try await coordinator.add(user: "me", host: "box.example", label: nil, confirm: { _ in true })
+            })
+            let copied = eventually(10) {
+                (try? Data(contentsOf: dir.appendingPathComponent(SSHPricingFile.litellm.rawValue))) == bytes[.litellm]
+                    && (try? Data(contentsOf: dir.appendingPathComponent(SSHPricingFile.openrouter.rawValue))) == bytes[.openrouter]
+            }
+            expect(added != nil && copied, "SSH price table: a completed add copies both files to the machine")
+        } else { expect(false, "SSH price table: rig") }
     }
 }

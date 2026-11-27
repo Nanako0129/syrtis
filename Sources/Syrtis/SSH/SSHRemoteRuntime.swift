@@ -10,6 +10,7 @@ final class SSHRemoteRuntime: @unchecked Sendable {
     let store: SSHMachines
     let supervisor: SSHTunnelSupervisor
     let coordinator: SSHMachineCoordinator
+    let pricing: SSHPricingPush
 
     private let lock = NSLock()
     private var launched = false
@@ -21,11 +22,13 @@ final class SSHRemoteRuntime: @unchecked Sendable {
         self.store = store
         supervisor = SSHTunnelSupervisor(options: .init(stateDirectory: stateDirectory))
         let tunnels = supervisor
+        pricing = SSHPricingPush(store: store)
+        pricing.observe(supervisor)
         coordinator = SSHMachineCoordinator(.init(
             store: store, tunnels: tunnels, local: LiveSSHLocalPairing(),
             makeRemote: { target, cancel in SSHCtl(target: target, cancel: cancel) },
             binaryFor: { SSHAgentPin.bundledBinary(triple: $0, resources: resources) },
-            pin: SSHAgentPin.pin(resources: resources)))
+            pin: SSHAgentPin.pin(resources: resources), pricing: pricing))
     }
 
     /// Pid files of the tunnels, kept apart for a development build exactly as

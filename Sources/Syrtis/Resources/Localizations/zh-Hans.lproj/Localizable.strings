@@ -890,7 +890,7 @@
 /* SSH machines (Devices page) */
 "SSH machines" = "SSH 机器";
 "Read usage from Linux machines you can reach over SSH." = "读取你能通过 SSH 连上的 Linux 机器的用量。";
-"Syrtis installs its usage agent on the machine over your ssh, keeps an ssh tunnel to it, and pairs through the tunnel. It uses your ssh config and ssh-agent, and never accepts an unknown host key. The machine's usage then appears in the device menu like any linked device." = "Syrtis 会通过你的 ssh 把用量 agent 安装到那台机器，维持一条 ssh 转发，并通过它配对。使用你的 ssh 配置与 ssh-agent，且不会自动接受未知的 host key。之后该机器的用量就像其他已链接的设备一样出现在设备菜单。";
+"Syrtis installs its usage agent on the machine over your ssh, keeps an ssh tunnel to it, and pairs through the tunnel. It uses your ssh config and ssh-agent, and never accepts an unknown host key. It also copies Syrtis's price table to the machine so its costs can be calculated. The machine's usage then appears in the device menu like any linked device." = "Syrtis 会通过你的 ssh 把用量 agent 安装到那台机器，维持一条 ssh 转发，并通过它配对。使用你的 ssh 配置与 ssh-agent，且不会自动接受未知的 host key。也会把 Syrtis 的价格表复制到那台机器，让它的费用算得出来。之后该机器的用量就像其他已链接的设备一样出现在设备菜单。";
 "This version doesn't include the remote agent." = "此版本未附带远端 agent。";
 "No SSH machines." = "没有 SSH 机器。";
 "Add a machine" = "添加机器";

@@ -120,6 +120,8 @@ final class SSHMachineCoordinator: @unchecked Sendable {
         var tunnelTimeout: TimeInterval = 20
         var offerTTL = 120
         var claimAttempts = 5
+        /// Copies the price table after an add or re-approval; forgets a removed machine.
+        var pricing: SSHPricingPush?
     }
 
     private let deps: Dependencies
@@ -205,9 +207,12 @@ final class SSHMachineCoordinator: @unchecked Sendable {
         let remote = deps.makeRemote(target, cancel)
         let flow = Flow(target: target, machineId: UUID())
         do {
-            return try await addSteps(
+            let machine = try await addSteps(
                 flow: flow, remote: remote, target: target, user: user, host: host, sshPort: sshPort,
                 label: label, pin: pin, confirm: confirm, cancel: cancel)
+            // Off this flow: the push holds none of its state and its failure is not the add's.
+            deps.pricing?.trigger(machine.id, force: true)
+            return machine
         } catch {
             throw await rollback(flow, after: error)
         }
@@ -274,9 +279,11 @@ final class SSHMachineCoordinator: @unchecked Sendable {
         let remote = deps.makeRemote(target, cancel)
         let flow = Flow(target: target, machineId: id, original: original)
         do {
-            return try await reapproveSteps(
+            let result = try await reapproveSteps(
                 flow: flow, remote: remote, original: original, target: target,
                 confirm: confirm, confirmIdentityChange: confirmIdentityChange, cancel: cancel)
+            deps.pricing?.trigger(id, force: true)
+            return result
         } catch {
             throw await rollback(flow, after: error)
         }
@@ -337,6 +344,7 @@ final class SSHMachineCoordinator: @unchecked Sendable {
         try begin()
         defer { end() }
         guard let machine = deps.store.machine(id: id) else { throw SSHRemoteError.invalidInput("machine") }
+        deps.pricing?.forget(id)
         let outcome = await revokeRemote(machine, purge: purge)
         deps.tunnels.stop(id: id)
         if let key = machine.producerStatic {

@@ -327,6 +327,61 @@ struct SSHRemoteCommand: Equatable, Sendable {
         ].joined(separator: "; ")
         return try SSHRemoteCommand(script: script)
     }
+
+    // MARK: Price table
+
+    /// The remote agent's pricing directory exists, is a real directory (not a link) owned by the
+    /// remote user; otherwise exit 74. Nothing creates it: an agent that never ran has none.
+    private static let pricingDirCheck =
+        "D=\"$HOME/.local/state/syrtis-agent/pricing\"; [ -d \"$D\" ] && [ ! -L \"$D\" ] && [ -O \"$D\" ] || exit \(SSHPricingExit.noDirectory)"
+
+    /// Read-only: `<sha256>  <name>` for each of the two files that exists, after the
+    /// directory checks; exit 75 when a name is a directory or a link to one.
+    static let pricingHashes = try! SSHRemoteCommand(script: [
+        pricingDirCheck,
+        "for n in \(SSHPricingFile.allCases.map(\.rawValue).joined(separator: " ")); do "
+            + "[ -d \"$D/$n\" ] && exit \(SSHPricingExit.nameIsDirectory); [ -f \"$D/$n\" ] || continue; "
+            + "H=$( (sha256sum \"$D/$n\" || shasum -a 256 \"$D/$n\") 2>/dev/null | cut -d\" \" -f1); "
+            + "printf \"%s  %s\\n\" \"$H\" \"$n\"; done",
+    ].joined(separator: "; "))
+
+    /// Upload one price file from stdin into a temp file in the pricing directory, check its
+    /// sha256 against `digest`, and rename it over `<name>` (same directory). Exit 74 or 75 as
+    /// `pricingHashes`, 70 mktemp, 71 upload, 72 hash mismatch; the temp file is removed on exit.
+    static func pricingUpload(_ file: SSHPricingFile, digest: String) throws -> SSHRemoteCommand {
+        guard SSHInput.isDigest(digest) else { throw SSHRemoteError.invalidInput("digest") }
+        let name = file.rawValue
+        let script = [
+            "umask 077",
+            pricingDirCheck,
+            "[ -d \"$D/\(name)\" ] && exit \(SSHPricingExit.nameIsDirectory)",
+            "T=$(mktemp \"$D/.up.XXXXXX\") || exit \(SSHPricingExit.tempFile)",
+            "trap \"rm -f \\\"\\$T\\\"\" EXIT",
+            "cat > \"$T\" || exit \(SSHPricingExit.upload)",
+            "H=$( (sha256sum \"$T\" || shasum -a 256 \"$T\") 2>/dev/null | cut -d\" \" -f1)",
+            "[ \"$H\" = \"\(digest)\" ] || exit \(SSHPricingExit.mismatch)",
+            "mv -f \"$T\" \"$D/\(name)\"",
+        ].joined(separator: "; ")
+        return try SSHRemoteCommand(script: script)
+    }
+}
+
+/// The two price files the engine reads (`RemotePricingSnapshot::from_cache_root`, the same names as
+/// `PRICING_FILES` in `remote_agent.rs`). The only names a price command may carry.
+enum SSHPricingFile: String, CaseIterable, Sendable {
+    case litellm = "pricing-litellm.json"
+    case openrouter = "pricing-openrouter.json"
+}
+
+/// Exit codes of the price commands. 70-72 mean what they mean for `deploy`.
+enum SSHPricingExit {
+    static let tempFile: Int32 = 70
+    static let upload: Int32 = 71
+    static let mismatch: Int32 = 72
+    /// No usable `pricing/` (missing, a link, or not the remote user's): skip, create nothing.
+    static let noDirectory: Int32 = 74
+    /// `pricing/<name>` is a directory or a link to one: `mv` would write into it, so skip.
+    static let nameIsDirectory: Int32 = 75
 }
 
 /// One `syrtis-agent ctl` invocation (the agent's `ctl` contract).
