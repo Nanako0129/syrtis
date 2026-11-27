@@ -24852,6 +24852,13 @@ enum SelfTest {
                            && table?[3].0 == #selector(NSText.selectAll(_:)) && table?[3].1 == "a"
                            && table?.allSatisfy({ $0.2.contains(.command) }) == true,
                        "DR2A (7) the main menu's Edit menu has Cut, Copy, Paste and Select All with ⌘X, ⌘C, ⌘V, ⌘A")
+                // ⌘W closes the key window (the Settings window). (Seeing the
+                // window close is an on-screen check.)
+                let close = menu.items.first?.submenu?.items.first
+                expect(menu.items.first?.submenu?.items.count == 1
+                           && close?.action == #selector(NSWindow.performClose(_:)) && close?.keyEquivalent == "w"
+                           && close?.keyEquivalentModifierMask == .command,
+                       "the main menu's application item has Close Window with ⌘W, sent as performClose")
                 let field = NSTextView()
                 expect([#selector(NSText.cut(_:)), #selector(NSText.copy(_:)), #selector(NSText.paste(_:)),
                         #selector(NSText.selectAll(_:))].allSatisfy { field.responds(to: $0) },

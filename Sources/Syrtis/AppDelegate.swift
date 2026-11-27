@@ -74,9 +74,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// a window of the app is key; without an Edit menu the Settings window's
     /// text fields ignore them. The actions are the responder-chain selectors
     /// of `NSText`, which a field's editor handles.
+    ///
+    /// The application item carries Close Window (⌘W) for the same reason:
+    /// `performClose(_:)` goes to the key window, so the Settings window closes
+    /// like any other Mac settings window. The app keeps running (an accessory
+    /// app does not quit with its last window).
     static func makeMainMenu() -> NSMenu {
         let main = NSMenu()
-        main.addItem(withTitle: "", action: nil, keyEquivalent: "").submenu = NSMenu()
+        let app = NSMenu()
+        app.addItem(
+            withTitle: "Close Window".localized, action: #selector(NSWindow.performClose(_:)), keyEquivalent: "w")
+        main.addItem(withTitle: "", action: nil, keyEquivalent: "").submenu = app
         let edit = NSMenu(title: "Edit".localized)
         for (title, action, key) in [
             ("Cut", #selector(NSText.cut(_:)), "x"),
