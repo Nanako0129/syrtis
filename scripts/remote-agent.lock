@@ -1,8 +1,8 @@
 # Pin of the Linux agent release that `make remote-agent` downloads. The
 # sha256 here is the trust root: the .sha256 file in the release is not.
-# Leave tag and sha256 empty until the upstream agent publishes a Linux
-# release; then fill all four in one reviewed commit.
+# Change tag and sha256 together, in one reviewed commit, from an asset you
+# downloaded and hashed yourself.
 repo=Nanako0129/Syrtis-Agent
-tag=
+tag=v0.1.0
 target=x86_64-unknown-linux-gnu
-sha256=
+sha256=322fc41f27b05cccd4f4e2f895ca8bfa23542c297d8e935a031b7682d600f57b

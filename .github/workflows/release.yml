@@ -124,6 +124,13 @@ jobs:
           echo "VERSION=$VERSION" >> "$GITHUB_ENV"
           echo "BUILD=$(git rev-list --count HEAD)" >> "$GITHUB_ENV"
 
+      # The Linux agent Syrtis installs on SSH machines: the release pinned in
+      # scripts/remote-agent.lock, checked against the lock's sha256. A failed
+      # download or a mismatch fails the release; bundle.sh re-hashes what is
+      # staged before copying it into the app.
+      - name: Stage the pinned remote agent
+        run: make remote-agent
+
       - name: Build and bundle (ad-hoc)
         run: scripts/bundle.sh "$VERSION" "$BUILD"
 
