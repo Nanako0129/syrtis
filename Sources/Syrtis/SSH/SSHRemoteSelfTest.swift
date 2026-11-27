@@ -1013,11 +1013,9 @@ extension SSHRemoteSelfTest {
         try? fm.createSymbolicLink(at: bad.appendingPathComponent(SSHPricingFile.litellm.rawValue),
                                    withDestinationURL: source.appendingPathComponent(SSHPricingFile.litellm.rawValue))
         let big = bad.appendingPathComponent(SSHPricingFile.openrouter.rawValue)
-        fm.createFile(atPath: big.path, contents: bytes[.openrouter])
-        if let handle = try? FileHandle(forWritingTo: big) {
-            try? handle.truncate(atOffset: UInt64(SSHPricingPush.maxBytes + 1))
-            try? handle.close()
-        }
+        // A valid envelope that is only too large: without the size cap it would be read.
+        try? (Data(#"{"timestamp":1,"data":{"p":""#.utf8) + Data(repeating: 0x61, count: SSHPricingPush.maxBytes)
+            + Data(#""}}"#.utf8)).write(to: big)
         let notEnvelope = fake.dir.appendingPathComponent("plain.json")
         try? Data(#"{"timestamp":-1,"data":{}}"#.utf8).write(to: notEnvelope)
         let boolStamp = fake.dir.appendingPathComponent("bool.json")
