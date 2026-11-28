@@ -331,9 +331,9 @@ char *tb_set_cursor_sync(const char *json);
 
 // Sync Cursor usage from the signed-in Cursor desktop app now, every
 // configured profile in turn within one time budget. Blocking (SQLite reads +
-// network, up to 10 min): never call on the main thread. `user_initiated`
-// non-zero = the user's "Sync now". Single-flight: a call made while one runs
-// waits for it and returns its status. Success data is
+// network, up to the Sync Now round cap): never call on the main thread.
+// `user_initiated` non-zero = the user's "Sync now". Single-flight: a call made
+// while one runs waits for it and returns its status. Success data is
 // `{"state":"ok|partial|expired|notSignedIn|offline|error|disabled|cliPresent",
 // "events":N,"lastSuccessMs":ms|null,"reason"?:"<fixed code>","changed":bool,
 // "profiles":[{"id","state","events","lastSuccessMs","reason"?,

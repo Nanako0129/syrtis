@@ -753,6 +753,7 @@
 "Cursor's new billing didn't provide this account's usage (%@). Syrtis will try again later." = "Cursor 新版計費沒有提供這個帳號的用量（%@），Syrtis 稍後會再試。";
 "Cursor's new billing has no usage for this account yet (%@). Syrtis will try again later." = "Cursor 新版計費目前還沒有這個帳號的用量（%@），Syrtis 稍後會再試。";
 "Cursor returned usage of another account, so Syrtis saved nothing (%@)." = "Cursor 回傳的是其他帳號的用量，因此 Syrtis 沒有儲存任何資料（%@）。";
+"If Sync Now times out, open cursor-sync-debug.log in ~/Library/Application Support/com.nyanako.tokenbar for timing details. The file never contains your Cursor login." = "如果「立即同步」逾時，請開啟 ~/Library/Application Support/com.nyanako.tokenbar 裡的 cursor-sync-debug.log 查看計時詳情。這個檔案不會儲存你的 Cursor 登入資訊。";
 
 /* Settings Devices page (SA-3c) */
 "Devices" = "裝置";

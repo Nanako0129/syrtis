@@ -8,17 +8,18 @@
 //!   is at most 4096 bytes, never repeats, and never reaches a reason.
 //! - The client (no redirects, https only) and the sensitive cookie are the
 //!   old walk's. Pages and body bytes are capped across every window of one
-//!   walk; any refusal (3xx/401/403/429/5xx, an `availability` answer,
-//!   an item neither on the cookie's user id nor on the walk's one other
-//!   `type: user` principal, see `owner`) ends the walk, and the caller then
-//!   writes nothing.
+//!   walk; any refusal (3xx/401/403/429, an exhausted 5xx/timeout retry, an
+//!   `availability` answer, an item neither on the cookie's user id nor on
+//!   the walk's one other `type: user` principal, see `owner`) ends the
+//!   walk, and the caller then writes nothing. A page that returns 5xx or
+//!   times out is retried up to twice (`fetch_page_body`) before that
+//!   refusal.
 //! - Items are read into a typed struct with only the fields below:
 //!   `displayExtras.userEmail` is never deserialised; `principal.id` and
 //!   `billingItemId` live only in memory (comparison, dedupe). No log line.
 
 use crate::cursor_sync::{
-    body_stop, read_capped, refusal, send_stop, timestamp_ms, Event, Limits, Num, State, Stop,
-    Timestamp, TokenUsage,
+    fetch_page_body, timestamp_ms, Event, Limits, Num, State, Stop, Timestamp, TokenUsage,
 };
 use chrono::{Datelike, TimeZone, Utc};
 use serde::Deserialize;
@@ -358,6 +359,7 @@ pub(crate) async fn walk(
     windows: &[i32],
     stop_after_empty: bool,
     now_ms: i64,
+    profile_id: &str,
 ) -> Result<Fetched, Stop> {
     use reqwest::header;
     let deadline = Instant::now() + limits.budget;
@@ -382,14 +384,6 @@ pub(crate) async fn walk(
             if pages > limits.max_v2_pages {
                 return Err(Stop::new(State::Partial, Some("too_many_pages")));
             }
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                return Err(Stop::new(State::Partial, Some("budget_exhausted")));
-            }
-            // S-3: the switch is re-read before every send.
-            if !enabled() {
-                return Err(Stop::new(State::Disabled, None));
-            }
             let mut url =
                 reqwest::Url::parse(base).map_err(|_| Stop::error("client_unavailable"))?;
             {
@@ -403,22 +397,31 @@ pub(crate) async fn walk(
                     query.append_pair("cursor", cursor);
                 }
             }
-            let sent = client
-                .get(url)
-                .header(header::COOKIE, cookie.clone())
-                .header(header::ORIGIN, "https://cursor.com")
-                .header(header::REFERER, "https://cursor.com/dashboard")
-                .header(header::ACCEPT, "application/json")
-                .header(header::USER_AGENT, "TokenBar")
-                .timeout(limits.page_timeout.min(remaining))
-                .send()
-                .await;
-            let mut response = sent.map_err(|error| send_stop(&error))?;
-            if let Some(stop) = refusal(&mut response).await {
-                return Err(stop);
-            }
             let cap = limits.max_body_bytes.saturating_sub(bytes_read);
-            let body = read_capped(&mut response, cap).await.map_err(body_stop)?;
+            if let Some(debug) = limits.debug.as_deref() {
+                debug.set_ctx(profile_id, "v2", pages, Some(month));
+            }
+            // S-3: fetch_page_body re-reads the switch before every attempt.
+            let body = fetch_page_body(
+                deadline,
+                limits.page_timeout,
+                enabled,
+                cap,
+                limits.debug.as_deref(),
+                &limits.backoffs,
+                |timeout| {
+                    client
+                        .get(url.clone())
+                        .header(header::COOKIE, cookie.clone())
+                        .header(header::ORIGIN, "https://cursor.com")
+                        .header(header::REFERER, "https://cursor.com/dashboard")
+                        .header(header::ACCEPT, "application/json")
+                        .header(header::USER_AGENT, "TokenBar")
+                        .timeout(timeout)
+                        .send()
+                },
+            )
+            .await?;
             bytes_read += body.len();
             // An object only: serde would also read these structs from an array.
             if body.iter().find(|b| !b.is_ascii_whitespace()) != Some(&b'{') {

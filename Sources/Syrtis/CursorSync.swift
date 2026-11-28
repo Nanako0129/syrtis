@@ -290,13 +290,17 @@ enum CursorSync {
         /// the walk's one other `type: user` principal (a second other user, another id that is not
         /// `type: user`, an empty id, a missing principal); nothing saved.
         static let billingV2PrincipalMismatch = "Cursor returned usage of another account, so Syrtis saved nothing (%@)."
+        /// Where Sync Now writes technical timing lines when a page times out
+        /// (`cursor-sync-debug.log` under the app's Application Support dir).
+        /// No login, cookie, account id or folder path is written there.
+        static let debugLogHint = "If Sync Now times out, open cursor-sync-debug.log in ~/Library/Application Support/com.nyanako.tokenbar for timing details. The file never contains your Cursor login."
 
         static var all: [String] {
             [title, toggle, privacy, `continue`, cancel, turnOff, lastSynced, partial, partialWithReason, expired, notSignedIn,
              offline, error, errorWithReason, cliPresent, syncNow, syncing, cliQuestion, useSyrtis, keepCLI, cleanupFailed,
              configRejected, staleCleanupFailed, defaultProfile, addProfile, duplicate, profilesPrivacy, cantAdd, cantRead,
              removeFolder, keychainConsent, keychainDenied, keychainUnlock, keychainAllowAccess, keychainDisclosure, allow,
-             billingV2TeamRequired, billingV2Unavailable, billingV2NoItems, billingV2PrincipalMismatch]
+             billingV2TeamRequired, billingV2Unavailable, billingV2NoItems, billingV2PrincipalMismatch, debugLogHint]
         }
     }
 
