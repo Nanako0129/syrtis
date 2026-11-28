@@ -4,7 +4,7 @@ id: kb-architecture
 kind: canonical
 scope: repository
 read_when: changing Rust parsing, the C ABI, Swift models, reports, cache, or filters
-last_verified: 2026-11-22
+last_verified: 2026-11-28
 sources: [".gitmodules", "Package.swift", "Makefile", "Sources/CTB/include/ctb.h", "crates/tb_core_ffi", "crates/tb_core_ffi/src/agent_account_scope.rs", "crates/tb_core_ffi/src/agent_quota_duration.rs", "crates/tb_core_ffi/src/agent_quota_history.rs", "Sources/TokenBarCore", "Sources/Syrtis", "docs/knowledge/plans/provider-quota-pace.md", "vendor/README.md", "public tokscale-core commit bb9a2a9", "public Syrtis PR #114", "public TokenBar-Windows PR #12", "public TokenBar-Windows PR #20", "Sources/Syrtis/ExtraScanRoots.swift", "crates/tb_core_ffi/src/remote_agent.rs", "crates/tb_core_ffi/src/remote_pages.rs"]
 ---
 
