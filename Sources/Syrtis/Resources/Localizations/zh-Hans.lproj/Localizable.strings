@@ -643,7 +643,7 @@
 "Turn On" = "开启";
 "Automatic capture is paused because the login keychain didn't answer. Press Capture to resume." = "登录钥匙串没有响应，自动捕获已暂停。点按“捕获”即可恢复。";
 "Automatic capture is unavailable on this Mac." = "这台 Mac 无法使用自动捕获。";
-"Turn this on to keep reading agy's current account through its captured sign-in, shown as one OAUTH card, so Syrtis rarely needs to run agy. With it off, a Capture lasts only until agy next refreshes its sign-in (usually within an hour); after that the main card runs agy again." = "开启后，agy 当前登录的账号会一直用捕获的登录读取额度，合并为一张标示 OAUTH 的卡，Syrtis 很少需要运行 agy。关闭时，按「捕获」的效果只维持到 agy 下次更新登录，通常不到一小时，之后主卡会改回运行 agy。";
+"Turn this on to keep reading agy's current account through its captured sign-in. While “Read quota while Antigravity is closed” is on, that account and the main card are shown as one OAUTH card, so Syrtis rarely needs to run agy. With this off, a Capture lasts only until agy next refreshes its sign-in (usually within an hour); after that the main card runs agy again, if that switch is on." = "开启后，agy 当前登录的账号会一直用捕获的登录读取额度。「Antigravity 没开时也读取额度」开启时，它会和主卡合并为一张标示 OAUTH 的卡，Syrtis 很少需要运行 agy。关闭时，按「捕获」的效果只维持到 agy 下次更新登录，通常不到一小时；之后如果那个开关是开的，主卡会改回运行 agy。";
 "Remove deletes only the copy on this Mac. Google still accepts it until you revoke access in Google Account → third-party access, which also signs Antigravity out of that account." = "移除只会删除这台 Mac 上的副本。在你到“Google 账号 → 第三方访问权限”撤销访问之前，Google 仍会接受它；撤销也会让 Antigravity 退出该账户。";
 "Couldn't read agy's login. Check that agy is signed in, and allow access if macOS asks." = "无法读取 agy 的登录。请确认 agy 已登录；macOS 询问时请允许访问。";
 "agy's saved login is in a format Syrtis doesn't recognize." = "agy 保存的登录格式 Syrtis 无法识别。";
@@ -657,7 +657,7 @@
 "Couldn't delete the copy from the login keychain." = "无法从登录钥匙串删除副本。";
 "Something went wrong. Try again." = "出现错误，请再试一次。";
 "Read quota while Antigravity is closed" = "Antigravity 没开时也读取额度";
-"Off: Syrtis reads quota only from the Antigravity app running on this Mac. On: when the app isn't running, Syrtis uses Antigravity's saved Google sign-in, or the agy CLI, to ask Google for the quota. Google's Antigravity terms say that using third-party software to access the service can lead to account suspension." = "关闭时，Syrtis 只从这台 Mac 上正在运行的 Antigravity 读取额度。开启后，Antigravity 没开时，Syrtis 会用 Antigravity 保存的 Google 登录或 agy CLI 向 Google 查询额度。Google 的 Antigravity 条款写明，用第三方软件访问服务可能导致账户被停用。";
+"Off: Syrtis reads the main card's quota only from the Antigravity app running on this Mac. On: when the app isn't running, Syrtis uses Antigravity's saved Google sign-in, or the agy CLI, to ask Google for the quota. Google's Antigravity terms say that using third-party software to access the service can lead to account suspension." = "关闭时，主卡的额度只从这台 Mac 上正在运行的 Antigravity 读取。开启后，Antigravity 没开时，Syrtis 会用 Antigravity 保存的 Google 登录或 agy CLI 向 Google 查询额度。Google 的 Antigravity 条款写明，用第三方软件访问服务可能导致账户被停用。";
 "Read quota while Antigravity is closed?" = "要在 Antigravity 没开时也读取额度吗？";
 "Added accounts are always read with their saved Google sign-in, which carries the same risk." = "添加的账户一律用保存的 Google 登录读取，风险相同。";
 

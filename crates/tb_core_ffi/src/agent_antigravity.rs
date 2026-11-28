@@ -206,14 +206,40 @@ pub(crate) async fn fetch(
         },
         antigravity_in_use,
         || async move {
-            // The local route already missed in `fetch_gated`.
+            // The local route already missed in `fetch_gated`. The flag is read
+            // again before each later leg starts, so a switch turned off while
+            // the first request is in flight starts no new outward operation
+            // (a request already sent may finish).
+            let off = || ProviderFetchFailure::terminal(ANTIGRAVITY_LOCAL_ONLY_ERROR);
             let primary = fetch_with(
                 || async { LocalAttempt::RouteMiss },
                 || fetch_oauth_primary(now),
-                |context| fetch_oauth_secondary(context, now),
+                |context| async move {
+                    if !remote_fallback_allowed() {
+                        return Err(off());
+                    }
+                    fetch_oauth_secondary(context, now).await
+                },
             )
             .await;
-            with_agy_fallback(primary, bound, live_agy_marker, || fetch_agy_cli(now)).await
+            with_agy_fallback(
+                primary,
+                bound,
+                || async {
+                    if remote_fallback_allowed() {
+                        live_agy_marker().await
+                    } else {
+                        None
+                    }
+                },
+                || async move {
+                    if !remote_fallback_allowed() {
+                        return Err(off());
+                    }
+                    fetch_agy_cli(now).await
+                },
+            )
+            .await
         },
     )
     .await

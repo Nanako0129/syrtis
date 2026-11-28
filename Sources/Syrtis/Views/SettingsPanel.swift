@@ -2089,13 +2089,13 @@ enum AccountsCopy {
     static let confirmBody = "Syrtis reads agy's current sign-in now and again each time agy rewrites its saved sign-in, and keeps a copy of each account in this Mac's login keychain without asking again. To check a new sign-in, Syrtis sends agy's refresh token to Google's token service. macOS may ask you to allow access to agy's keychain item. Accounts you remove while this is on stay removed until you sign agy in to them and press Capture."
     static let confirmOk = "Turn On"
     static let confirmCancel = "Cancel"
-    static let autoOff = "Turn this on to keep reading agy's current account through its captured sign-in, shown as one OAUTH card, so Syrtis rarely needs to run agy. With it off, a Capture lasts only until agy next refreshes its sign-in (usually within an hour); after that the main card runs agy again."
+    static let autoOff = "Turn this on to keep reading agy's current account through its captured sign-in. While “Read quota while Antigravity is closed” is on, that account and the main card are shown as one OAUTH card, so Syrtis rarely needs to run agy. With this off, a Capture lasts only until agy next refreshes its sign-in (usually within an hour); after that the main card runs agy again, if that switch is on."
     static let remove = "Remove deletes only the copy on this Mac. Google still accepts it until you revoke access in Google Account → third-party access, which also signs Antigravity out of that account."
 
     // #596, approved verbatim by the maintainer 2026-11-28. The caption is
     // also the confirmation's message; the buttons reuse confirmCancel/Ok.
     static let remoteToggle = "Read quota while Antigravity is closed"
-    static let remoteCaption = "Off: Syrtis reads quota only from the Antigravity app running on this Mac. On: when the app isn't running, Syrtis uses Antigravity's saved Google sign-in, or the agy CLI, to ask Google for the quota. Google's Antigravity terms say that using third-party software to access the service can lead to account suspension."
+    static let remoteCaption = "Off: Syrtis reads the main card's quota only from the Antigravity app running on this Mac. On: when the app isn't running, Syrtis uses Antigravity's saved Google sign-in, or the agy CLI, to ask Google for the quota. Google's Antigravity terms say that using third-party software to access the service can lead to account suspension."
     static let remoteConfirmTitle = "Read quota while Antigravity is closed?"
     static let addedAccountsRisk = "Added accounts are always read with their saved Google sign-in, which carries the same risk."
     static let antigravityRemote = [remoteToggle, remoteCaption, remoteConfirmTitle, addedAccountsRisk]
