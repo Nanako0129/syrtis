@@ -22,6 +22,8 @@ let sshLog = Logger(subsystem: "com.nyanako.tokenbar", category: "ssh-remote")
 enum SSHRemoteError: Error, Equatable, Sendable {
     /// A field failed its format check (the field name, never the value).
     case invalidInput(String)
+    /// A saved machine already has this user, host and port.
+    case duplicateMachine
     case launchFailed
     /// The host key is unknown or changed; the owner confirms it in a terminal.
     case hostKeyRejected

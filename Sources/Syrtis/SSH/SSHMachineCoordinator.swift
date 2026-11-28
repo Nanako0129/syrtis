@@ -199,7 +199,7 @@ final class SSHMachineCoordinator: @unchecked Sendable {
         let target = try SSHTarget(user: user, host: host, port: sshPort)
         guard !deps.store.all().contains(where: {
             $0.user == user && $0.host == host && $0.sshPort == sshPort
-        }) else { throw SSHRemoteError.invalidInput("duplicate machine") }
+        }) else { throw SSHRemoteError.duplicateMachine }
         let pin = deps.pin
         guard SSHInput.isDigest(pin), !SSHAgentPin.isPlaceholder(pin) else {
             throw SSHRemoteError.agentPinMissing

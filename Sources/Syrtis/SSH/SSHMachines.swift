@@ -32,7 +32,7 @@ final class SSHMachines: @unchecked Sendable {
         guard !list.contains(where: {
             $0.id == clean.id
                 || ($0.user == clean.user && $0.host == clean.host && $0.sshPort == clean.sshPort)
-        }) else { throw SSHRemoteError.invalidInput("duplicate machine") }
+        }) else { throw SSHRemoteError.duplicateMachine }
         guard !list.contains(where: { $0.localPort == clean.localPort }) else {
             throw SSHRemoteError.portInUse(clean.localPort)
         }

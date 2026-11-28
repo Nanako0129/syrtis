@@ -23204,6 +23204,9 @@ enum SelfTest {
                     == SSHMachinesCopy.portBusy.localized(47501)
                 && SSHMachinesModel.hostKeyCommand(.init(machine: machine, tunnel: .up, needsReapproval: false)) == nil,
                 "SSH3 port-in-use has its fixed line; a running forward has no host key hint")
+            expect(SSHMachinesModel.message(for: SSHRemoteError.duplicateMachine, command: nil)
+                    == SSHMachinesCopy.errDuplicate.localized,
+                "SSH3 a machine that is already saved gets its own sentence, not the field check")
         }
 
         // SA-3c: the Devices page's model, driven by a fake client and a fake

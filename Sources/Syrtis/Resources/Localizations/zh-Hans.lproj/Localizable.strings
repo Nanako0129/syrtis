@@ -932,6 +932,7 @@
 "Re-approved. The machine's identity changed and you accepted the new one." = "已重新批准。机器的身份有变，且你接受了新身份。";
 "Syrtis couldn't finish this on the machine. To finish it yourself, run:\n%@" = "Syrtis 未能在那台机器上完成这件事。要自己完成的话，请执行：\n%@";
 "Check the %@ field." = "请检查「%@」栏位。";
+"This machine is already in the list." = "这台机器已经在列表里了。";
 "Couldn't start /usr/bin/ssh." = "无法启动 /usr/bin/ssh。";
 "Couldn't reach the machine: %@" = "连不上那台机器：%@";
 "Couldn't reach the machine." = "连不上那台机器。";

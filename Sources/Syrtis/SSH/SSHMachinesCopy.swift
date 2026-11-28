@@ -46,6 +46,7 @@ enum SSHMachinesCopy {
     static let purge = "Also uninstall the agent and delete its data there (uninstall --purge), unless other devices still use it"
     static let identityKept = "Re-approved. The machine's identity changed and you accepted the new one."
     static let errInvalid = "Check the %@ field."
+    static let errDuplicate = "This machine is already in the list."
     static let errLaunch = "Couldn't start /usr/bin/ssh."
     static let errUnreachable = "Couldn't reach the machine: %@"
     static let errUnreachableBare = "Couldn't reach the machine."
@@ -86,7 +87,7 @@ enum SSHMachinesCopy {
         turnsOn, scopeHeader, approvePair, identityTitle, identityMessage, identityAccept,
         connecting, retrying, stopped, portBusy,
         needsReapproval, reapprove, hostKey, removeTitle, removeMessage, purge,
-        identityKept, errInvalid, errLaunch, errUnreachable, errUnreachableBare, errTimeout, errOutput, errMalformed,
+        identityKept, errInvalid, errDuplicate, errLaunch, errUnreachable, errUnreachableBare, errTimeout, errOutput, errMalformed,
         errPlatform, errIntegrity, errAgentMissing, errCannotRun, errCommand, errBusy, errNoPort,
         errDeclined, errNotLoopback, errTunnel, errTunnelBare, errPairing, errIdentity,
         errCancelled, errOther, errUnsafeDirs, portInUse,

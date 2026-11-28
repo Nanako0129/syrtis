@@ -933,6 +933,7 @@
 "Re-approved. The machine's identity changed and you accepted the new one." = "已重新核准。機器的身分有變，且你接受了新身分。";
 "Syrtis couldn't finish this on the machine. To finish it yourself, run:\n%@" = "Syrtis 沒能在那台機器上完成這件事。要自己完成的話，請執行：\n%@";
 "Check the %@ field." = "請檢查「%@」欄位。";
+"This machine is already in the list." = "這台機器已經在清單裡了。";
 "Couldn't start /usr/bin/ssh." = "無法啟動 /usr/bin/ssh。";
 "Couldn't reach the machine: %@" = "連不上那台機器：%@";
 "Couldn't reach the machine." = "連不上那台機器。";

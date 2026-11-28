@@ -380,7 +380,9 @@ enum SSHRemoteSelfTest {
         expect(health == [.ok, .warning, .warning, .warning, .error, .error, .idle],
                "SSH machines: the state dot is green for a live forward, orange for reconnecting or re-approval, red for a host key or port problem")
         expect(store.all().first?.label == "box", "SSH machines: a saved label is cleaned of bidi controls")
-        expect((try? store.add(make("a.example", lport: 47102))) == nil, "SSH machines: the same user and host is not added twice")
+        var duplicate: SSHRemoteError?
+        do { try store.add(make("a.example", lport: 47102)) } catch { duplicate = error as? SSHRemoteError }
+        expect(duplicate == .duplicateMachine, "SSH machines: the same user and host is not added twice")
         expect((try? store.add(make("b.example", lport: 47101))) == nil, "SSH machines: a local port is held by one machine")
         // One record that does not decode is skipped, and a store that is not a list is never overwritten.
         let lossySuite = "com.tokenbar.selftest.ssh-machines-lossy"

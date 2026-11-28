@@ -281,6 +281,7 @@ final class SSHMachinesModel: ObservableObject {
         guard let error = error as? SSHRemoteError else { return C.errOther.localized }
         switch error {
         case .invalidInput(let field): return C.errInvalid.localized(field)
+        case .duplicateMachine: return C.errDuplicate.localized
         case .launchFailed: return C.errLaunch.localized
         case .hostKeyRejected: return C.hostKey.localized(command ?? "ssh")
         case .unreachable(let line): return line.isEmpty ? C.errUnreachableBare.localized : C.errUnreachable.localized(line)
