@@ -1997,9 +1997,10 @@ unsafe fn set_cursor_sync_from_c(json: *const c_char) -> Result<serde_json::Valu
 
 /// Run one Cursor desktop sync now: every configured profile, one at a
 /// time, within one time budget. Blocking (SQLite reads + network, up to
-/// 10 min): never call on the main thread. `user_initiated` non-zero = the
-/// user's "Sync now" (10 min budget); zero = background (10 min until every
-/// profile has a complete file, then 60 s). Single-flight: a call made while
+/// the Sync Now round cap): never call on the main thread. `user_initiated`
+/// non-zero = the user's "Sync now" (per-profile full budget, round capped);
+/// zero = background (full budget until every profile has a complete file,
+/// then the shorter background budget). Single-flight: a call made while
 /// one runs waits for it and returns its status. Success data is
 /// `{"state":"ok|partial|expired|notSignedIn|offline|error|disabled|cliPresent",
 /// "events":N,"lastSuccessMs":ms|null,"reason"?:"<fixed code>",

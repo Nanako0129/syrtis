@@ -1293,6 +1293,7 @@ struct SettingsPanel: View {
             details: {
                 hint(CursorSync.Copy.privacy)
                 hint(CursorSync.Copy.profilesPrivacy)
+                hint(CursorSync.Copy.debugLogHint)
             }
         ) {
             // Consent: turning the switch on opens a confirmation carrying the

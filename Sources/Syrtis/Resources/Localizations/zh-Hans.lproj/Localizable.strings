@@ -732,6 +732,7 @@
 "Cursor's new billing didn't provide this account's usage (%@). Syrtis will try again later." = "Cursor 新版计费没有提供这个账号的用量（%@），Syrtis 稍后会再试。";
 "Cursor's new billing has no usage for this account yet (%@). Syrtis will try again later." = "Cursor 新版计费目前还没有这个账号的用量（%@），Syrtis 稍后会再试。";
 "Cursor returned usage of another account, so Syrtis saved nothing (%@)." = "Cursor 返回的是其他账号的用量，因此 Syrtis 没有保存任何数据（%@）。";
+"If Sync Now times out, open cursor-sync-debug.log in Syrtis's Application Support folder for timing details. It never stores your Cursor login." = "如果「立即同步」超时，请打开 Syrtis 的 Application Support 文件夹中的 cursor-sync-debug.log 查看计时详情。它不会存储你的 Cursor 登录信息。";
 
 /* Settings Devices page (SA-3c) */
 "Devices" = "设备";
