@@ -214,6 +214,7 @@ fn limits() -> Limits {
         max_body_bytes: 1024 * 1024,
         explicit: false,
         debug: None,
+        debug_log: false,
     }
 }
 
@@ -916,6 +917,15 @@ fn registry(enabled: bool, dir: &Path) -> RwLock<Config> {
 }
 
 fn sync_status(f: &Fixture, url: &str, registry: &RwLock<Config>) -> serde_json::Value {
+    sync_status_with(f, url, registry, limits())
+}
+
+fn sync_status_with(
+    f: &Fixture,
+    url: &str,
+    registry: &RwLock<Config>,
+    limits: Limits,
+) -> serde_json::Value {
     let billing = v2_url(url);
     let target = Target {
         db_path: &f.db,
@@ -927,7 +937,7 @@ fn sync_status(f: &Fixture, url: &str, registry: &RwLock<Config>) -> serde_json:
         consent: &no_consent,
     };
     let source = || registry.read().unwrap().clone();
-    sync_with(true, None, &target, &source, Some(limits())).0
+    sync_with(true, None, &target, &source, Some(limits)).0
 }
 
 #[test]
@@ -1004,11 +1014,18 @@ fn canaries_never_reach_the_file_names_status_or_errors() {
             slow_ok(&page(4, &["c", "d"])),
         ],
     ];
+    // The #520 debug log is on here, as in production, and searched too.
+    let logged = || Limits {
+        debug_log: true,
+        ..limits()
+    };
+    let debug_log = |f: &Fixture| f.dir.parent().unwrap().join(DEBUG_LOG_NAME);
     let mut outputs = Vec::new();
     for reply in replies {
         let f = fixture();
         let (url, _) = serve(reply);
-        outputs.push(sync_status(&f, &url, &registry(true, &f.dir)).to_string());
+        outputs.push(sync_status_with(&f, &url, &registry(true, &f.dir), logged()).to_string());
+        outputs.push(std::fs::read_to_string(debug_log(&f)).unwrap());
         for entry in std::fs::read_dir(&f.dir).into_iter().flatten().flatten() {
             outputs.push(entry.file_name().to_string_lossy().into_owned());
             if entry.file_type().unwrap().is_file() {
@@ -1032,13 +1049,15 @@ fn canaries_never_reach_the_file_names_status_or_errors() {
         token: token.clone(),
     };
     outputs.push(
-        sync_status(
+        sync_status_with(
             &mismatch,
             "http://127.0.0.1:9/never",
             &registry(true, &mismatch.dir),
+            logged(),
         )
         .to_string(),
     );
+    outputs.push(std::fs::read_to_string(debug_log(&mismatch)).unwrap());
 
     // Control: the scenarios above did produce the outputs being searched.
     let all = outputs.join("\n");
@@ -1051,6 +1070,11 @@ fn canaries_never_reach_the_file_names_status_or_errors() {
         "\"partial\"",
         "account_mismatch",
         "usage.",
+        "event=round_start",
+        "event=profile_start",
+        "event=page_ok",
+        "event=page_retry",
+        "event=page_fail",
     ] {
         assert!(all.contains(expected), "missing {expected} in {all}");
     }
@@ -1374,8 +1398,18 @@ fn disable_deletes_only_our_files_in_every_profile_dir() {
     std::fs::write(default.join("keep.txt"), "x").unwrap();
     std::fs::write(default.join("usage.not-ours.json"), "x").unwrap();
     std::fs::write(default.join(format!("usage.{}.json", "a".repeat(63))), "x").unwrap();
+    // The #520 debug log and its rotated copy go too (not counted).
+    let logs = [app.join(DEBUG_LOG_NAME), app.join(format!("{DEBUG_LOG_NAME}.old"))];
+    for log in &logs {
+        std::fs::write(log, "ts=1 event=round_start\n").unwrap();
+    }
+    std::fs::write(app.join("keep.log"), "x").unwrap();
 
     let result = set_in(home.path(), off).unwrap();
+    for log in &logs {
+        assert!(!log.exists(), "{log:?} survived sync off");
+    }
+    assert!(app.join("keep.log").exists(), "a foreign file in appDir was deleted");
     assert_eq!(result["removedFiles"], 4);
     assert_eq!(result["cleanupFailed"], false);
     assert_eq!(
@@ -2682,8 +2716,14 @@ fn a_round_writes_nothing_into_an_app_dir_that_now_fails_the_checks() {
     std::os::unix::fs::symlink(&outside, &app).unwrap();
     let default_db = login_db(&tmp.path().join("default"), &valid_token(), USER);
     let (url, seen) = serve(vec![json_ok(&page(1, &["a"]))]);
-    let status = sync_round_in(&default_db, &url, &registry, limits(), Some(&home));
+    // The debug log is on, as in production: it must not be opened either.
+    let logged = Limits {
+        debug_log: true,
+        ..limits()
+    };
+    let status = sync_round_in(&default_db, &url, &registry, logged, Some(&home));
     assert_eq!(states(&status), ["error:app_dir_rejected"]);
+    assert!(!outside.join(DEBUG_LOG_NAME).exists(), "debug log written through the symlink");
     assert_eq!(status["reason"], "app_dir_rejected");
     assert_eq!(status["changed"], false);
     assert!(seen.lock().unwrap().is_empty());

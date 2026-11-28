@@ -39,10 +39,13 @@
 //!   `keychain_consent`, `keychain_denied`, `keychain_missing`,
 //!   `keychain_unavailable`, `keychain_unlock`, `token_sealed_unreadable`,
 //!   `token_sealed_unsupported`.
-//! - Optional append-only `<appDir>/cursor-sync-debug.log` (#520): fixed
-//!   event names and decimal timings only (page send/retry/fail, round and
-//!   profile outcomes). Never token, cookie, `sub`, user id, stem, URL query
-//!   or folder path. Rotated at 2 MiB. Absent in hermetic tests.
+//! - Append-only `<appDir>/cursor-sync-debug.log` (#520), written by every
+//!   round while sync is on and the appDir passes the checks (never through
+//!   a rejected appDir): fixed event names and decimal timings only (page
+//!   send/retry/fail, round and profile outcomes). Never token, cookie,
+//!   `sub`, user id, stem, URL query or folder path. Rotated at 2 MiB to
+//!   `.log.old`; turning sync off deletes both. Off in hermetic tests unless
+//!   a test sets `Limits::debug_log`.
 //! - Swift passes a bundle id and `(uuid, root)` pairs, never a directory or a
 //!   database path; Rust derives both (CMP-520 B2). `sub` never crosses the
 //!   FFI: a profile whose account an earlier profile already covered this
@@ -570,6 +573,12 @@ impl Cleanup {
             remove_usage_files_locked(&default_dir(app_dir), false),
         );
         self.orphans(app_dir, &[]);
+        // The sync debug log and its rotated copy: nothing of the sync is
+        // left once it is off. Best effort, not counted in `removed` (not a
+        // usage file); `remove_file` deletes a symlink itself, never its target.
+        for name in [DEBUG_LOG_NAME.to_string(), format!("{DEBUG_LOG_NAME}.old")] {
+            let _ = std::fs::remove_file(app_dir.join(name));
+        }
     }
 
     /// Every `<uuid>` dir under `cursor-profiles` not in `keep`. Only real
@@ -1494,6 +1503,8 @@ struct DebugCtx {
 impl SyncDebugLog {
     /// `<appDir>/cursor-sync-debug.log`. Creates appDir if needed; `None` if
     /// the path cannot be prepared (sync still runs without a log).
+    /// The caller decides first: never for a rejected appDir or a round with
+    /// sync off (`sync_with`).
     fn open(app_dir: &Path) -> Option<Arc<Self>> {
         std::fs::create_dir_all(app_dir).ok()?;
         let path = app_dir.join(DEBUG_LOG_NAME);
@@ -1580,13 +1591,18 @@ pub(crate) struct Limits {
     /// The round was started by the user: a V2 walk re-reads every month in
     /// its range (design 6), not only the recent and never-read ones.
     explicit: bool,
-    /// Optional #520 debug log for this round (`None` in hermetic tests).
+    /// The round's #520 debug log, set by `sync_with` (`None` when the round
+    /// opens none).
     pub(crate) debug: Option<Arc<SyncDebugLog>>,
+    /// Whether `sync_with` may open the debug log at all. Production: true;
+    /// hermetic tests: false unless a test turns it on.
+    pub(crate) debug_log: bool,
 }
 
 impl Limits {
     pub(crate) fn production(budget: Duration, debug: Option<Arc<SyncDebugLog>>) -> Self {
         Self {
+            debug_log: true,
             budget,
             page_timeout: PAGE_TIMEOUT,
             page_size: PAGE_SIZE,
@@ -2611,12 +2627,21 @@ fn sync_with(
     let budget = round_budget(explicit, &profiles, &last.no_file);
     #[cfg(test)]
     ROUND_BUDGET.with(|cell| cell.set(Some(budget)));
-    let debug = start
-        .app_dir
-        .as_deref()
-        .and_then(SyncDebugLog::open)
-        .filter(|_| test_limits.is_none());
-    let limits = test_limits.unwrap_or(Limits::production(budget, debug.clone()));
+    // Decided before anything is created: no log (and no `create_dir_all`)
+    // through a rejected appDir or in a round with sync off.
+    let log_wanted = test_limits.as_ref().map_or(true, |l| l.debug_log);
+    let debug = if log_wanted && start.enabled && !app_dir_rejected {
+        start.app_dir.as_deref().and_then(SyncDebugLog::open)
+    } else {
+        None
+    };
+    let limits = match test_limits {
+        Some(limits) => Limits {
+            debug: debug.clone(),
+            ..limits
+        },
+        None => Limits::production(budget, debug.clone()),
+    };
     let round_started = Instant::now();
     if let Some(debug) = debug.as_deref() {
         let n = profiles.len().to_string();
