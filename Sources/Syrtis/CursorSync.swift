@@ -293,7 +293,7 @@ enum CursorSync {
         /// Where Sync Now writes technical timing lines when a page times out
         /// (`cursor-sync-debug.log` under the app's Application Support dir).
         /// No login, cookie, account id or folder path is written there.
-        static let debugLogHint = "If Sync Now times out, open cursor-sync-debug.log in Syrtis's Application Support folder for timing details. It never stores your Cursor login."
+        static let debugLogHint = "If Sync Now times out, open cursor-sync-debug.log in ~/Library/Application Support/com.nyanako.tokenbar for timing details. The file never contains your Cursor login."
 
         static var all: [String] {
             [title, toggle, privacy, `continue`, cancel, turnOff, lastSynced, partial, partialWithReason, expired, notSignedIn,
