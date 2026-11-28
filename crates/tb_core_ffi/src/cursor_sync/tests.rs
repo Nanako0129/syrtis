@@ -148,7 +148,10 @@ fn serve(replies: Vec<Reply>) -> (String, Arc<Mutex<Vec<Seen>>>) {
                 let mut stream = stream;
                 let request = read_request(&mut stream);
                 log.lock().unwrap().push(request);
-                match replies.lock().unwrap().next() {
+                // Taken before the match: a Delayed/Hang reply must not sleep
+                // holding the lock, or every other connection waits for it.
+                let next = replies.lock().unwrap().next();
+                match next {
                     Some(Reply::Raw(bytes)) => {
                         let _ = stream.write_all(&bytes);
                     }
@@ -215,6 +218,8 @@ fn limits() -> Limits {
         explicit: false,
         debug: None,
         debug_log: false,
+        // Production waits 0.5 s and 1 s; the retry logic is the same.
+        backoffs: [Duration::from_millis(5), Duration::from_millis(10)],
     }
 }
 
@@ -438,23 +443,21 @@ fn timeout_is_partial_and_keeps_the_old_file() {
 fn a_transient_timeout_retries_and_succeeds() {
     let f = fixture();
     let ok_page = page(1, &["a"]);
-    // One slow send, then plenty of successes so a raced mock connection
-    // cannot starve the retried walk of a 2xx body.
-    let (url, seen) = serve(vec![
-        slow_ok(&ok_page),
-        json_ok(&ok_page),
-        json_ok(&ok_page),
-        json_ok(&ok_page),
-    ]);
+    let (url, seen) = serve(vec![slow_ok(&ok_page), json_ok(&ok_page)]);
     let outcome = run_with(&f.db, &f.dir, &url, limits(), &|| true);
-    let heads: Vec<String> = seen
-        .lock()
-        .unwrap()
-        .iter()
-        .map(|s| s.head.lines().next().unwrap_or("").to_string())
-        .collect();
-    assert_eq!(outcome, ok(1), "heads={heads:?}");
-    assert!(heads.len() >= 2, "heads={heads:?}");
+    assert_eq!(outcome, ok(1));
+    assert_eq!(seen.lock().unwrap().len(), 2);
+    assert!(expected_file(&f.dir).exists());
+}
+
+/// #520: headers arrive but the body stalls past the page timeout
+/// (`BodyError::Timeout`); the page is retried and the walk can finish.
+#[test]
+fn a_transient_body_timeout_retries_and_succeeds() {
+    let f = fixture();
+    let (url, seen) = serve(vec![Reply::Hang, json_ok(&page(1, &["a"]))]);
+    assert_eq!(run_with(&f.db, &f.dir, &url, limits(), &|| true), ok(1));
+    assert_eq!(seen.lock().unwrap().len(), 2);
     assert!(expected_file(&f.dir).exists());
 }
 
@@ -2509,6 +2512,43 @@ fn the_round_budget_scales_with_the_profile_count() {
     );
 }
 
+/// #520: with enough profiles both caps bind (8 slots: 8 × 3 min = 24 min
+/// background, 8 × 15 min = 120 min Sync Now). Literal values, so a cap that
+/// stops binding cannot pass by recomputing the same expression.
+#[test]
+fn the_round_budget_caps_bind_with_many_profiles() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ids: Vec<String> = (0..7)
+        .map(|i| format!("0A1B2C3D-0000-4000-8000-00000000010{i}"))
+        .collect();
+    let config = Config {
+        enabled: true,
+        app_dir: Some(tmp.path().join("app")),
+        profiles: ids
+            .iter()
+            .map(|id| profile(id, &tmp.path().join(id)))
+            .collect(),
+        ..Config::default()
+    };
+    let slots = slots(&config, &tmp.path().join("default.vscdb"));
+    assert_eq!(slots.len(), 8);
+    // Every slot's last round wrote no file, so none asks for the full budget.
+    let no_file: Vec<_> = slots.iter().map(Slot::key).collect();
+    assert_eq!(
+        round_budget(false, &slots, &no_file),
+        Duration::from_secs(20 * 60)
+    );
+    assert_eq!(
+        round_budget(true, &slots, &no_file),
+        Duration::from_secs(45 * 60)
+    );
+    // Control: below the cap the background budget is per profile.
+    assert_eq!(
+        round_budget(false, &slots[..2], &no_file),
+        Duration::from_secs(2 * 3 * 60)
+    );
+}
+
 /// FIX 2 ✱: an account is covered only by a walk that synced. The default
 /// profile's session for X is refused (401); profile B on the same account
 /// then tries its own session, and X still counts once.
@@ -2919,7 +2959,7 @@ fn a_profile_that_cannot_write_a_file_does_not_hold_the_full_budget() {
         seen_states,
         ["ok", "notSignedIn", "duplicate", "error:db_not_file"]
     );
-    // Four slots (default + three added): per-profile full, capped at 30 m.
+    // Four slots (default + three added): per-profile budget × 4, under the cap.
     let full4 = FULL_BUDGET.saturating_mul(4).min(FULL_BUDGET_CAP);
     let bg4 = BACKGROUND_BUDGET
         .saturating_mul(4)

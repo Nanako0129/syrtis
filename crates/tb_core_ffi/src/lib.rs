@@ -414,7 +414,8 @@ static RAYON_INIT: LazyLock<()> = LazyLock::new(|| {
 /// one worker: a second one waits in `run_on_caller_pool`, on its own thread,
 /// until the first finishes. Everything else
 /// keeps the caller's thread and the global pool, including `tb_agent_usage` and
-/// `tb_cursor_sync` (network, up to tens of seconds) and the live-rate tail tick
+/// `tb_cursor_sync` (network, up to its round budget: 45 min for Sync Now, 20 min
+/// in the background, at most) and the live-rate tail tick
 /// (about 1 s of CPU per 30 s, which must not wait behind a graph).
 ///
 /// Measured: a warm compute uses about 1.05 cores however many workers it is
@@ -1997,11 +1998,15 @@ unsafe fn set_cursor_sync_from_c(json: *const c_char) -> Result<serde_json::Valu
 
 /// Run one Cursor desktop sync now: every configured profile, one at a
 /// time, within one time budget. Blocking (SQLite reads + network, up to
-/// the Sync Now round cap): never call on the main thread. `user_initiated`
-/// non-zero = the user's "Sync now" (per-profile full budget, round capped);
-/// zero = background (full budget until every profile has a complete file,
-/// then the shorter background budget). Single-flight: a call made while
-/// one runs waits for it and returns its status. Success data is
+/// the round budget): never call on the main thread. The round budget is
+/// 15 min × profiles capped at 45 min for `user_initiated` non-zero (the
+/// user's "Sync now"), and 3 min × profiles capped at 20 min for zero
+/// (background); it is shared by the round, so an earlier profile may use all
+/// of it. A background round still gets the Sync Now budget while some
+/// profile has no complete file, unless that profile's last round could write
+/// no file (not signed in, expired, duplicate, or `Outcome::refused`).
+/// Single-flight: a call made while one runs waits for it and returns its
+/// status. Success data is
 /// `{"state":"ok|partial|expired|notSignedIn|offline|error|disabled|cliPresent",
 /// "events":N,"lastSuccessMs":ms|null,"reason"?:"<fixed code>",
 /// "changed":bool,"profiles":[{"id","state","events","lastSuccessMs","reason"?,

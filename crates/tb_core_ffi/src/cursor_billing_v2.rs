@@ -408,6 +408,7 @@ pub(crate) async fn walk(
                 enabled,
                 cap,
                 limits.debug.as_deref(),
+                &limits.backoffs,
                 |timeout| {
                     client
                         .get(url.clone())

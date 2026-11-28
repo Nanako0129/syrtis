@@ -93,9 +93,11 @@ const SIDECAR_PREFIX: &str = ".cursor-sync.history.";
 const PAGE_SIZE: u32 = 500;
 /// Per-page HTTP timeout, clamped to the remaining round budget.
 /// Measured (#520 `cursor-sync-debug.log`): page `took_ms` tops out ~30–32 s;
-/// 5 min stays as headroom. Multi-profile `partial` was round-budget
-/// starvation (Keychain + heavy Billing V2), not this cap.
-const PAGE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+/// 90 s is about three times that. Multi-profile `partial` was round-budget
+/// starvation (Keychain + heavy Billing V2), not this cap. With the two
+/// retries (`TRANSIENT_PAGE_BACKOFFS`) one stalled page can hold the round
+/// for about 4.5 min before it stops.
+const PAGE_TIMEOUT: Duration = Duration::from_secs(90);
 /// 256 pages × 500 = 128k events. The byte cap below normally binds first.
 const MAX_PAGES: u32 = 256;
 /// Billing V2 pages hold 100 items (`cursor_billing_v2::PAGE_SIZE`), a fifth
@@ -110,24 +112,26 @@ const MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
 /// Only a 403 body is read, to tell an auth refusal (JSON) from an HTML wall.
 const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
 /// D4: per-profile allowance for the first sync (no complete file yet) and
-/// every explicit "Sync now"; the round multiplies by profile count up to
-/// [`FULL_BUDGET_CAP`] (#520 multi-profile). Measured profile `took_ms` up to
-/// ~598 s on Billing V2 — 15 min leaves headroom over that.
+/// every explicit "Sync now"; the round multiplies it by the profile count up
+/// to [`FULL_BUDGET_CAP`] (#520 multi-profile). The result is one budget
+/// shared by the whole round: an earlier profile may use all of it. Measured
+/// profile `took_ms` up to ~598 s on Billing V2 — 15 min leaves headroom.
 const FULL_BUDGET: Duration = Duration::from_secs(15 * 60);
 /// Cap on a Sync Now / first-file round across every profile. Measured round
 /// `took_ms` ~21 min when every profile finished; 45 min covers that plus a
 /// slow Keychain prompt without starving later profiles.
 const FULL_BUDGET_CAP: Duration = Duration::from_secs(45 * 60);
 /// D4: per-profile allowance for later background syncs. A Billing V2 profile
-/// can need several minutes (measured ~275–598 s); 3 min each, round capped
-/// by [`BACKGROUND_BUDGET_CAP`]. A walk that does not fit leaves the existing
-/// complete file in place and reports `partial`.
+/// can need several minutes (measured ~275–598 s); 3 min × profile count,
+/// capped by [`BACKGROUND_BUDGET_CAP`], shared by the round like the full
+/// budget. A walk that does not fit leaves the existing complete file in
+/// place and reports `partial`.
 const BACKGROUND_BUDGET: Duration = Duration::from_secs(3 * 60);
-/// Cap on a background round across every profile (was 5 min; one V2 profile
-/// alone can exceed that).
+/// Cap on a background round across every profile; it binds from 7 profiles.
 const BACKGROUND_BUDGET_CAP: Duration = Duration::from_secs(20 * 60);
 /// Backoffs before the 2nd and 3rd attempts when a page fails transiently
-/// (Cursor 5xx or a request/body timeout) on multi-profile Sync Now (#520).
+/// (Cursor 5xx or a request/body timeout), in every round, old walk and
+/// Billing V2 alike (#520). Tests override them through `Limits::backoffs`.
 const TRANSIENT_PAGE_BACKOFFS: [Duration; 2] =
     [Duration::from_millis(500), Duration::from_secs(1)];
 /// A token this close to `exp` could expire mid-walk; treat it as expired.
@@ -1597,12 +1601,15 @@ pub(crate) struct Limits {
     /// Whether `sync_with` may open the debug log at all. Production: true;
     /// hermetic tests: false unless a test turns it on.
     pub(crate) debug_log: bool,
+    /// Waits before the 2nd and 3rd attempt of a transiently failed page.
+    pub(crate) backoffs: [Duration; 2],
 }
 
 impl Limits {
     pub(crate) fn production(budget: Duration, debug: Option<Arc<SyncDebugLog>>) -> Self {
         Self {
             debug_log: true,
+            backoffs: TRANSIENT_PAGE_BACKOFFS,
             budget,
             page_timeout: PAGE_TIMEOUT,
             page_size: PAGE_SIZE,
@@ -1925,7 +1932,8 @@ fn transient_page_stop(stop: &Stop) -> bool {
 }
 
 /// Fetch one page's body. On Cursor 5xx or a send/body timeout, retry the
-/// same page up to twice with [`TRANSIENT_PAGE_BACKOFFS`] (budget and the
+/// same page once per entry of `backoffs` (production:
+/// [`TRANSIENT_PAGE_BACKOFFS`], twice; budget and the
 /// live switch still bind). 429, auth and redirects are not retried.
 pub(crate) async fn fetch_page_body<F, Fut>(
     deadline: Instant,
@@ -1933,6 +1941,7 @@ pub(crate) async fn fetch_page_body<F, Fut>(
     enabled: &dyn Fn() -> bool,
     cap: usize,
     debug: Option<&SyncDebugLog>,
+    backoffs: &[Duration],
     mut send: F,
 ) -> Result<Vec<u8>, Stop>
 where
@@ -1948,7 +1957,7 @@ where
                     reason: &str| {
         if let Some(debug) = debug {
             let attempt = (attempt + 1).to_string();
-            let max = (TRANSIENT_PAGE_BACKOFFS.len() + 1).to_string();
+            let max = (backoffs.len() + 1).to_string();
             let budget_ms = remaining.as_millis().to_string();
             let timeout_ms = page_timeout.min(remaining).as_millis().to_string();
             let elapsed_ms = started.elapsed().as_millis().to_string();
@@ -1995,9 +2004,9 @@ where
             Err(error) => {
                 let stop = send_stop(&error);
                 let reason = stop.reason.unwrap_or("send_error");
-                if transient_page_stop(&stop) && attempt < TRANSIENT_PAGE_BACKOFFS.len() {
+                if transient_page_stop(&stop) && attempt < backoffs.len() {
                     log_fail(debug, "page_retry", attempt, remaining, reason);
-                    let delay = TRANSIENT_PAGE_BACKOFFS[attempt];
+                    let delay = backoffs[attempt];
                     attempt += 1;
                     let remaining = deadline.saturating_duration_since(Instant::now());
                     if remaining.is_zero() {
@@ -2020,10 +2029,10 @@ where
                 State::Disabled => "disabled",
                 _ => "refused",
             });
-            if transient_page_stop(&stop) && attempt < TRANSIENT_PAGE_BACKOFFS.len() {
+            if transient_page_stop(&stop) && attempt < backoffs.len() {
                 drop(response);
                 log_fail(debug, "page_retry", attempt, remaining, reason);
-                let delay = TRANSIENT_PAGE_BACKOFFS[attempt];
+                let delay = backoffs[attempt];
                 attempt += 1;
                 let remaining = deadline.saturating_duration_since(Instant::now());
                 if remaining.is_zero() {
@@ -2056,9 +2065,9 @@ where
                 }
                 return Ok(body);
             }
-            Err(BodyError::Timeout) if attempt < TRANSIENT_PAGE_BACKOFFS.len() => {
+            Err(BodyError::Timeout) if attempt < backoffs.len() => {
                 log_fail(debug, "page_retry", attempt, remaining, "timeout");
-                let delay = TRANSIENT_PAGE_BACKOFFS[attempt];
+                let delay = backoffs[attempt];
                 attempt += 1;
                 let remaining = deadline.saturating_duration_since(Instant::now());
                 if remaining.is_zero() {
@@ -2137,6 +2146,7 @@ async fn walk(
             enabled,
             cap,
             limits.debug.as_deref(),
+            &limits.backoffs,
             |timeout| {
                 client
                     .post(target.url)
@@ -2532,9 +2542,10 @@ impl Slot {
     }
 }
 
-/// The round's budget: per-profile full for "Sync now" and while some
-/// profile has no complete file but could write one; per-profile background
-/// otherwise; both capped (#520). A profile whose last round could not write
+/// The round's budget: 15 min × profiles capped at 45 min for "Sync now"
+/// and while some profile has no complete file but could write one; 3 min ×
+/// profiles capped at 20 min otherwise (#520). Shared by the round, not per
+/// profile: an earlier profile may use all of it. A profile whose last round could not write
 /// a file however long it ran (`writes_no_file`) does not hold every later
 /// round at the full budget. One budget still covers the whole round so
 /// several profiles cannot hold `IN_FLIGHT` unboundedly.

@@ -653,7 +653,8 @@ public enum TBCore {
         try unwrap(json.withCString { tb_set_cursor_sync($0) })
     }
 
-    /// One Cursor desktop sync. Blocking (SQLite + network, up to 10 min):
+    /// One Cursor desktop sync. Blocking (SQLite + network, within a round
+    /// budget of at most 45 min for Sync Now and 20 min in the background):
     /// never call on the main thread. Single-flight in the core.
     public static func cursorSync(explicit: Bool) throws -> CursorSyncStatus {
         try unwrap(tb_cursor_sync(explicit ? 1 : 0))
