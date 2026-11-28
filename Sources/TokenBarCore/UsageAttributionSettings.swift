@@ -396,7 +396,9 @@ public enum UsageAttributionSettings {
     /// client's rows. Grok Bot's plan is spent by Grok Bot alone; letting it also accept `xai` reached from elsewhere
     /// would make every cross-client xai row ambiguous between `grok` and `grok-bot` whenever both are subscribed,
     /// and the existing `.assigned("grok")` suggestion would disappear (found on Windows E2 review).
-    public static let ownRowsOnlySubscriptions: Set<String> = ["grok-bot"]
+    /// A Factory plan likewise can only be spent through Droid: an anthropic, openai or google row another client
+    /// logged was not paid from it, so `droid` never takes another client's row either.
+    public static let ownRowsOnlySubscriptions: Set<String> = ["grok-bot", "droid"]
 
     public static func suggestionTarget(
         sourceClient: String, provider: String, subscriptionClients: [String],
