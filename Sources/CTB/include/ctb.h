@@ -206,6 +206,15 @@ char *tb_set_antigravity_accounts(const char *json);
 // Antigravity card takes that account's OAuth result (source "oauth", with
 // agyLoginMarker and boundAccountKey) instead of running agy. No secret.
 char *tb_set_antigravity_binding(const char *json);
+// Allow or forbid the primary Antigravity card's remote routes (#596):
+// {"allowed":true|false}; NULL turns them off, which is also every process's
+// default. Off: when the local IDE route misses, no Google request, no agy
+// login-marker read and no agy run for the primary card; it shows a fixed
+// message instead (or stays unconfigured when nothing suggests Antigravity is
+// used here). Captured accounts are unaffected. Success data:
+// {"allowed":true|false}. Any other input turns them off first, then fails
+// with invalid_remote_fallback_json; the input is never echoed.
+char *tb_set_antigravity_remote_fallback(const char *json);
 // Copy agy's current Google login into a Syrtis-owned login-keychain item
 // (service com.nyanako.tokenbar.antigravity-account, account = key). agy's
 // own item is read once and never written. Blocking (keychain + network):

@@ -156,6 +156,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // label resolver goes first so no card can render a key as its label.
         AntigravityAccounts.installLabelResolver()
         AntigravityAccounts.apply()
+        // Synchronous, before `animator.start()` below runs the first poll.
+        AntigravityRemoteFallback.apply(wake: false)
 
         // After the Syrtis rename, repoint a Dock tile still pinned to the
         // old bundle file name. Background queue; a no-op unless it matches.

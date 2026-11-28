@@ -656,6 +656,10 @@
 "Couldn't save to the login keychain." = "无法存入登录钥匙串。";
 "Couldn't delete the copy from the login keychain." = "无法从登录钥匙串删除副本。";
 "Something went wrong. Try again." = "出现错误，请再试一次。";
+"Read quota while Antigravity is closed" = "Antigravity 没开时也读取额度";
+"Off: Syrtis reads quota only from the Antigravity app running on this Mac. On: when the app isn't running, Syrtis uses Antigravity's saved Google sign-in, or the agy CLI, to ask Google for the quota. Google's Antigravity terms say that using third-party software to access the service can lead to account suspension." = "关闭时，Syrtis 只从这台 Mac 上正在运行的 Antigravity 读取额度。开启后，Antigravity 没开时，Syrtis 会用 Antigravity 保存的 Google 登录或 agy CLI 向 Google 查询额度。Google 的 Antigravity 条款写明，用第三方软件访问服务可能导致账户被停用。";
+"Read quota while Antigravity is closed?" = "要在 Antigravity 没开时也读取额度吗？";
+"Added accounts are always read with their saved Google sign-in, which carries the same risk." = "添加的账户一律用保存的 Google 登录读取，风险相同。";
 
 /* Cursor usage sync (approved copy: .agent-local/plans/cursor-c3-copy.md) */
 "Cursor usage sync" = "Cursor 用量同步";

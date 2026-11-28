@@ -1629,6 +1629,26 @@ pub unsafe extern "C" fn tb_set_antigravity_binding(json: *const c_char) -> *mut
     })
 }
 
+/// Allow or forbid the primary Antigravity card's remote routes (#596).
+/// `json` is `{"allowed":true|false}`; NULL turns them off. Off is the default
+/// of every process: when the local IDE route misses, the primary card then
+/// makes no Google request, reads no agy login marker, runs no `agy`, and
+/// shows a fixed Terminal message (or the unconfigured marker when nothing on
+/// this Mac suggests Antigravity is used). Captured accounts are unaffected.
+/// Success data is `{"allowed":true|false}`. Any other input turns the routes
+/// off first, then fails with `invalid_remote_fallback_json`; the input is
+/// never echoed.
+///
+/// # Safety
+/// `json` must be NULL or a valid NUL-terminated string.
+#[no_mangle]
+pub unsafe extern "C" fn tb_set_antigravity_remote_fallback(json: *const c_char) -> *mut c_char {
+    guarded("tb_set_antigravity_remote_fallback", || {
+        let raw = (!json.is_null()).then(|| unsafe { CStr::from_ptr(json) }.to_bytes());
+        envelope(agent_antigravity::set_remote_fallback(raw))
+    })
+}
+
 /// Copy agy's current Google login into a Syrtis-owned login-keychain item
 /// (service `com.nyanako.tokenbar.antigravity-account`, account = key). Reads
 /// agy's item once through `/usr/bin/security` and never writes it; proves the
@@ -4117,6 +4137,30 @@ mod tests {
         let s = unsafe { take(p) };
         assert!(s.contains(r#""ok":false"#), "got: {s}");
         assert!(s.contains("tb_test panicked: boom"), "got: {s}");
+    }
+
+    #[test]
+    fn antigravity_remote_fallback_round_trips_and_fails_closed() {
+        let _guard = agent_antigravity::REMOTE_FALLBACK_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let on = CString::new(r#"{"allowed":true}"#).unwrap();
+        let s = unsafe { take(tb_set_antigravity_remote_fallback(on.as_ptr())) };
+        assert_eq!(s, r#"{"data":{"allowed":true},"ok":true}"#);
+        assert!(agent_antigravity::remote_fallback_allowed());
+        let bad = CString::new(r#"{"allowed":"CANARY"}"#).unwrap();
+        let s = unsafe { take(tb_set_antigravity_remote_fallback(bad.as_ptr())) };
+        assert_eq!(s, r#"{"err":"invalid_remote_fallback_json","ok":false}"#);
+        assert!(!agent_antigravity::remote_fallback_allowed());
+        unsafe { take(tb_set_antigravity_remote_fallback(on.as_ptr())) };
+        let off = CString::new(r#"{"allowed":false}"#).unwrap();
+        let s = unsafe { take(tb_set_antigravity_remote_fallback(off.as_ptr())) };
+        assert_eq!(s, r#"{"data":{"allowed":false},"ok":true}"#);
+        assert!(!agent_antigravity::remote_fallback_allowed());
+        unsafe { take(tb_set_antigravity_remote_fallback(on.as_ptr())) };
+        let s = unsafe { take(tb_set_antigravity_remote_fallback(std::ptr::null())) };
+        assert_eq!(s, r#"{"data":{"allowed":false},"ok":true}"#);
+        assert!(!agent_antigravity::remote_fallback_allowed());
     }
 
     #[test]

@@ -2025,7 +2025,12 @@ async fn fetch_antigravity_accounts(id: ProviderId) -> Vec<AgentUsageSnapshot> {
     if accounts.is_empty() {
         return vec![fetch_antigravity(id, None).await];
     }
-    let binding = agent_antigravity::antigravity_binding();
+    // With the remote routes off (#596) the primary never takes a bound
+    // result, so agy's login marker is not read for it either. The captured
+    // accounts below are fetched as before.
+    let binding = agent_antigravity::remote_fallback_allowed()
+        .then(agent_antigravity::antigravity_binding)
+        .flatten();
     let bound = agent_antigravity::bound_account(
         binding.as_ref(),
         &accounts,
