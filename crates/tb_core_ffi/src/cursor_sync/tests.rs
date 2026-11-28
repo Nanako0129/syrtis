@@ -131,37 +131,47 @@ fn read_request(stream: &mut TcpStream) -> Seen {
 }
 
 /// Serves `replies` in order (then 404s) forever; records every request.
+/// Each connection runs on its own thread so a timed-out client can retry
+/// while a Delayed/Hang reply is still sleeping (#520).
 fn serve(replies: Vec<Reply>) -> (String, Arc<Mutex<Vec<Seen>>>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://{}/api/usage", listener.local_addr().unwrap());
     let seen = Arc::new(Mutex::new(Vec::new()));
     let log = seen.clone();
+    let replies = Arc::new(Mutex::new(replies.into_iter()));
     std::thread::spawn(move || {
-        let mut replies = replies.into_iter();
         for stream in listener.incoming() {
-            let Ok(mut stream) = stream else { continue };
-            let request = read_request(&mut stream);
-            log.lock().unwrap().push(request);
-            match replies.next() {
-                Some(Reply::Raw(bytes)) => {
-                    let _ = stream.write_all(&bytes);
+            let Ok(stream) = stream else { continue };
+            let log = log.clone();
+            let replies = replies.clone();
+            std::thread::spawn(move || {
+                let mut stream = stream;
+                let request = read_request(&mut stream);
+                log.lock().unwrap().push(request);
+                // Taken before the match: a Delayed/Hang reply must not sleep
+                // holding the lock, or every other connection waits for it.
+                let next = replies.lock().unwrap().next();
+                match next {
+                    Some(Reply::Raw(bytes)) => {
+                        let _ = stream.write_all(&bytes);
+                    }
+                    Some(Reply::Delayed(delay, bytes)) => {
+                        std::thread::sleep(delay);
+                        let _ = stream.write_all(&bytes);
+                    }
+                    Some(Reply::Hang) => {
+                        let _ = stream.write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 100000\r\n\r\n{\"usageEventsDisplay\":[",
+                        );
+                        std::thread::sleep(Duration::from_secs(3));
+                    }
+                    None => {
+                        let _ = stream.write_all(
+                            b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        );
+                    }
                 }
-                Some(Reply::Delayed(delay, bytes)) => {
-                    std::thread::sleep(delay);
-                    let _ = stream.write_all(&bytes);
-                }
-                Some(Reply::Hang) => {
-                    let _ = stream.write_all(
-                        b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 100000\r\n\r\n{\"usageEventsDisplay\":[",
-                    );
-                    std::thread::sleep(Duration::from_secs(3));
-                }
-                None => {
-                    let _ = stream.write_all(
-                        b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-                    );
-                }
-            }
+            });
         }
     });
     (url, seen)
@@ -206,6 +216,10 @@ fn limits() -> Limits {
         max_v2_pages: 64,
         max_body_bytes: 1024 * 1024,
         explicit: false,
+        debug: None,
+        debug_log: false,
+        // Production waits 0.5 s and 1 s; the retry logic is the same.
+        backoffs: [Duration::from_millis(5), Duration::from_millis(10)],
     }
 }
 
@@ -386,7 +400,7 @@ fn byte_cap_is_an_error_and_keeps_the_old_file() {
         let f = fixture();
         let old = seed_old_file(&f.dir);
         let (url, _) = serve(replies);
-        let outcome = run_with(&f.db, &f.dir, &url, small, &|| true);
+        let outcome = run_with(&f.db, &f.dir, &url, small.clone(), &|| true);
         assert_eq!(outcome, stop(State::Error, Some("body_too_large")));
         assert_eq!(std::fs::read(expected_file(&f.dir)).unwrap(), old);
     }
@@ -399,15 +413,52 @@ fn byte_cap_is_an_error_and_keeps_the_old_file() {
     );
 }
 
+fn slow_ok(body: &str) -> Reply {
+    // Longer than `limits().page_timeout` so the client times out on send.
+    match json_ok(body) {
+        Reply::Raw(bytes) => Reply::Delayed(Duration::from_secs(3), bytes),
+        other => other,
+    }
+}
+
 #[test]
 fn timeout_is_partial_and_keeps_the_old_file() {
     let f = fixture();
     let old = seed_old_file(&f.dir);
-    let (url, seen) = serve(vec![json_ok(&page(4, &["a", "b"])), Reply::Hang]);
+    // Three slow pages: exhausted transient retries (#520), then `timeout`.
+    let (url, seen) = serve(vec![
+        json_ok(&page(4, &["a", "b"])),
+        slow_ok(&page(4, &["c", "d"])),
+        slow_ok(&page(4, &["c", "d"])),
+        slow_ok(&page(4, &["c", "d"])),
+    ]);
     let outcome = run_with(&f.db, &f.dir, &url, limits(), &|| true);
     assert_eq!(outcome, stop(State::Partial, Some("timeout")));
-    assert_eq!(seen.lock().unwrap().len(), 2);
+    assert_eq!(seen.lock().unwrap().len(), 4);
     assert_eq!(std::fs::read(expected_file(&f.dir)).unwrap(), old);
+}
+
+/// #520: a single page timeout is retried and the walk can finish.
+#[test]
+fn a_transient_timeout_retries_and_succeeds() {
+    let f = fixture();
+    let ok_page = page(1, &["a"]);
+    let (url, seen) = serve(vec![slow_ok(&ok_page), json_ok(&ok_page)]);
+    let outcome = run_with(&f.db, &f.dir, &url, limits(), &|| true);
+    assert_eq!(outcome, ok(1));
+    assert_eq!(seen.lock().unwrap().len(), 2);
+    assert!(expected_file(&f.dir).exists());
+}
+
+/// #520: headers arrive but the body stalls past the page timeout
+/// (`BodyError::Timeout`); the page is retried and the walk can finish.
+#[test]
+fn a_transient_body_timeout_retries_and_succeeds() {
+    let f = fixture();
+    let (url, seen) = serve(vec![Reply::Hang, json_ok(&page(1, &["a"]))]);
+    assert_eq!(run_with(&f.db, &f.dir, &url, limits(), &|| true), ok(1));
+    assert_eq!(seen.lock().unwrap().len(), 2);
+    assert!(expected_file(&f.dir).exists());
 }
 
 #[test]
@@ -474,10 +525,6 @@ fn http_statuses_map_to_states() {
             stop(State::Error, Some("rate_limited")),
         ),
         (
-            http("500 Internal Server Error", "text/plain", "x"),
-            stop(State::Error, Some("server_error")),
-        ),
-        (
             json_ok(r#"{"totalUsageEventsCount":1,"usageEventsDisplay":"x"}"#),
             stop(State::Error, Some("unexpected_response")),
         ),
@@ -498,6 +545,32 @@ fn http_statuses_map_to_states() {
         assert_eq!(seen.lock().unwrap().len(), 1);
         assert_eq!(std::fs::read(expected_file(&f.dir)).unwrap(), old);
     }
+    // Exhausted 5xx retries (#520): three attempts, then `server_error`.
+    {
+        let f = fixture();
+        let old = seed_old_file(&f.dir);
+        let five = http("500 Internal Server Error", "text/plain", "x");
+        let (url, seen) = serve(vec![five.clone(), five.clone(), five]);
+        assert_eq!(
+            run_with(&f.db, &f.dir, &url, limits(), &|| true),
+            stop(State::Error, Some("server_error"))
+        );
+        assert_eq!(seen.lock().unwrap().len(), 3);
+        assert_eq!(std::fs::read(expected_file(&f.dir)).unwrap(), old);
+    }
+}
+
+/// #520: a single Cursor 5xx on a page is retried and the walk can finish.
+#[test]
+fn a_transient_server_error_retries_and_succeeds() {
+    let f = fixture();
+    let (url, seen) = serve(vec![
+        http("500 Internal Server Error", "text/plain", "x"),
+        json_ok(&page(1, &["a"])),
+    ]);
+    assert_eq!(run_with(&f.db, &f.dir, &url, limits(), &|| true), ok(1));
+    assert_eq!(seen.lock().unwrap().len(), 2);
+    assert!(expected_file(&f.dir).exists());
 }
 
 #[test]
@@ -794,7 +867,8 @@ fn a_complete_walk_drops_other_usage_files_and_a_failed_one_does_not() {
     std::fs::write(&orphan, "{}").unwrap();
     std::fs::write(&unrelated, "keep").unwrap();
 
-    let (url, _) = serve(vec![http("500 Internal Server Error", "text/plain", "")]);
+    let five = http("500 Internal Server Error", "text/plain", "");
+    let (url, _) = serve(vec![five.clone(), five.clone(), five]);
     assert_eq!(
         run_with(&f.db, &f.dir, &url, limits(), &|| true).stop.state,
         State::Error
@@ -846,6 +920,15 @@ fn registry(enabled: bool, dir: &Path) -> RwLock<Config> {
 }
 
 fn sync_status(f: &Fixture, url: &str, registry: &RwLock<Config>) -> serde_json::Value {
+    sync_status_with(f, url, registry, limits())
+}
+
+fn sync_status_with(
+    f: &Fixture,
+    url: &str,
+    registry: &RwLock<Config>,
+    limits: Limits,
+) -> serde_json::Value {
     let billing = v2_url(url);
     let target = Target {
         db_path: &f.db,
@@ -857,7 +940,7 @@ fn sync_status(f: &Fixture, url: &str, registry: &RwLock<Config>) -> serde_json:
         consent: &no_consent,
     };
     let source = || registry.read().unwrap().clone();
-    sync_with(true, None, &target, &source, Some(limits())).0
+    sync_with(true, None, &target, &source, Some(limits)).0
 }
 
 #[test]
@@ -927,13 +1010,25 @@ fn canaries_never_reach_the_file_names_status_or_errors() {
         vec![json_ok(&format!(
             r#"{{"usageEventsDisplay":{{"owningUser":"{OWNING_CANARY}"}}}}"#
         ))],
-        vec![json_ok(&page(4, &["a", "b"])), Reply::Hang],
+        vec![
+            json_ok(&page(4, &["a", "b"])),
+            slow_ok(&page(4, &["c", "d"])),
+            slow_ok(&page(4, &["c", "d"])),
+            slow_ok(&page(4, &["c", "d"])),
+        ],
     ];
+    // The #520 debug log is on here, as in production, and searched too.
+    let logged = || Limits {
+        debug_log: true,
+        ..limits()
+    };
+    let debug_log = |f: &Fixture| f.dir.parent().unwrap().join(DEBUG_LOG_NAME);
     let mut outputs = Vec::new();
     for reply in replies {
         let f = fixture();
         let (url, _) = serve(reply);
-        outputs.push(sync_status(&f, &url, &registry(true, &f.dir)).to_string());
+        outputs.push(sync_status_with(&f, &url, &registry(true, &f.dir), logged()).to_string());
+        outputs.push(std::fs::read_to_string(debug_log(&f)).unwrap());
         for entry in std::fs::read_dir(&f.dir).into_iter().flatten().flatten() {
             outputs.push(entry.file_name().to_string_lossy().into_owned());
             if entry.file_type().unwrap().is_file() {
@@ -957,13 +1052,15 @@ fn canaries_never_reach_the_file_names_status_or_errors() {
         token: token.clone(),
     };
     outputs.push(
-        sync_status(
+        sync_status_with(
             &mismatch,
             "http://127.0.0.1:9/never",
             &registry(true, &mismatch.dir),
+            logged(),
         )
         .to_string(),
     );
+    outputs.push(std::fs::read_to_string(debug_log(&mismatch)).unwrap());
 
     // Control: the scenarios above did produce the outputs being searched.
     let all = outputs.join("\n");
@@ -976,6 +1073,11 @@ fn canaries_never_reach_the_file_names_status_or_errors() {
         "\"partial\"",
         "account_mismatch",
         "usage.",
+        "event=round_start",
+        "event=profile_start",
+        "event=page_ok",
+        "event=page_retry",
+        "event=page_fail",
     ] {
         assert!(all.contains(expected), "missing {expected} in {all}");
     }
@@ -1299,8 +1401,18 @@ fn disable_deletes_only_our_files_in_every_profile_dir() {
     std::fs::write(default.join("keep.txt"), "x").unwrap();
     std::fs::write(default.join("usage.not-ours.json"), "x").unwrap();
     std::fs::write(default.join(format!("usage.{}.json", "a".repeat(63))), "x").unwrap();
+    // The #520 debug log and its rotated copy go too (not counted).
+    let logs = [app.join(DEBUG_LOG_NAME), app.join(format!("{DEBUG_LOG_NAME}.old"))];
+    for log in &logs {
+        std::fs::write(log, "ts=1 event=round_start\n").unwrap();
+    }
+    std::fs::write(app.join("keep.log"), "x").unwrap();
 
     let result = set_in(home.path(), off).unwrap();
+    for log in &logs {
+        assert!(!log.exists(), "{log:?} survived sync off");
+    }
+    assert!(app.join("keep.log").exists(), "a foreign file in appDir was deleted");
     assert_eq!(result["removedFiles"], 4);
     assert_eq!(result["cleanupFailed"], false);
     assert_eq!(
@@ -2036,6 +2148,10 @@ fn other_token() -> String {
     jwt(&format!("auth0|{OTHER_USER}"), Some(now_secs() + 3600.0))
 }
 
+fn third_token() -> String {
+    jwt(&format!("auth0|{THIRD_USER}"), Some(now_secs() + 3600.0))
+}
+
 fn sync_round(default_db: &Path, url: &str, registry: &RwLock<Config>) -> serde_json::Value {
     sync_round_with(default_db, url, registry, limits())
 }
@@ -2360,6 +2476,79 @@ fn one_budget_covers_every_profile() {
     assert!(seen.lock().unwrap().is_empty());
 }
 
+/// #520: Sync Now's round budget grows with the profile count (capped).
+#[test]
+fn the_round_budget_scales_with_the_profile_count() {
+    let _guard = lock();
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let default_db = login_db(&tmp.path().join("default"), &valid_token(), USER);
+    let root_a = profile_root(tmp.path(), "a", &other_token(), OTHER_USER);
+    let root_b = profile_root(tmp.path(), "b", &third_token(), THIRD_USER);
+    let (url, _) = serve(vec![json_ok(&page(1, &["a"])); 6]);
+    let round = |profiles: Vec<Profile>| {
+        let registry = RwLock::new(multi(&home, true, profiles));
+        let source = || registry.read().unwrap().clone();
+        let _ = sync_with(
+            true,
+            None,
+            &target(&default_db, &url),
+            &source,
+            Some(limits()),
+        );
+        ROUND_BUDGET.with(std::cell::Cell::get).unwrap()
+    };
+    assert_eq!(round(vec![]), FULL_BUDGET);
+    assert_eq!(
+        round(vec![profile(PROFILE_A, &root_a)]),
+        FULL_BUDGET.saturating_mul(2).min(FULL_BUDGET_CAP)
+    );
+    assert_eq!(
+        round(vec![
+            profile(PROFILE_A, &root_a),
+            profile(PROFILE_B, &root_b),
+        ]),
+        FULL_BUDGET.saturating_mul(3).min(FULL_BUDGET_CAP)
+    );
+}
+
+/// #520: with enough profiles both caps bind (8 slots: 8 × 3 min = 24 min
+/// background, 8 × 15 min = 120 min Sync Now). Literal values, so a cap that
+/// stops binding cannot pass by recomputing the same expression.
+#[test]
+fn the_round_budget_caps_bind_with_many_profiles() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ids: Vec<String> = (0..7)
+        .map(|i| format!("0A1B2C3D-0000-4000-8000-00000000010{i}"))
+        .collect();
+    let config = Config {
+        enabled: true,
+        app_dir: Some(tmp.path().join("app")),
+        profiles: ids
+            .iter()
+            .map(|id| profile(id, &tmp.path().join(id)))
+            .collect(),
+        ..Config::default()
+    };
+    let slots = slots(&config, &tmp.path().join("default.vscdb"));
+    assert_eq!(slots.len(), 8);
+    // Every slot's last round wrote no file, so none asks for the full budget.
+    let no_file: Vec<_> = slots.iter().map(Slot::key).collect();
+    assert_eq!(
+        round_budget(false, &slots, &no_file),
+        Duration::from_secs(20 * 60)
+    );
+    assert_eq!(
+        round_budget(true, &slots, &no_file),
+        Duration::from_secs(45 * 60)
+    );
+    // Control: below the cap the background budget is per profile.
+    assert_eq!(
+        round_budget(false, &slots[..2], &no_file),
+        Duration::from_secs(2 * 3 * 60)
+    );
+}
+
 /// FIX 2 ✱: an account is covered only by a walk that synced. The default
 /// profile's session for X is refused (401); profile B on the same account
 /// then tries its own session, and X still counts once.
@@ -2567,8 +2756,14 @@ fn a_round_writes_nothing_into_an_app_dir_that_now_fails_the_checks() {
     std::os::unix::fs::symlink(&outside, &app).unwrap();
     let default_db = login_db(&tmp.path().join("default"), &valid_token(), USER);
     let (url, seen) = serve(vec![json_ok(&page(1, &["a"]))]);
-    let status = sync_round_in(&default_db, &url, &registry, limits(), Some(&home));
+    // The debug log is on, as in production: it must not be opened either.
+    let logged = Limits {
+        debug_log: true,
+        ..limits()
+    };
+    let status = sync_round_in(&default_db, &url, &registry, logged, Some(&home));
     assert_eq!(states(&status), ["error:app_dir_rejected"]);
+    assert!(!outside.join(DEBUG_LOG_NAME).exists(), "debug log written through the symlink");
     assert_eq!(status["reason"], "app_dir_rejected");
     assert_eq!(status["changed"], false);
     assert!(seen.lock().unwrap().is_empty());
@@ -2764,16 +2959,17 @@ fn a_profile_that_cannot_write_a_file_does_not_hold_the_full_budget() {
         seen_states,
         ["ok", "notSignedIn", "duplicate", "error:db_not_file"]
     );
-    assert_eq!(budget, FULL_BUDGET, "the default had no file yet");
-    assert_eq!(round(false).1, BACKGROUND_BUDGET);
-    assert_eq!(round(true).1, FULL_BUDGET, "Sync Now");
-    assert_eq!(round(false).1, BACKGROUND_BUDGET);
+    // Four slots (default + three added): per-profile budget × 4, under the cap.
+    let full4 = FULL_BUDGET.saturating_mul(4).min(FULL_BUDGET_CAP);
+    let bg4 = BACKGROUND_BUDGET
+        .saturating_mul(4)
+        .min(BACKGROUND_BUDGET_CAP);
+    assert_eq!(budget, full4, "the default had no file yet");
+    assert_eq!(round(false).1, bg4);
+    assert_eq!(round(true).1, full4, "Sync Now");
+    assert_eq!(round(false).1, bg4);
     registry.write().unwrap().profiles[0].root = tmp.path().join("moved");
-    assert_eq!(
-        round(false).1,
-        FULL_BUDGET,
-        "a changed profile's first round"
-    );
+    assert_eq!(round(false).1, full4, "a changed profile's first round");
     // Control: an outage is not a profile that cannot write; it keeps the full
     // budget until a file exists.
     let lonely = tmp.path().join("lonely");
@@ -2781,6 +2977,7 @@ fn a_profile_that_cannot_write_a_file_does_not_hold_the_full_budget() {
     *registry.write().unwrap() = multi(&lonely, true, vec![profile(PROFILE_A, &down)]);
     let unreachable = "http://127.0.0.1:1/api/usage";
     let source = || registry.read().unwrap().clone();
+    let full2 = FULL_BUDGET.saturating_mul(2).min(FULL_BUDGET_CAP);
     for _ in 0..2 {
         let status = sync_with(
             false,
@@ -2791,7 +2988,7 @@ fn a_profile_that_cannot_write_a_file_does_not_hold_the_full_budget() {
         )
         .0;
         assert_eq!(states(&status), ["notSignedIn", "offline:unreachable"]);
-        assert_eq!(ROUND_BUDGET.with(std::cell::Cell::get), Some(FULL_BUDGET));
+        assert_eq!(ROUND_BUDGET.with(std::cell::Cell::get), Some(full2));
     }
 }
 
@@ -4294,9 +4491,13 @@ fn refusals_leave_the_file_and_sidecar_unchanged() {
             1,
         ),
         (
-            vec![http("500 Internal Server Error", "text/plain", "x")],
+            vec![
+                http("500 Internal Server Error", "text/plain", "x"),
+                http("500 Internal Server Error", "text/plain", "x"),
+                http("500 Internal Server Error", "text/plain", "x"),
+            ],
             stop(State::Error, Some("server_error")),
-            1,
+            3,
         ),
         (
             vec![json_ok("[]")],
@@ -4322,6 +4523,40 @@ fn refusals_leave_the_file_and_sidecar_unchanged() {
         assert_eq!(std::fs::read(expected_file(&f.dir)).unwrap(), live);
         assert_eq!(std::fs::read(sidecar_path(&f.dir)).unwrap(), side);
     }
+}
+
+/// #520: Billing V2 retries a single page 5xx and still commits.
+#[test]
+fn billing_v2_retries_a_transient_server_error_and_commits() {
+    let f = fixture();
+    let cutover = v2_cutover();
+    seed_by_old_walk(
+        &f,
+        &[
+            old_row("a", month_start_ms(1) + HOUR),
+            old_row("b", cutover),
+        ],
+    );
+    let (outcome, seen) = run_v2(
+        &f,
+        vec![
+            old_migrated(),
+            http("500 Internal Server Error", "text/plain", "x"),
+            v2_page(&[item("v-current", month_start_ms(0))], None),
+            v2_page(
+                &[
+                    item("v-before", cutover - HOUR / 2),
+                    item("v-at", cutover),
+                    item("v-after", cutover + HOUR),
+                ],
+                None,
+            ),
+        ],
+        v2_limits(false),
+    );
+    assert_eq!(outcome, ok(4));
+    assert_eq!(v2_requests(&seen).len(), 3, "one 5xx retry plus two months");
+    assert!(sidecar_path(&f.dir).exists());
 }
 
 /// Design 5: no old file and rows only in the current month: the first
@@ -5097,7 +5332,7 @@ fn a_v2_walk_past_the_old_page_cap_commits() {
         )
     }));
     replies.extend((0..3).map(|_| v2_empty()));
-    let (outcome, seen) = run_v2(&f, replies, Limits::production(Duration::from_secs(120)));
+    let (outcome, seen) = run_v2(&f, replies, Limits::production(Duration::from_secs(120), None));
     assert_eq!(outcome, ok(pages));
     assert_eq!(v2_requests(&seen).len(), pages + 3);
 }

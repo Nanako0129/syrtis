@@ -39,6 +39,13 @@
 //!   `keychain_consent`, `keychain_denied`, `keychain_missing`,
 //!   `keychain_unavailable`, `keychain_unlock`, `token_sealed_unreadable`,
 //!   `token_sealed_unsupported`.
+//! - Append-only `<appDir>/cursor-sync-debug.log` (#520), written by every
+//!   round while sync is on and the appDir passes the checks (never through
+//!   a rejected appDir): fixed event names and decimal timings only (page
+//!   send/retry/fail, round and profile outcomes). Never token, cookie,
+//!   `sub`, user id, stem, URL query or folder path. Rotated at 2 MiB to
+//!   `.log.old`; turning sync off deletes both. Off in hermetic tests unless
+//!   a test sets `Limits::debug_log`.
 //! - Swift passes a bundle id and `(uuid, root)` pairs, never a directory or a
 //!   database path; Rust derives both (CMP-520 B2). `sub` never crosses the
 //!   FFI: a profile whose account an earlier profile already covered this
@@ -69,7 +76,7 @@ use serde::{Deserialize, Serialize};
 use std::io::Write as _;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{LazyLock, Mutex, RwLock};
+use std::sync::{Arc, LazyLock, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const USAGE_EVENTS_URL: &str = "https://cursor.com/api/dashboard/get-filtered-usage-events";
@@ -84,8 +91,13 @@ const TEMP_FILE_PREFIX: &str = ".cursor-sync.tmp-";
 const SIDECAR_PREFIX: &str = ".cursor-sync.history.";
 
 const PAGE_SIZE: u32 = 500;
-/// Upstream's per-page timeout (`CURSOR_HTTP_TIMEOUT`), clamped to the budget.
-const PAGE_TIMEOUT: Duration = Duration::from_secs(15);
+/// Per-page HTTP timeout, clamped to the remaining round budget.
+/// Measured (#520 `cursor-sync-debug.log`): page `took_ms` tops out ~30–32 s;
+/// 90 s is about three times that. Multi-profile `partial` was round-budget
+/// starvation (Keychain + heavy Billing V2), not this cap. With the two
+/// retries (`TRANSIENT_PAGE_BACKOFFS`) one stalled page can hold the round
+/// for about 4.5 min before it stops.
+const PAGE_TIMEOUT: Duration = Duration::from_secs(90);
 /// 256 pages × 500 = 128k events. The byte cap below normally binds first.
 const MAX_PAGES: u32 = 256;
 /// Billing V2 pages hold 100 items (`cursor_billing_v2::PAGE_SIZE`), a fifth
@@ -99,15 +111,34 @@ const MAX_V2_PAGES: u32 = 1280;
 const MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
 /// Only a 403 body is read, to tell an auth refusal (JSON) from an HTML wall.
 const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
-/// D4: the first sync (no complete file yet) and every explicit "Sync now".
-const FULL_BUDGET: Duration = Duration::from_secs(10 * 60);
-/// D4: later background syncs, ≥ 2× the measured full walk and ≤ 10 min.
-/// C0.5: the largest known history, 3542 events ≈ 8 pages at ~1 s/page,
-/// walks in ≈ 10 s; 60 s is 6× that. A walk that does not fit leaves the
-/// existing complete file in place and reports `partial`.
-const BACKGROUND_BUDGET: Duration = Duration::from_secs(60);
+/// D4: per-profile allowance for the first sync (no complete file yet) and
+/// every explicit "Sync now"; the round multiplies it by the profile count up
+/// to [`FULL_BUDGET_CAP`] (#520 multi-profile). The result is one budget
+/// shared by the whole round: an earlier profile may use all of it. Measured
+/// profile `took_ms` up to ~598 s on Billing V2 — 15 min leaves headroom.
+const FULL_BUDGET: Duration = Duration::from_secs(15 * 60);
+/// Cap on a Sync Now / first-file round across every profile. Measured round
+/// `took_ms` ~21 min when every profile finished; 45 min covers that plus a
+/// slow Keychain prompt without starving later profiles.
+const FULL_BUDGET_CAP: Duration = Duration::from_secs(45 * 60);
+/// D4: per-profile allowance for later background syncs. A Billing V2 profile
+/// can need several minutes (measured ~275–598 s); 3 min × profile count,
+/// capped by [`BACKGROUND_BUDGET_CAP`], shared by the round like the full
+/// budget. A walk that does not fit leaves the existing complete file in
+/// place and reports `partial`.
+const BACKGROUND_BUDGET: Duration = Duration::from_secs(3 * 60);
+/// Cap on a background round across every profile; it binds from 7 profiles.
+const BACKGROUND_BUDGET_CAP: Duration = Duration::from_secs(20 * 60);
+/// Backoffs before the 2nd and 3rd attempts when a page fails transiently
+/// (Cursor 5xx or a request/body timeout), in every round, old walk and
+/// Billing V2 alike (#520). Tests override them through `Limits::backoffs`.
+const TRANSIENT_PAGE_BACKOFFS: [Duration; 2] =
+    [Duration::from_millis(500), Duration::from_secs(1)];
 /// A token this close to `exp` could expire mid-walk; treat it as expired.
 const EXP_SKEW_SECS: f64 = 60.0;
+/// Debug log under `appDir` (`cursor-sync-debug.log`). Rotated when larger.
+const DEBUG_LOG_NAME: &str = "cursor-sync-debug.log";
+const DEBUG_LOG_MAX_BYTES: u64 = 2 * 1024 * 1024;
 
 // ---------------------------------------------------------------------------
 // Switch registry (in-memory, default off; Swift re-applies it at launch).
@@ -546,6 +577,12 @@ impl Cleanup {
             remove_usage_files_locked(&default_dir(app_dir), false),
         );
         self.orphans(app_dir, &[]);
+        // The sync debug log and its rotated copy: nothing of the sync is
+        // left once it is off. Best effort, not counted in `removed` (not a
+        // usage file); `remove_file` deletes a symlink itself, never its target.
+        for name in [DEBUG_LOG_NAME.to_string(), format!("{DEBUG_LOG_NAME}.old")] {
+            let _ = std::fs::remove_file(app_dir.join(name));
+        }
     }
 
     /// Every `<uuid>` dir under `cursor-profiles` not in `keep`. Only real
@@ -1448,9 +1485,103 @@ fn writes_no_file(outcome: &Outcome) -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// Debug log (#520): fixed fields only — never a token, cookie, user id,
+// stem, or response body. Written under appDir so a Sync Now screenshot's
+// timeouts can be matched to page / attempt / budget lines.
+
+/// Append-only sync debug log. Safe to share across the round's profiles.
+pub(crate) struct SyncDebugLog {
+    path: PathBuf,
+    /// Current page context; set by the walk before each fetch.
+    ctx: Mutex<DebugCtx>,
+}
+
+#[derive(Clone, Default)]
+struct DebugCtx {
+    profile: String,
+    phase: String,
+    page: u32,
+    month: Option<i32>,
+}
+
+impl SyncDebugLog {
+    /// `<appDir>/cursor-sync-debug.log`. Creates appDir if needed; `None` if
+    /// the path cannot be prepared (sync still runs without a log).
+    /// The caller decides first: never for a rejected appDir or a round with
+    /// sync off (`sync_with`).
+    fn open(app_dir: &Path) -> Option<Arc<Self>> {
+        std::fs::create_dir_all(app_dir).ok()?;
+        let path = app_dir.join(DEBUG_LOG_NAME);
+        Some(Arc::new(Self {
+            path,
+            ctx: Mutex::new(DebugCtx::default()),
+        }))
+    }
+
+    pub(crate) fn set_ctx(&self, profile: &str, phase: &str, page: u32, month: Option<i32>) {
+        if let Ok(mut ctx) = self.ctx.lock() {
+            ctx.profile = profile.to_string();
+            ctx.phase = phase.to_string();
+            ctx.page = page;
+            ctx.month = month;
+        }
+    }
+
+    /// One line: `ts event=… profile=… phase=… …`. Never caller-supplied free text.
+    pub(crate) fn event(&self, event: &str, fields: &[(&str, &str)]) {
+        let ctx = self.ctx.lock().ok();
+        let (profile, phase, page, month) = ctx
+            .as_ref()
+            .map(|c| {
+                (
+                    c.profile.as_str(),
+                    c.phase.as_str(),
+                    c.page,
+                    c.month,
+                )
+            })
+            .unwrap_or(("", "", 0, None));
+        let ts = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ");
+        let mut line = format!("ts={ts} event={event}");
+        if !profile.is_empty() {
+            line.push_str(&format!(" profile={profile}"));
+        }
+        if !phase.is_empty() {
+            line.push_str(&format!(" phase={phase}"));
+        }
+        if page != 0 {
+            line.push_str(&format!(" page={page}"));
+        }
+        if let Some(month) = month {
+            line.push_str(&format!(" month={month}"));
+        }
+        for (key, value) in fields {
+            // Keys and values are fixed literals or decimal digits from us.
+            line.push_str(&format!(" {key}={value}"));
+        }
+        line.push('\n');
+        let _ = self.append(&line);
+    }
+
+    fn append(&self, line: &str) -> std::io::Result<()> {
+        if let Ok(meta) = std::fs::metadata(&self.path) {
+            if meta.len() >= DEBUG_LOG_MAX_BYTES {
+                let backup = self.path.with_extension("log.old");
+                let _ = std::fs::rename(&self.path, &backup);
+            }
+        }
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)?;
+        file.write_all(line.as_bytes())
+    }
+}
+
+// ---------------------------------------------------------------------------
 // The walk.
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub(crate) struct Limits {
     pub(crate) budget: Duration,
     pub(crate) page_timeout: Duration,
@@ -1464,11 +1595,21 @@ pub(crate) struct Limits {
     /// The round was started by the user: a V2 walk re-reads every month in
     /// its range (design 6), not only the recent and never-read ones.
     explicit: bool,
+    /// The round's #520 debug log, set by `sync_with` (`None` when the round
+    /// opens none).
+    pub(crate) debug: Option<Arc<SyncDebugLog>>,
+    /// Whether `sync_with` may open the debug log at all. Production: true;
+    /// hermetic tests: false unless a test turns it on.
+    pub(crate) debug_log: bool,
+    /// Waits before the 2nd and 3rd attempt of a transiently failed page.
+    pub(crate) backoffs: [Duration; 2],
 }
 
 impl Limits {
-    fn production(budget: Duration) -> Self {
+    pub(crate) fn production(budget: Duration, debug: Option<Arc<SyncDebugLog>>) -> Self {
         Self {
+            debug_log: true,
+            backoffs: TRANSIENT_PAGE_BACKOFFS,
             budget,
             page_timeout: PAGE_TIMEOUT,
             page_size: PAGE_SIZE,
@@ -1476,6 +1617,7 @@ impl Limits {
             max_v2_pages: MAX_V2_PAGES,
             max_body_bytes: MAX_BODY_BYTES,
             explicit: false,
+            debug,
         }
     }
 }
@@ -1783,6 +1925,175 @@ pub(crate) async fn refusal(response: &mut reqwest::Response) -> Option<Stop> {
     None
 }
 
+/// A page failure that is worth retrying: Cursor 5xx, or a send/body timeout.
+fn transient_page_stop(stop: &Stop) -> bool {
+    *stop == Stop::error("server_error")
+        || *stop == Stop::new(State::Partial, Some("timeout"))
+}
+
+/// Fetch one page's body. On Cursor 5xx or a send/body timeout, retry the
+/// same page once per entry of `backoffs` (production:
+/// [`TRANSIENT_PAGE_BACKOFFS`], twice; budget and the
+/// live switch still bind). 429, auth and redirects are not retried.
+pub(crate) async fn fetch_page_body<F, Fut>(
+    deadline: Instant,
+    page_timeout: Duration,
+    enabled: &dyn Fn() -> bool,
+    cap: usize,
+    debug: Option<&SyncDebugLog>,
+    backoffs: &[Duration],
+    mut send: F,
+) -> Result<Vec<u8>, Stop>
+where
+    F: FnMut(Duration) -> Fut,
+    Fut: std::future::Future<Output = Result<reqwest::Response, reqwest::Error>>,
+{
+    let mut attempt = 0usize;
+    let started = Instant::now();
+    let log_fail = |debug: Option<&SyncDebugLog>,
+                    event: &str,
+                    attempt: usize,
+                    remaining: Duration,
+                    reason: &str| {
+        if let Some(debug) = debug {
+            let attempt = (attempt + 1).to_string();
+            let max = (backoffs.len() + 1).to_string();
+            let budget_ms = remaining.as_millis().to_string();
+            let timeout_ms = page_timeout.min(remaining).as_millis().to_string();
+            let elapsed_ms = started.elapsed().as_millis().to_string();
+            debug.event(
+                event,
+                &[
+                    ("attempt", &attempt),
+                    ("attempts", &max),
+                    ("budget_ms", &budget_ms),
+                    ("timeout_ms", &timeout_ms),
+                    ("elapsed_ms", &elapsed_ms),
+                    ("reason", reason),
+                ],
+            );
+        }
+    };
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            log_fail(debug, "page_fail", attempt, remaining, "budget_exhausted");
+            return Err(Stop::new(State::Partial, Some("budget_exhausted")));
+        }
+        if !enabled() {
+            log_fail(debug, "page_fail", attempt, remaining, "disabled");
+            return Err(Stop::new(State::Disabled, None));
+        }
+        if let Some(debug) = debug {
+            let attempt_n = (attempt + 1).to_string();
+            let budget_ms = remaining.as_millis().to_string();
+            let timeout_ms = page_timeout.min(remaining).as_millis().to_string();
+            debug.event(
+                "page_send",
+                &[
+                    ("attempt", &attempt_n),
+                    ("budget_ms", &budget_ms),
+                    ("timeout_ms", &timeout_ms),
+                ],
+            );
+        }
+        let send_started = Instant::now();
+        let sent = send(page_timeout.min(remaining)).await;
+        let mut response = match sent {
+            Ok(response) => response,
+            Err(error) => {
+                let stop = send_stop(&error);
+                let reason = stop.reason.unwrap_or("send_error");
+                if transient_page_stop(&stop) && attempt < backoffs.len() {
+                    log_fail(debug, "page_retry", attempt, remaining, reason);
+                    let delay = backoffs[attempt];
+                    attempt += 1;
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        log_fail(debug, "page_fail", attempt, remaining, "budget_exhausted");
+                        return Err(Stop::new(State::Partial, Some("budget_exhausted")));
+                    }
+                    if !enabled() {
+                        return Err(Stop::new(State::Disabled, None));
+                    }
+                    tokio::time::sleep(delay.min(remaining)).await;
+                    continue;
+                }
+                log_fail(debug, "page_fail", attempt, remaining, reason);
+                return Err(stop);
+            }
+        };
+        if let Some(stop) = refusal(&mut response).await {
+            let reason = stop.reason.unwrap_or(match stop.state {
+                State::Expired => "expired",
+                State::Disabled => "disabled",
+                _ => "refused",
+            });
+            if transient_page_stop(&stop) && attempt < backoffs.len() {
+                drop(response);
+                log_fail(debug, "page_retry", attempt, remaining, reason);
+                let delay = backoffs[attempt];
+                attempt += 1;
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    log_fail(debug, "page_fail", attempt, remaining, "budget_exhausted");
+                    return Err(Stop::new(State::Partial, Some("budget_exhausted")));
+                }
+                if !enabled() {
+                    return Err(Stop::new(State::Disabled, None));
+                }
+                tokio::time::sleep(delay.min(remaining)).await;
+                continue;
+            }
+            log_fail(debug, "page_fail", attempt, remaining, reason);
+            return Err(stop);
+        }
+        match read_capped(&mut response, cap).await {
+            Ok(body) => {
+                if let Some(debug) = debug {
+                    let bytes = body.len().to_string();
+                    let took_ms = send_started.elapsed().as_millis().to_string();
+                    let attempt_n = (attempt + 1).to_string();
+                    debug.event(
+                        "page_ok",
+                        &[
+                            ("attempt", &attempt_n),
+                            ("bytes", &bytes),
+                            ("took_ms", &took_ms),
+                        ],
+                    );
+                }
+                return Ok(body);
+            }
+            Err(BodyError::Timeout) if attempt < backoffs.len() => {
+                log_fail(debug, "page_retry", attempt, remaining, "timeout");
+                let delay = backoffs[attempt];
+                attempt += 1;
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    log_fail(debug, "page_fail", attempt, remaining, "budget_exhausted");
+                    return Err(Stop::new(State::Partial, Some("budget_exhausted")));
+                }
+                if !enabled() {
+                    return Err(Stop::new(State::Disabled, None));
+                }
+                tokio::time::sleep(delay.min(remaining)).await;
+            }
+            Err(error) => {
+                let stop = body_stop(error);
+                log_fail(
+                    debug,
+                    "page_fail",
+                    attempt,
+                    remaining,
+                    stop.reason.unwrap_or("body_error"),
+                );
+                return Err(stop);
+            }
+        }
+    }
+}
+
 /// D1a: a JSON object with no `usageEventsDisplay` key (only the key names
 /// are kept, in memory). Anything else, a malformed array included, is not.
 fn lacks_usage_events(body: &[u8]) -> bool {
@@ -1807,6 +2118,7 @@ async fn walk(
     cookie: &reqwest::header::HeaderValue,
     limits: Limits,
     enabled: &dyn Fn() -> bool,
+    profile_id: &str,
 ) -> Result<Option<Vec<Event>>, Stop> {
     use reqwest::header;
     let end_ms = SystemTime::now()
@@ -1817,40 +2129,44 @@ async fn walk(
     let mut events: Vec<Event> = Vec::new();
     let mut bytes_read = 0usize;
     for page in 1..=limits.max_pages {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return Err(Stop::new(State::Partial, Some("budget_exhausted")));
-        }
-        // S-3: the switch is re-read before every send.
-        if !enabled() {
-            return Err(Stop::new(State::Disabled, None));
-        }
-        let body = serde_json::json!({
+        let request_body = serde_json::json!({
             "startDate": "0",
             "endDate": end_ms.to_string(),
             "page": page,
             "pageSize": limits.page_size,
         });
-        let sent = client
-            .post(target.url)
-            .header(header::COOKIE, cookie.clone())
-            .header(header::ORIGIN, "https://cursor.com")
-            .header(header::REFERER, "https://cursor.com/dashboard")
-            .header(header::CONTENT_TYPE, "application/json")
-            .header(header::ACCEPT, "application/json")
-            .header(header::USER_AGENT, "TokenBar")
-            .body(body.to_string())
-            .timeout(limits.page_timeout.min(remaining))
-            .send()
-            .await;
-        let mut response = sent.map_err(|error| send_stop(&error))?;
-        if let Some(stop) = refusal(&mut response).await {
-            return Err(stop);
-        }
         let cap = limits.max_body_bytes.saturating_sub(bytes_read);
-        let body = read_capped(&mut response, cap).await.map_err(body_stop)?;
+        if let Some(debug) = limits.debug.as_deref() {
+            debug.set_ctx(profile_id, "old", page, None);
+        }
+        // S-3: fetch_page_body re-reads the switch before every attempt.
+        let body = fetch_page_body(
+            deadline,
+            limits.page_timeout,
+            enabled,
+            cap,
+            limits.debug.as_deref(),
+            &limits.backoffs,
+            |timeout| {
+                client
+                    .post(target.url)
+                    .header(header::COOKIE, cookie.clone())
+                    .header(header::ORIGIN, "https://cursor.com")
+                    .header(header::REFERER, "https://cursor.com/dashboard")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::ACCEPT, "application/json")
+                    .header(header::USER_AGENT, "TokenBar")
+                    .body(request_body.to_string())
+                    .timeout(timeout)
+                    .send()
+            },
+        )
+        .await?;
         bytes_read += body.len();
         if page == 1 && lacks_usage_events(&body) {
+            if let Some(debug) = limits.debug.as_deref() {
+                debug.event("old_migrated", &[]);
+            }
             return Ok(None);
         }
         let page: Page =
@@ -1982,20 +2298,54 @@ async fn run(
         Ok(client) => client,
         Err(stop) => return stopped(stop),
     };
+    let profile_id = slot.id.as_str();
+    if let Some(debug) = limits.debug.as_deref() {
+        let budget_ms = limits.budget.as_millis().to_string();
+        let timeout_ms = limits.page_timeout.as_millis().to_string();
+        debug.set_ctx(profile_id, "start", 0, None);
+        debug.event(
+            "profile_start",
+            &[
+                ("budget_ms", &budget_ms),
+                ("timeout_ms", &timeout_ms),
+                ("explicit", if limits.explicit { "1" } else { "0" }),
+            ],
+        );
+    }
     let walk_started = Instant::now();
-    let events = match walk(&client, target, &cookie, limits, enabled).await {
+    let events = match walk(&client, target, &cookie, limits.clone(), enabled, profile_id).await {
         Ok(Some(events)) => events,
         Ok(None) => {
             let limits = Limits {
                 budget: limits.budget.saturating_sub(walk_started.elapsed()),
                 ..limits
             };
-            let (synced, dropped) =
-                billing_v2(&client, target, dir, &stem, &user, &cookie, limits, enabled).await;
+            let debug = limits.debug.clone();
+            let (synced, dropped) = billing_v2(
+                &client,
+                target,
+                dir,
+                &stem,
+                &user,
+                &cookie,
+                limits,
+                enabled,
+                profile_id,
+            )
+            .await;
             drop(cookie);
             return match synced {
                 Ok((committed, events)) => {
                     claim(&stem, true);
+                    if let Some(debug) = debug.as_deref() {
+                        let events_s = events.to_string();
+                        let took_ms = walk_started.elapsed().as_millis().to_string();
+                        debug.set_ctx(profile_id, "v2", 0, None);
+                        debug.event(
+                            "profile_ok",
+                            &[("events", &events_s), ("took_ms", &took_ms), ("path", "v2")],
+                        );
+                    }
                     Outcome {
                         events,
                         changed: committed.changed,
@@ -2008,6 +2358,31 @@ async fn run(
                     if covers_account(stop) {
                         claim(&stem, true);
                     }
+                    if let Some(debug) = debug.as_deref() {
+                        let took_ms = walk_started.elapsed().as_millis().to_string();
+                        let reason = stop.reason.unwrap_or("error");
+                        let state = match stop.state {
+                            State::Ok => "ok",
+                            State::Partial => "partial",
+                            State::Expired => "expired",
+                            State::NotSignedIn => "notSignedIn",
+                            State::Offline => "offline",
+                            State::Error => "error",
+                            State::Disabled => "disabled",
+                            State::CliPresent => "cliPresent",
+                            State::Duplicate => "duplicate",
+                        };
+                        debug.set_ctx(profile_id, "v2", 0, None);
+                        debug.event(
+                            "profile_fail",
+                            &[
+                                ("state", state),
+                                ("reason", reason),
+                                ("took_ms", &took_ms),
+                                ("path", "v2"),
+                            ],
+                        );
+                    }
                     Outcome {
                         dropped,
                         ..stopped(stop)
@@ -2019,6 +2394,31 @@ async fn run(
             if covers_account(stop) {
                 claim(&stem, true);
             }
+            if let Some(debug) = limits.debug.as_deref() {
+                let took_ms = walk_started.elapsed().as_millis().to_string();
+                let reason = stop.reason.unwrap_or("error");
+                let state = match stop.state {
+                    State::Ok => "ok",
+                    State::Partial => "partial",
+                    State::Expired => "expired",
+                    State::NotSignedIn => "notSignedIn",
+                    State::Offline => "offline",
+                    State::Error => "error",
+                    State::Disabled => "disabled",
+                    State::CliPresent => "cliPresent",
+                    State::Duplicate => "duplicate",
+                };
+                debug.set_ctx(profile_id, "old", 0, None);
+                debug.event(
+                    "profile_fail",
+                    &[
+                        ("state", state),
+                        ("reason", reason),
+                        ("took_ms", &took_ms),
+                        ("path", "old"),
+                    ],
+                );
+            }
             return stopped(stop);
         }
     };
@@ -2026,6 +2426,15 @@ async fn run(
     match commit_file(dir, &stem, &events, enabled) {
         Ok(committed) => {
             claim(&stem, true);
+            if let Some(debug) = limits.debug.as_deref() {
+                let events_s = events.len().to_string();
+                let took_ms = walk_started.elapsed().as_millis().to_string();
+                debug.set_ctx(profile_id, "old", 0, None);
+                debug.event(
+                    "profile_ok",
+                    &[("events", &events_s), ("took_ms", &took_ms), ("path", "old")],
+                );
+            }
             Outcome {
                 events: events.len(),
                 changed: committed.changed,
@@ -2052,6 +2461,7 @@ async fn billing_v2(
     cookie: &reqwest::header::HeaderValue,
     limits: Limits,
     enabled: &dyn Fn() -> bool,
+    profile_id: &str,
 ) -> (Result<(Committed, usize), Stop>, usize) {
     let now_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -2067,16 +2477,28 @@ async fn billing_v2(
     let history = stored.filter(|_| !stale);
     let plan = v2_windows(history.as_ref(), &live.rows, stale, limits.explicit, now_ms);
     drop((history, live));
+    if let Some(debug) = limits.debug.as_deref() {
+        let windows = plan.windows.len().to_string();
+        debug.set_ctx(profile_id, "v2", 0, None);
+        debug.event(
+            "v2_plan",
+            &[
+                ("windows", &windows),
+                ("stop_after_empty", if plan.stop_after_empty { "1" } else { "0" }),
+            ],
+        );
+    }
     let fetched = match cursor_billing_v2::walk(
         client,
         target.billing_url,
         cookie,
         user,
-        limits,
+        limits.clone(),
         enabled,
         &plan.windows,
         plan.stop_after_empty,
         now_ms,
+        profile_id,
     )
     .await
     {
@@ -2120,18 +2542,24 @@ impl Slot {
     }
 }
 
-/// The round's budget: full for "Sync now" and while some profile has no
-/// complete file but could write one; background otherwise. A profile whose last round could not write a
-/// file however long it ran (`writes_no_file`) does not hold every later
-/// round at the full budget.
+/// The round's budget: 15 min × profiles capped at 45 min for "Sync now"
+/// and while some profile has no complete file but could write one; 3 min ×
+/// profiles capped at 20 min otherwise (#520). Shared by the round, not per
+/// profile: an earlier profile may use all of it. A profile whose last round could not write
+/// a file however long it ran (`writes_no_file`) does not hold every later
+/// round at the full budget. One budget still covers the whole round so
+/// several profiles cannot hold `IN_FLIGHT` unboundedly.
 fn round_budget(explicit: bool, slots: &[Slot], no_file: &[(String, Option<PathBuf>)]) -> Duration {
     let wants_full = slots
         .iter()
         .any(|slot| complete_file(&slot.dir).is_none() && !no_file.contains(&slot.key()));
+    let n = u32::try_from(slots.len()).unwrap_or(u32::MAX).max(1);
     if explicit || wants_full {
-        FULL_BUDGET
+        FULL_BUDGET.saturating_mul(n).min(FULL_BUDGET_CAP)
     } else {
         BACKGROUND_BUDGET
+            .saturating_mul(n)
+            .min(BACKGROUND_BUDGET_CAP)
     }
 }
 
@@ -2210,12 +2638,43 @@ fn sync_with(
     let budget = round_budget(explicit, &profiles, &last.no_file);
     #[cfg(test)]
     ROUND_BUDGET.with(|cell| cell.set(Some(budget)));
-    let limits = test_limits.unwrap_or(Limits::production(budget));
-    // One budget for the whole round, so several profiles cannot hold
-    // IN_FLIGHT for longer than one would. (A database read that blocks in
-    // the kernel, e.g. on a stalled network volume, is not bounded by it.)
+    // Decided before anything is created: no log (and no `create_dir_all`)
+    // through a rejected appDir or in a round with sync off.
+    let log_wanted = test_limits.as_ref().map_or(true, |l| l.debug_log);
+    let debug = if log_wanted && start.enabled && !app_dir_rejected {
+        start.app_dir.as_deref().and_then(SyncDebugLog::open)
+    } else {
+        None
+    };
+    let limits = match test_limits {
+        Some(limits) => Limits {
+            debug: debug.clone(),
+            ..limits
+        },
+        None => Limits::production(budget, debug.clone()),
+    };
+    let round_started = Instant::now();
+    if let Some(debug) = debug.as_deref() {
+        let n = profiles.len().to_string();
+        let budget_ms = budget.as_millis().to_string();
+        let timeout_ms = limits.page_timeout.as_millis().to_string();
+        debug.set_ctx("-", "round", 0, None);
+        debug.event(
+            "round_start",
+            &[
+                ("profiles", &n),
+                ("budget_ms", &budget_ms),
+                ("timeout_ms", &timeout_ms),
+                ("explicit", if explicit { "1" } else { "0" }),
+            ],
+        );
+    }
+    // One budget for the whole round (scaled by profile count, capped), so
+    // several profiles cannot hold IN_FLIGHT unboundedly. (A database read
+    // that blocks in the kernel, e.g. on a stalled network volume, is not
+    // bounded by it.)
     let deadline = Instant::now() + limits.budget;
-    let mut walked: Vec<(String, usize)> = Vec::new();
+    let mut walked: Vec<(String, usize)> = Vec::with_capacity(profiles.len());
     let mut outcomes: Vec<Outcome> = Vec::with_capacity(profiles.len());
     let switch_on = || config().enabled;
     let mut sealed = SealedRound::new(
@@ -2225,8 +2684,16 @@ fn sync_with(
     for (index, profile) in profiles.iter().enumerate() {
         let remaining = deadline.saturating_duration_since(Instant::now());
         let outcome = if app_dir_rejected {
+            if let Some(debug) = limits.debug.as_deref() {
+                debug.set_ctx(&profile.id, "round", 0, None);
+                debug.event("profile_fail", &[("reason", "app_dir_rejected")]);
+            }
             Outcome::refused(Stop::error("app_dir_rejected"))
         } else if remaining.is_zero() {
+            if let Some(debug) = limits.debug.as_deref() {
+                debug.set_ctx(&profile.id, "round", 0, None);
+                debug.event("profile_fail", &[("reason", "budget_exhausted")]);
+            }
             Outcome::stopped(Stop::new(State::Partial, Some("budget_exhausted")))
         } else {
             let still_wanted = || profile.still_in(&start, &config()) && app_dir_ok();
@@ -2246,7 +2713,7 @@ fn sync_with(
                 Limits {
                     budget: remaining,
                     explicit,
-                    ..limits
+                    ..limits.clone()
                 },
                 &still_wanted,
                 &mut claim,
@@ -2326,6 +2793,30 @@ fn sync_with(
         .filter(|(_, outcome)| writes_no_file(outcome))
         .map(|(profile, _)| profile.key())
         .collect();
+    if let Some(debug) = debug.as_deref() {
+        let state = match state {
+            State::Ok => "ok",
+            State::Partial => "partial",
+            State::Expired => "expired",
+            State::NotSignedIn => "notSignedIn",
+            State::Offline => "offline",
+            State::Error => "error",
+            State::Disabled => "disabled",
+            State::CliPresent => "cliPresent",
+            State::Duplicate => "duplicate",
+        };
+        let reason = head.reason.unwrap_or("-");
+        let took_ms = round_started.elapsed().as_millis().to_string();
+        debug.set_ctx("-", "round", 0, None);
+        debug.event(
+            "round_end",
+            &[
+                ("state", state),
+                ("reason", reason),
+                ("took_ms", &took_ms),
+            ],
+        );
+    }
     last.status = Some(status.clone());
     (status, changed)
 }
