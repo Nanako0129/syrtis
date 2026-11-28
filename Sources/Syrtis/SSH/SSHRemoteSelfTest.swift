@@ -1062,6 +1062,9 @@ extension SSHRemoteSelfTest {
         expect(arrived && leftovers().isEmpty,
                "SSH price table: after the tunnel connects both files arrive with the local bytes, no temp file left")
         _ = eventually(5) { supervisor.status(id: machine.id) == .up }
+        // The files are visible before the first push clears its in-flight mark; a push
+        // started in that gap returns 0 without the hash call.
+        _ = eventually(5) { !push.isPushing(machine.id) }
 
         // (b) Unchanged: even a forced trigger sends no body (the remote hashes match).
         var mark = fake.invocations.count

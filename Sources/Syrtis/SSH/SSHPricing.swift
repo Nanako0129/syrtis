@@ -102,6 +102,9 @@ final class SSHPricingPush: @unchecked Sendable {
         DispatchQueue.global(qos: .utility).async { [self] in push(id, force: force) }
     }
 
+    /// Whether a push for this machine is running (self-tests wait on it).
+    func isPushing(_ id: UUID) -> Bool { lock.withLock { inFlight[id] != nil } }
+
     /// The machine was removed: its push in flight is cancelled and none starts again.
     func forget(_ id: UUID) {
         let cancel = lock.withLock { () -> SSHCancellation? in

@@ -4,7 +4,7 @@ id: kb-remote-agent
 kind: canonical
 scope: repository
 read_when: changing the embedded remote-usage agent, its tb_remote_* C ABI, its start and stop wiring, or the agent dependency pin
-last_verified: 2026-11-27
+last_verified: 2026-11-28
 sources: ["crates/tb_core_ffi/src/remote_agent.rs", "crates/tb_core_ffi/src/remote_pages.rs", "crates/tb_core_ffi/src/usage_graph.rs", "crates/tb_core_ffi/src/model_report.rs", "crates/tb_core_ffi/src/hourly_report.rs", "crates/tb_core_ffi/src/agents_report.rs", "crates/tb_core_ffi/src/lib.rs", "crates/tb_core_ffi/Cargo.toml", "Cargo.toml", "Cargo.lock", "Sources/CTB/include/ctb.h", "Sources/TokenBarCore/TBCore.swift", "Sources/TokenBarCore/RemoteAgent.swift", "Sources/Syrtis/RemoteAgentLaunch.swift", "Sources/Syrtis/DevicesModel.swift", "Sources/Syrtis/DashboardModel.swift", "Sources/Syrtis/UsageDataSource.swift", "Sources/Syrtis/PopoverView.swift", "Sources/Syrtis/Views/DeviceSelectionMenu.swift", "Sources/Syrtis/Views/DeviceTotalsCard.swift", "Sources/Syrtis/Views/OverviewView.swift", "Sources/Syrtis/Views/StatsView.swift", "Sources/Syrtis/Views/DevicesSettingsView.swift", "Sources/Syrtis/Views/SettingsPanel.swift", "Sources/Syrtis/AppDelegate.swift", "Sources/Syrtis/ClaudeExtraRoots.swift", "Sources/Syrtis/CursorSync.swift", "Sources/Syrtis/SelfTest.swift", "Sources/Syrtis/SSH/SSHPricing.swift", "Sources/Syrtis/SSH/SSHRemoteTypes.swift", "Sources/Syrtis/SSH/SSHRemoteSelfTest.swift", "scripts/check_agent_engine_pin.py", ".github/workflows/ci.yml", "public Syrtis-Agent 36ce38283d4972d30e2696e5725cf78a9fef59ad"]
 ---
 
@@ -197,7 +197,7 @@ Popover 的 Overview、Graph（Stats、Daily、Monthly）、Models、Hourly、Ag
 - **不重送**：遠端雜湊等於本機的檔不送；雜湊輸出只接受每行恰為 `<64 hex>  <固定檔名>`，其他一律當「不知道」。每台每個檔記住最後一次送出的本機 sha256 與時間（不論成功失敗），一小時內同樣的位元組不再送，所以上傳一直失敗時不會跟著 tunnel 的重連頻率重送。上傳的 timeout 與 deploy 相同（300 秒）。
 - **失敗**：只寫 private log，不顯示錯誤、不改機器狀態；下一次觸發重試。唯一的訊號仍是既有的 `costIncomplete` 那句。
 
-已知限制：兩台 Mac 連到同一台機器時後寫的贏，可能是較舊的那份表；遠端時鐘比 Mac 慢、`timestamp` 落在遠端的未來時，那份表在遠端是 `Corrupt`（見上）。連到同一個遠端 agent 的其他裝置看到的 cost 也用這台 Mac 的表計價。移除機器時 `ctl uninstall --purge` 本來就留下 `pricing/`。實機（188）尚未驗證。
+已知限制：兩台 Mac 連到同一台機器時後寫的贏，可能是較舊的那份表；遠端時鐘比 Mac 慢、`timestamp` 落在遠端的未來時，那份表在遠端是 `Corrupt`（見上）。連到同一個遠端 agent 的其他裝置看到的 cost 也用這台 Mac 的表計價。移除機器時 `ctl uninstall --purge` 本來就留下 `pricing/`。實機驗證（2026-11-28，Linux x86_64 主機、釘選 `v0.1.0` agent 的 release bundle）：add 之後兩個檔在遠端的 sha256 與本機相同、測試紀錄的 cost 不為 0、`costIncomplete` 那句沒有出現。來源是出貨路徑（正式 bundle id 的 agent root）。每小時一次的重送未在實機驗證。
 
 ## 單一引擎與依賴 pin
 

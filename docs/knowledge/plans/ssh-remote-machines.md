@@ -4,7 +4,7 @@ id: kb-plan-ssh-remote-machines
 kind: plan
 scope: repository
 read_when: implementing or resuming SSH remote machines
-last_verified: 2026-11-24
+last_verified: 2026-11-28
 sources: ["Sources/Syrtis/SSH/SSHMachinesModel.swift", "Sources/Syrtis/Views/SSHMachinesSection.swift", "Sources/Syrtis/SSH/SSHRemoteRuntime.swift", "scripts/stage_remote_agent.sh", "scripts/remote-agent.lock", "Makefile", "crates/tb_core_ffi/src/remote_agent.rs", "crates/tb_core_ffi/src/remote_pages.rs", "Sources/TokenBarCore/RemoteAgent.swift", "Sources/Syrtis/Views/DevicesSettingsView.swift", "public Syrtis-Agent 36ce38283d4972d30e2696e5725cf78a9fef59ad"]
 ---
 
@@ -27,7 +27,7 @@ sources: ["Sources/Syrtis/SSH/SSHMachinesModel.swift", "Sources/Syrtis/Views/SSH
 | 已有 | 缺口 |
 | --- | --- |
 | Devices 頁可配對跑 `syrtis-agent` 的 producer，四頁可折入其用量 | producer 必須自己開 TCP listener，且 owner 要在 producer 端互動操作選單 |
-| `syrtis-agent` 可在 Linux 執行（附 systemd unit） | 沒有任何 release binary；argv 只接受 `run`，其餘只有互動選單 |
+| `syrtis-agent` 可在 Linux 執行（附 systemd unit） | 規劃當時沒有任何 release binary，argv 只接受 `run`、其餘只有互動選單；Syrtis-Agent `v0.1.0` 起有 Linux x86_64 release asset 與 `ctl` 子命令 |
 | Pair URL 的 Noise prologue 與 secret hash 不含 host:port，只 pin `responderStatic` | consumer 沒有改寫 URL 位址的介面；`PeerRecord` 的 host:port 配對後不能改 |
 | listener 允許 `127.0.0.1`，port 須 >= 1024 | — |
 
@@ -57,8 +57,8 @@ sequenceDiagram
 
 | 元件 | 位置 | 內容 |
 | --- | --- | --- |
-| 非互動控制命令 | [Syrtis-Agent](https://github.com/Nanako0129/Syrtis-Agent)（`ctl` 由 agent 端另一個 PR 提供，合併前本功能無法對真實主機運作） | `syrtis-agent ctl` 子命令（`status`、`install`、`uninstall`、`scope disclosure／approve`、`sharing on／off`、`listen`、`offer create／cancel`、`pending approve`、`grant revoke`），走既有 `control::Client`，以固定框架的 JSON 輸出到 stdout；不改協定 |
-| Linux binary | agent repository 的 release workflow（目前上游尚未發布） | MVP 只出 `x86_64-unknown-linux-gnu`（在 ubuntu-22.04 runner 建置，glibc 下限 2.35）release asset 與 sha256；`aarch64`、musl 留到有需求再加 |
+| 非互動控制命令 | [Syrtis-Agent](https://github.com/Nanako0129/Syrtis-Agent)（`ctl` 自 `v0.1.0` 起提供） | `syrtis-agent ctl` 子命令（`status`、`install`、`uninstall`、`scope disclosure／approve`、`sharing on／off`、`listen`、`offer create／cancel`、`pending approve`、`grant revoke`），走既有 `control::Client`，以固定框架的 JSON 輸出到 stdout；不改協定 |
+| Linux binary | agent repository 的 release workflow（`v0.1.0` 起發布） | MVP 只出 `x86_64-unknown-linux-gnu`（在 ubuntu-22.04 runner 建置，glibc 下限 2.35）release asset 與 sha256；`aarch64`、musl 留到有需求再加 |
 | binary 打包 | Syrtis `make remote-agent`（`scripts/stage_remote_agent.sh`） | 以 `curl --proto =https` 下載已提交的 `scripts/remote-agent.lock`（repo、tag、target、sha256 四項）所指定的 release asset，下載後的 sha256 必須等於 lock 的值（lock 是信任根；release 內的 `.sha256` 與 binary 同源，只當額外交叉檢查，不一致就失敗）。lock 目前釘在 Syrtis-Agent `v0.1.0`（第一個 Linux x86_64 release）；`release.yml` 的 `build` job 在打包前跑 `make remote-agent`，下載或雜湊不符就讓發版失敗。lock 的 tag 與 sha256 若留空，又未給 `REMOTE_AGENT_BIN` 的 `make remote-agent` 會以說明訊息失敗。要用別的 release（例如 fork）有兩種方式：改 lock，或給 `REMOTE_AGENT_REPO`、`REMOTE_AGENT_TAG` 加 `REMOTE_AGENT_SHA256`（覆寫 repo 或 tag 時 sha256 必填）。通過才暫存到 `.build/remote-agent/<triple>/`，失敗會清掉暫存；`REMOTE_AGENT_BIN=<檔案>` 直接用該檔。`scripts/bundle.sh` 在簽章前複製進 app `Resources/remote-agent/<triple>/`，旁邊的 `syrtis-agent.sha256` 就是 pin：程式讀它、先與本機檔比對、再交給遠端腳本比對。pin 與 binary 由同一步產生，所以不會脫鉤，也不需要生成 Swift 原始碼，沒有 binary 的建置（CI、`swift build`）照常可用，新增機器時顯示「此版本未附遠端 agent」 |
 | URL 改寫 | `tb_core_ffi`，新 `tb_remote_pair_url_rehost` | 用 agent 的 parse／encode 重產 canonical URL，host 一律強制 `127.0.0.1`、port 為該機器的 lport |
 | 機器清單 | Swift `SSHMachines`（UserDefaults） | label、user、host、ssh port、remote port、local port、`producerStatic`、enabled；不存任何 secret，載入時重新驗證 |
