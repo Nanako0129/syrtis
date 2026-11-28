@@ -23015,6 +23015,7 @@ enum SelfTest {
             let fixture = "/tmp/sa3a-selftest-\(getpid())"
             let sentinel = fixture + "/sentinel/opencode.db"
             let home = RemoteAgentLaunch.homeOverride(bundleIdentifier: "selftest-\(getpid())")
+            let pricingFixture = Data(#"{"timestamp":\#(Int(Date().timeIntervalSince1970) - 60),"data":{"sa3a-model":{"input_cost_per_token":1e-6}}}"#.utf8)
             var child: [String: Any]?
             let manager = FileManager.default
             // The root is created exclusively and 0700 before anything is
@@ -23037,6 +23038,12 @@ enum SelfTest {
                 let settings = try? JSONSerialization.data(
                     withJSONObject: ["scanner": ["opencodeDbPaths": [sentinel]]])
                 manager.createFile(atPath: fixture + "/config/settings.json", contents: settings)
+                // A price file in the engine's cache (`TOKSCALE_CONFIG_DIR/cache`): the agent's start
+                // copies it into its pricing directory, which the SSH price push reads.
+                try? manager.createDirectory(
+                    atPath: fixture + "/config/cache", withIntermediateDirectories: false,
+                    attributes: [.posixPermissions: 0o700])
+                manager.createFile(atPath: fixture + "/config/cache/pricing-litellm.json", contents: pricingFixture)
                 let process = Process()
                 process.executableURL = executable
                 process.arguments = ["--selftest", "-AppleLanguages", "(en)"]
@@ -23068,6 +23075,10 @@ enum SelfTest {
                            [fixture, home ?? fixture].contains { path.hasPrefix($0 + "/") || path == $0 }
                        }) == true,
                    "SA3A no disclosed path lies outside the fixture root or the agent home")
+            expect(child?["pricingSha256"] as? String == SSHPricingPush.sha256(pricingFixture),
+                   "SSH price table: the local source directory is where the running agent copies the engine's price file (same bytes)")
+            expect(SSHPricingPush.localDirectory(home: nil).path == realRoot + "/pricing",
+                   "SSH price table: the shipping source is the real agent root's pricing directory")
             if let home { try? FileManager.default.removeItem(atPath: home) }
             if fixtureCreated { try? FileManager.default.removeItem(atPath: fixture) }
             expect(realRootStamp() == realBefore,
@@ -23113,6 +23124,89 @@ enum SelfTest {
                        && page?.devices.last?.label == "10.0.0.2:47000"
                        && page?.devices.last?.lastSuccessAt == nil,
                    "SA3B the devices rows decode with their state, label and unknown last success")
+        }
+
+        // SSH machines section (plan P3): copy, row state and messages. No ssh runs.
+        do {
+            var sshMissing: [String] = []
+            for key in SSHMachinesCopy.all {
+                for locale in ["zh-Hant", "zh-Hans"] {
+                    let value = AppLanguage.localizedString(key, locale: locale, bundle: .tokenBarResources)
+                    if value == nil || (value == key && !["Remove %@?", "Something went wrong. Try again."].contains(key)) {
+                        sshMissing.append("\(locale): \(key.prefix(24))")
+                    }
+                }
+            }
+            expect(sshMissing.isEmpty, "SSH3 every SSH machines copy key resolves to a translation: \(sshMissing)")
+
+            let tmp = FileManager.default.temporaryDirectory.appendingPathComponent("syrtis-ssh-ui-\(UUID().uuidString)")
+            let suite = "syrtis.ssh.ui.\(UUID().uuidString)"
+            let defaults = UserDefaults(suiteName: suite)!
+            defer {
+                try? FileManager.default.removeItem(at: tmp)
+                defaults.removePersistentDomain(forName: suite)
+            }
+            let store = SSHMachines(defaults: defaults)
+            let key = String(repeating: "cd", count: 32)
+            let machine = SSHMachine(
+                id: UUID(), label: "box", user: "me", host: "box.example", sshPort: 2222, remotePort: 47500,
+                localPort: 47501, producerStatic: key, fingerprint: String(repeating: "ab", count: 8),
+                grantId: String(repeating: "01", count: 16), enabled: true)
+            try? store.add(machine)
+            let runtime = SSHRemoteRuntime(store: store, resources: tmp, stateDirectory: tmp)
+            func peerList(_ state: String) -> [RemotePeer] {
+                let json = #"[{"producerStatic":"\#(key)","fingerprint":"abababababababab","nodeLabel":null,"host":"127.0.0.1","port":47501,"createdAt":1,"expiresAt":2,"state":"\#(state)"}]"#
+                return (try? JSONDecoder().decode([RemotePeer].self, from: Data(json.utf8))) ?? []
+            }
+            final class Box: @unchecked Sendable { var peers: [RemotePeer]? }
+            let box = Box()
+            let model = awaitMainActorValue {
+                SSHMachinesModel(runtime: runtime, peersProvider: {
+                    guard let peers = box.peers else { throw SSHRemoteError.cancelled }
+                    return peers
+                }, hasAgent: { false }, notifications: NotificationCenter())
+            }
+            func needs() -> [Bool]? {
+                awaitMainActorValue { await model?.refresh(); return model?.rows.map(\.needsReapproval) ?? [] }
+            }
+            box.peers = nil
+            expect(needs() == [false], "SSH3 an unreadable peer list does not mark a machine as needing re-approval")
+            box.peers = []
+            expect(needs() == [true], "SSH3 a machine whose peer is gone needs re-approval")
+            box.peers = peerList("revoked")
+            expect(needs() == [true], "SSH3 a revoked peer needs re-approval")
+            box.peers = peerList("active")
+            expect(needs() == [false], "SSH3 an active peer needs nothing")
+            let noAgent = awaitMainActorValue { () -> String? in
+                model?.add(user: "me", host: "h", portText: "22", label: "")
+                return model?.notice
+            }
+            expect(noAgent == SSHMachinesCopy.noAgent && awaitMainActorValue { model?.working == false } == true,
+                   "SSH3 a build without the agent refuses to add, before any ssh call")
+            let incomplete = SSHMachinesModel.message(
+                for: SSHRollbackIncomplete(cause: SSHRemoteError.declined, commands: ["ssh -- me@box 'sh -c x'"]), command: nil)
+            expect(incomplete.contains(SSHMachinesCopy.errDeclined.localized) && incomplete.contains("ssh -- me@box 'sh -c x'"),
+                   "SSH3 a flow whose undo did not finish shows its error and the commands to run by hand")
+            let row = SSHMachinesModel.Row(
+                machine: machine, tunnel: .backoff(attempt: 1, retryIn: 4, reason: "Host key verification failed."),
+                needsReapproval: false)
+            expect(SSHMachinesModel.hostKeyCommand(row) == "ssh -p 2222 me@box.example"
+                && SSHMachinesModel.message(for: SSHRemoteError.hostKeyRejected, command: "ssh me@h").contains("ssh me@h")
+                && SSHMachinesModel.statusLine(row) == SSHMachinesCopy.retrying.localized(4),
+                "SSH3 a host key failure names the ssh command to run once; a backoff shows its retry time")
+            let unsafeText = SSHMachinesModel.message(
+                for: SSHRemoteError.unsafeRemoteDirs(["~/.local", "~/.config"]), command: "ssh -p 2222 me@box.example")
+            expect(unsafeText.contains("~/.local, ~/.config")
+                && unsafeText.contains("ssh -p 2222 me@box.example 'chmod go-w ~/.local ~/.config'")
+                && !unsafeText.contains("~/.local/bin"),
+                "SSH3 unsafe remote folders are listed with a copyable chmod command for only those paths")
+            expect(SSHMachinesModel.message(for: SSHRemoteError.portInUse(47501), command: nil)
+                    == SSHMachinesCopy.portBusy.localized(47501)
+                && SSHMachinesModel.hostKeyCommand(.init(machine: machine, tunnel: .up, needsReapproval: false)) == nil,
+                "SSH3 port-in-use has its fixed line; a running forward has no host key hint")
+            expect(SSHMachinesModel.message(for: SSHRemoteError.duplicateMachine, command: nil)
+                    == SSHMachinesCopy.errDuplicate.localized,
+                "SSH3 a machine that is already saved gets its own sentence, not the field check")
         }
 
         // SA-3c: the Devices page's model, driven by a fake client and a fake
@@ -25397,6 +25491,8 @@ enum SelfTest {
             DeviceOverlayState.freshWindowSeconds = 60
         }
 
+        SSHRemoteSelfTest.run { ok, label in expect(ok, label) }
+
         accountsDefaults.restore()
 
         if failures > 0 {
@@ -25414,6 +25510,8 @@ enum SelfTest {
     @MainActor static func runRemoteAgentChild(home: String) -> Never {
         let status = try? RemoteAgentLaunch.start(home: home)
         let disclosure = try? TBCore.remoteScopeDisclosure()
+        let pricing = SSHPricingPush.readSource(
+            SSHPricingPush.localDirectory(home: home).appendingPathComponent(SSHPricingFile.litellm.rawValue))
         // SA-3b: the device-aware pages with this Mac and a device that was
         // never paired (cached: no connection). The snapshot directory is the
         // user's own Caches directory (Foundation does not follow `HOME`), so
@@ -25468,6 +25566,7 @@ enum SelfTest {
             "sa3bLocalOnly": localOnly?.devices.map(\.state) as Any,
             "sa3bLocalOnlyDuplicate": localOnly?.duplicateWarning as Any,
             "sa3bSnapshotSame": snapshotSame,
+            "pricingSha256": pricing.map(SSHPricingPush.sha256) as Any,
         ]
         let data = (try? JSONSerialization.data(withJSONObject: line)) ?? Data("{}".utf8)
         print(String(decoding: data, as: UTF8.self))

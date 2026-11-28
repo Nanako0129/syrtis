@@ -744,6 +744,12 @@ public enum TBCore {
         try unwrap(pairUrl.withCString { tb_remote_pair_destination($0) })
     }
 
+    /// The Pair URL with host forced to 127.0.0.1 and port set to `localPort`
+    /// (1024...65535); parses only.
+    public static func remotePairUrlRehost(pairUrl: String, localPort: Int) throws -> RemoteRehostedPairUrl {
+        try unwrap(pairUrl.withCString { tb_remote_pair_url_rehost($0, Int64(localPort)) })
+    }
+
     public static func remotePairClaim(pairUrl: String) throws -> RemoteClaim {
         try unwrap(pairUrl.withCString { tb_remote_pair_claim($0) })
     }

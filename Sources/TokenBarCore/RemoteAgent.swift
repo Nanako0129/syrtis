@@ -87,6 +87,12 @@ public struct RemotePairDestination: Decodable, Equatable, Sendable {
     }
 }
 
+/// `tb_remote_pair_url_rehost`: the Pair URL rewritten to a local loopback
+/// port. It is a secret; never log or persist it.
+public struct RemoteRehostedPairUrl: Decodable, Equatable, Sendable {
+    public let pairUrl: String
+}
+
 /// `tb_remote_pair_claim`: compare `sas` with the producer's screen.
 public struct RemoteClaim: Decodable, Equatable, Sendable {
     public let handle: Int64

@@ -23,6 +23,7 @@ struct DevicesSettingsView: View {
 
     let panel: SettingsPanel
     @ObservedObject private var model = DevicesModel.shared
+    @ObservedObject private var sshModel = SSHMachinesModel.shared
 
     @State private var host = ""
     @State private var portText = ""
@@ -41,6 +42,7 @@ struct DevicesSettingsView: View {
             if model.running {
                 scopeSection()
                 linkedSection()
+                SSHMachinesSection(panel: panel)
             }
         }
         .onAppear {
@@ -325,8 +327,9 @@ struct DevicesSettingsView: View {
             DevicesCopy.linkedSection, summary: DevicesCopy.linkedSummary,
             details: { panel.hint(DevicesCopy.removeMessage) }
         ) {
-            if model.peers.isEmpty { panel.hint(DevicesCopy.noLinked) }
-            ForEach(model.peers, id: \.producerStatic) { peer in
+            let linked = SSHPeerNames.linked(model.peers, machines: sshModel.rows.map(\.machine))
+            if linked.isEmpty { panel.hint(DevicesCopy.noLinked) }
+            ForEach(linked, id: \.producerStatic) { peer in
                 // The name its owner gave it, on its own line and only as
                 // data: `panel.row` and `hint` look their text up as a
                 // localization key.

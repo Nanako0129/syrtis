@@ -25,6 +25,21 @@ if CommandLine.arguments.contains("--refresh-timing") {
 if CommandLine.arguments.contains("--launch-timeline") {
     LaunchTimelineProbe.start()
 }
+// Only the SSH remote machine checks (plan P2); the same ones run inside --selftest.
+if CommandLine.arguments.contains("--selftest-ssh") {
+    var failures = 0
+    SSHRemoteSelfTest.run { ok, label in
+        print(ok ? "ok   \(label)" : "FAIL \(label)")
+        if !ok { failures += 1 }
+    }
+    // Manual lane: needs SYRTIS_SSH_IT_AGENT (a debug build of the agent with `ctl`).
+    SSHRemoteIntegrationTest.run { ok, label in
+        print(ok ? "ok   \(label)" : "FAIL \(label)")
+        if !ok { failures += 1 }
+    }
+    print(failures == 0 ? "ssh selftest passed" : "\(failures) ssh selftest check(s) failed")
+    exit(failures == 0 ? 0 : 1)
+}
 if CommandLine.arguments.contains("--selftest") {
     // Some assertions compare against English UI copy, so on a non-English Mac
     // they would fail for the wrong reason. Say so instead of looking broken.

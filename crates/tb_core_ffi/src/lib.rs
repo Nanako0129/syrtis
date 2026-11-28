@@ -2352,6 +2352,22 @@ mod remote_ffi {
         })
     }
 
+    /// Data `{pairUrl}`: this Pair URL with its host forced to `127.0.0.1`
+    /// and its port set to `local_port` (1024..=65535, else `invalid`),
+    /// re-encoded by the agent. Parses only; nothing kept or logged.
+    ///
+    /// # Safety
+    /// `pair_url` must be a valid NUL-terminated UTF-8 string.
+    #[no_mangle]
+    pub unsafe extern "C" fn tb_remote_pair_url_rehost(
+        pair_url: *const c_char,
+        local_port: i64,
+    ) -> *mut c_char {
+        run("tb_remote_pair_url_rehost", || {
+            AGENT.pair_url_rehost(unsafe { text(pair_url) }?, local_port)
+        })
+    }
+
     /// Data `{handle, sas, expiresAt, producerFingerprint}`.
     ///
     /// # Safety

@@ -671,7 +671,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             RemoteAgentLaunch.stop()
             agentStopped.signal()
         }
-        _ = agentStopped.wait(timeout: .now() + 2)
+        // The SSH tunnels (each waits up to 5 s for its ssh child) end in
+        // parallel under the same bound; a pid file left behind is ended by
+        // the next launch's `reapStale`.
+        let tunnelsStopped = DispatchSemaphore(value: 0)
+        DispatchQueue.global(qos: .userInitiated).async {
+            SSHRemoteRuntime.shared.stop()
+            tunnelsStopped.signal()
+        }
+        let stopDeadline = DispatchTime.now() + 2
+        _ = agentStopped.wait(timeout: stopDeadline)
+        _ = tunnelsStopped.wait(timeout: stopDeadline)
     }
 
     /// Re-derive every menu-bar surface from the cached data and the current
