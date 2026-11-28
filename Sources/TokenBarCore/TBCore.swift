@@ -143,6 +143,11 @@ package struct AntigravityBindingResult: Decodable {
     package let bound: Bool
 }
 
+/// Success data of `tb_set_antigravity_remote_fallback`.
+package struct AntigravityRemoteFallbackResult: Decodable {
+    package let allowed: Bool
+}
+
 /// Success data of `tb_antigravity_remove`.
 package struct AntigravityRemoved: Decodable {
     package let removed: Bool
@@ -587,6 +592,17 @@ public enum TBCore {
             decoding: try JSONEncoder().encode(["key": key, "marker": marker]), as: UTF8.self)
         let r: AntigravityBindingResult = try unwrap(json.withCString { tb_set_antigravity_binding($0) })
         return r.bound
+    }
+
+    /// Allow or forbid the primary Antigravity card's remote routes (Google
+    /// sign-in, the bound account, agy) when the IDE is not running (#596).
+    /// Off in every new process. An atomic store; no I/O.
+    @discardableResult
+    public static func setAntigravityRemoteFallback(_ allowed: Bool) throws -> Bool {
+        let json = allowed ? #"{"allowed":true}"# : #"{"allowed":false}"#
+        let r: AntigravityRemoteFallbackResult = try unwrap(
+            json.withCString { tb_set_antigravity_remote_fallback($0) })
+        return r.allowed
     }
 
     /// Copy agy's current Google login into a Syrtis-owned login-keychain

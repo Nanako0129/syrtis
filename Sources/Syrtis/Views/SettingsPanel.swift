@@ -148,6 +148,8 @@ struct SettingsPanel: View {
     /// written back over that change.
     @AppStorage(AntigravityAccounts.storageKey) private var antigravityAccountsRaw = ""
     @AppStorage(AntigravityAutoCapture.enabledKey) private var antigravityAutoCaptureOn = false
+    @AppStorage(AntigravityRemoteFallback.storageKey) private var antigravityRemoteFallbackOn = false
+    @State private var antigravityRemoteConfirm = false
     /// Busy, paused, unavailable and the last failure sentence.
     @ObservedObject private var antigravityAutoCapture = AntigravityAutoCapture.shared
     @ObservedObject private var cursorSync = CursorSyncController.shared
@@ -1579,6 +1581,45 @@ struct SettingsPanel: View {
                 ForEach(AccountsCopy.autoToggleGroup(autoCaptureOn: antigravityAutoCaptureOn), id: \.self) { hint($0) }
             }
         ) {
+            // #596: the main card's remote routes. On asks first; nothing is
+            // pushed to the core until the user confirms. Off needs no question.
+            toggleRow(
+                AccountsCopy.remoteToggle,
+                isOn: Binding(
+                    get: { antigravityRemoteFallbackOn },
+                    set: { on in
+                        if on {
+                            antigravityRemoteConfirm = true
+                        } else {
+                            antigravityRemoteFallbackOn = false
+                            AntigravityRemoteFallback.apply(wake: true)
+                        }
+                    }))
+                .popover(isPresented: $antigravityRemoteConfirm, arrowEdge: .bottom) {
+                    VStack(alignment: .leading, spacing: 10) {
+                        Text(AccountsCopy.remoteConfirmTitle.localized)
+                            .font(.callout.weight(.semibold))
+                        hint(AccountsCopy.remoteCaption)
+                        HStack {
+                            Spacer()
+                            Button(AccountsCopy.confirmCancel.localized) {
+                                antigravityRemoteConfirm = false
+                            }
+                            .keyboardShortcut(.cancelAction)
+                            // No default-action shortcut: Return must not consent.
+                            Button(AccountsCopy.confirmOk.localized) {
+                                antigravityRemoteConfirm = false
+                                antigravityRemoteFallbackOn = true
+                                AntigravityRemoteFallback.apply(wake: true)
+                            }
+                        }
+                        .controlSize(.small)
+                    }
+                    .frame(width: 280, alignment: .leading)
+                    .padding(12)
+                }
+            hint(AccountsCopy.remoteCaption)
+                .padding(.horizontal, 10)
             ForEach(accounts, id: \.key) { account in
                 row(account.label) {
                     Button {
@@ -1604,6 +1645,8 @@ struct SettingsPanel: View {
             .buttonStyle(.plain)
             .disabled(busy)
             .padding(.horizontal, 10)
+            hint(AccountsCopy.addedAccountsRisk)
+                .padding(.horizontal, 10)
             if let message = antigravityAutoCapture.message {
                 Text(message.localized)
                     .font(.caption2)
@@ -2152,8 +2195,16 @@ enum AccountsCopy {
     static let confirmBody = "Syrtis reads agy's current sign-in now and again each time agy rewrites its saved sign-in, and keeps a copy of each account in this Mac's login keychain without asking again. To check a new sign-in, Syrtis sends agy's refresh token to Google's token service. macOS may ask you to allow access to agy's keychain item. Accounts you remove while this is on stay removed until you sign agy in to them and press Capture."
     static let confirmOk = "Turn On"
     static let confirmCancel = "Cancel"
-    static let autoOff = "Turn this on to keep reading agy's current account through its captured sign-in, shown as one OAUTH card, so Syrtis rarely needs to run agy. With it off, a Capture lasts only until agy next refreshes its sign-in (usually within an hour); after that the main card runs agy again."
+    static let autoOff = "Turn this on to keep reading agy's current account through its captured sign-in. While “Read quota while Antigravity is closed” is on, that account and the main card are shown as one OAUTH card, so Syrtis rarely needs to run agy. With this off, a Capture lasts only until agy next refreshes its sign-in (usually within an hour); after that the main card runs agy again, if that switch is on."
     static let remove = "Remove deletes only the copy on this Mac. Google still accepts it until you revoke access in Google Account → third-party access, which also signs Antigravity out of that account."
+
+    // #596, approved verbatim by the maintainer 2026-11-28. The caption is
+    // also the confirmation's message; the buttons reuse confirmCancel/Ok.
+    static let remoteToggle = "Read quota while Antigravity is closed"
+    static let remoteCaption = "Off: Syrtis reads the main card's quota only from the Antigravity app running on this Mac. On: when the app isn't running, Syrtis uses Antigravity's saved Google sign-in, or the agy CLI, to ask Google for the quota. Google's Antigravity terms say that using third-party software to access the service can lead to account suspension."
+    static let remoteConfirmTitle = "Read quota while Antigravity is closed?"
+    static let addedAccountsRisk = "Added accounts are always read with their saved Google sign-in, which carries the same risk."
+    static let antigravityRemote = [remoteToggle, remoteCaption, remoteConfirmTitle, addedAccountsRisk]
 
     /// Popover order: general paragraphs first, then the toggle group last so
     /// "When on" / "this" follow the caption naming the switch.
@@ -2171,7 +2222,7 @@ enum AccountsCopy {
                              autoToggle, piSummary, cursorSummary, removeNamed, folderMissing, addConfigDir,
                              addFolder, addPrompt, removeHelp, unreadableFolders, rejectedPaths, capturing,
                              captureCurrent, autoPaused, autoUnavailable]
-        + claudeDetails + refusalSentences + piDetails + antigravityDetails + antigravityConfirm
+        + claudeDetails + refusalSentences + piDetails + antigravityDetails + antigravityConfirm + antigravityRemote
         + antigravityMessages + CursorSync.Copy.all + factoryCopy
 }
 

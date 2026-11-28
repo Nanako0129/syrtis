@@ -144,6 +144,29 @@ enum AntigravityAccounts {
     }
 }
 
+/// Whether the primary Antigravity card may use Google sign-in or agy while
+/// the IDE is not running (#596). Off unless the user confirms it in Settings.
+/// The core flag starts off every launch, so the stored choice is pushed
+/// before the first quota poll and on every change.
+enum AntigravityRemoteFallback {
+    static let storageKey = "tokenbar.antigravity.remoteFallback"
+
+    static func isOn(defaults: UserDefaults = .standard) -> Bool {
+        defaults.bool(forKey: storageKey)
+    }
+
+    /// Push the stored choice to the core (an atomic store, safe on the main
+    /// thread). `wake` refreshes the quota cards, as an account change does.
+    static func apply(defaults: UserDefaults = .standard, wake: Bool) {
+        _ = try? TBCore.setAntigravityRemoteFallback(isOn(defaults: defaults))
+        guard wake else { return }
+        Task { @MainActor in
+            await AgentUsageThrottle.shared.invalidate()
+            ClaudeExtraRoots.RegistryChange.signal()
+        }
+    }
+}
+
 // MARK: - Registry mutations and removed keys (S4)
 
 extension AntigravityAccounts {

@@ -18193,6 +18193,21 @@ enum SelfTest {
         expect(
             accountsCopyMissing.isEmpty,
             "ACCOUNTS-PAGE every Accounts copy key exists in zh-Hant and zh-Hans: \(accountsCopyMissing)")
+        // #596: the remote-route switch's copy is in the translated list (so
+        // the loop above checks zh-Hant and zh-Hans), and the switch is off
+        // when nothing was ever stored.
+        let remoteSuite = "com.tokenbar.selftest.antigravity-remote-fallback"
+        if let defaults = UserDefaults(suiteName: remoteSuite) {
+            defaults.removePersistentDomain(forName: remoteSuite)
+            defer { defaults.removePersistentDomain(forName: remoteSuite) }
+            expect(
+                AccountsCopy.antigravityRemote.allSatisfy(AccountsCopy.translated.contains)
+                    && AccountsCopy.antigravityRemote.count == 4
+                    && !AntigravityRemoteFallback.isOn(defaults: defaults),
+                "AGY-REMOTE the switch copy is translated and the switch defaults to off")
+        } else {
+            expect(false, "AGY-REMOTE could not open its UserDefaults suite")
+        }
         let agyDetails = AccountsCopy.antigravityDetails.joined(separator: "\n")
         expect(
             ["login keychain", "refresh token to Google's token service", "Cloud Code quota service",

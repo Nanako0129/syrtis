@@ -16,8 +16,19 @@
 //!    (client id/secret scanned from the installed Antigravity.app binary, with
 //!    the `agy` CLI as a fallback when the IDE is not installed), and
 //!    hit the `cloudcode-pa.googleapis.com` Code Assist quota endpoints.
+//!    After that the optional `agy` CLI (or a bound captured account in its
+//!    place, plan E).
 //!
-//! Both yield "remaining fraction + reset" values which map to `UsageWindow`s.
+//! Route 2 and everything after it run only while the user has allowed them
+//! (`tb_set_antigravity_remote_fallback`, #596); every process starts with
+//! them off. Off, a local miss ends the primary fetch with a fixed Terminal
+//! message — no network request, no subprocess, no agy marker read — or with
+//! `ANTIGRAVITY_UNCONFIGURED_ERROR` when existence checks find no trace of
+//! Antigravity on this Mac (`fetch_gated`, `antigravity_in_use`). Captured
+//! accounts (below) are their own opt-in and ignore this flag.
+//!
+//! Every route yields "remaining fraction + reset" values which map to
+//! `UsageWindow`s.
 
 use crate::agent_account_scope::{
     self, AccountScope, AccountScopeError, AuthoritativeIdKind, HistoryScope, RefreshCheckpoint,
@@ -175,27 +186,160 @@ where
     }
 }
 
-/// Auto: prefer the live Local IDE API, then the OAuth remote API, and finally
-/// the optional `agy` CLI usage command when the earlier routes are unavailable.
-/// With `bound` (agy's current account is a captured account bound under agy's
-/// current login), the agy leg is replaced by that account's OAuth result when
-/// the login is still the same at the decision point (`with_agy_fallback`).
+/// Auto: prefer the live Local IDE API, then — only while the user has allowed
+/// remote routes (`remote_fallback_allowed`, #596) — the OAuth remote API, and
+/// finally the optional `agy` CLI usage command when the earlier routes are
+/// unavailable. With `bound` (agy's current account is a captured account bound
+/// under agy's current login), the agy leg is replaced by that account's OAuth
+/// result when the login is still the same at the decision point
+/// (`with_agy_fallback`).
 pub(crate) async fn fetch(
     now: DateTime<Utc>,
     bound: Option<BoundOAuth>,
 ) -> Result<Fetched, ProviderFetchFailure> {
-    let primary = fetch_with(
+    fetch_gated(
         || async move {
             match fetch_local_ide(now).await {
                 Ok(local) if !local.windows.is_empty() => LocalAttempt::Success(local),
                 Ok(_) | Err(_) => LocalAttempt::RouteMiss,
             }
         },
-        || fetch_oauth_primary(now),
-        |context| fetch_oauth_secondary(context, now),
+        antigravity_in_use,
+        || async move {
+            // The local route already missed in `fetch_gated`. The flag is read
+            // again before each later leg starts, so a switch turned off while
+            // the first request is in flight starts no new outward operation
+            // (a request already sent may finish).
+            let off = || ProviderFetchFailure::terminal(ANTIGRAVITY_LOCAL_ONLY_ERROR);
+            let primary = fetch_with(
+                || async { LocalAttempt::RouteMiss },
+                || fetch_oauth_primary(now),
+                |context| async move {
+                    if !remote_fallback_allowed() {
+                        return Err(off());
+                    }
+                    fetch_oauth_secondary(context, now).await
+                },
+            )
+            .await;
+            with_agy_fallback(
+                primary,
+                bound,
+                || async {
+                    if remote_fallback_allowed() {
+                        live_agy_marker().await
+                    } else {
+                        None
+                    }
+                },
+                || async move {
+                    if !remote_fallback_allowed() {
+                        return Err(off());
+                    }
+                    fetch_agy_cli(now).await
+                },
+            )
+            .await
+        },
     )
-    .await;
-    with_agy_fallback(primary, bound, live_agy_marker, || fetch_agy_cli(now)).await
+    .await
+}
+
+/// Shown on the primary card when the local IDE route missed and the remote
+/// routes are off but Antigravity is installed or signed in on this Mac.
+/// Terminal, and not `ANTIGRAVITY_UNCONFIGURED_ERROR`, so the card keeps its
+/// tab and says what to do.
+pub(crate) const ANTIGRAVITY_LOCAL_ONLY_ERROR: &str = "Antigravity isn't running. Open it to see quota, or allow reading while it's closed in Settings › Accounts › Antigravity.";
+
+/// Whether the primary card may leave this Mac when the IDE is not running:
+/// the OAuth routes, the bound substitution and the `agy` CLI. Off until the
+/// host says otherwise (`tb_set_antigravity_remote_fallback`), so a process
+/// that never heard from Swift never reaches Google on the primary's behalf.
+/// Captured accounts are their own opt-in and do not read this.
+static REMOTE_FALLBACK_ALLOWED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(REMOTE_FALLBACK_DEFAULT);
+const REMOTE_FALLBACK_DEFAULT: bool = false;
+
+pub(crate) fn remote_fallback_allowed() -> bool {
+    REMOTE_FALLBACK_ALLOWED.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Serialises tests that set `REMOTE_FALLBACK_ALLOWED`.
+#[cfg(test)]
+pub(crate) static REMOTE_FALLBACK_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+const REMOTE_FALLBACK_INVALID_JSON: &str = "invalid_remote_fallback_json";
+
+/// `tb_set_antigravity_remote_fallback`: `{"allowed":true|false}`. NULL turns
+/// it off with `{"allowed":false}`. Anything else turns it off first, then
+/// fails with one fixed code: a bad input never leaves the remote routes on.
+pub(crate) fn set_remote_fallback(raw: Option<&[u8]>) -> Result<Value, String> {
+    use std::sync::atomic::Ordering::SeqCst;
+    REMOTE_FALLBACK_ALLOWED.store(false, SeqCst);
+    let Some(raw) = raw else {
+        return Ok(json!({ "allowed": false }));
+    };
+    let allowed = serde_json::from_slice::<Value>(raw)
+        .ok()
+        .and_then(|input| input.as_object()?.get("allowed")?.as_bool())
+        .ok_or_else(|| REMOTE_FALLBACK_INVALID_JSON.to_string())?;
+    REMOTE_FALLBACK_ALLOWED.store(allowed, SeqCst);
+    Ok(json!({ "allowed": allowed }))
+}
+
+/// The local route first; on a miss, `remote` only while the flag is on.
+/// With it off nothing after the local route runs — no OAuth, no agy marker
+/// read, no agy, no client discovery — and the answer is one of two fixed
+/// Terminal failures: the unconfigured marker when `in_use` finds no trace of
+/// Antigravity (so an unconfigured card stays hidden, #345), the local-only
+/// message otherwise.
+async fn fetch_gated<Local, LocalFuture, Remote, RemoteFuture>(
+    local_attempt: Local,
+    in_use: impl FnOnce() -> bool,
+    remote: Remote,
+) -> Result<Fetched, ProviderFetchFailure>
+where
+    Local: FnOnce() -> LocalFuture,
+    LocalFuture: std::future::Future<Output = LocalAttempt>,
+    Remote: FnOnce() -> RemoteFuture,
+    RemoteFuture: std::future::Future<Output = Result<Fetched, ProviderFetchFailure>>,
+{
+    if let LocalAttempt::Success(fetched) = local_attempt().await {
+        return Ok(fetched);
+    }
+    if !remote_fallback_allowed() {
+        return Err(ProviderFetchFailure::terminal(if in_use() {
+            ANTIGRAVITY_LOCAL_ONLY_ERROR
+        } else {
+            ANTIGRAVITY_UNCONFIGURED_ERROR
+        }));
+    }
+    remote().await
+}
+
+/// Any trace of Antigravity on this Mac, from existence checks only: the
+/// shared Google creds file (`<gemini home>/oauth_creds.json`), an
+/// `Antigravity.app` bundle at the roots `client_artifact_candidates` scans,
+/// or an executable `agy` on this process's PATH. No file is opened, no
+/// process starts, and the login shell `agy_cli_artifact_candidates` may use
+/// is deliberately not consulted.
+fn antigravity_in_use() -> bool {
+    let creds = gemini_home().map(|home| home.join("oauth_creds.json"));
+    antigravity_in_use_with(
+        creds.as_deref(),
+        &antigravity_app_roots(),
+        std::env::var_os("PATH").as_deref(),
+    )
+}
+
+fn antigravity_in_use_with(
+    creds: Option<&Path>,
+    app_roots: &[PathBuf],
+    path_env: Option<&OsStr>,
+) -> bool {
+    creds.is_some_and(Path::exists)
+        || app_roots.iter().any(|root| root.exists())
+        || executable_from_path(path_env, "agy").is_some()
 }
 
 /// The `agy` route's arbitration, separated from the route itself so the
@@ -2412,14 +2556,18 @@ fn client_artifact_candidates() -> Vec<PathBuf> {
         "Contents/Resources/app/extensions/antigravity/bin/language_server_macos",
         "Contents/Resources/app/out/main.js",
     ];
+    antigravity_app_roots()
+        .iter()
+        .flat_map(|root| relative.iter().map(move |r| root.join(r)))
+        .collect()
+}
+
+fn antigravity_app_roots() -> Vec<PathBuf> {
     let mut roots = vec![PathBuf::from("/Applications/Antigravity.app")];
     if let Some(home) = crate::user_home_dir() {
         roots.push(home.join("Applications/Antigravity.app"));
     }
     roots
-        .iter()
-        .flat_map(|root| relative.iter().map(move |r| root.join(r)))
-        .collect()
 }
 
 /// `throttle_login_shell` is true only for the quota poll. Without `agy` an
@@ -5551,6 +5699,142 @@ mod tests {
             cache_binding: None,
             windows: Vec::new(),
         }
+    }
+
+    #[derive(Default)]
+    struct RemoteCalls {
+        oauth: std::cell::Cell<u32>,
+        marker: std::cell::Cell<u32>,
+        agy: std::cell::Cell<u32>,
+    }
+
+    /// `fetch`'s shape with every outward step counted: a local miss, an
+    /// OAuth primary that finds no login, a bound offer whose post-marker
+    /// read decides, and agy answering.
+    async fn gated_fetch(
+        calls: &RemoteCalls,
+        local: LocalAttempt,
+        in_use: bool,
+    ) -> Result<Fetched, ProviderFetchFailure> {
+        let bound = BoundOAuth {
+            key: "k".to_string(),
+            marker_pre: "m".to_string(),
+            fetched: orchestration_fetched("bound"),
+        };
+        fetch_gated(
+            || async { local },
+            || in_use,
+            || async {
+                let primary = fetch_with(
+                    || async { LocalAttempt::RouteMiss },
+                    || async {
+                        calls.oauth.set(calls.oauth.get() + 1);
+                        PrimaryAttempt::<()>::FinalFailure(ProviderFetchFailure::terminal(
+                            ANTIGRAVITY_UNCONFIGURED_ERROR,
+                        ))
+                    },
+                    |_: ()| async { Ok(orchestration_fetched("secondary")) },
+                )
+                .await;
+                with_agy_fallback(
+                    primary,
+                    Some(bound),
+                    || async {
+                        calls.marker.set(calls.marker.get() + 1);
+                        None
+                    },
+                    || async {
+                        calls.agy.set(calls.agy.get() + 1);
+                        Ok(orchestration_fetched("agy"))
+                    },
+                )
+                .await
+            },
+        )
+        .await
+    }
+
+    fn terminal_display(result: Result<Fetched, ProviderFetchFailure>) -> String {
+        match result {
+            Err(ProviderFetchFailure::Terminal { display }) => display,
+            other => panic!("expected a Terminal failure, got {other:?}"),
+        }
+    }
+
+    /// #596: with the remote routes off, a local miss reaches no OAuth route,
+    /// no agy marker read and no agy run; the card says to open Antigravity,
+    /// or stays unconfigured when nothing on this Mac suggests it is used.
+    /// With them on, today's routing runs every leg.
+    // The std lock is held across awaits on purpose: it serialises the
+    // process-wide flag, as the plan E tests do with theirs.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn remote_routes_off_stop_after_the_local_route() {
+        let _guard = REMOTE_FALLBACK_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        set_remote_fallback(Some(br#"{"allowed":false}"#)).unwrap();
+
+        let calls = RemoteCalls::default();
+        let shown = terminal_display(gated_fetch(&calls, LocalAttempt::RouteMiss, true).await);
+        assert_eq!(shown, ANTIGRAVITY_LOCAL_ONLY_ERROR);
+        let shown = terminal_display(gated_fetch(&calls, LocalAttempt::RouteMiss, false).await);
+        assert_eq!(shown, ANTIGRAVITY_UNCONFIGURED_ERROR, "unconfigured stays unconfigured");
+        assert_eq!(
+            (calls.oauth.get(), calls.marker.get(), calls.agy.get()),
+            (0, 0, 0),
+            "nothing after the local route may run while the remote routes are off"
+        );
+        let local = gated_fetch(&calls, LocalAttempt::Success(orchestration_fetched("cli")), true)
+            .await
+            .unwrap();
+        assert_eq!(local.source, "cli", "the local route still answers");
+
+        // Control: on, every leg runs as before.
+        set_remote_fallback(Some(br#"{"allowed":true}"#)).unwrap();
+        let fetched = gated_fetch(&calls, LocalAttempt::RouteMiss, true).await.unwrap();
+        assert_eq!(fetched.source, "agy");
+        assert_eq!((calls.oauth.get(), calls.marker.get(), calls.agy.get()), (1, 1, 1));
+        set_remote_fallback(None).unwrap();
+    }
+
+    /// The default is off, and every malformed input turns it off.
+    #[test]
+    fn remote_fallback_defaults_off_and_fails_closed() {
+        // A runtime check (not `const`), so flipping the default fails a test
+        // rather than the build.
+        assert!(!std::hint::black_box(REMOTE_FALLBACK_DEFAULT), "remote routes default to off");
+        let _guard = REMOTE_FALLBACK_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for bad in [&b"{"[..], b"[]", br#"{"allowed":"yes"}"#, br#"{}"#, b"\xff"] {
+            set_remote_fallback(Some(br#"{"allowed":true}"#)).unwrap();
+            assert_eq!(set_remote_fallback(Some(bad)).unwrap_err(), REMOTE_FALLBACK_INVALID_JSON);
+            assert!(!remote_fallback_allowed());
+        }
+        set_remote_fallback(None).unwrap();
+    }
+
+    /// The "in use" signals are existence checks; a bare home has none.
+    #[test]
+    fn antigravity_in_use_reads_only_existence() {
+        let root = tempfile::tempdir().unwrap();
+        let creds = root.path().join("oauth_creds.json");
+        let app = root.path().join("Antigravity.app");
+        let bin = root.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let path_env = bin.clone().into_os_string();
+        let apps = [app.clone()];
+        assert!(!antigravity_in_use_with(Some(&creds), &apps, Some(&path_env)));
+        std::fs::write(&creds, b"").unwrap();
+        assert!(antigravity_in_use_with(Some(&creds), &apps, Some(&path_env)));
+        assert!(!antigravity_in_use_with(None, &apps, Some(&path_env)));
+        std::fs::create_dir_all(&app).unwrap();
+        assert!(antigravity_in_use_with(None, &apps, None));
+        let agy = bin.join("agy");
+        std::fs::write(&agy, b"").unwrap();
+        mark_executable(&agy);
+        assert!(antigravity_in_use_with(None, &[], Some(&path_env)));
     }
 
     /// A credential that exists but cannot be parsed belongs to a configured
